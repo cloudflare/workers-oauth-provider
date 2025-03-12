@@ -706,10 +706,12 @@ class OAuthProviderImpl {
     // Note: We don't add CORS headers to default handler responses
     if (this.defaultHandlerType === HandlerType.EXPORTED_HANDLER) {
       // It's an object with a fetch method
-      return (this.options.defaultHandler as ExportedHandler).fetch(request, env, ctx);
+      // @ts-ignore
+      return (this.options.defaultHandler! as ExportedHandler).fetch(request, env, ctx);
     } else {
       // It's a WorkerEntrypoint class - instantiate it with ctx and env in that order
       const handler = new (this.options.defaultHandler as new (ctx: ExecutionContext, env: any) => WorkerEntrypoint)(ctx, env);
+      // @ts-ignore
       return handler.fetch(request);
     }
   }
@@ -1611,10 +1613,12 @@ class OAuthProviderImpl {
     // Call the API handler based on its type
     if (this.apiHandlerType === HandlerType.EXPORTED_HANDLER) {
       // It's an object with a fetch method
+      // @ts-ignore
       return (this.options.apiHandler as ExportedHandler).fetch(request, env, ctx);
     } else {
       // It's a WorkerEntrypoint class - instantiate it with ctx and env in that order
       const handler = new (this.options.apiHandler as new (ctx: ExecutionContext, env: any) => WorkerEntrypoint)(ctx, env);
+      // @ts-ignore
       return handler.fetch(request);
     }
   }
@@ -1771,7 +1775,8 @@ function base64ToArrayBuffer(base64: string): ArrayBuffer {
  */
 async function encryptProps(data: any): Promise<{ encryptedData: string, key: CryptoKey }> {
   // Generate a new encryption key for this specific props data
-  const key = await crypto.subtle.generateKey(
+  // @ts-ignore
+  const key: CryptoKey = await crypto.subtle.generateKey(
     {
       name: 'AES-GCM',
       length: 256
