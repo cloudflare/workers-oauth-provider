@@ -4,7 +4,7 @@ import { WorkerEntrypoint } from './mocks/cloudflare-workers';
 // Mock the 'cloudflare:workers' module
 vi.mock('cloudflare:workers', () => {
   return {
-    WorkerEntrypoint
+    WorkerEntrypoint,
   };
 });
 

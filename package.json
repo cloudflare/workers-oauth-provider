@@ -22,6 +22,7 @@
     "@cloudflare/workers-types": "^4.20250311.0"
   },
   "devDependencies": {
+    "prettier": "^3.5.3",
     "tsup": "^8.4.0",
     "typescript": "^5.8.2",
     "vitest": "^1.2.2"
