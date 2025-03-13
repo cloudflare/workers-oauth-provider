@@ -149,6 +149,16 @@ export interface OAuthHelpers {
   listUserGrants(userId: string, options?: ListOptions): Promise<ListResult<GrantSummary>>;
 
   /**
+   * Updates the application-specific properties (props) for a grant
+   * @param grantId - The ID of the grant to update
+   * @param userId - The ID of the user who owns the grant
+   * @param refreshToken - The current refresh token for authentication
+   * @param newProps - The new props data to set
+   * @returns A Promise resolving when the update is confirmed.
+   */
+  updateGrantProps(grantId: string, userId: string, refreshToken: string, newProps: any): Promise<void>;
+
+  /**
    * Revokes an authorization grant
    * @param grantId - The ID of the grant to revoke
    * @param userId - The ID of the user who owns the grant
@@ -2215,6 +2225,116 @@ class OAuthHelpersImpl implements OAuthHelpers {
       items: grantSummaries,
       cursor: response.list_complete ? undefined : response.cursor,
     };
+  }
+
+  /**
+   * Updates the application-specific properties (props) for a grant
+   * @param grantId - The ID of the grant to update
+   * @param userId - The ID of the user who owns the grant
+   * @param refreshToken - The current refresh token for authentication
+   * @param newProps - The new props data to set
+   * @returns A Promise resolving when the update is confirmed.
+   */
+  async updateGrantProps(grantId: string, userId: string, refreshToken: string, newProps: any): Promise<void> {
+    // Construct the full grant key with user ID
+    const grantKey = `grant:${userId}:${grantId}`;
+
+    // Fetch the grant record
+    const grantData: Grant | null = await this.env.OAUTH_KV.get(grantKey, { type: 'json' });
+
+    if (!grantData) {
+      throw new Error('Grant not found');
+    }
+
+    // Verify the refresh token by comparing its hash
+    const providedTokenHash = await generateTokenId(refreshToken);
+    const isCurrentToken = grantData.refreshTokenId === providedTokenHash;
+    const isPreviousToken = grantData.previousRefreshTokenId === providedTokenHash;
+
+    if (!isCurrentToken && !isPreviousToken) {
+      throw new Error('Invalid refresh token');
+    }
+
+    // Determine which wrapped key to use for unwrapping
+    let wrappedKeyToUse: string;
+    if (isCurrentToken) {
+      wrappedKeyToUse = grantData.refreshTokenWrappedKey!;
+    } else {
+      wrappedKeyToUse = grantData.previousRefreshTokenWrappedKey!;
+    }
+
+    // Unwrap the encryption key using the refresh token
+    const encryptionKey = await unwrapKeyWithToken(refreshToken, wrappedKeyToUse);
+
+    // Re-encrypt the new props with the same key
+    const encoder = new TextEncoder();
+    const jsonData = JSON.stringify(newProps);
+    const encodedData = encoder.encode(jsonData);
+
+    // Use a constant IV (all zeros) as done in the original code
+    const iv = new Uint8Array(12);
+
+    // Encrypt the data
+    const encryptedBuffer = await crypto.subtle.encrypt(
+      {
+        name: 'AES-GCM',
+        iv
+      },
+      encryptionKey,
+      encodedData
+    );
+
+    // Convert to base64 for storage
+    const encryptedData = arrayBufferToBase64(encryptedBuffer);
+
+    // Update the grant with the new encrypted props
+    grantData.encryptedProps = encryptedData;
+
+    // Save the updated grant
+    await this.env.OAUTH_KV.put(grantKey, JSON.stringify(grantData));
+
+    // Update all access tokens with the new encrypted props
+    const tokenPrefix = `token:${userId}:${grantId}:`;
+
+    // Handle pagination to ensure we process all tokens
+    let cursor: string | undefined;
+    let allTokensProcessed = false;
+
+    while (!allTokensProcessed) {
+      const listOptions: { prefix: string; cursor?: string } = {
+        prefix: tokenPrefix
+      };
+
+      if (cursor) {
+        listOptions.cursor = cursor;
+      }
+
+      const result = await this.env.OAUTH_KV.list(listOptions);
+
+      // Update each token in this batch
+      if (result.keys.length > 0) {
+        await Promise.all(result.keys.map(async (key: { name: string }) => {
+          const tokenData: Token | null = await this.env.OAUTH_KV.get(key.name, { type: 'json' });
+          if (tokenData) {
+            // Update the denormalized grant info with the new encrypted props
+            tokenData.grant.encryptedProps = encryptedData;
+
+            // Save the updated token with its original TTL
+            const timeRemaining = tokenData.expiresAt - Math.floor(Date.now() / 1000);
+            if (timeRemaining > 0) {
+              await this.env.OAUTH_KV.put(key.name, JSON.stringify(tokenData), { expirationTtl: timeRemaining });
+            }
+          }
+        }));
+      }
+
+      // Check if we need to fetch more tokens
+      if (result.list_complete) {
+        allTokensProcessed = true;
+      } else {
+        cursor = result.cursor;
+      }
+    }
   }
 
   /**
