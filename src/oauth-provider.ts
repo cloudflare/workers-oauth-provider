@@ -172,6 +172,14 @@ export interface OAuthProviderOptions {
   tokenExchangeCallback?: (
     options: TokenExchangeCallbackOptions
   ) => Promise<TokenExchangeCallbackResult | void> | TokenExchangeCallbackResult | void;
+
+  /**
+   * Controls logging of client errors (HTTP 4xx errors). This is useful for debugging but can be
+   * disabled if it becomes too noisy.
+   * - 'console': Log errors to console.warn (default)
+   * - 'none': Don't log errors
+   */
+  logClientErrors?: 'console' | 'none';
 }
 
 // Using ExportedHandler from Cloudflare Workers Types for both API and default handlers
@@ -687,6 +695,7 @@ class OAuthProviderImpl {
     this.options = {
       ...options,
       accessTokenTTL: options.accessTokenTTL || DEFAULT_ACCESS_TOKEN_TTL,
+      logClientErrors: options.logClientErrors || 'console',
     };
   }
 
@@ -1002,7 +1011,7 @@ class OAuthProviderImpl {
   private async handleTokenRequest(request: Request, env: any): Promise<Response> {
     // Only accept POST requests
     if (request.method !== 'POST') {
-      return createErrorResponse('invalid_request', 'Method not allowed', 405);
+      return this.createErrorResponse('invalid_request', 'Method not allowed', 405);
     }
 
     let contentType = request.headers.get('Content-Type') || '';
@@ -1011,7 +1020,7 @@ class OAuthProviderImpl {
     // According to OAuth 2.0 RFC 6749 Section 2.3, token requests MUST use
     // application/x-www-form-urlencoded content type
     if (!contentType.includes('application/x-www-form-urlencoded')) {
-      return createErrorResponse('invalid_request', 'Content-Type must be application/x-www-form-urlencoded', 400);
+      return this.createErrorResponse('invalid_request', 'Content-Type must be application/x-www-form-urlencoded', 400);
     }
 
     // Process application/x-www-form-urlencoded
@@ -1038,13 +1047,13 @@ class OAuthProviderImpl {
     }
 
     if (!clientId) {
-      return createErrorResponse('invalid_client', 'Client ID is required', 401);
+      return this.createErrorResponse('invalid_client', 'Client ID is required', 401);
     }
 
     // Verify client exists
     const clientInfo = await this.getClient(env, clientId);
     if (!clientInfo) {
-      return createErrorResponse('invalid_client', 'Client not found', 401);
+      return this.createErrorResponse('invalid_client', 'Client not found', 401);
     }
 
     // Determine authentication requirements based on token endpoint auth method
@@ -1053,12 +1062,12 @@ class OAuthProviderImpl {
     // For confidential clients, validate the secret
     if (!isPublicClient) {
       if (!clientSecret) {
-        return createErrorResponse('invalid_client', 'Client authentication failed: missing client_secret', 401);
+        return this.createErrorResponse('invalid_client', 'Client authentication failed: missing client_secret', 401);
       }
 
       // Verify the client secret matches
       if (!clientInfo.clientSecret) {
-        return createErrorResponse(
+        return this.createErrorResponse(
           'invalid_client',
           'Client authentication failed: client has no registered secret',
           401
@@ -1067,7 +1076,7 @@ class OAuthProviderImpl {
 
       const providedSecretHash = await hashSecret(clientSecret);
       if (providedSecretHash !== clientInfo.clientSecret) {
-        return createErrorResponse('invalid_client', 'Client authentication failed: invalid client_secret', 401);
+        return this.createErrorResponse('invalid_client', 'Client authentication failed: invalid client_secret', 401);
       }
     }
     // For public clients, no secret is required
@@ -1080,7 +1089,7 @@ class OAuthProviderImpl {
     } else if (grantType === 'refresh_token') {
       return this.handleRefreshTokenGrant(body, clientInfo, env);
     } else {
-      return createErrorResponse('unsupported_grant_type', 'Grant type not supported');
+      return this.createErrorResponse('unsupported_grant_type', 'Grant type not supported');
     }
   }
 
@@ -1098,13 +1107,13 @@ class OAuthProviderImpl {
     const codeVerifier = body.code_verifier;
 
     if (!code) {
-      return createErrorResponse('invalid_request', 'Authorization code is required');
+      return this.createErrorResponse('invalid_request', 'Authorization code is required');
     }
 
     // Parse the authorization code to extract user ID and grant ID
     const codeParts = code.split(':');
     if (codeParts.length !== 3) {
-      return createErrorResponse('invalid_grant', 'Invalid authorization code format');
+      return this.createErrorResponse('invalid_grant', 'Invalid authorization code format');
     }
 
     const [userId, grantId, _] = codeParts;
@@ -1114,23 +1123,23 @@ class OAuthProviderImpl {
     const grantData: Grant | null = await env.OAUTH_KV.get(grantKey, { type: 'json' });
 
     if (!grantData) {
-      return createErrorResponse('invalid_grant', 'Grant not found or authorization code expired');
+      return this.createErrorResponse('invalid_grant', 'Grant not found or authorization code expired');
     }
 
     // Verify that the grant contains an auth code hash
     if (!grantData.authCodeId) {
-      return createErrorResponse('invalid_grant', 'Authorization code already used');
+      return this.createErrorResponse('invalid_grant', 'Authorization code already used');
     }
 
     // Verify the authorization code by comparing its hash to the one in the grant
     const codeHash = await hashSecret(code);
     if (codeHash !== grantData.authCodeId) {
-      return createErrorResponse('invalid_grant', 'Invalid authorization code');
+      return this.createErrorResponse('invalid_grant', 'Invalid authorization code');
     }
 
     // Verify client ID matches
     if (grantData.clientId !== clientInfo.clientId) {
-      return createErrorResponse('invalid_grant', 'Client ID mismatch');
+      return this.createErrorResponse('invalid_grant', 'Client ID mismatch');
     }
 
     // Check if PKCE is being used
@@ -1138,18 +1147,18 @@ class OAuthProviderImpl {
 
     // OAuth 2.1 requires redirect_uri parameter unless PKCE is used
     if (!redirectUri && !isPkceEnabled) {
-      return createErrorResponse('invalid_request', 'redirect_uri is required when not using PKCE');
+      return this.createErrorResponse('invalid_request', 'redirect_uri is required when not using PKCE');
     }
 
     // Verify redirect URI if provided
     if (redirectUri && !clientInfo.redirectUris.includes(redirectUri)) {
-      return createErrorResponse('invalid_grant', 'Invalid redirect URI');
+      return this.createErrorResponse('invalid_grant', 'Invalid redirect URI');
     }
 
     // Verify PKCE code_verifier if code_challenge was provided during authorization
     if (isPkceEnabled) {
       if (!codeVerifier) {
-        return createErrorResponse('invalid_request', 'code_verifier is required for PKCE');
+        return this.createErrorResponse('invalid_request', 'code_verifier is required for PKCE');
       }
 
       // Verify the code verifier against the stored code challenge
@@ -1168,7 +1177,7 @@ class OAuthProviderImpl {
       }
 
       if (calculatedChallenge !== grantData.codeChallenge) {
-        return createErrorResponse('invalid_grant', 'Invalid PKCE code_verifier');
+        return this.createErrorResponse('invalid_grant', 'Invalid PKCE code_verifier');
       }
     }
 
@@ -1326,13 +1335,13 @@ class OAuthProviderImpl {
     const refreshToken = body.refresh_token;
 
     if (!refreshToken) {
-      return createErrorResponse('invalid_request', 'Refresh token is required');
+      return this.createErrorResponse('invalid_request', 'Refresh token is required');
     }
 
     // Parse the token to extract user ID and grant ID
     const tokenParts = refreshToken.split(':');
     if (tokenParts.length !== 3) {
-      return createErrorResponse('invalid_grant', 'Invalid token format');
+      return this.createErrorResponse('invalid_grant', 'Invalid token format');
     }
 
     const [userId, grantId, _] = tokenParts;
@@ -1345,7 +1354,7 @@ class OAuthProviderImpl {
     const grantData: Grant | null = await env.OAUTH_KV.get(grantKey, { type: 'json' });
 
     if (!grantData) {
-      return createErrorResponse('invalid_grant', 'Grant not found');
+      return this.createErrorResponse('invalid_grant', 'Grant not found');
     }
 
     // Check if the provided token matches either the current or previous refresh token
@@ -1353,12 +1362,12 @@ class OAuthProviderImpl {
     const isPreviousToken = grantData.previousRefreshTokenId === providedTokenHash;
 
     if (!isCurrentToken && !isPreviousToken) {
-      return createErrorResponse('invalid_grant', 'Invalid refresh token');
+      return this.createErrorResponse('invalid_grant', 'Invalid refresh token');
     }
 
     // Verify client ID matches
     if (grantData.clientId !== clientInfo.clientId) {
-      return createErrorResponse('invalid_grant', 'Client ID mismatch');
+      return this.createErrorResponse('invalid_grant', 'Client ID mismatch');
     }
 
     // Generate new access token with embedded user and grant IDs
@@ -1534,19 +1543,19 @@ class OAuthProviderImpl {
    */
   private async handleClientRegistration(request: Request, env: any): Promise<Response> {
     if (!this.options.clientRegistrationEndpoint) {
-      return createErrorResponse('not_implemented', 'Client registration is not enabled', 501);
+      return this.createErrorResponse('not_implemented', 'Client registration is not enabled', 501);
     }
 
     // Check method
     if (request.method !== 'POST') {
-      return createErrorResponse('invalid_request', 'Method not allowed', 405);
+      return this.createErrorResponse('invalid_request', 'Method not allowed', 405);
     }
 
     // Check content length to ensure it's not too large (1 MiB limit)
     const contentLength = parseInt(request.headers.get('Content-Length') || '0', 10);
     if (contentLength > 1048576) {
       // 1 MiB = 1048576 bytes
-      return createErrorResponse('invalid_request', 'Request payload too large, must be under 1 MiB', 413);
+      return this.createErrorResponse('invalid_request', 'Request payload too large, must be under 1 MiB', 413);
     }
 
     // Parse client metadata with a size limitation
@@ -1555,11 +1564,11 @@ class OAuthProviderImpl {
       const text = await request.text();
       if (text.length > 1048576) {
         // Double-check text length
-        return createErrorResponse('invalid_request', 'Request payload too large, must be under 1 MiB', 413);
+        return this.createErrorResponse('invalid_request', 'Request payload too large, must be under 1 MiB', 413);
       }
       clientMetadata = JSON.parse(text);
     } catch (error) {
-      return createErrorResponse('invalid_request', 'Invalid JSON payload', 400);
+      return this.createErrorResponse('invalid_request', 'Invalid JSON payload', 400);
     }
 
     // Basic type validation functions
@@ -1597,7 +1606,7 @@ class OAuthProviderImpl {
 
     // Check if public client registrations are disallowed
     if (isPublicClient && this.options.disallowPublicClientRegistration) {
-      return createErrorResponse('invalid_client_metadata', 'Public client registration is not allowed');
+      return this.createErrorResponse('invalid_client_metadata', 'Public client registration is not allowed');
     }
 
     // Create client ID
@@ -1641,7 +1650,7 @@ class OAuthProviderImpl {
         clientInfo.clientSecret = hashedSecret;
       }
     } catch (error) {
-      return createErrorResponse(
+      return this.createErrorResponse(
         'invalid_client_metadata',
         error instanceof Error ? error.message : 'Invalid client metadata'
       );
@@ -1691,7 +1700,7 @@ class OAuthProviderImpl {
     const authHeader = request.headers.get('Authorization');
 
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return createErrorResponse('invalid_token', 'Missing or invalid access token', 401, {
+      return this.createErrorResponse('invalid_token', 'Missing or invalid access token', 401, {
         'WWW-Authenticate':
           'Bearer realm="OAuth", error="invalid_token", error_description="Missing or invalid access token"',
       });
@@ -1702,7 +1711,7 @@ class OAuthProviderImpl {
     // Parse the token to extract user ID and grant ID for parallel lookups
     const tokenParts = accessToken.split(':');
     if (tokenParts.length !== 3) {
-      return createErrorResponse('invalid_token', 'Invalid token format', 401, {
+      return this.createErrorResponse('invalid_token', 'Invalid token format', 401, {
         'WWW-Authenticate': 'Bearer realm="OAuth", error="invalid_token"',
       });
     }
@@ -1718,7 +1727,7 @@ class OAuthProviderImpl {
 
     // Verify token
     if (!tokenData) {
-      return createErrorResponse('invalid_token', 'Invalid access token', 401, {
+      return this.createErrorResponse('invalid_token', 'Invalid access token', 401, {
         'WWW-Authenticate': 'Bearer realm="OAuth", error="invalid_token"',
       });
     }
@@ -1726,7 +1735,7 @@ class OAuthProviderImpl {
     // Check if token is expired (should be auto-deleted by KV TTL, but double-check)
     const now = Math.floor(Date.now() / 1000);
     if (tokenData.expiresAt < now) {
-      return createErrorResponse('invalid_token', 'Access token expired', 401, {
+      return this.createErrorResponse('invalid_token', 'Access token expired', 401, {
         'WWW-Authenticate': 'Bearer realm="OAuth", error="invalid_token"',
       });
     }
@@ -1778,6 +1787,39 @@ class OAuthProviderImpl {
     const clientKey = `client:${clientId}`;
     return env.OAUTH_KV.get(clientKey, { type: 'json' });
   }
+
+  /**
+   * Helper function to create OAuth error responses
+   * @param code - OAuth error code (e.g., 'invalid_request', 'invalid_token')
+   * @param description - Human-readable error description
+   * @param status - HTTP status code (default: 400)
+   * @param headers - Additional headers to include
+   * @returns A Response object with the error
+   */
+  private createErrorResponse(
+    code: string,
+    description: string,
+    status: number = 400,
+    headers: Record<string, string> = {}
+  ): Response {
+    const body = JSON.stringify({
+      error: code,
+      error_description: description,
+    });
+
+    // Log error for debugging purposes if enabled
+    if (this.options.logClientErrors === 'console') {
+      console.warn(`OAuth error response: ${status} ${code} - ${description}`);
+    }
+
+    return new Response(body, {
+      status,
+      headers: {
+        'Content-Type': 'application/json',
+        ...headers,
+      },
+    });
+  };
 }
 
 // Constants
@@ -1792,34 +1834,6 @@ const DEFAULT_ACCESS_TOKEN_TTL = 60 * 60;
 const TOKEN_LENGTH = 32;
 
 // Helper Functions
-/**
- * Helper function to create OAuth error responses
- * @param code - OAuth error code (e.g., 'invalid_request', 'invalid_token')
- * @param description - Human-readable error description
- * @param status - HTTP status code (default: 400)
- * @param headers - Additional headers to include
- * @returns A Response object with the error
- */
-function createErrorResponse(
-  code: string,
-  description: string,
-  status: number = 400,
-  headers: Record<string, string> = {}
-): Response {
-  const body = JSON.stringify({
-    error: code,
-    error_description: description,
-  });
-
-  return new Response(body, {
-    status,
-    headers: {
-      'Content-Type': 'application/json',
-      ...headers,
-    },
-  });
-}
-
 /**
  * Hashes a secret value using SHA-256
  * @param secret - The secret value to hash
