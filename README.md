@@ -43,6 +43,16 @@ export default new OAuthProvider({
   // You can provide either an object with a fetch method (ExportedHandler)
   // or a class extending WorkerEntrypoint.
   apiHandler: ApiHandler, // Using a WorkerEntrypoint class
+  
+  // For multi-handler setups, you can use apiHandlers instead of apiRoute+apiHandler.
+  // This allows you to use different handlers for different API routes.
+  // Note: You must use either apiRoute+apiHandler (single-handler) OR apiHandlers (multi-handler), not both.
+  // Example:
+  // apiHandlers: {
+  //   "/api/users/": UsersApiHandler,
+  //   "/api/documents/": DocumentsApiHandler,
+  //   "https://api.example.com/": ExternalApiHandler,
+  // },
 
   // Any requests which aren't API request will be passed to the default handler instead.
   // Again, this can be either an object or a WorkerEntrypoint.
