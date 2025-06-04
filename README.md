@@ -300,6 +300,36 @@ new OAuthProvider({
 
 By default, the `onError` callback is set to ``({ status, code, description }) => console.warn(`OAuth error response: ${status} ${code} - ${description}`)``.
 
+## Passing custom or per-request props
+
+If your application needs to pass through context from each request to the ApiHandler, you can pass a `customProps` callback. This receives the same parameters (`request`, `env`, and `ctx`) as a standard Workers event handler, and lets you return arbitrary data that will be forwarded to your handler inside `ctx.props.customProps`.
+
+```ts
+new OAuthProvider({
+  // ... other options ...
+  customProps: async (request, env, ctx) => {
+    // Will be added to ctx.props.customProps when invoking apiHandler
+    return {
+      customToken: request.headers.get('x-custom-token'),
+      featureFlags: await env.FEATURES.parse(request.headers.get('x-feature-flags')),
+    }
+  }
+})
+```
+
+For use with Cloudflare's [`McpAgent`](https://developers.cloudflare.com/agents/model-context-protocol/mcp-agent-api/), this will be automatically available on `this.props.customProps`:
+
+```ts
+export class MyMCP extends McpAgent {
+  server = new McpServer({ /* ... */ });
+
+  async init() {
+    const { customToken, featureFlags } = this.props.customProps
+    // ...
+  }
+}
+```
+
 ## Implementation Notes
 
 ### End-to-end encryption

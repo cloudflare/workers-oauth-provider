@@ -205,6 +205,13 @@ export interface OAuthProviderOptions {
     status: number;
     headers: Record<string, string>;
   }) => Response | void;
+
+  /**
+   * Optional callback function that is called for each API request to provide custom props.
+   * This receives the same parameters (request, env, ctx) as a standard Workers event handler,
+   * and lets you return arbitrary data that will be forwarded to your handler inside ctx.props.customProps.
+   */
+  customProps?: (request: Request, env: any, ctx: ExecutionContext) => Promise<any> | any;
 }
 
 // Using ExportedHandler from Cloudflare Workers Types for both API and default handlers
@@ -1834,6 +1841,11 @@ class OAuthProviderImpl {
 
     // Set the decrypted props on the context object
     ctx.props = decryptedProps;
+
+    // Add custom props if callback is provided
+    if (this.options.customProps) {
+      ctx.props.customProps = await this.options.customProps(request, env, ctx);
+    }
 
     // Inject OAuth helpers into env if not already present
     if (!env.OAUTH_PROVIDER) {

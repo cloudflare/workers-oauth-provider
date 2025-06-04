@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
-import { OAuthProvider, ClientInfo, AuthRequest, CompleteAuthorizationOptions } from '../src/oauth-provider';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { OAuthProvider } from '../src/oauth-provider';
 import { ExecutionContext } from '@cloudflare/workers-types';
 // We're importing WorkerEntrypoint from our mock implementation
 // The actual import is mocked in setup.ts
@@ -2228,6 +2228,123 @@ describe('OAuthProvider', () => {
       // Verify client was deleted
       const clientsAfterDelete = await mockEnv.OAUTH_PROVIDER.listClients();
       expect(clientsAfterDelete.items.length).toBe(0);
+    });
+  });
+
+  describe('Custom Props', () => {
+    it('should call customProps callback and include result in ctx.props.customProps', async () => {
+      const oauthProviderWithCustomProps = new OAuthProvider({
+        apiRoute: ['/api/', 'https://api.example.com/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        customProps: async (request: Request, env: any, ctx: ExecutionContext) => {
+          // Return custom props based on request headers
+          return {
+            customToken: request.headers.get('x-custom-token'),
+            requestId: request.headers.get('x-request-id'),
+            userAgent: request.headers.get('user-agent'),
+          };
+        },
+      });
+
+      // Create a client
+      const clientData = {
+        redirect_uris: ['https://client.example.com/callback'],
+        client_name: 'Test Client',
+        token_endpoint_auth_method: 'client_secret_basic',
+      };
+
+      const registerRequest = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify(clientData)
+      );
+
+      const registerResponse = await oauthProviderWithCustomProps.fetch(registerRequest, mockEnv, mockCtx);
+      const client = await registerResponse.json();
+      const clientId = client.client_id;
+      const clientSecret = client.client_secret;
+
+      // Get an auth code
+      const redirectUri = 'https://client.example.com/callback';
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123`
+      );
+
+      const authResponse = await oauthProviderWithCustomProps.fetch(authRequest, mockEnv, mockCtx);
+      const location = authResponse.headers.get('Location')!;
+      const code = new URL(location).searchParams.get('code')!;
+
+      // Exchange for tokens
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      );
+
+      const tokenResponse = await oauthProviderWithCustomProps.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokens = await tokenResponse.json();
+      const accessToken = tokens.access_token;
+
+      {
+        // Make an API request with custom headers
+        const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
+          Authorization: `Bearer ${accessToken}`,
+          'x-custom-token': 'custom-token-123',
+          'x-request-id': 'req-456',
+          'user-agent': 'Test User Agent',
+        });
+
+        const apiResponse = await oauthProviderWithCustomProps.fetch(apiRequest, mockEnv, mockCtx);
+
+        expect(apiResponse.status).toBe(200);
+
+        const result = await apiResponse.json();
+        expect(result.success).toBe(true);
+
+        // Verify the custom props were added to ctx.props.customProps
+        expect(result.user.customProps).toBeDefined();
+        expect(result.user.customProps.customToken).toBe('custom-token-123');
+        expect(result.user.customProps.requestId).toBe('req-456');
+        expect(result.user.customProps.userAgent).toBe('Test User Agent');
+      }
+
+      {
+        // Make an API request with different custom headers
+        const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
+          Authorization: `Bearer ${accessToken}`,
+          'x-custom-token': 'custom-token-456',
+          'x-request-id': 'req-789',
+          'user-agent': 'Test User Agent 2.0',
+        });
+
+        const apiResponse = await oauthProviderWithCustomProps.fetch(apiRequest, mockEnv, mockCtx);
+
+        expect(apiResponse.status).toBe(200);
+
+        const result = await apiResponse.json();
+        expect(result.success).toBe(true);
+
+        // Verify the custom props were added to ctx.props.customProps
+        expect(result.user.customProps).toBeDefined();
+        expect(result.user.customProps.customToken).toBe('custom-token-456');
+        expect(result.user.customProps.requestId).toBe('req-789');
+        expect(result.user.customProps.userAgent).toBe('Test User Agent 2.0');
+      }
     });
   });
 });
