@@ -1118,9 +1118,9 @@ class OAuthProviderImpl {
     if (authHeader && authHeader.startsWith('Basic ')) {
       // Basic auth
       const credentials = atob(authHeader.substring(6));
-      const [id, secret] = credentials.split(':');
-      clientId = id;
-      clientSecret = secret || '';
+      const [id, secret] = credentials.split(':', 2);
+      clientId = decodeURIComponent(id);
+      clientSecret = decodeURIComponent(secret || '');
     } else {
       // Form parameters
       clientId = body.client_id;
