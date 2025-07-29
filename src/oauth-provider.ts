@@ -1,5 +1,77 @@
 import { WorkerEntrypoint } from 'cloudflare:workers';
 
+// Retry utility for KV operations with exponential backoff
+interface RetryOptions {
+  maxAttempts?: number;
+  baseDelayMs?: number;
+  maxDelayMs?: number;
+  jitterFactor?: number;
+}
+
+/**
+ * Executes a KV operation with retry logic and exponential backoff
+ * @param operation - The KV operation to retry
+ * @param options - Retry configuration options
+ * @returns Promise that resolves when the operation succeeds
+ */
+async function retryKvOperation<T>(
+  operation: () => Promise<T>,
+  options: RetryOptions = {}
+): Promise<T> {
+  const {
+    maxAttempts = 3,
+    baseDelayMs = 100,
+    maxDelayMs = 5000,
+    jitterFactor = 0.1
+  } = options;
+
+  let lastError: Error | undefined;
+  
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error as Error;
+      
+      // Don't retry on the last attempt
+      if (attempt === maxAttempts) {
+        break;
+      }
+      
+      // Calculate delay with exponential backoff and jitter
+      const exponentialDelay = Math.min(baseDelayMs * Math.pow(2, attempt - 1), maxDelayMs);
+      const jitter = exponentialDelay * jitterFactor * Math.random();
+      const delay = exponentialDelay + jitter;
+      
+      console.warn(`KV operation failed (attempt ${attempt}/${maxAttempts}), retrying in ${Math.round(delay)}ms:`, error);
+      
+      // Wait before retrying
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+  
+  // If we get here, all attempts failed
+  console.error(`KV operation failed after ${maxAttempts} attempts:`, lastError);
+  throw lastError || new Error('KV operation failed after all retry attempts');
+}
+
+/**
+ * Wrapper for KV put operations with retry logic
+ * @param kv - The KV namespace
+ * @param key - The key to store
+ * @param value - The value to store
+ * @param options - KV put options (expiration, metadata, etc.)
+ * @returns Promise that resolves when the put operation succeeds
+ */
+async function retryKvPut(
+  kv: any,
+  key: string,
+  value: string,
+  options?: any
+): Promise<void> {
+  return retryKvOperation(() => kv.put(key, value, options));
+}
+
 // Types
 
 /**
@@ -1372,7 +1444,7 @@ class OAuthProviderImpl {
     grantData.previousRefreshTokenWrappedKey = undefined; // No previous token for first use
 
     // Update the grant with the refresh token hash and no TTL
-    await env.OAUTH_KV.put(grantKey, JSON.stringify(grantData));
+    await retryKvPut(env.OAUTH_KV, grantKey, JSON.stringify(grantData));
 
     // Store access token with denormalized grant information
     const accessTokenData: Token = {
@@ -1390,7 +1462,7 @@ class OAuthProviderImpl {
     };
 
     // Save access token with TTL (using the potentially callback-provided TTL)
-    await env.OAUTH_KV.put(`token:${userId}:${grantId}:${accessTokenId}`, JSON.stringify(accessTokenData), {
+    await retryKvPut(env.OAUTH_KV, `token:${userId}:${grantId}:${accessTokenId}`, JSON.stringify(accessTokenData), {
       expirationTtl: accessTokenTTL,
     });
 
@@ -1584,7 +1656,7 @@ class OAuthProviderImpl {
     grantData.refreshTokenWrappedKey = newRefreshTokenWrappedKey;
 
     // Save the updated grant
-    await env.OAUTH_KV.put(grantKey, JSON.stringify(grantData));
+    await retryKvPut(env.OAUTH_KV, grantKey, JSON.stringify(grantData));
 
     // Store new access token with denormalized grant information
     const accessTokenData: Token = {
@@ -1602,7 +1674,7 @@ class OAuthProviderImpl {
     };
 
     // Save access token with TTL (using the potentially callback-provided TTL)
-    await env.OAUTH_KV.put(`token:${userId}:${grantId}:${accessTokenId}`, JSON.stringify(accessTokenData), {
+    await retryKvPut(env.OAUTH_KV, `token:${userId}:${grantId}:${accessTokenId}`, JSON.stringify(accessTokenData), {
       expirationTtl: accessTokenTTL,
     });
 
@@ -1743,7 +1815,7 @@ class OAuthProviderImpl {
     }
 
     // Store client info
-    await env.OAUTH_KV.put(`client:${clientId}`, JSON.stringify(clientInfo));
+    await retryKvPut(env.OAUTH_KV, `client:${clientId}`, JSON.stringify(clientInfo));
 
     // Return client information with the original unhashed secret
     const response: Record<string, any> = {
@@ -2278,7 +2350,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
 
       // Store the grant with a key that includes the user ID
       const grantKey = `grant:${options.userId}:${grantId}`;
-      await this.env.OAUTH_KV.put(grantKey, JSON.stringify(grant));
+      await retryKvPut(this.env.OAUTH_KV, grantKey, JSON.stringify(grant));
 
       // Store access token with denormalized grant information
       const accessTokenData: Token = {
@@ -2296,7 +2368,8 @@ class OAuthHelpersImpl implements OAuthHelpers {
       };
 
       // Save access token with TTL
-      await this.env.OAUTH_KV.put(
+      await retryKvPut(
+        this.env.OAUTH_KV,
         `token:${options.userId}:${grantId}:${accessTokenId}`,
         JSON.stringify(accessTokenData),
         { expirationTtl: accessTokenTTL }
@@ -2351,7 +2424,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
 
       // Set 10-minute TTL for the grant (will be extended when code is exchanged)
       const codeExpiresIn = 600; // 10 minutes
-      await this.env.OAUTH_KV.put(grantKey, JSON.stringify(grant), { expirationTtl: codeExpiresIn });
+      await retryKvPut(this.env.OAUTH_KV, grantKey, JSON.stringify(grant), { expirationTtl: codeExpiresIn });
 
       // Build the redirect URL for authorization code flow
       const redirectUrl = new URL(options.request.redirectUri);
@@ -2401,7 +2474,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
       newClient.clientSecret = await hashSecret(clientSecret);
     }
 
-    await this.env.OAUTH_KV.put(`client:${clientId}`, JSON.stringify(newClient));
+    await retryKvPut(this.env.OAUTH_KV, `client:${clientId}`, JSON.stringify(newClient));
 
     // Create the response object
     const clientResponse = { ...newClient };
@@ -2498,7 +2571,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
       delete updatedClient.clientSecret;
     }
 
-    await this.env.OAUTH_KV.put(`client:${clientId}`, JSON.stringify(updatedClient));
+    await retryKvPut(this.env.OAUTH_KV, `client:${clientId}`, JSON.stringify(updatedClient));
 
     // Create a response object
     const response = { ...updatedClient };
