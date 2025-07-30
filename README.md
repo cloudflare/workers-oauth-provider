@@ -20,7 +20,7 @@ As of March, 2025, this library is very new, prerelease software. The API is sti
 A Worker that uses the library might look like this:
 
 ```ts
-import { OAuthProvider } from "my-oauth";
+import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
 import { WorkerEntrypoint } from "cloudflare:workers";
 
 // We export the OAuthProvider instance as the entrypoint to our Worker. This means it
