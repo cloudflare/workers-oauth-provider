@@ -2054,16 +2054,21 @@ describe('OAuthProvider', () => {
 
     beforeEach(async () => {
       redirectUri = 'https://client.example.com/callback';
-      
+
       // Create a test client
       const clientResponse = await oauthProvider.fetch(
-        createMockRequest('https://example.com/oauth/register', 'POST', {
-          'Content-Type': 'application/json',
-        }, JSON.stringify({
-          redirect_uris: [redirectUri],
-          client_name: 'Test Client for Revocation',
-          token_endpoint_auth_method: 'client_secret_basic'
-        })),
+        createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          {
+            'Content-Type': 'application/json',
+          },
+          JSON.stringify({
+            redirect_uris: [redirectUri],
+            client_name: 'Test Client for Revocation',
+            token_endpoint_auth_method: 'client_secret_basic',
+          })
+        ),
         mockEnv,
         mockCtx
       );
@@ -2085,34 +2090,44 @@ describe('OAuthProvider', () => {
       const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
       const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code');
 
-      const tokenRequest = createMockRequest('https://example.com/oauth/token', 'POST', {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Authorization': `Basic ${btoa(`${clientId}:${clientSecret}`)}`
-      }, `grant_type=authorization_code&code=${code}&redirect_uri=${encodeURIComponent(redirectUri)}`);
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+        },
+        `grant_type=authorization_code&code=${code}&redirect_uri=${encodeURIComponent(redirectUri)}`
+      );
 
       const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
       expect(tokenResponse.status).toBe(200);
       const tokens = await tokenResponse.json();
 
       // Step 2:this should successfully revoke the token
-      const revokeRequest = createMockRequest('https://example.com/oauth/token', 'POST', {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Authorization': `Basic ${btoa(`${clientId}:${clientSecret}`)}`
-      }, `token=${tokens.access_token}`);
+      const revokeRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+        },
+        `token=${tokens.access_token}`
+      );
 
       const revokeResponse = await oauthProvider.fetch(revokeRequest, mockEnv, mockCtx);
       expect(revokeResponse.status).toBe(200); // Should NOT be unsupported_grant_type anymore
-      
+
       // Verify response doesn't contain unsupported_grant_type error
       const revokeResponseText = await revokeResponse.text();
       expect(revokeResponseText).not.toContain('unsupported_grant_type');
-      
+
       // Step 3: Verify the token is actually revoked (proves revokeGrant was called)
       const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
-        'Authorization': `Bearer ${tokens.access_token}`
+        Authorization: `Bearer ${tokens.access_token}`,
       });
       const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
       expect(apiResponse.status).toBe(401); // Token should no longer work
     });
-});
+  });
 });

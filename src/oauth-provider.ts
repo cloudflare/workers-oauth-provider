@@ -853,7 +853,7 @@ class OAuthProviderImpl {
     // Handle token endpoint (including revocation)
     if (this.isTokenEndpoint(url)) {
       const parsed = await this.parseTokenEndpointRequest(request, env);
-      
+
       // If parsing failed, return the error response
       if (parsed instanceof Response) {
         return this.addCorsHeaders(parsed, request);
@@ -865,7 +865,7 @@ class OAuthProviderImpl {
       } else {
         response = await this.handleTokenRequest(parsed.body, parsed.clientInfo, env);
       }
-      
+
       return this.addCorsHeaders(response, request);
     }
 
@@ -952,11 +952,17 @@ class OAuthProviderImpl {
    * @param request - The HTTP request to parse
    * @returns Promise with parsed body and client info, or error response
    */
-  private async parseTokenEndpointRequest(request: Request, env: any): Promise<{
-    body: any;
-    clientInfo: ClientInfo;
-    isRevocationRequest: boolean;
-  } | Response> {
+  private async parseTokenEndpointRequest(
+    request: Request,
+    env: any
+  ): Promise<
+    | {
+        body: any;
+        clientInfo: ClientInfo;
+        isRevocationRequest: boolean;
+      }
+    | Response
+  > {
     // Only accept POST requests
     if (request.method !== 'POST') {
       return this.createErrorResponse('invalid_request', 'Method not allowed', 405);
@@ -1030,12 +1036,12 @@ class OAuthProviderImpl {
     // Determine if this is a revocation request
     // RFC 7009: Revocation requests have 'token' parameter but no 'grant_type'
     // Also handle case where token_type_hint is provided but no token (should be invalid_request)
-    const isRevocationRequest = (!body.grant_type && (!!body.token || !!body.token_type_hint));
+    const isRevocationRequest = !body.grant_type && (!!body.token || !!body.token_type_hint);
 
     return {
       body,
       clientInfo,
-      isRevocationRequest
+      isRevocationRequest,
     };
   }
 
@@ -1196,7 +1202,6 @@ class OAuthProviderImpl {
    * @returns Response with token data or error
    */
   private async handleTokenRequest(body: any, clientInfo: ClientInfo, env: any): Promise<Response> {
-
     // Handle different grant types
     const grantType = body.grant_type;
 
@@ -1708,8 +1713,9 @@ class OAuthProviderImpl {
 
       // If hint didn't work or no hint provided, try both types
       if (!isValidToken) {
-        isValidToken = (await this.validateAccessToken(token, userId, grantId, env)) ||
-                      (await this.validateRefreshToken(token, userId, grantId, env));
+        isValidToken =
+          (await this.validateAccessToken(token, userId, grantId, env)) ||
+          (await this.validateRefreshToken(token, userId, grantId, env));
       }
 
       // If we found a valid token, revoke the entire grant
@@ -1737,7 +1743,7 @@ class OAuthProviderImpl {
       const accessTokenId = await generateTokenId(token);
       const tokenKey = `token:${userId}:${grantId}:${accessTokenId}`;
       const tokenData = await env.OAUTH_KV.get(tokenKey, { type: 'json' });
-      
+
       if (!tokenData) {
         return false;
       }
@@ -1763,14 +1769,13 @@ class OAuthProviderImpl {
       const refreshTokenId = await generateTokenId(token);
       const grantKey = `grant:${userId}:${grantId}`;
       const grantData = await env.OAUTH_KV.get(grantKey, { type: 'json' });
-      
+
       if (!grantData) {
         return false;
       }
 
       // Check if this matches the current or previous refresh token
-      return grantData.refreshTokenId === refreshTokenId || 
-             grantData.previousRefreshTokenId === refreshTokenId;
+      return grantData.refreshTokenId === refreshTokenId || grantData.previousRefreshTokenId === refreshTokenId;
     } catch {
       return false;
     }
