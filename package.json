@@ -6,6 +6,7 @@
   "types": "dist/oauth-provider.d.ts",
   "author": "Kenton Varda <kenton@cloudflare.com>",
   "license": "MIT",
+  "sideEffects": false,
   "files": [
     "dist"
   ],
@@ -16,17 +17,18 @@
   "scripts": {
     "build": "tsup",
     "build:watch": "tsup --watch",
+    "typecheck": "tsc",
     "test": "vitest run",
     "test:watch": "vitest",
     "prepublishOnly": "npm run build",
     "prettier": "prettier -w ."
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20250311.0",
-    "prettier": "^3.5.3",
-    "tsup": "^8.4.0",
-    "typescript": "^5.8.2",
-    "vitest": "^3.0.8"
+    "@cloudflare/workers-types": "^4.20250807.0",
+    "prettier": "^3.6.2",
+    "tsup": "^8.5.0",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
   },
   "repository": {
     "type": "git",
