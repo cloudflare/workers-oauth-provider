@@ -2264,9 +2264,6 @@ describe('OAuthProvider', () => {
     });
 
     it('should connect revokeGrant to token endpoint ', async () => {
-      // Issue: "revokeGrant not implemented in handleTokenRequest?"
-      // This test verifies that token revocation now works via the token endpoint
-
       // Step 1: Get tokens through normal OAuth flow
       const authRequest = createMockRequest(
         `https://example.com/authorize?response_type=code&client_id=${encodeURIComponent(clientId)}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=read&state=test-state`
