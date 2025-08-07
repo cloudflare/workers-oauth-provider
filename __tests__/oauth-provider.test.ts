@@ -511,6 +511,41 @@ describe('OAuthProvider', () => {
       expect(grants.keys.length).toBe(0);
     });
 
+    it('should reject authorization request with invalid client id', async () => {
+      // Create an authorization request with an invalid redirect URI
+      const invalidClientId = 'attackerClientId'
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${invalidClientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123`
+      );
+
+      // Expect the request to be rejected
+      await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+
+      // Verify no grant was created
+      const grants = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      expect(grants.keys.length).toBe(0);
+    });
+
+    it('should reject authorization request with invalid client id and redirect uri', async () => {
+      // Create an authorization request with an invalid redirect URI
+      const invalidRedirectUri = 'https://attacker.example.com/callback';
+      const invalidClientId = 'attackerClientId'
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${invalidClientId}` +
+          `&redirect_uri=${encodeURIComponent(invalidRedirectUri)}` +
+          `&scope=read%20write&state=xyz123`
+      );
+
+      // Expect the request to be rejected
+      await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+
+      // Verify no grant was created
+      const grants = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      expect(grants.keys.length).toBe(0);
+    });
+
     // Add more tests for auth code flow...
   });
 
