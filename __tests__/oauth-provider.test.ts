@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
-import { OAuthProvider, ClientInfo, AuthRequest, CompleteAuthorizationOptions } from '../src/oauth-provider';
-import { ExecutionContext } from '@cloudflare/workers-types';
+import { OAuthProvider, type OAuthHelpers } from '../src/oauth-provider';
+import type { ExecutionContext } from '@cloudflare/workers-types';
 // We're importing WorkerEntrypoint from our mock implementation
 // The actual import is mocked in setup.ts
 import { WorkerEntrypoint } from 'cloudflare:workers';
@@ -163,6 +163,9 @@ function createMockEnv() {
   return {
     OAUTH_KV: new MockKV(),
     OAUTH_PROVIDER: null, // Will be populated by the OAuthProvider
+  } as {
+    OAUTH_KV: MockKV;
+    OAUTH_PROVIDER: OAuthHelpers | null;
   };
 }
 
@@ -241,7 +244,7 @@ describe('OAuthProvider', () => {
       );
 
       const registerResponse = await providerWithMultiHandler.fetch(registerRequest, mockEnv, mockCtx);
-      const client = await registerResponse.json();
+      const client = await registerResponse.json<any>();
       const clientId = client.client_id;
       const clientSecret = client.client_secret;
       const redirectUri = 'https://client.example.com/callback';
@@ -273,7 +276,7 @@ describe('OAuthProvider', () => {
       );
 
       const tokenResponse = await providerWithMultiHandler.fetch(tokenRequest, mockEnv, mockCtx);
-      const tokens = await tokenResponse.json();
+      const tokens = await tokenResponse.json<any>();
       const accessToken = tokens.access_token;
 
       // Make requests to different API routes
@@ -334,7 +337,7 @@ describe('OAuthProvider', () => {
 
       expect(response.status).toBe(200);
 
-      const metadata = await response.json();
+      const metadata = await response.json<any>();
       expect(metadata.issuer).toBe('https://example.com');
       expect(metadata.authorization_endpoint).toBe('https://example.com/authorize');
       expect(metadata.token_endpoint).toBe('https://example.com/oauth/token');
@@ -363,7 +366,7 @@ describe('OAuthProvider', () => {
 
       expect(response.status).toBe(200);
 
-      const metadata = await response.json();
+      const metadata = await response.json<any>();
       expect(metadata.response_types_supported).toContain('code');
       expect(metadata.response_types_supported).not.toContain('token');
     });
@@ -388,7 +391,7 @@ describe('OAuthProvider', () => {
 
       expect(response.status).toBe(201);
 
-      const registeredClient = await response.json();
+      const registeredClient = await response.json<any>();
       expect(registeredClient.client_id).toBeDefined();
       expect(registeredClient.client_secret).toBeDefined();
       expect(registeredClient.redirect_uris).toEqual(['https://client.example.com/callback']);
@@ -420,7 +423,7 @@ describe('OAuthProvider', () => {
 
       expect(response.status).toBe(201);
 
-      const registeredClient = await response.json();
+      const registeredClient = await response.json<any>();
       expect(registeredClient.client_id).toBeDefined();
       expect(registeredClient.client_secret).toBeUndefined(); // Public client should not have a secret
       expect(registeredClient.token_endpoint_auth_method).toBe('none');
@@ -453,7 +456,7 @@ describe('OAuthProvider', () => {
       );
 
       const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
-      const client = await response.json();
+      const client = await response.json<any>();
 
       clientId = client.client_id;
       clientSecret = client.client_secret;
@@ -513,7 +516,7 @@ describe('OAuthProvider', () => {
 
     it('should reject authorization request with invalid client id', async () => {
       // Create an authorization request with an invalid redirect URI
-      const invalidClientId = 'attackerClientId'
+      const invalidClientId = 'attackerClientId';
       const authRequest = createMockRequest(
         `https://example.com/authorize?response_type=code&client_id=${invalidClientId}` +
           `&redirect_uri=${encodeURIComponent(redirectUri)}` +
@@ -531,7 +534,7 @@ describe('OAuthProvider', () => {
     it('should reject authorization request with invalid client id and redirect uri', async () => {
       // Create an authorization request with an invalid redirect URI
       const invalidRedirectUri = 'https://attacker.example.com/callback';
-      const invalidClientId = 'attackerClientId'
+      const invalidClientId = 'attackerClientId';
       const authRequest = createMockRequest(
         `https://example.com/authorize?response_type=code&client_id=${invalidClientId}` +
           `&redirect_uri=${encodeURIComponent(invalidRedirectUri)}` +
@@ -569,7 +572,7 @@ describe('OAuthProvider', () => {
       );
 
       const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
-      const client = await response.json();
+      const client = await response.json<any>();
 
       clientId = client.client_id;
       redirectUri = 'https://spa-client.example.com/callback';
@@ -680,7 +683,7 @@ describe('OAuthProvider', () => {
 
       expect(apiResponse.status).toBe(200);
 
-      const apiData = await apiResponse.json();
+      const apiData = await apiResponse.json<any>();
       expect(apiData.success).toBe(true);
       expect(apiData.user).toEqual({ userId: 'test-user-123', username: 'TestUser' });
     });
@@ -707,7 +710,7 @@ describe('OAuthProvider', () => {
       );
 
       const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
-      const client = await response.json();
+      const client = await response.json<any>();
 
       clientId = client.client_id;
       clientSecret = client.client_secret;
@@ -752,7 +755,7 @@ describe('OAuthProvider', () => {
 
       expect(tokenResponse.status).toBe(200);
 
-      const tokens = await tokenResponse.json();
+      const tokens = await tokenResponse.json<any>();
       expect(tokens.access_token).toBeDefined();
       expect(tokens.refresh_token).toBeDefined();
       expect(tokens.token_type).toBe('bearer');
@@ -803,7 +806,7 @@ describe('OAuthProvider', () => {
 
       // Should fail because redirect_uri is required when not using PKCE
       expect(tokenResponse.status).toBe(400);
-      const error = await tokenResponse.json();
+      const error = await tokenResponse.json<any>();
       expect(error.error).toBe('invalid_request');
       expect(error.error_description).toBe('redirect_uri is required when not using PKCE');
     });
@@ -841,7 +844,7 @@ describe('OAuthProvider', () => {
 
       // Should fail because code_verifier is provided but PKCE wasn't used in authorization
       expect(tokenResponse.status).toBe(400);
-      const error = await tokenResponse.json();
+      const error = await tokenResponse.json<any>();
       expect(error.error).toBe('invalid_request');
       expect(error.error_description).toBe('code_verifier provided for a flow that did not use PKCE');
     });
@@ -906,7 +909,7 @@ describe('OAuthProvider', () => {
       // Should succeed because redirect_uri is optional when using PKCE
       expect(tokenResponse.status).toBe(200);
 
-      const tokens = await tokenResponse.json();
+      const tokens = await tokenResponse.json<any>();
       expect(tokens.access_token).toBeDefined();
       expect(tokens.refresh_token).toBeDefined();
       expect(tokens.token_type).toBe('bearer');
@@ -941,7 +944,7 @@ describe('OAuthProvider', () => {
       );
 
       const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
-      const tokens = await tokenResponse.json();
+      const tokens = await tokenResponse.json<any>();
 
       // Now use the access token for an API request
       const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
@@ -952,7 +955,7 @@ describe('OAuthProvider', () => {
 
       expect(apiResponse.status).toBe(200);
 
-      const apiData = await apiResponse.json();
+      const apiData = await apiResponse.json<any>();
       expect(apiData.success).toBe(true);
       expect(apiData.user).toEqual({ userId: 'test-user-123', username: 'TestUser' });
     });
@@ -980,7 +983,7 @@ describe('OAuthProvider', () => {
       );
 
       const registerResponse = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
-      const client = await registerResponse.json();
+      const client = await registerResponse.json<any>();
       clientId = client.client_id;
       clientSecret = client.client_secret;
       const redirectUri = 'https://client.example.com/callback';
@@ -1012,7 +1015,7 @@ describe('OAuthProvider', () => {
       );
 
       const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
-      const tokens = await tokenResponse.json();
+      const tokens = await tokenResponse.json<any>();
       refreshToken = tokens.refresh_token;
     }
 
@@ -1039,7 +1042,7 @@ describe('OAuthProvider', () => {
 
       expect(refreshResponse.status).toBe(200);
 
-      const newTokens = await refreshResponse.json();
+      const newTokens = await refreshResponse.json<any>();
       expect(newTokens.access_token).toBeDefined();
       expect(newTokens.refresh_token).toBeDefined();
       expect(newTokens.refresh_token).not.toBe(refreshToken); // Should get a new refresh token
@@ -1073,7 +1076,7 @@ describe('OAuthProvider', () => {
       );
 
       const refreshResponse1 = await oauthProvider.fetch(refreshRequest1, mockEnv, mockCtx);
-      const newTokens1 = await refreshResponse1.json();
+      const newTokens1 = await refreshResponse1.json<any>();
       const newRefreshToken = newTokens1.refresh_token;
 
       // Now try to use the original refresh token again (simulating a retry after failure)
@@ -1095,7 +1098,7 @@ describe('OAuthProvider', () => {
       // The request should succeed
       expect(refreshResponse2.status).toBe(200);
 
-      const newTokens2 = await refreshResponse2.json();
+      const newTokens2 = await refreshResponse2.json<any>();
       expect(newTokens2.access_token).toBeDefined();
       expect(newTokens2.refresh_token).toBeDefined();
 
@@ -1130,7 +1133,7 @@ describe('OAuthProvider', () => {
       );
 
       const registerResponse = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
-      const client = await registerResponse.json();
+      const client = await registerResponse.json<any>();
       const clientId = client.client_id;
       const clientSecret = client.client_secret;
       const redirectUri = 'https://client.example.com/callback';
@@ -1162,7 +1165,7 @@ describe('OAuthProvider', () => {
       );
 
       const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
-      const tokens = await tokenResponse.json();
+      const tokens = await tokenResponse.json<any>();
       accessToken = tokens.access_token;
     }
 
@@ -1177,7 +1180,7 @@ describe('OAuthProvider', () => {
 
       expect(apiResponse.status).toBe(401);
 
-      const error = await apiResponse.json();
+      const error = await apiResponse.json<any>();
       expect(error.error).toBe('invalid_token');
     });
 
@@ -1190,7 +1193,7 @@ describe('OAuthProvider', () => {
 
       expect(apiResponse.status).toBe(401);
 
-      const error = await apiResponse.json();
+      const error = await apiResponse.json<any>();
       expect(error.error).toBe('invalid_token');
     });
 
@@ -1203,7 +1206,7 @@ describe('OAuthProvider', () => {
 
       expect(apiResponse.status).toBe(200);
 
-      const data = await apiResponse.json();
+      const data = await apiResponse.json<any>();
       expect(data.success).toBe(true);
       expect(data.user).toEqual({ userId: 'test-user-123', username: 'TestUser' });
     });
@@ -1302,7 +1305,7 @@ describe('OAuthProvider', () => {
       );
 
       const response = await oauthProviderWithCallback.fetch(request, mockEnv, mockCtx);
-      const client = await response.json();
+      const client = await response.json<any>();
 
       clientId = client.client_id;
       clientSecret = client.client_secret;
@@ -1363,7 +1366,7 @@ describe('OAuthProvider', () => {
 
       // Check that the token exchange was successful
       expect(tokenResponse.status).toBe(200);
-      const tokens = await tokenResponse.json();
+      const tokens = await tokenResponse.json<any>();
       expect(tokens.access_token).toBeDefined();
 
       // Check that the callback was called once
@@ -1384,7 +1387,7 @@ describe('OAuthProvider', () => {
       expect(apiResponse.status).toBe(200);
 
       // Check that the API received the token-specific props from the callback
-      const apiData = await apiResponse.json();
+      const apiData = await apiResponse.json<any>();
       expect(apiData.user).toEqual({
         userId: 'test-user-123',
         username: 'TestUser',
@@ -1421,7 +1424,7 @@ describe('OAuthProvider', () => {
       );
 
       const tokenResponse = await oauthProviderWithCallback.fetch(tokenRequest, mockEnv, mockCtx);
-      const tokens = await tokenResponse.json();
+      const tokens = await tokenResponse.json<any>();
 
       // Reset the callback invocations tracking before refresh
       callbackInvocations = [];
@@ -1444,7 +1447,7 @@ describe('OAuthProvider', () => {
 
       // Check that the refresh was successful
       expect(refreshResponse.status).toBe(200);
-      const newTokens = await refreshResponse.json();
+      const newTokens = await refreshResponse.json<any>();
       expect(newTokens.access_token).toBeDefined();
 
       // Check that the callback was called once
@@ -1471,7 +1474,7 @@ describe('OAuthProvider', () => {
       expect(apiResponse.status).toBe(200);
 
       // Check that the API received the token-specific props from the refresh callback
-      const apiData = await apiResponse.json();
+      const apiData = await apiResponse.json<any>();
       expect(apiData.user).toEqual({
         userId: 'test-user-123',
         username: 'TestUser',
@@ -1551,7 +1554,7 @@ describe('OAuthProvider', () => {
       );
 
       const registerResponse = await refreshPropsProvider.fetch(registerRequest, mockEnv, mockCtx);
-      const client = await registerResponse.json();
+      const client = await registerResponse.json<any>();
       const testClientId = client.client_id;
       const testClientSecret = client.client_secret;
       const testRedirectUri = 'https://client.example.com/callback';
@@ -1582,7 +1585,7 @@ describe('OAuthProvider', () => {
       );
 
       const tokenResponse = await refreshPropsProvider.fetch(tokenRequest, mockEnv, mockCtx);
-      const tokens = await tokenResponse.json();
+      const tokens = await tokenResponse.json<any>();
 
       // Now do a refresh token exchange
       const refreshParams = new URLSearchParams();
@@ -1599,7 +1602,7 @@ describe('OAuthProvider', () => {
       );
 
       const refreshResponse = await refreshPropsProvider.fetch(refreshRequest, mockEnv, mockCtx);
-      const newTokens = await refreshResponse.json();
+      const newTokens = await refreshResponse.json<any>();
 
       // Use the new token to access API
       const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
@@ -1607,7 +1610,7 @@ describe('OAuthProvider', () => {
       });
 
       const apiResponse = await refreshPropsProvider.fetch(apiRequest, mockEnv, mockCtx);
-      const apiData = await apiResponse.json();
+      const apiData = await apiResponse.json<any>();
 
       // The access token should contain the token-specific props from the refresh callback
       expect(apiData.user).toHaveProperty('refreshed', true);
@@ -1658,7 +1661,7 @@ describe('OAuthProvider', () => {
       );
 
       const registerResponse = await specialProvider.fetch(registerRequest, mockEnv, mockCtx);
-      const client = await registerResponse.json();
+      const client = await registerResponse.json<any>();
       const testClientId = client.client_id;
       const testClientSecret = client.client_secret;
       const testRedirectUri = 'https://client.example.com/callback';
@@ -1689,7 +1692,7 @@ describe('OAuthProvider', () => {
       );
 
       const tokenResponse = await specialProvider.fetch(tokenRequest, mockEnv, mockCtx);
-      const tokens = await tokenResponse.json();
+      const tokens = await tokenResponse.json<any>();
 
       // Verify the token has the tokenOnly property when used for API access
       const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
@@ -1697,7 +1700,7 @@ describe('OAuthProvider', () => {
       });
 
       const apiResponse = await specialProvider.fetch(apiRequest, mockEnv, mockCtx);
-      const apiData = await apiResponse.json();
+      const apiData = await apiResponse.json<any>();
       expect(apiData.user.tokenOnly).toBe(true);
 
       // Now do a refresh token exchange
@@ -1715,7 +1718,7 @@ describe('OAuthProvider', () => {
       );
 
       const refreshResponse = await specialProvider.fetch(refreshRequest, mockEnv, mockCtx);
-      const newTokens = await refreshResponse.json();
+      const newTokens = await refreshResponse.json<any>();
 
       // Use the new token to access API
       const api2Request = createMockRequest('https://example.com/api/test', 'GET', {
@@ -1723,7 +1726,7 @@ describe('OAuthProvider', () => {
       });
 
       const api2Response = await specialProvider.fetch(api2Request, mockEnv, mockCtx);
-      const api2Data = await api2Response.json();
+      const api2Data = await api2Response.json<any>();
 
       // With the enhanced implementation, the token props now inherit from grant props
       // when only newProps is returned but accessTokenProps is not specified
@@ -1774,7 +1777,7 @@ describe('OAuthProvider', () => {
       );
 
       const registerResponse = await customTtlProvider.fetch(registerRequest, mockEnv, mockCtx);
-      const client = await registerResponse.json();
+      const client = await registerResponse.json<any>();
       const testClientId = client.client_id;
       const testClientSecret = client.client_secret;
       const testRedirectUri = 'https://client.example.com/callback';
@@ -1805,7 +1808,7 @@ describe('OAuthProvider', () => {
       );
 
       const tokenResponse = await customTtlProvider.fetch(tokenRequest, mockEnv, mockCtx);
-      const tokens = await tokenResponse.json();
+      const tokens = await tokenResponse.json<any>();
 
       // Now do a refresh
       const refreshParams = new URLSearchParams();
@@ -1822,7 +1825,7 @@ describe('OAuthProvider', () => {
       );
 
       const refreshResponse = await customTtlProvider.fetch(refreshRequest, mockEnv, mockCtx);
-      const newTokens = await refreshResponse.json();
+      const newTokens = await refreshResponse.json<any>();
 
       // Verify that the TTL is from the callback, not the default
       expect(newTokens.expires_in).toBe(7200);
@@ -1833,7 +1836,7 @@ describe('OAuthProvider', () => {
       });
 
       const apiResponse = await customTtlProvider.fetch(apiRequest, mockEnv, mockCtx);
-      const apiData = await apiResponse.json();
+      const apiData = await apiResponse.json<any>();
       expect(apiData.user.customTtl).toBe(true);
     });
 
@@ -1870,7 +1873,7 @@ describe('OAuthProvider', () => {
       );
 
       const registerResponse = await noopProvider.fetch(registerRequest, mockEnv, mockCtx);
-      const client = await registerResponse.json();
+      const client = await registerResponse.json<any>();
       const testClientId = client.client_id;
       const testClientSecret = client.client_secret;
       const testRedirectUri = 'https://client.example.com/callback';
@@ -1901,7 +1904,7 @@ describe('OAuthProvider', () => {
       );
 
       const tokenResponse = await noopProvider.fetch(tokenRequest, mockEnv, mockCtx);
-      const tokens = await tokenResponse.json();
+      const tokens = await tokenResponse.json<any>();
 
       // Verify the token has the original props when used for API access
       const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
@@ -1909,7 +1912,7 @@ describe('OAuthProvider', () => {
       });
 
       const apiResponse = await noopProvider.fetch(apiRequest, mockEnv, mockCtx);
-      const apiData = await apiResponse.json();
+      const apiData = await apiResponse.json<any>();
 
       // The props should be the original ones (no change)
       expect(apiData.user).toEqual({ userId: 'test-user-123', username: 'TestUser' });
@@ -1964,7 +1967,7 @@ describe('OAuthProvider', () => {
       );
 
       const registerResponse = await testProvider.fetch(registerRequest, mockEnv, mockCtx);
-      const client = await registerResponse.json();
+      const client = await registerResponse.json<any>();
       const testClientId = client.client_id;
       const testClientSecret = client.client_secret;
       const testRedirectUri = 'https://client.example.com/callback';
@@ -1995,7 +1998,7 @@ describe('OAuthProvider', () => {
       );
 
       const tokenResponse = await testProvider.fetch(tokenRequest, mockEnv, mockCtx);
-      const tokens = await tokenResponse.json();
+      const tokens = await tokenResponse.json<any>();
       const refreshToken = tokens.refresh_token;
 
       // Reset the callback invocations before refresh
@@ -2022,7 +2025,7 @@ describe('OAuthProvider', () => {
       expect(callCount).toBe(1);
 
       // Get the new tokens from the first refresh
-      const newTokens = await refreshResponse.json();
+      const newTokens = await refreshResponse.json<any>();
 
       // Get the refresh token's corresponding token data to verify it has the updated props
       const apiRequest1 = createMockRequest('https://example.com/api/test', 'GET', {
@@ -2030,7 +2033,7 @@ describe('OAuthProvider', () => {
       });
 
       const apiResponse1 = await testProvider.fetch(apiRequest1, mockEnv, mockCtx);
-      const apiData1 = await apiResponse1.json();
+      const apiData1 = await apiResponse1.json<any>();
 
       // Print the actual API response to debug
       console.log('First API response:', JSON.stringify(apiData1));
@@ -2056,7 +2059,7 @@ describe('OAuthProvider', () => {
       // When fixed, it should succeed because the previous refresh token is still valid once.
       expect(secondRefreshResponse.status).toBe(200);
 
-      const secondTokens = await secondRefreshResponse.json();
+      const secondTokens = await secondRefreshResponse.json<any>();
       expect(secondTokens.access_token).toBeDefined();
 
       // The callback should have been called again
@@ -2068,7 +2071,7 @@ describe('OAuthProvider', () => {
       });
 
       const apiResponse2 = await testProvider.fetch(apiRequest2, mockEnv, mockCtx);
-      const apiData2 = await apiResponse2.json();
+      const apiData2 = await apiResponse2.json<any>();
 
       // The updatedCount should be 2 now (incremented again during the second refresh)
       expect(apiData2.user.updatedCount).toBe(2);
@@ -2089,7 +2092,7 @@ describe('OAuthProvider', () => {
 
       // Verify the error response
       expect(response.status).toBe(401);
-      const error = await response.json();
+      const error = await response.json<any>();
       expect(error.error).toBe('invalid_token');
 
       // Verify the default onError callback was triggered and logged a warning
@@ -2138,7 +2141,7 @@ describe('OAuthProvider', () => {
       expect(response.status).toBe(401); // Status should be preserved
       expect(response.headers.get('X-Custom-Error')).toBe('true');
 
-      const error = await response.json();
+      const error = await response.json<any>();
       expect(error.custom_error).toBe(true);
       expect(error.original_code).toBe('invalid_token');
       expect(error.custom_message).toContain('Custom error handler');
@@ -2169,7 +2172,7 @@ describe('OAuthProvider', () => {
 
       // Verify the standard error response
       expect(response.status).toBe(401);
-      const error = await response.json();
+      const error = await response.json<any>();
       expect(error.error).toBe('invalid_client');
 
       // Verify callback was invoked
@@ -2211,7 +2214,7 @@ describe('OAuthProvider', () => {
       expect(mockEnv.OAUTH_PROVIDER).not.toBeNull();
 
       // List grants for the user
-      const grants = await mockEnv.OAUTH_PROVIDER.listUserGrants('test-user-123');
+      const grants = await mockEnv.OAUTH_PROVIDER!.listUserGrants('test-user-123');
 
       expect(grants.items.length).toBe(1);
       expect(grants.items[0].clientId).toBe(clientId);
@@ -2219,10 +2222,10 @@ describe('OAuthProvider', () => {
       expect(grants.items[0].metadata).toEqual({ testConsent: true });
 
       // Revoke the grant
-      await mockEnv.OAUTH_PROVIDER.revokeGrant(grants.items[0].id, 'test-user-123');
+      await mockEnv.OAUTH_PROVIDER!.revokeGrant(grants.items[0].id, 'test-user-123');
 
       // Verify grant was deleted
-      const grantsAfterRevoke = await mockEnv.OAUTH_PROVIDER.listUserGrants('test-user-123');
+      const grantsAfterRevoke = await mockEnv.OAUTH_PROVIDER!.listUserGrants('test-user-123');
       expect(grantsAfterRevoke.items.length).toBe(0);
     });
 
@@ -2235,7 +2238,7 @@ describe('OAuthProvider', () => {
       expect(mockEnv.OAUTH_PROVIDER).not.toBeNull();
 
       // Create a client
-      const client = await mockEnv.OAUTH_PROVIDER.createClient({
+      const client = await mockEnv.OAUTH_PROVIDER!.createClient({
         redirectUris: ['https://client.example.com/callback'],
         clientName: 'Test Client',
         tokenEndpointAuthMethod: 'client_secret_basic',
@@ -2245,12 +2248,12 @@ describe('OAuthProvider', () => {
       expect(client.clientSecret).toBeDefined();
 
       // List clients
-      const clients = await mockEnv.OAUTH_PROVIDER.listClients();
+      const clients = await mockEnv.OAUTH_PROVIDER!.listClients();
       expect(clients.items.length).toBe(1);
       expect(clients.items[0].clientId).toBe(client.clientId);
 
       // Update client
-      const updatedClient = await mockEnv.OAUTH_PROVIDER.updateClient(client.clientId, {
+      const updatedClient = await mockEnv.OAUTH_PROVIDER!.updateClient(client.clientId, {
         clientName: 'Updated Client Name',
       });
 
@@ -2258,10 +2261,10 @@ describe('OAuthProvider', () => {
       expect(updatedClient!.clientName).toBe('Updated Client Name');
 
       // Delete client
-      await mockEnv.OAUTH_PROVIDER.deleteClient(client.clientId);
+      await mockEnv.OAUTH_PROVIDER!.deleteClient(client.clientId);
 
       // Verify client was deleted
-      const clientsAfterDelete = await mockEnv.OAUTH_PROVIDER.listClients();
+      const clientsAfterDelete = await mockEnv.OAUTH_PROVIDER!.listClients();
       expect(clientsAfterDelete.items.length).toBe(0);
     });
   });
