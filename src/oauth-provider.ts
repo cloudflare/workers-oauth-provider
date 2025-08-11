@@ -1690,12 +1690,13 @@ class OAuthProviderImpl {
     }
 
     const [userId, grantId, _] = tokenParts;
+    const tokenId = await generateTokenId(token);
 
-    const isAccessToken = await this.validateAccessToken(token, userId, grantId, env);
-    const isRefreshToken = await this.validateRefreshToken(token, userId, grantId, env);
+    const isAccessToken = await this.validateAccessToken(tokenId, userId, grantId, env);
+    const isRefreshToken = await this.validateRefreshToken(tokenId, userId, grantId, env);
 
     if (isAccessToken) {
-      await this.revokeSpecificAccessToken(token, userId, grantId, env);
+      await this.revokeSpecificAccessToken(tokenId, userId, grantId, env);
     } else if (isRefreshToken) {
       await this.createOAuthHelpers(env).revokeGrant(grantId, userId);
     }
@@ -1704,28 +1705,26 @@ class OAuthProviderImpl {
 
   /**
    * Revokes a specific access token without affecting the refresh token
-   * @param token - The access token to revoke
+   * @param tokenId - The hashed token ID
    * @param userId - The user ID extracted from the token
    * @param grantId - The grant ID extracted from the token
    * @param env - Cloudflare Worker environment variables
    */
-  private async revokeSpecificAccessToken(token: string, userId: string, grantId: string, env: any): Promise<void> {
-    const accessTokenId = await generateTokenId(token);
-    const tokenKey = `token:${userId}:${grantId}:${accessTokenId}`;
+  private async revokeSpecificAccessToken(tokenId: string, userId: string, grantId: string, env: any): Promise<void> {
+    const tokenKey = `token:${userId}:${grantId}:${tokenId}`;
     await env.OAUTH_KV.delete(tokenKey);
   }
 
   /**
    * Validates if a token is a valid access token
-   * @param token - The token to validate
+   * @param tokenId - The hashed token ID
    * @param userId - The user ID extracted from the token
    * @param grantId - The grant ID extracted from the token
    * @param env - Cloudflare Worker environment variables
    * @returns Promise<boolean> indicating if the token is valid
    */
-  private async validateAccessToken(token: string, userId: string, grantId: string, env: any): Promise<boolean> {
-    const accessTokenId = await generateTokenId(token);
-    const tokenKey = `token:${userId}:${grantId}:${accessTokenId}`;
+  private async validateAccessToken(tokenId: string, userId: string, grantId: string, env: any): Promise<boolean> {
+    const tokenKey = `token:${userId}:${grantId}:${tokenId}`;
     const tokenData = await env.OAUTH_KV.get(tokenKey, { type: 'json' });
 
     if (!tokenData) {
@@ -1739,14 +1738,13 @@ class OAuthProviderImpl {
 
   /**
    * Validates if a token is a valid refresh token
-   * @param token - The token to validate
+   * @param tokenId - The hashed token ID
    * @param userId - The user ID extracted from the token
    * @param grantId - The grant ID extracted from the token
    * @param env - Cloudflare Worker environment variables
    * @returns Promise<boolean> indicating if the token is valid
    */
-  private async validateRefreshToken(token: string, userId: string, grantId: string, env: any): Promise<boolean> {
-    const refreshTokenId = await generateTokenId(token);
+  private async validateRefreshToken(tokenId: string, userId: string, grantId: string, env: any): Promise<boolean> {
     const grantKey = `grant:${userId}:${grantId}`;
     const grantData = await env.OAUTH_KV.get(grantKey, { type: 'json' });
 
@@ -1755,7 +1753,7 @@ class OAuthProviderImpl {
     }
 
     // Check if this matches the current or previous refresh token
-    return grantData.refreshTokenId === refreshTokenId || grantData.previousRefreshTokenId === refreshTokenId;
+    return grantData.refreshTokenId === tokenId || grantData.previousRefreshTokenId === tokenId;
   }
 
   /**
