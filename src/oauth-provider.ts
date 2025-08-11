@@ -1035,8 +1035,7 @@ class OAuthProviderImpl {
 
     // Determine if this is a revocation request
     // RFC 7009: Revocation requests have 'token' parameter but no 'grant_type'
-    // Also handle case where token_type_hint is provided but no token (should be invalid_request)
-    const isRevocationRequest = !body.grant_type && (!!body.token || !!body.token_type_hint);
+    const isRevocationRequest = !body.grant_type && !!body.token;
 
     return {
       body,
@@ -1673,61 +1672,47 @@ class OAuthProviderImpl {
   }
 
   /**
-   * Processes token revocation logic
-   * @param body - The parsed request body containing token and optional token_type_hint
+   * - Access tokens: Revokes only the specific token
+   * - Refresh tokens: Revokes the entire grant (access + refresh tokens)
+   * @param body - The parsed request body containing token parameter
    * @param env - Cloudflare Worker environment variables
    * @returns Response confirming revocation or error
    */
   private async revokeToken(body: any, env: any): Promise<Response> {
     const token = body.token;
-    const tokenTypeHint = body.token_type_hint;
 
     if (!token) {
       return this.createErrorResponse('invalid_request', 'Token parameter is required');
     }
-
-    // Validate token_type_hint before processing (RFC 7009)
-    if (tokenTypeHint && tokenTypeHint !== 'access_token' && tokenTypeHint !== 'refresh_token') {
-      return this.createErrorResponse('unsupported_token_type', 'Unsupported token type hint');
-    }
-
-    try {
-      // Parse the token to extract user ID and grant ID
-      const tokenParts = token.split(':');
-      if (tokenParts.length !== 3) {
-        // Invalid token format, but RFC 7009 requires 200 response even for invalid tokens
-        return new Response('', { status: 200 });
-      }
-
-      const [userId, grantId, _] = tokenParts;
-
-      // Determine what type of token this is by checking if it's an access token or refresh token
-      let isValidToken = false;
-
-      // If hint is provided, try that type first for efficiency
-      if (tokenTypeHint === 'access_token') {
-        isValidToken = await this.validateAccessToken(token, userId, grantId, env);
-      } else if (tokenTypeHint === 'refresh_token') {
-        isValidToken = await this.validateRefreshToken(token, userId, grantId, env);
-      }
-
-      // If hint didn't work or no hint provided, try both types
-      if (!isValidToken) {
-        isValidToken =
-          (await this.validateAccessToken(token, userId, grantId, env)) ||
-          (await this.validateRefreshToken(token, userId, grantId, env));
-      }
-
-      // If we found a valid token, revoke the entire grant
-      if (isValidToken) {
-        await this.createOAuthHelpers(env).revokeGrant(grantId, userId);
-      }
-
-      return new Response('', { status: 200 });
-    } catch (error) {
-      console.error('Token revocation error:', error);
+    const tokenParts = token.split(':');
+    if (tokenParts.length !== 3) {
       return new Response('', { status: 200 });
     }
+
+    const [userId, grantId, _] = tokenParts;
+
+    const isAccessToken = await this.validateAccessToken(token, userId, grantId, env);
+    const isRefreshToken = await this.validateRefreshToken(token, userId, grantId, env);
+
+    if (isAccessToken) {
+      await this.revokeSpecificAccessToken(token, userId, grantId, env);
+    } else if (isRefreshToken) {
+      await this.createOAuthHelpers(env).revokeGrant(grantId, userId);
+    }
+    return new Response('', { status: 500 });
+  }
+
+  /**
+   * Revokes a specific access token without affecting the refresh token
+   * @param token - The access token to revoke
+   * @param userId - The user ID extracted from the token
+   * @param grantId - The grant ID extracted from the token
+   * @param env - Cloudflare Worker environment variables
+   */
+  private async revokeSpecificAccessToken(token: string, userId: string, grantId: string, env: any): Promise<void> {
+    const accessTokenId = await generateTokenId(token);
+    const tokenKey = `token:${userId}:${grantId}:${accessTokenId}`;
+    await env.OAUTH_KV.delete(tokenKey);
   }
 
   /**
@@ -1739,21 +1724,17 @@ class OAuthProviderImpl {
    * @returns Promise<boolean> indicating if the token is valid
    */
   private async validateAccessToken(token: string, userId: string, grantId: string, env: any): Promise<boolean> {
-    try {
-      const accessTokenId = await generateTokenId(token);
-      const tokenKey = `token:${userId}:${grantId}:${accessTokenId}`;
-      const tokenData = await env.OAUTH_KV.get(tokenKey, { type: 'json' });
+    const accessTokenId = await generateTokenId(token);
+    const tokenKey = `token:${userId}:${grantId}:${accessTokenId}`;
+    const tokenData = await env.OAUTH_KV.get(tokenKey, { type: 'json' });
 
-      if (!tokenData) {
-        return false;
-      }
-
-      // Check if token is expired
-      const now = Math.floor(Date.now() / 1000);
-      return tokenData.expiresAt >= now;
-    } catch {
+    if (!tokenData) {
       return false;
     }
+
+    // Check if token is expired
+    const now = Math.floor(Date.now() / 1000);
+    return tokenData.expiresAt >= now;
   }
 
   /**
@@ -1765,20 +1746,16 @@ class OAuthProviderImpl {
    * @returns Promise<boolean> indicating if the token is valid
    */
   private async validateRefreshToken(token: string, userId: string, grantId: string, env: any): Promise<boolean> {
-    try {
-      const refreshTokenId = await generateTokenId(token);
-      const grantKey = `grant:${userId}:${grantId}`;
-      const grantData = await env.OAUTH_KV.get(grantKey, { type: 'json' });
+    const refreshTokenId = await generateTokenId(token);
+    const grantKey = `grant:${userId}:${grantId}`;
+    const grantData = await env.OAUTH_KV.get(grantKey, { type: 'json' });
 
-      if (!grantData) {
-        return false;
-      }
-
-      // Check if this matches the current or previous refresh token
-      return grantData.refreshTokenId === refreshTokenId || grantData.previousRefreshTokenId === refreshTokenId;
-    } catch {
+    if (!grantData) {
       return false;
     }
+
+    // Check if this matches the current or previous refresh token
+    return grantData.refreshTokenId === refreshTokenId || grantData.previousRefreshTokenId === refreshTokenId;
   }
 
   /**

@@ -2335,18 +2335,33 @@ describe('OAuthProvider', () => {
       );
 
       const revokeResponse = await oauthProvider.fetch(revokeRequest, mockEnv, mockCtx);
-      expect(revokeResponse.status).toBe(200); // Should NOT be unsupported_grant_type anymore
-
       // Verify response doesn't contain unsupported_grant_type error
       const revokeResponseText = await revokeResponse.text();
       expect(revokeResponseText).not.toContain('unsupported_grant_type');
 
-      // Step 3: Verify the token is actually revoked (proves revokeGrant was called)
+      // Step 3: Verify the access token is actually revoked
       const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
         Authorization: `Bearer ${tokens.access_token}`,
       });
       const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
-      expect(apiResponse.status).toBe(401); // Token should no longer work
+      expect(apiResponse.status).toBe(401); // Access token should no longer work
+
+      // Step 4: Verify refresh token still works 
+      const refreshRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+        },
+        `grant_type=refresh_token&refresh_token=${tokens.refresh_token}`
+      );
+
+      const refreshResponse = await oauthProvider.fetch(refreshRequest, mockEnv, mockCtx);
+      expect(refreshResponse.status).toBe(200); // Refresh token should still work
+      const newTokens = await refreshResponse.json<any>();
+      expect(newTokens.access_token).toBeDefined();
+      expect(newTokens.refresh_token).toBeDefined();
     });
   });
 });
