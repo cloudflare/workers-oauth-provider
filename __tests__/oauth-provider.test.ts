@@ -1210,7 +1210,9 @@ describe('OAuthProvider', () => {
       expect(data.success).toBe(true);
       expect(data.user).toEqual({ userId: 'test-user-123', username: 'TestUser' });
     });
+  });
 
+  describe('CORS Support', () => {
     it('should handle CORS preflight for API requests', async () => {
       const preflightRequest = createMockRequest('https://example.com/api/test', 'OPTIONS', {
         Origin: 'https://client.example.com',
@@ -1224,6 +1226,215 @@ describe('OAuthProvider', () => {
       expect(preflightResponse.headers.get('Access-Control-Allow-Origin')).toBe('https://client.example.com');
       expect(preflightResponse.headers.get('Access-Control-Allow-Methods')).toBe('*');
       expect(preflightResponse.headers.get('Access-Control-Allow-Headers')).toContain('Authorization');
+    });
+
+    it('should add CORS headers to OAuth metadata discovery endpoint', async () => {
+      const request = createMockRequest('https://example.com/.well-known/oauth-authorization-server', 'GET', {
+        Origin: 'https://client.example.com',
+      });
+
+      const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get('Access-Control-Allow-Origin')).toBe('https://client.example.com');
+      expect(response.headers.get('Access-Control-Allow-Methods')).toBe('*');
+      expect(response.headers.get('Access-Control-Allow-Headers')).toBe('Authorization, *');
+      expect(response.headers.get('Access-Control-Max-Age')).toBe('86400');
+    });
+
+    it('should handle OPTIONS preflight for metadata discovery endpoint', async () => {
+      const preflightRequest = createMockRequest('https://example.com/.well-known/oauth-authorization-server', 'OPTIONS', {
+        Origin: 'https://spa.example.com',
+        'Access-Control-Request-Method': 'GET',
+      });
+
+      const response = await oauthProvider.fetch(preflightRequest, mockEnv, mockCtx);
+
+      expect(response.status).toBe(204);
+      expect(response.headers.get('Access-Control-Allow-Origin')).toBe('https://spa.example.com');
+      expect(response.headers.get('Access-Control-Allow-Methods')).toBe('*');
+      expect(response.headers.get('Access-Control-Allow-Headers')).toBe('Authorization, *');
+      expect(response.headers.get('Access-Control-Max-Age')).toBe('86400');
+      expect(response.headers.get('Content-Length')).toBe('0');
+    });
+
+    it('should add CORS headers to token endpoint responses', async () => {
+      // First create a client and get auth code
+      const clientData = {
+        redirect_uris: ['https://client.example.com/callback'],
+        client_name: 'CORS Test Client',
+        token_endpoint_auth_method: 'client_secret_basic',
+      };
+
+      const registerRequest = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify(clientData)
+      );
+
+      const registerResponse = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
+      const client = await registerResponse.json<any>();
+      const clientId = client.client_id;
+      const clientSecret = client.client_secret;
+      const redirectUri = 'https://client.example.com/callback';
+
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123`
+      );
+
+      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const location = authResponse.headers.get('Location')!;
+      const code = new URL(location).searchParams.get('code')!;
+
+      // Now test token exchange with CORS
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Origin': 'https://webapp.example.com'
+        },
+        params.toString()
+      );
+
+      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+
+      expect(tokenResponse.status).toBe(200);
+      expect(tokenResponse.headers.get('Access-Control-Allow-Origin')).toBe('https://webapp.example.com');
+      expect(tokenResponse.headers.get('Access-Control-Allow-Methods')).toBe('*');
+      expect(tokenResponse.headers.get('Access-Control-Allow-Headers')).toBe('Authorization, *');
+      expect(tokenResponse.headers.get('Access-Control-Max-Age')).toBe('86400');
+    });
+
+    it('should handle OPTIONS preflight for token endpoint', async () => {
+      const preflightRequest = createMockRequest('https://example.com/oauth/token', 'OPTIONS', {
+        Origin: 'https://mobile.example.com',
+        'Access-Control-Request-Method': 'POST',
+        'Access-Control-Request-Headers': 'Content-Type',
+      });
+
+      const response = await oauthProvider.fetch(preflightRequest, mockEnv, mockCtx);
+
+      expect(response.status).toBe(204);
+      expect(response.headers.get('Access-Control-Allow-Origin')).toBe('https://mobile.example.com');
+      expect(response.headers.get('Access-Control-Allow-Methods')).toBe('*');
+      expect(response.headers.get('Access-Control-Allow-Headers')).toBe('Authorization, *');
+      expect(response.headers.get('Access-Control-Max-Age')).toBe('86400');
+    });
+
+    it('should add CORS headers to client registration endpoint', async () => {
+      const clientData = {
+        redirect_uris: ['https://newapp.example.com/callback'],
+        client_name: 'New CORS Test Client',
+        token_endpoint_auth_method: 'client_secret_basic',
+      };
+
+      const request = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 
+          'Content-Type': 'application/json',
+          'Origin': 'https://admin.example.com'
+        },
+        JSON.stringify(clientData)
+      );
+
+      const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
+
+      expect(response.status).toBe(201);
+      expect(response.headers.get('Access-Control-Allow-Origin')).toBe('https://admin.example.com');
+      expect(response.headers.get('Access-Control-Allow-Methods')).toBe('*');
+      expect(response.headers.get('Access-Control-Allow-Headers')).toBe('Authorization, *');
+    });
+
+    it('should handle OPTIONS preflight for client registration endpoint', async () => {
+      const preflightRequest = createMockRequest('https://example.com/oauth/register', 'OPTIONS', {
+        Origin: 'https://dashboard.example.com',
+        'Access-Control-Request-Method': 'POST',
+        'Access-Control-Request-Headers': 'Content-Type, Authorization',
+      });
+
+      const response = await oauthProvider.fetch(preflightRequest, mockEnv, mockCtx);
+
+      expect(response.status).toBe(204);
+      expect(response.headers.get('Access-Control-Allow-Origin')).toBe('https://dashboard.example.com');
+      expect(response.headers.get('Access-Control-Allow-Methods')).toBe('*');
+      expect(response.headers.get('Access-Control-Allow-Headers')).toBe('Authorization, *');
+    });
+
+    it('should not add CORS headers when no Origin header is present', async () => {
+      const request = createMockRequest('https://example.com/.well-known/oauth-authorization-server');
+      const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get('Access-Control-Allow-Origin')).toBeNull();
+      expect(response.headers.get('Access-Control-Allow-Methods')).toBeNull();
+      expect(response.headers.get('Access-Control-Allow-Headers')).toBeNull();
+    });
+
+    it('should add CORS headers to API error responses', async () => {
+      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
+        Origin: 'https://client.example.com',
+        // No Authorization header - should get 401 error with CORS headers
+      });
+
+      const response = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+
+      expect(response.status).toBe(401);
+      expect(response.headers.get('Access-Control-Allow-Origin')).toBe('https://client.example.com');
+      expect(response.headers.get('Access-Control-Allow-Methods')).toBe('*');
+      expect(response.headers.get('Access-Control-Allow-Headers')).toBe('Authorization, *');
+
+      const error = await response.json<any>();
+      expect(error.error).toBe('invalid_token');
+    });
+
+    it('should add CORS headers to token endpoint error responses', async () => {
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', 'invalid-code');
+      params.append('client_id', 'invalid-client');
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Origin': 'https://evil.example.com'
+        },
+        params.toString()
+      );
+
+      const response = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+
+      expect(response.status).toBe(401); // Should be an error
+      expect(response.headers.get('Access-Control-Allow-Origin')).toBe('https://evil.example.com');
+      expect(response.headers.get('Access-Control-Allow-Methods')).toBe('*');
+      expect(response.headers.get('Access-Control-Allow-Headers')).toBe('Authorization, *');
+    });
+
+    it('should not add CORS headers to default handler responses', async () => {
+      const defaultRequest = createMockRequest('https://example.com/some-other-route', 'GET', {
+        Origin: 'https://client.example.com',
+      });
+
+      const response = await oauthProvider.fetch(defaultRequest, mockEnv, mockCtx);
+
+      expect(response.status).toBe(200);
+      // CORS headers should NOT be added to default handler responses
+      expect(response.headers.get('Access-Control-Allow-Origin')).toBeNull();
+      expect(response.headers.get('Access-Control-Allow-Methods')).toBeNull();
+      expect(response.headers.get('Access-Control-Allow-Headers')).toBeNull();
     });
   });
 
