@@ -850,9 +850,22 @@ class OAuthProviderImpl {
       return this.addCorsHeaders(response, request);
     }
 
-    // Handle token endpoint
+    // Handle token endpoint (including revocation)
     if (this.isTokenEndpoint(url)) {
-      const response = await this.handleTokenRequest(request, env);
+      const parsed = await this.parseTokenEndpointRequest(request, env);
+
+      // If parsing failed, return the error response
+      if (parsed instanceof Response) {
+        return this.addCorsHeaders(parsed, request);
+      }
+
+      let response: Response;
+      if (parsed.isRevocationRequest) {
+        response = await this.handleRevocationRequest(parsed.body, env);
+      } else {
+        response = await this.handleTokenRequest(parsed.body, parsed.clientInfo, env);
+      }
+
       return this.addCorsHeaders(response, request);
     }
 
@@ -932,6 +945,103 @@ class OAuthProviderImpl {
   private isClientRegistrationEndpoint(url: URL): boolean {
     if (!this.options.clientRegistrationEndpoint) return false;
     return this.matchEndpoint(url, this.options.clientRegistrationEndpoint);
+  }
+
+  /**
+   * Parses and validates a token endpoint request (used for both token exchange and revocation)
+   * @param request - The HTTP request to parse
+   * @returns Promise with parsed body and client info, or error response
+   */
+  private async parseTokenEndpointRequest(
+    request: Request,
+    env: any
+  ): Promise<
+    | {
+        body: any;
+        clientInfo: ClientInfo;
+        isRevocationRequest: boolean;
+      }
+    | Response
+  > {
+    // Only accept POST requests
+    if (request.method !== 'POST') {
+      return this.createErrorResponse('invalid_request', 'Method not allowed', 405);
+    }
+
+    let contentType = request.headers.get('Content-Type') || '';
+    let body: any = {};
+
+    // According to OAuth 2.0 RFC 6749/7009, requests MUST use application/x-www-form-urlencoded
+    if (!contentType.includes('application/x-www-form-urlencoded')) {
+      return this.createErrorResponse('invalid_request', 'Content-Type must be application/x-www-form-urlencoded', 400);
+    }
+
+    // Process application/x-www-form-urlencoded
+    const formData = await request.formData();
+    for (const [key, value] of formData.entries()) {
+      body[key] = value;
+    }
+
+    // Get client ID from request
+    const authHeader = request.headers.get('Authorization');
+    let clientId = '';
+    let clientSecret = '';
+
+    if (authHeader && authHeader.startsWith('Basic ')) {
+      // Basic auth
+      const credentials = atob(authHeader.substring(6));
+      const [id, secret] = credentials.split(':', 2);
+      clientId = decodeURIComponent(id);
+      clientSecret = decodeURIComponent(secret || '');
+    } else {
+      // Form parameters
+      clientId = body.client_id;
+      clientSecret = body.client_secret || '';
+    }
+
+    if (!clientId) {
+      return this.createErrorResponse('invalid_client', 'Client ID is required', 401);
+    }
+
+    // Verify client exists
+    const clientInfo = await this.getClient(env, clientId);
+    if (!clientInfo) {
+      return this.createErrorResponse('invalid_client', 'Client not found', 401);
+    }
+
+    // Determine authentication requirements based on token endpoint auth method
+    const isPublicClient = clientInfo.tokenEndpointAuthMethod === 'none';
+
+    // For confidential clients, validate the secret
+    if (!isPublicClient) {
+      if (!clientSecret) {
+        return this.createErrorResponse('invalid_client', 'Client authentication failed: missing client_secret', 401);
+      }
+
+      // Verify the client secret matches
+      if (!clientInfo.clientSecret) {
+        return this.createErrorResponse(
+          'invalid_client',
+          'Client authentication failed: client has no registered secret',
+          401
+        );
+      }
+
+      const providedSecretHash = await hashSecret(clientSecret);
+      if (providedSecretHash !== clientInfo.clientSecret) {
+        return this.createErrorResponse('invalid_client', 'Client authentication failed: invalid client_secret', 401);
+      }
+    }
+
+    // Determine if this is a revocation request
+    // RFC 7009: Revocation requests have 'token' parameter but no 'grant_type'
+    const isRevocationRequest = !body.grant_type && !!body.token;
+
+    return {
+      body,
+      clientInfo,
+      isRevocationRequest,
+    };
   }
 
   /**
@@ -1085,83 +1195,12 @@ class OAuthProviderImpl {
   /**
    * Handles client authentication and token issuance via the token endpoint
    * Supports authorization_code and refresh_token grant types
-   * @param request - The HTTP request
+   * @param body - The parsed request body
+   * @param clientInfo - The authenticated client information
    * @param env - Cloudflare Worker environment variables
    * @returns Response with token data or error
    */
-  private async handleTokenRequest(request: Request, env: any): Promise<Response> {
-    // Only accept POST requests
-    if (request.method !== 'POST') {
-      return this.createErrorResponse('invalid_request', 'Method not allowed', 405);
-    }
-
-    let contentType = request.headers.get('Content-Type') || '';
-    let body: any = {};
-
-    // According to OAuth 2.0 RFC 6749 Section 2.3, token requests MUST use
-    // application/x-www-form-urlencoded content type
-    if (!contentType.includes('application/x-www-form-urlencoded')) {
-      return this.createErrorResponse('invalid_request', 'Content-Type must be application/x-www-form-urlencoded', 400);
-    }
-
-    // Process application/x-www-form-urlencoded
-    const formData = await request.formData();
-    for (const [key, value] of formData.entries()) {
-      body[key] = value;
-    }
-
-    // Get client ID from request
-    const authHeader = request.headers.get('Authorization');
-    let clientId = '';
-    let clientSecret = '';
-
-    if (authHeader && authHeader.startsWith('Basic ')) {
-      // Basic auth
-      const credentials = atob(authHeader.substring(6));
-      const [id, secret] = credentials.split(':', 2);
-      clientId = decodeURIComponent(id);
-      clientSecret = decodeURIComponent(secret || '');
-    } else {
-      // Form parameters
-      clientId = body.client_id;
-      clientSecret = body.client_secret || '';
-    }
-
-    if (!clientId) {
-      return this.createErrorResponse('invalid_client', 'Client ID is required', 401);
-    }
-
-    // Verify client exists
-    const clientInfo = await this.getClient(env, clientId);
-    if (!clientInfo) {
-      return this.createErrorResponse('invalid_client', 'Client not found', 401);
-    }
-
-    // Determine authentication requirements based on token endpoint auth method
-    const isPublicClient = clientInfo.tokenEndpointAuthMethod === 'none';
-
-    // For confidential clients, validate the secret
-    if (!isPublicClient) {
-      if (!clientSecret) {
-        return this.createErrorResponse('invalid_client', 'Client authentication failed: missing client_secret', 401);
-      }
-
-      // Verify the client secret matches
-      if (!clientInfo.clientSecret) {
-        return this.createErrorResponse(
-          'invalid_client',
-          'Client authentication failed: client has no registered secret',
-          401
-        );
-      }
-
-      const providedSecretHash = await hashSecret(clientSecret);
-      if (providedSecretHash !== clientInfo.clientSecret) {
-        return this.createErrorResponse('invalid_client', 'Client authentication failed: invalid client_secret', 401);
-      }
-    }
-    // For public clients, no secret is required
-
+  private async handleTokenRequest(body: any, clientInfo: ClientInfo, env: any): Promise<Response> {
     // Handle different grant types
     const grantType = body.grant_type;
 
@@ -1619,6 +1658,102 @@ class OAuthProviderImpl {
         headers: { 'Content-Type': 'application/json' },
       }
     );
+  }
+
+  /**
+   * Handles OAuth 2.0 token revocation requests (RFC 7009)
+   * @param body - The parsed request body containing revocation parameters
+   * @param env - Cloudflare Worker environment variables
+   * @returns Response confirming revocation or error
+   */
+  private async handleRevocationRequest(body: any, env: any): Promise<Response> {
+    // Handle the revocation request
+    return this.revokeToken(body, env);
+  }
+
+  /**
+   * - Access tokens: Revokes only the specific token
+   * - Refresh tokens: Revokes the entire grant (access + refresh tokens)
+   * @param body - The parsed request body containing token parameter
+   * @param env - Cloudflare Worker environment variables
+   * @returns Response confirming revocation or error
+   */
+  private async revokeToken(body: any, env: any): Promise<Response> {
+    const token = body.token;
+
+    if (!token) {
+      return this.createErrorResponse('invalid_request', 'Token parameter is required');
+    }
+    const tokenParts = token.split(':');
+    if (tokenParts.length !== 3) {
+      return new Response('', { status: 200 });
+    }
+
+    const [userId, grantId, _] = tokenParts;
+    const tokenId = await generateTokenId(token);
+
+    const isAccessToken = await this.validateAccessToken(tokenId, userId, grantId, env);
+    const isRefreshToken = await this.validateRefreshToken(tokenId, userId, grantId, env);
+
+    if (isAccessToken) {
+      await this.revokeSpecificAccessToken(tokenId, userId, grantId, env);
+    } else if (isRefreshToken) {
+      await this.createOAuthHelpers(env).revokeGrant(grantId, userId);
+    }
+    return new Response('', { status: 500 });
+  }
+
+  /**
+   * Revokes a specific access token without affecting the refresh token
+   * @param tokenId - The hashed token ID
+   * @param userId - The user ID extracted from the token
+   * @param grantId - The grant ID extracted from the token
+   * @param env - Cloudflare Worker environment variables
+   */
+  private async revokeSpecificAccessToken(tokenId: string, userId: string, grantId: string, env: any): Promise<void> {
+    const tokenKey = `token:${userId}:${grantId}:${tokenId}`;
+    await env.OAUTH_KV.delete(tokenKey);
+  }
+
+  /**
+   * Validates if a token is a valid access token
+   * @param tokenId - The hashed token ID
+   * @param userId - The user ID extracted from the token
+   * @param grantId - The grant ID extracted from the token
+   * @param env - Cloudflare Worker environment variables
+   * @returns Promise<boolean> indicating if the token is valid
+   */
+  private async validateAccessToken(tokenId: string, userId: string, grantId: string, env: any): Promise<boolean> {
+    const tokenKey = `token:${userId}:${grantId}:${tokenId}`;
+    const tokenData = await env.OAUTH_KV.get(tokenKey, { type: 'json' });
+
+    if (!tokenData) {
+      return false;
+    }
+
+    // Check if token is expired
+    const now = Math.floor(Date.now() / 1000);
+    return tokenData.expiresAt >= now;
+  }
+
+  /**
+   * Validates if a token is a valid refresh token
+   * @param tokenId - The hashed token ID
+   * @param userId - The user ID extracted from the token
+   * @param grantId - The grant ID extracted from the token
+   * @param env - Cloudflare Worker environment variables
+   * @returns Promise<boolean> indicating if the token is valid
+   */
+  private async validateRefreshToken(tokenId: string, userId: string, grantId: string, env: any): Promise<boolean> {
+    const grantKey = `grant:${userId}:${grantId}`;
+    const grantData = await env.OAUTH_KV.get(grantKey, { type: 'json' });
+
+    if (!grantData) {
+      return false;
+    }
+
+    // Check if this matches the current or previous refresh token
+    return grantData.refreshTokenId === tokenId || grantData.previousRefreshTokenId === tokenId;
   }
 
   /**
