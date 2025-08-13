@@ -1,6 +1,19 @@
-import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
-import { OAuthProvider, type OAuthHelpers } from '../src/oauth-provider';
+/** biome-ignore-all lint/style/noNonNullAssertion: it's fine */
+/** biome-ignore-all lint/style/noUnusedTemplateLiteral: it's fine */
+/** biome-ignore-all lint/correctness/noUnusedFunctionParameters: it's fine */
+
 import type { ExecutionContext } from '@cloudflare/workers-types';
+
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import {
+  OAuthProvider,
+  type TokenExchangeCallbackOptions,
+  type ClientInfo,
+  type Grant,
+  type RequiredEnv,
+} from '../src/oauth-provider';
+
 // We're importing WorkerEntrypoint from our mock implementation
 // The actual import is mocked in setup.ts
 import { WorkerEntrypoint } from 'cloudflare:workers';
@@ -9,10 +22,10 @@ import { WorkerEntrypoint } from 'cloudflare:workers';
  * Mock KV namespace implementation that stores data in memory
  */
 class MockKV {
-  private storage: Map<string, { value: any; expiration?: number }> = new Map();
+  private storage: Map<string, { value: unknown; expiration?: number }> = new Map();
 
   async put(key: string, value: string | ArrayBuffer, options?: { expirationTtl?: number }): Promise<void> {
-    let expirationTime: number | undefined = undefined;
+    let expirationTime: number | undefined;
 
     if (options?.expirationTtl) {
       expirationTime = Date.now() + options.expirationTtl * 1000;
@@ -50,7 +63,7 @@ class MockKV {
     cursor?: string;
   }> {
     const { prefix, limit = 1000 } = options;
-    let keys: { name: string }[] = [];
+    const keys: { name: string }[] = [];
 
     for (const key of this.storage.keys()) {
       if (key.startsWith(prefix)) {
@@ -80,9 +93,9 @@ class MockKV {
  * Mock execution context for Cloudflare Workers
  */
 class MockExecutionContext implements ExecutionContext {
-  props: any = {};
+  props: Record<string, unknown> = {};
 
-  waitUntil(promise: Promise<any>): void {
+  waitUntil(promise: Promise<unknown>): void {
     // In tests, we can just ignore waitUntil
   }
 
@@ -121,6 +134,7 @@ const testDefaultHandler = {
     if (url.pathname === '/authorize') {
       // Mock authorize endpoint
       const oauthReqInfo = await env.OAUTH_PROVIDER.parseAuthRequest(request);
+      // biome-ignore lint/correctness/noUnusedVariables: just keeping this pattern consistent
       const clientInfo = await env.OAUTH_PROVIDER.lookupClient(oauthReqInfo.clientId);
 
       // Mock user consent flow - automatically grant consent
@@ -142,7 +156,7 @@ const testDefaultHandler = {
 // Helper function to create mock requests
 function createMockRequest(
   url: string,
-  method: string = 'GET',
+  method = 'GET',
   headers: Record<string, string> = {},
   body?: string | FormData
 ): Request {
@@ -163,10 +177,7 @@ function createMockEnv() {
   return {
     OAUTH_KV: new MockKV(),
     OAUTH_PROVIDER: null, // Will be populated by the OAuthProvider
-  } as {
-    OAUTH_KV: MockKV;
-    OAUTH_PROVIDER: OAuthHelpers | null;
-  };
+  } as unknown as RequiredEnv;
 }
 
 describe('OAuthProvider', () => {
@@ -198,6 +209,7 @@ describe('OAuthProvider', () => {
 
   afterEach(() => {
     // Clean up KV storage after each test
+    // @ts-expect-error: .clear is only in the mocked kv namespace in tests
     mockEnv.OAUTH_KV.clear();
   });
 
@@ -244,7 +256,7 @@ describe('OAuthProvider', () => {
       );
 
       const registerResponse = await providerWithMultiHandler.fetch(registerRequest, mockEnv, mockCtx);
-      const client = await registerResponse.json<any>();
+      const client = await registerResponse.json<Record<string, unknown>>();
       const clientId = client.client_id;
       const clientSecret = client.client_secret;
       const redirectUri = 'https://client.example.com/callback';
@@ -265,8 +277,8 @@ describe('OAuthProvider', () => {
       params.append('grant_type', 'authorization_code');
       params.append('code', code);
       params.append('redirect_uri', redirectUri);
-      params.append('client_id', clientId);
-      params.append('client_secret', clientSecret);
+      params.append('client_id', clientId as string);
+      params.append('client_secret', clientSecret as string);
 
       const tokenRequest = createMockRequest(
         'https://example.com/oauth/token',
@@ -276,7 +288,7 @@ describe('OAuthProvider', () => {
       );
 
       const tokenResponse = await providerWithMultiHandler.fetch(tokenRequest, mockEnv, mockCtx);
-      const tokens = await tokenResponse.json<any>();
+      const tokens = await tokenResponse.json<Record<string, unknown>>();
       const accessToken = tokens.access_token;
 
       // Make requests to different API routes
@@ -337,7 +349,7 @@ describe('OAuthProvider', () => {
 
       expect(response.status).toBe(200);
 
-      const metadata = await response.json<any>();
+      const metadata = await response.json<Record<string, unknown>>();
       expect(metadata.issuer).toBe('https://example.com');
       expect(metadata.authorization_endpoint).toBe('https://example.com/authorize');
       expect(metadata.token_endpoint).toBe('https://example.com/oauth/token');
@@ -366,7 +378,7 @@ describe('OAuthProvider', () => {
 
       expect(response.status).toBe(200);
 
-      const metadata = await response.json<any>();
+      const metadata = await response.json<Record<string, unknown>>();
       expect(metadata.response_types_supported).toContain('code');
       expect(metadata.response_types_supported).not.toContain('token');
     });
@@ -391,18 +403,20 @@ describe('OAuthProvider', () => {
 
       expect(response.status).toBe(201);
 
-      const registeredClient = await response.json<any>();
+      const registeredClient = await response.json<Record<string, unknown>>();
       expect(registeredClient.client_id).toBeDefined();
       expect(registeredClient.client_secret).toBeDefined();
       expect(registeredClient.redirect_uris).toEqual(['https://client.example.com/callback']);
       expect(registeredClient.client_name).toBe('Test Client');
 
       // Verify the client was saved to KV
-      const savedClient = await mockEnv.OAUTH_KV.get(`client:${registeredClient.client_id}`, { type: 'json' });
+      const savedClient = await mockEnv.OAUTH_KV.get<ClientInfo>(`client:${registeredClient.client_id}`, {
+        type: 'json',
+      });
       expect(savedClient).not.toBeNull();
-      expect(savedClient.clientId).toBe(registeredClient.client_id);
+      expect(savedClient!.clientId).toBe(registeredClient.client_id);
       // Secret should be stored as a hash
-      expect(savedClient.clientSecret).not.toBe(registeredClient.client_secret);
+      expect(savedClient!.clientSecret).not.toBe(registeredClient.client_secret);
     });
 
     it('should register a public client', async () => {
@@ -423,20 +437,23 @@ describe('OAuthProvider', () => {
 
       expect(response.status).toBe(201);
 
-      const registeredClient = await response.json<any>();
+      const registeredClient = await response.json<Record<string, unknown>>();
       expect(registeredClient.client_id).toBeDefined();
       expect(registeredClient.client_secret).toBeUndefined(); // Public client should not have a secret
       expect(registeredClient.token_endpoint_auth_method).toBe('none');
 
       // Verify the client was saved to KV
-      const savedClient = await mockEnv.OAUTH_KV.get(`client:${registeredClient.client_id}`, { type: 'json' });
+      const savedClient = await mockEnv.OAUTH_KV.get<ClientInfo>(`client:${registeredClient.client_id}`, {
+        type: 'json',
+      });
       expect(savedClient).not.toBeNull();
-      expect(savedClient.clientSecret).toBeUndefined(); // No secret stored
+      expect(savedClient!.clientSecret).toBeUndefined(); // No secret stored
     });
   });
 
   describe('Authorization Code Flow', () => {
     let clientId: string;
+    // biome-ignore lint/correctness/noUnusedVariables: just keeping this pattern consistent
     let clientSecret: string;
     let redirectUri: string;
 
@@ -456,10 +473,10 @@ describe('OAuthProvider', () => {
       );
 
       const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
-      const client = await response.json<any>();
+      const client = await response.json<Record<string, unknown>>();
 
-      clientId = client.client_id;
-      clientSecret = client.client_secret;
+      clientId = client.client_id as string;
+      clientSecret = client.client_secret as string;
       redirectUri = 'https://client.example.com/callback';
     }
 
@@ -572,9 +589,9 @@ describe('OAuthProvider', () => {
       );
 
       const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
-      const client = await response.json<any>();
+      const client = await response.json<Record<string, unknown>>();
 
-      clientId = client.client_id;
+      clientId = client.client_id as string;
       redirectUri = 'https://spa-client.example.com/callback';
     }
 
@@ -683,7 +700,7 @@ describe('OAuthProvider', () => {
 
       expect(apiResponse.status).toBe(200);
 
-      const apiData = await apiResponse.json<any>();
+      const apiData = await apiResponse.json<Record<string, unknown>>();
       expect(apiData.success).toBe(true);
       expect(apiData.user).toEqual({ userId: 'test-user-123', username: 'TestUser' });
     });
@@ -710,10 +727,10 @@ describe('OAuthProvider', () => {
       );
 
       const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
-      const client = await response.json<any>();
+      const client = await response.json<Record<string, unknown>>();
 
-      clientId = client.client_id;
-      clientSecret = client.client_secret;
+      clientId = client.client_id as string;
+      clientSecret = client.client_secret as string;
       redirectUri = 'https://client.example.com/callback';
     }
 
@@ -755,7 +772,7 @@ describe('OAuthProvider', () => {
 
       expect(tokenResponse.status).toBe(200);
 
-      const tokens = await tokenResponse.json<any>();
+      const tokens = await tokenResponse.json<Record<string, unknown>>();
       expect(tokens.access_token).toBeDefined();
       expect(tokens.refresh_token).toBeDefined();
       expect(tokens.token_type).toBe('bearer');
@@ -768,10 +785,12 @@ describe('OAuthProvider', () => {
       // Verify grant was updated (auth code removed, refresh token added)
       const grantEntries = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
       const grantKey = grantEntries.keys[0].name;
-      const grant = await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' });
+      const grant = await mockEnv.OAUTH_KV.get<Grant>(grantKey, { type: 'json' });
 
-      expect(grant.authCodeId).toBeUndefined(); // Auth code should be removed
-      expect(grant.refreshTokenId).toBeDefined(); // Refresh token should be added
+      expect(grant).not.toBeNull();
+
+      expect(grant!.authCodeId).toBeUndefined(); // Auth code should be removed
+      expect(grant!.refreshTokenId).toBeDefined(); // Refresh token should be added
     });
 
     it('should reject token exchange without redirect_uri when not using PKCE', async () => {
@@ -806,7 +825,7 @@ describe('OAuthProvider', () => {
 
       // Should fail because redirect_uri is required when not using PKCE
       expect(tokenResponse.status).toBe(400);
-      const error = await tokenResponse.json<any>();
+      const error = await tokenResponse.json<Record<string, unknown>>();
       expect(error.error).toBe('invalid_request');
       expect(error.error_description).toBe('redirect_uri is required when not using PKCE');
     });
@@ -844,7 +863,7 @@ describe('OAuthProvider', () => {
 
       // Should fail because code_verifier is provided but PKCE wasn't used in authorization
       expect(tokenResponse.status).toBe(400);
-      const error = await tokenResponse.json<any>();
+      const error = await tokenResponse.json<Record<string, unknown>>();
       expect(error.error).toBe('invalid_request');
       expect(error.error_description).toBe('code_verifier provided for a flow that did not use PKCE');
     });
@@ -909,7 +928,7 @@ describe('OAuthProvider', () => {
       // Should succeed because redirect_uri is optional when using PKCE
       expect(tokenResponse.status).toBe(200);
 
-      const tokens = await tokenResponse.json<any>();
+      const tokens = await tokenResponse.json<Record<string, unknown>>();
       expect(tokens.access_token).toBeDefined();
       expect(tokens.refresh_token).toBeDefined();
       expect(tokens.token_type).toBe('bearer');
@@ -944,7 +963,7 @@ describe('OAuthProvider', () => {
       );
 
       const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
-      const tokens = await tokenResponse.json<any>();
+      const tokens = await tokenResponse.json<Record<string, unknown>>();
 
       // Now use the access token for an API request
       const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
@@ -955,7 +974,7 @@ describe('OAuthProvider', () => {
 
       expect(apiResponse.status).toBe(200);
 
-      const apiData = await apiResponse.json<any>();
+      const apiData = await apiResponse.json<Record<string, unknown>>();
       expect(apiData.success).toBe(true);
       expect(apiData.user).toEqual({ userId: 'test-user-123', username: 'TestUser' });
     });
@@ -983,9 +1002,9 @@ describe('OAuthProvider', () => {
       );
 
       const registerResponse = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
-      const client = await registerResponse.json<any>();
-      clientId = client.client_id;
-      clientSecret = client.client_secret;
+      const client = await registerResponse.json<Record<string, unknown>>();
+      clientId = client.client_id as string;
+      clientSecret = client.client_secret as string;
       const redirectUri = 'https://client.example.com/callback';
 
       // Get an auth code
@@ -1015,8 +1034,8 @@ describe('OAuthProvider', () => {
       );
 
       const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
-      const tokens = await tokenResponse.json<any>();
-      refreshToken = tokens.refresh_token;
+      const tokens = await tokenResponse.json<Record<string, unknown>>();
+      refreshToken = tokens.refresh_token as string;
     }
 
     beforeEach(async () => {
@@ -1042,7 +1061,7 @@ describe('OAuthProvider', () => {
 
       expect(refreshResponse.status).toBe(200);
 
-      const newTokens = await refreshResponse.json<any>();
+      const newTokens = await refreshResponse.json<Record<string, unknown>>();
       expect(newTokens.access_token).toBeDefined();
       expect(newTokens.refresh_token).toBeDefined();
       expect(newTokens.refresh_token).not.toBe(refreshToken); // Should get a new refresh token
@@ -1054,10 +1073,12 @@ describe('OAuthProvider', () => {
       // Verify the grant was updated
       const grantEntries = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
       const grantKey = grantEntries.keys[0].name;
-      const grant = await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' });
+      const grant = await mockEnv.OAUTH_KV.get<Grant>(grantKey, { type: 'json' });
 
-      expect(grant.previousRefreshTokenId).toBeDefined(); // Old refresh token should be tracked
-      expect(grant.refreshTokenId).toBeDefined(); // New refresh token should be set
+      expect(grant).not.toBeNull();
+
+      expect(grant!.previousRefreshTokenId).toBeDefined(); // Old refresh token should be tracked
+      expect(grant!.refreshTokenId).toBeDefined(); // New refresh token should be set
     });
 
     it('should allow using the previous refresh token once', async () => {
@@ -1076,8 +1097,8 @@ describe('OAuthProvider', () => {
       );
 
       const refreshResponse1 = await oauthProvider.fetch(refreshRequest1, mockEnv, mockCtx);
-      const newTokens1 = await refreshResponse1.json<any>();
-      const newRefreshToken = newTokens1.refresh_token;
+      const _newTokens1 = await refreshResponse1.json<Record<string, unknown>>();
+      const _newRefreshToken = _newTokens1.refresh_token;
 
       // Now try to use the original refresh token again (simulating a retry after failure)
       const params2 = new URLSearchParams();
@@ -1098,7 +1119,7 @@ describe('OAuthProvider', () => {
       // The request should succeed
       expect(refreshResponse2.status).toBe(200);
 
-      const newTokens2 = await refreshResponse2.json<any>();
+      const newTokens2 = await refreshResponse2.json<Record<string, unknown>>();
       expect(newTokens2.access_token).toBeDefined();
       expect(newTokens2.refresh_token).toBeDefined();
 
@@ -1106,10 +1127,12 @@ describe('OAuthProvider', () => {
       // as the previous token
       const grantEntries = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
       const grantKey = grantEntries.keys[0].name;
-      const grant = await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' });
+      const grant = await mockEnv.OAUTH_KV.get<Grant>(grantKey, { type: 'json' });
 
       // The previousRefreshTokenId should now be from the first refresh, not the original
-      expect(grant.previousRefreshTokenId).toBeDefined();
+      expect(grant).not.toBeNull();
+
+      expect(grant!.previousRefreshTokenId).toBeDefined();
     });
   });
 
@@ -1133,7 +1156,7 @@ describe('OAuthProvider', () => {
       );
 
       const registerResponse = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
-      const client = await registerResponse.json<any>();
+      const client = await registerResponse.json<Record<string, unknown>>();
       const clientId = client.client_id;
       const clientSecret = client.client_secret;
       const redirectUri = 'https://client.example.com/callback';
@@ -1154,8 +1177,8 @@ describe('OAuthProvider', () => {
       params.append('grant_type', 'authorization_code');
       params.append('code', code);
       params.append('redirect_uri', redirectUri);
-      params.append('client_id', clientId);
-      params.append('client_secret', clientSecret);
+      params.append('client_id', clientId as string);
+      params.append('client_secret', clientSecret as string);
 
       const tokenRequest = createMockRequest(
         'https://example.com/oauth/token',
@@ -1165,8 +1188,8 @@ describe('OAuthProvider', () => {
       );
 
       const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
-      const tokens = await tokenResponse.json<any>();
-      accessToken = tokens.access_token;
+      const tokens = await tokenResponse.json<Record<string, unknown>>();
+      accessToken = tokens.access_token as string;
     }
 
     beforeEach(async () => {
@@ -1180,7 +1203,7 @@ describe('OAuthProvider', () => {
 
       expect(apiResponse.status).toBe(401);
 
-      const error = await apiResponse.json<any>();
+      const error = await apiResponse.json<Record<string, unknown>>();
       expect(error.error).toBe('invalid_token');
     });
 
@@ -1193,7 +1216,7 @@ describe('OAuthProvider', () => {
 
       expect(apiResponse.status).toBe(401);
 
-      const error = await apiResponse.json<any>();
+      const error = await apiResponse.json<Record<string, unknown>>();
       expect(error.error).toBe('invalid_token');
     });
 
@@ -1206,7 +1229,7 @@ describe('OAuthProvider', () => {
 
       expect(apiResponse.status).toBe(200);
 
-      const data = await apiResponse.json<any>();
+      const data = await apiResponse.json<Record<string, unknown>>();
       expect(data.success).toBe(true);
       expect(data.user).toEqual({ userId: 'test-user-123', username: 'TestUser' });
     });
@@ -1243,10 +1266,14 @@ describe('OAuthProvider', () => {
     });
 
     it('should handle OPTIONS preflight for metadata discovery endpoint', async () => {
-      const preflightRequest = createMockRequest('https://example.com/.well-known/oauth-authorization-server', 'OPTIONS', {
-        Origin: 'https://spa.example.com',
-        'Access-Control-Request-Method': 'GET',
-      });
+      const preflightRequest = createMockRequest(
+        'https://example.com/.well-known/oauth-authorization-server',
+        'OPTIONS',
+        {
+          Origin: 'https://spa.example.com',
+          'Access-Control-Request-Method': 'GET',
+        }
+      );
 
       const response = await oauthProvider.fetch(preflightRequest, mockEnv, mockCtx);
 
@@ -1274,9 +1301,9 @@ describe('OAuthProvider', () => {
       );
 
       const registerResponse = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
-      const client = await registerResponse.json<any>();
-      const clientId = client.client_id;
-      const clientSecret = client.client_secret;
+      const client = await registerResponse.json<Record<string, unknown>>();
+      const clientId = client.client_id as string;
+      const clientSecret = client.client_secret as string;
       const redirectUri = 'https://client.example.com/callback';
 
       const authRequest = createMockRequest(
@@ -1300,9 +1327,9 @@ describe('OAuthProvider', () => {
       const tokenRequest = createMockRequest(
         'https://example.com/oauth/token',
         'POST',
-        { 
+        {
           'Content-Type': 'application/x-www-form-urlencoded',
-          'Origin': 'https://webapp.example.com'
+          Origin: 'https://webapp.example.com',
         },
         params.toString()
       );
@@ -1342,9 +1369,9 @@ describe('OAuthProvider', () => {
       const request = createMockRequest(
         'https://example.com/oauth/register',
         'POST',
-        { 
+        {
           'Content-Type': 'application/json',
-          'Origin': 'https://admin.example.com'
+          Origin: 'https://admin.example.com',
         },
         JSON.stringify(clientData)
       );
@@ -1395,7 +1422,7 @@ describe('OAuthProvider', () => {
       expect(response.headers.get('Access-Control-Allow-Methods')).toBe('*');
       expect(response.headers.get('Access-Control-Allow-Headers')).toBe('Authorization, *');
 
-      const error = await response.json<any>();
+      const error = await response.json<Record<string, unknown>>();
       expect(error.error).toBe('invalid_token');
     });
 
@@ -1408,9 +1435,9 @@ describe('OAuthProvider', () => {
       const tokenRequest = createMockRequest(
         'https://example.com/oauth/token',
         'POST',
-        { 
+        {
           'Content-Type': 'application/x-www-form-urlencoded',
-          'Origin': 'https://evil.example.com'
+          Origin: 'https://evil.example.com',
         },
         params.toString()
       );
@@ -1441,7 +1468,7 @@ describe('OAuthProvider', () => {
   describe('Token Exchange Callback', () => {
     // Test with provider that has token exchange callback
     let oauthProviderWithCallback: OAuthProvider;
-    let callbackInvocations: any[] = [];
+    let callbackInvocations: TokenExchangeCallbackOptions[] = [];
     let mockEnv: ReturnType<typeof createMockEnv>;
     let mockCtx: MockExecutionContext;
 
@@ -1449,7 +1476,7 @@ describe('OAuthProvider', () => {
     function createProviderWithCallback() {
       callbackInvocations = [];
 
-      const tokenExchangeCallback = async (options: any) => {
+      const tokenExchangeCallback = async (options: TokenExchangeCallbackOptions) => {
         // Record that the callback was called and with what arguments
         callbackInvocations.push({ ...options });
 
@@ -1476,7 +1503,7 @@ describe('OAuthProvider', () => {
             newProps: {
               ...options.props,
               grantUpdated: true,
-              refreshCount: (options.props.refreshCount || 0) + 1,
+              refreshCount: ((options.props.refreshCount as number) ?? 0) + 1,
             },
           };
         }
@@ -1516,10 +1543,10 @@ describe('OAuthProvider', () => {
       );
 
       const response = await oauthProviderWithCallback.fetch(request, mockEnv, mockCtx);
-      const client = await response.json<any>();
+      const client = await response.json<Record<string, unknown>>();
 
-      clientId = client.client_id;
-      clientSecret = client.client_secret;
+      clientId = client.client_id as string;
+      clientSecret = client.client_secret as string;
       redirectUri = 'https://client.example.com/callback';
     }
 
@@ -1540,6 +1567,7 @@ describe('OAuthProvider', () => {
 
     afterEach(() => {
       // Clean up KV storage after each test
+      // @ts-expect-error: .clear is only in the mocked kv namespace in tests
       mockEnv.OAUTH_KV.clear();
     });
 
@@ -1577,7 +1605,7 @@ describe('OAuthProvider', () => {
 
       // Check that the token exchange was successful
       expect(tokenResponse.status).toBe(200);
-      const tokens = await tokenResponse.json<any>();
+      const tokens = await tokenResponse.json<Record<string, unknown>>();
       expect(tokens.access_token).toBeDefined();
 
       // Check that the callback was called once
@@ -1598,7 +1626,7 @@ describe('OAuthProvider', () => {
       expect(apiResponse.status).toBe(200);
 
       // Check that the API received the token-specific props from the callback
-      const apiData = await apiResponse.json<any>();
+      const apiData = await apiResponse.json<Record<string, unknown>>();
       expect(apiData.user).toEqual({
         userId: 'test-user-123',
         username: 'TestUser',
@@ -1635,7 +1663,7 @@ describe('OAuthProvider', () => {
       );
 
       const tokenResponse = await oauthProviderWithCallback.fetch(tokenRequest, mockEnv, mockCtx);
-      const tokens = await tokenResponse.json<any>();
+      const tokens = await tokenResponse.json<Record<string, unknown>>();
 
       // Reset the callback invocations tracking before refresh
       callbackInvocations = [];
@@ -1643,9 +1671,9 @@ describe('OAuthProvider', () => {
       // Now use the refresh token
       const refreshParams = new URLSearchParams();
       refreshParams.append('grant_type', 'refresh_token');
-      refreshParams.append('refresh_token', tokens.refresh_token);
-      refreshParams.append('client_id', clientId);
-      refreshParams.append('client_secret', clientSecret);
+      refreshParams.append('refresh_token', tokens.refresh_token as string);
+      refreshParams.append('client_id', clientId as string);
+      refreshParams.append('client_secret', clientSecret as string);
 
       const refreshRequest = createMockRequest(
         'https://example.com/oauth/token',
@@ -1658,7 +1686,7 @@ describe('OAuthProvider', () => {
 
       // Check that the refresh was successful
       expect(refreshResponse.status).toBe(200);
-      const newTokens = await refreshResponse.json<any>();
+      const newTokens = await refreshResponse.json<Record<string, unknown>>();
       expect(newTokens.access_token).toBeDefined();
 
       // Check that the callback was called once
@@ -1685,7 +1713,7 @@ describe('OAuthProvider', () => {
       expect(apiResponse.status).toBe(200);
 
       // Check that the API received the token-specific props from the refresh callback
-      const apiData = await apiResponse.json<any>();
+      const apiData = await apiResponse.json<Record<string, unknown>>();
       expect(apiData.user).toEqual({
         userId: 'test-user-123',
         username: 'TestUser',
@@ -1697,7 +1725,7 @@ describe('OAuthProvider', () => {
       // Do a second refresh to verify that grant props are properly updated
       const refresh2Params = new URLSearchParams();
       refresh2Params.append('grant_type', 'refresh_token');
-      refresh2Params.append('refresh_token', newTokens.refresh_token);
+      refresh2Params.append('refresh_token', newTokens.refresh_token as string);
       refresh2Params.append('client_id', clientId);
       refresh2Params.append('client_secret', clientSecret);
 
@@ -1712,7 +1740,7 @@ describe('OAuthProvider', () => {
       );
 
       const refresh2Response = await oauthProviderWithCallback.fetch(refresh2Request, mockEnv, mockCtx);
-      const newerTokens = await refresh2Response.json();
+      const _newerTokens = await refresh2Response.json();
 
       // Check that the refresh count was incremented in the grant props
       expect(callbackInvocations.length).toBe(1);
@@ -1722,7 +1750,7 @@ describe('OAuthProvider', () => {
     it('should update token props during refresh when explicitly provided', async () => {
       // Create a provider with a callback that returns both accessTokenProps and newProps
       // but with different values for each
-      const differentPropsCallback = async (options: any) => {
+      const differentPropsCallback = async (options: TokenExchangeCallbackOptions) => {
         if (options.grantType === 'refresh_token') {
           return {
             accessTokenProps: {
@@ -1765,7 +1793,7 @@ describe('OAuthProvider', () => {
       );
 
       const registerResponse = await refreshPropsProvider.fetch(registerRequest, mockEnv, mockCtx);
-      const client = await registerResponse.json<any>();
+      const client = await registerResponse.json<Record<string, unknown>>();
       const testClientId = client.client_id;
       const testClientSecret = client.client_secret;
       const testRedirectUri = 'https://client.example.com/callback';
@@ -1785,8 +1813,8 @@ describe('OAuthProvider', () => {
       params.append('grant_type', 'authorization_code');
       params.append('code', code);
       params.append('redirect_uri', testRedirectUri);
-      params.append('client_id', testClientId);
-      params.append('client_secret', testClientSecret);
+      params.append('client_id', testClientId as string);
+      params.append('client_secret', testClientSecret as string);
 
       const tokenRequest = createMockRequest(
         'https://example.com/oauth/token',
@@ -1796,14 +1824,14 @@ describe('OAuthProvider', () => {
       );
 
       const tokenResponse = await refreshPropsProvider.fetch(tokenRequest, mockEnv, mockCtx);
-      const tokens = await tokenResponse.json<any>();
+      const tokens = await tokenResponse.json<Record<string, unknown>>();
 
       // Now do a refresh token exchange
       const refreshParams = new URLSearchParams();
       refreshParams.append('grant_type', 'refresh_token');
-      refreshParams.append('refresh_token', tokens.refresh_token);
-      refreshParams.append('client_id', testClientId);
-      refreshParams.append('client_secret', testClientSecret);
+      refreshParams.append('refresh_token', tokens.refresh_token as string);
+      refreshParams.append('client_id', testClientId as string);
+      refreshParams.append('client_secret', testClientSecret as string);
 
       const refreshRequest = createMockRequest(
         'https://example.com/oauth/token',
@@ -1813,7 +1841,7 @@ describe('OAuthProvider', () => {
       );
 
       const refreshResponse = await refreshPropsProvider.fetch(refreshRequest, mockEnv, mockCtx);
-      const newTokens = await refreshResponse.json<any>();
+      const newTokens = await refreshResponse.json<Record<string, unknown>>();
 
       // Use the new token to access API
       const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
@@ -1821,7 +1849,7 @@ describe('OAuthProvider', () => {
       });
 
       const apiResponse = await refreshPropsProvider.fetch(apiRequest, mockEnv, mockCtx);
-      const apiData = await apiResponse.json<any>();
+      const apiData = await apiResponse.json<Record<string, unknown>>();
 
       // The access token should contain the token-specific props from the refresh callback
       expect(apiData.user).toHaveProperty('refreshed', true);
@@ -1834,7 +1862,7 @@ describe('OAuthProvider', () => {
       // and only newProps for refresh token
       // Note: With the enhanced implementation, when only newProps is returned
       // without accessTokenProps, the token props will inherit from newProps
-      const propsCallback = async (options: any) => {
+      const propsCallback = async (options: TokenExchangeCallbackOptions) => {
         if (options.grantType === 'authorization_code') {
           return {
             accessTokenProps: { ...options.props, tokenOnly: true },
@@ -1872,7 +1900,7 @@ describe('OAuthProvider', () => {
       );
 
       const registerResponse = await specialProvider.fetch(registerRequest, mockEnv, mockCtx);
-      const client = await registerResponse.json<any>();
+      const client = await registerResponse.json<Record<string, unknown>>();
       const testClientId = client.client_id;
       const testClientSecret = client.client_secret;
       const testRedirectUri = 'https://client.example.com/callback';
@@ -1892,8 +1920,8 @@ describe('OAuthProvider', () => {
       params.append('grant_type', 'authorization_code');
       params.append('code', code);
       params.append('redirect_uri', testRedirectUri);
-      params.append('client_id', testClientId);
-      params.append('client_secret', testClientSecret);
+      params.append('client_id', testClientId as string);
+      params.append('client_secret', testClientSecret as string);
 
       const tokenRequest = createMockRequest(
         'https://example.com/oauth/token',
@@ -1903,7 +1931,7 @@ describe('OAuthProvider', () => {
       );
 
       const tokenResponse = await specialProvider.fetch(tokenRequest, mockEnv, mockCtx);
-      const tokens = await tokenResponse.json<any>();
+      const tokens = await tokenResponse.json<Record<string, unknown>>();
 
       // Verify the token has the tokenOnly property when used for API access
       const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
@@ -1911,15 +1939,15 @@ describe('OAuthProvider', () => {
       });
 
       const apiResponse = await specialProvider.fetch(apiRequest, mockEnv, mockCtx);
-      const apiData = await apiResponse.json<any>();
-      expect(apiData.user.tokenOnly).toBe(true);
+      const apiData = await apiResponse.json<Record<string, unknown>>();
+      expect((apiData.user as Record<string, unknown>).tokenOnly).toBe(true);
 
       // Now do a refresh token exchange
       const refreshParams = new URLSearchParams();
       refreshParams.append('grant_type', 'refresh_token');
-      refreshParams.append('refresh_token', tokens.refresh_token);
-      refreshParams.append('client_id', testClientId);
-      refreshParams.append('client_secret', testClientSecret);
+      refreshParams.append('refresh_token', tokens.refresh_token as string);
+      refreshParams.append('client_id', testClientId as string);
+      refreshParams.append('client_secret', testClientSecret as string);
 
       const refreshRequest = createMockRequest(
         'https://example.com/oauth/token',
@@ -1929,7 +1957,7 @@ describe('OAuthProvider', () => {
       );
 
       const refreshResponse = await specialProvider.fetch(refreshRequest, mockEnv, mockCtx);
-      const newTokens = await refreshResponse.json<any>();
+      const newTokens = await refreshResponse.json<Record<string, unknown>>();
 
       // Use the new token to access API
       const api2Request = createMockRequest('https://example.com/api/test', 'GET', {
@@ -1937,7 +1965,7 @@ describe('OAuthProvider', () => {
       });
 
       const api2Response = await specialProvider.fetch(api2Request, mockEnv, mockCtx);
-      const api2Data = await api2Response.json<any>();
+      const api2Data = await api2Response.json<Record<string, unknown>>();
 
       // With the enhanced implementation, the token props now inherit from grant props
       // when only newProps is returned but accessTokenProps is not specified
@@ -1950,7 +1978,7 @@ describe('OAuthProvider', () => {
 
     it('should allow customizing access token TTL via callback', async () => {
       // Create a provider with a callback that customizes TTL
-      const customTtlCallback = async (options: any) => {
+      const customTtlCallback = async (options: TokenExchangeCallbackOptions) => {
         if (options.grantType === 'refresh_token') {
           // Return custom TTL for the access token
           return {
@@ -1988,7 +2016,7 @@ describe('OAuthProvider', () => {
       );
 
       const registerResponse = await customTtlProvider.fetch(registerRequest, mockEnv, mockCtx);
-      const client = await registerResponse.json<any>();
+      const client = await registerResponse.json<Record<string, unknown>>();
       const testClientId = client.client_id;
       const testClientSecret = client.client_secret;
       const testRedirectUri = 'https://client.example.com/callback';
@@ -2008,8 +2036,8 @@ describe('OAuthProvider', () => {
       params.append('grant_type', 'authorization_code');
       params.append('code', code);
       params.append('redirect_uri', testRedirectUri);
-      params.append('client_id', testClientId);
-      params.append('client_secret', testClientSecret);
+      params.append('client_id', testClientId as string);
+      params.append('client_secret', testClientSecret as string);
 
       const tokenRequest = createMockRequest(
         'https://example.com/oauth/token',
@@ -2019,14 +2047,14 @@ describe('OAuthProvider', () => {
       );
 
       const tokenResponse = await customTtlProvider.fetch(tokenRequest, mockEnv, mockCtx);
-      const tokens = await tokenResponse.json<any>();
+      const tokens = await tokenResponse.json<Record<string, unknown>>();
 
       // Now do a refresh
       const refreshParams = new URLSearchParams();
       refreshParams.append('grant_type', 'refresh_token');
-      refreshParams.append('refresh_token', tokens.refresh_token);
-      refreshParams.append('client_id', testClientId);
-      refreshParams.append('client_secret', testClientSecret);
+      refreshParams.append('refresh_token', tokens.refresh_token as string);
+      refreshParams.append('client_id', testClientId as string);
+      refreshParams.append('client_secret', testClientSecret as string);
 
       const refreshRequest = createMockRequest(
         'https://example.com/oauth/token',
@@ -2036,7 +2064,7 @@ describe('OAuthProvider', () => {
       );
 
       const refreshResponse = await customTtlProvider.fetch(refreshRequest, mockEnv, mockCtx);
-      const newTokens = await refreshResponse.json<any>();
+      const newTokens = await refreshResponse.json<Record<string, unknown>>();
 
       // Verify that the TTL is from the callback, not the default
       expect(newTokens.expires_in).toBe(7200);
@@ -2047,13 +2075,13 @@ describe('OAuthProvider', () => {
       });
 
       const apiResponse = await customTtlProvider.fetch(apiRequest, mockEnv, mockCtx);
-      const apiData = await apiResponse.json<any>();
-      expect(apiData.user.customTtl).toBe(true);
+      const apiData = await apiResponse.json<Record<string, unknown>>();
+      expect((apiData.user as Record<string, unknown>).customTtl).toBe(true);
     });
 
     it('should handle callback that returns undefined (keeping original props)', async () => {
       // Create a provider with a callback that returns undefined
-      const noopCallback = async (options: any) => {
+      const noopCallback = async (options: TokenExchangeCallbackOptions) => {
         // Don't return anything, which should keep the original props
         return undefined;
       };
@@ -2084,7 +2112,7 @@ describe('OAuthProvider', () => {
       );
 
       const registerResponse = await noopProvider.fetch(registerRequest, mockEnv, mockCtx);
-      const client = await registerResponse.json<any>();
+      const client = await registerResponse.json<Record<string, unknown>>();
       const testClientId = client.client_id;
       const testClientSecret = client.client_secret;
       const testRedirectUri = 'https://client.example.com/callback';
@@ -2104,8 +2132,8 @@ describe('OAuthProvider', () => {
       params.append('grant_type', 'authorization_code');
       params.append('code', code);
       params.append('redirect_uri', testRedirectUri);
-      params.append('client_id', testClientId);
-      params.append('client_secret', testClientSecret);
+      params.append('client_id', testClientId as string);
+      params.append('client_secret', testClientSecret as string);
 
       const tokenRequest = createMockRequest(
         'https://example.com/oauth/token',
@@ -2115,7 +2143,7 @@ describe('OAuthProvider', () => {
       );
 
       const tokenResponse = await noopProvider.fetch(tokenRequest, mockEnv, mockCtx);
-      const tokens = await tokenResponse.json<any>();
+      const tokens = await tokenResponse.json<Record<string, unknown>>();
 
       // Verify the token has the original props when used for API access
       const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
@@ -2123,7 +2151,7 @@ describe('OAuthProvider', () => {
       });
 
       const apiResponse = await noopProvider.fetch(apiRequest, mockEnv, mockCtx);
-      const apiData = await apiResponse.json<any>();
+      const apiData = await apiResponse.json<Record<string, unknown>>();
 
       // The props should be the original ones (no change)
       expect(apiData.user).toEqual({ userId: 'test-user-123', username: 'TestUser' });
@@ -2134,12 +2162,12 @@ describe('OAuthProvider', () => {
       // 1. previousRefreshTokenWrappedKey not being re-wrapped when grant props change
       // 2. accessTokenProps not inheriting from newProps when only newProps is returned
       let callCount = 0;
-      const propUpdatingCallback = async (options: any) => {
+      const propUpdatingCallback = async (options: TokenExchangeCallbackOptions) => {
         callCount++;
         if (options.grantType === 'refresh_token') {
           const updatedProps = {
             ...options.props,
-            updatedCount: (options.props.updatedCount || 0) + 1,
+            updatedCount: ((options.props.updatedCount as number) ?? 0) + 1,
           };
 
           // Only return newProps to test that accessTokenProps will inherit from it
@@ -2178,7 +2206,7 @@ describe('OAuthProvider', () => {
       );
 
       const registerResponse = await testProvider.fetch(registerRequest, mockEnv, mockCtx);
-      const client = await registerResponse.json<any>();
+      const client = await registerResponse.json<Record<string, unknown>>();
       const testClientId = client.client_id;
       const testClientSecret = client.client_secret;
       const testRedirectUri = 'https://client.example.com/callback';
@@ -2198,8 +2226,8 @@ describe('OAuthProvider', () => {
       params.append('grant_type', 'authorization_code');
       params.append('code', code);
       params.append('redirect_uri', testRedirectUri);
-      params.append('client_id', testClientId);
-      params.append('client_secret', testClientSecret);
+      params.append('client_id', testClientId as string);
+      params.append('client_secret', testClientSecret as string);
 
       const tokenRequest = createMockRequest(
         'https://example.com/oauth/token',
@@ -2209,7 +2237,7 @@ describe('OAuthProvider', () => {
       );
 
       const tokenResponse = await testProvider.fetch(tokenRequest, mockEnv, mockCtx);
-      const tokens = await tokenResponse.json<any>();
+      const tokens = await tokenResponse.json<Record<string, unknown>>();
       const refreshToken = tokens.refresh_token;
 
       // Reset the callback invocations before refresh
@@ -2218,9 +2246,9 @@ describe('OAuthProvider', () => {
       // First refresh - this will update the grant props and re-encrypt them with a new key
       const refreshParams = new URLSearchParams();
       refreshParams.append('grant_type', 'refresh_token');
-      refreshParams.append('refresh_token', refreshToken);
-      refreshParams.append('client_id', testClientId);
-      refreshParams.append('client_secret', testClientSecret);
+      refreshParams.append('refresh_token', refreshToken as string);
+      refreshParams.append('client_id', testClientId as string);
+      refreshParams.append('client_secret', testClientSecret as string);
 
       const refreshRequest = createMockRequest(
         'https://example.com/oauth/token',
@@ -2236,7 +2264,7 @@ describe('OAuthProvider', () => {
       expect(callCount).toBe(1);
 
       // Get the new tokens from the first refresh
-      const newTokens = await refreshResponse.json<any>();
+      const newTokens = await refreshResponse.json<Record<string, unknown>>();
 
       // Get the refresh token's corresponding token data to verify it has the updated props
       const apiRequest1 = createMockRequest('https://example.com/api/test', 'GET', {
@@ -2244,13 +2272,13 @@ describe('OAuthProvider', () => {
       });
 
       const apiResponse1 = await testProvider.fetch(apiRequest1, mockEnv, mockCtx);
-      const apiData1 = await apiResponse1.json<any>();
+      const apiData1 = await apiResponse1.json<Record<string, unknown>>();
 
       // Print the actual API response to debug
       console.log('First API response:', JSON.stringify(apiData1));
 
       // Verify that the token has the updated props (updatedCount should be 1)
-      expect(apiData1.user.updatedCount).toBe(1);
+      expect((apiData1.user as Record<string, unknown>).updatedCount).toBe(1);
 
       // Reset callCount before the second refresh
       callCount = 0;
@@ -2270,7 +2298,7 @@ describe('OAuthProvider', () => {
       // When fixed, it should succeed because the previous refresh token is still valid once.
       expect(secondRefreshResponse.status).toBe(200);
 
-      const secondTokens = await secondRefreshResponse.json<any>();
+      const secondTokens = await secondRefreshResponse.json<Record<string, unknown>>();
       expect(secondTokens.access_token).toBeDefined();
 
       // The callback should have been called again
@@ -2282,10 +2310,10 @@ describe('OAuthProvider', () => {
       });
 
       const apiResponse2 = await testProvider.fetch(apiRequest2, mockEnv, mockCtx);
-      const apiData2 = await apiResponse2.json<any>();
+      const apiData2 = await apiResponse2.json<Record<string, unknown>>();
 
       // The updatedCount should be 2 now (incremented again during the second refresh)
-      expect(apiData2.user.updatedCount).toBe(2);
+      expect((apiData2.user as Record<string, unknown>).updatedCount).toBe(2);
     });
   });
 
@@ -2303,7 +2331,7 @@ describe('OAuthProvider', () => {
 
       // Verify the error response
       expect(response.status).toBe(401);
-      const error = await response.json<any>();
+      const error = await response.json<Record<string, unknown>>();
       expect(error.error).toBe('invalid_token');
 
       // Verify the default onError callback was triggered and logged a warning
@@ -2352,7 +2380,7 @@ describe('OAuthProvider', () => {
       expect(response.status).toBe(401); // Status should be preserved
       expect(response.headers.get('X-Custom-Error')).toBe('true');
 
-      const error = await response.json<any>();
+      const error = await response.json<Record<string, unknown>>();
       expect(error.custom_error).toBe(true);
       expect(error.original_code).toBe('invalid_token');
       expect(error.custom_message).toContain('Custom error handler');
@@ -2370,7 +2398,6 @@ describe('OAuthProvider', () => {
         scopesSupported: ['read', 'write'],
         onError: () => {
           callbackInvoked = true;
-          // No return - should use standard error response
         },
       });
 
@@ -2383,7 +2410,7 @@ describe('OAuthProvider', () => {
 
       // Verify the standard error response
       expect(response.status).toBe(401);
-      const error = await response.json<any>();
+      const error = await response.json<Record<string, unknown>>();
       expect(error.error).toBe('invalid_client');
 
       // Verify callback was invoked
@@ -2507,9 +2534,9 @@ describe('OAuthProvider', () => {
       );
 
       expect(clientResponse.status).toBe(201);
-      const client = await clientResponse.json<any>();
-      clientId = client.client_id;
-      clientSecret = client.client_secret;
+      const client = await clientResponse.json<Record<string, unknown>>();
+      clientId = client.client_id as string;
+      clientSecret = client.client_secret as string;
     });
 
     it('should connect revokeGrant to token endpoint ', async () => {
@@ -2532,7 +2559,7 @@ describe('OAuthProvider', () => {
 
       const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
       expect(tokenResponse.status).toBe(200);
-      const tokens = await tokenResponse.json<any>();
+      const tokens = await tokenResponse.json<Record<string, unknown>>();
 
       // Step 2:this should successfully revoke the token
       const revokeRequest = createMockRequest(
@@ -2557,7 +2584,7 @@ describe('OAuthProvider', () => {
       const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
       expect(apiResponse.status).toBe(401); // Access token should no longer work
 
-      // Step 4: Verify refresh token still works 
+      // Step 4: Verify refresh token still works
       const refreshRequest = createMockRequest(
         'https://example.com/oauth/token',
         'POST',
@@ -2570,7 +2597,7 @@ describe('OAuthProvider', () => {
 
       const refreshResponse = await oauthProvider.fetch(refreshRequest, mockEnv, mockCtx);
       expect(refreshResponse.status).toBe(200); // Refresh token should still work
-      const newTokens = await refreshResponse.json<any>();
+      const newTokens = await refreshResponse.json<Record<string, unknown>>();
       expect(newTokens.access_token).toBeDefined();
       expect(newTokens.refresh_token).toBeDefined();
     });

@@ -17,14 +17,14 @@
   "scripts": {
     "build": "tsup",
     "build:watch": "tsup --watch",
-    "check": "npm run typecheck && npm run test",
-    "typecheck": "tsc",
+    "check": "biome check && tsc && npm run test",
     "test": "vitest run",
     "test:watch": "vitest",
     "prepublishOnly": "npm run build",
     "prettier": "prettier -w ."
   },
   "devDependencies": {
+    "@biomejs/biome": "^2.1.4",
     "@changesets/changelog-github": "^0.5.1",
     "@changesets/cli": "^2.29.5",
     "@cloudflare/workers-types": "^4.20250807.0",

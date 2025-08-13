@@ -1,33 +1,47 @@
-import { WorkerEntrypoint } from 'cloudflare:workers';
+/** biome-ignore-all lint/style/noNonNullAssertion: it's fine */
+import { type env, WorkerEntrypoint } from 'cloudflare:workers';
 
 // Types
+
+/**
+ * Required environment bindings
+ */
+export type RequiredEnv = {
+  OAUTH_KV: KVNamespace;
+  OAUTH_PROVIDER: OAuthHelpers;
+};
+
+/**
+ * Default environment bindings
+ */
+export type DefaultEnv = typeof env & RequiredEnv;
 
 /**
  * Enum representing the type of handler (ExportedHandler or WorkerEntrypoint)
  */
 enum HandlerType {
-  EXPORTED_HANDLER,
-  WORKER_ENTRYPOINT,
+  EXPORTED_HANDLER = 0,
+  WORKER_ENTRYPOINT = 1,
 }
 
 /**
  * Discriminated union type for handlers
  */
-type TypedHandler =
+type TypedHandler<Env extends RequiredEnv = DefaultEnv> =
   | {
       type: HandlerType.EXPORTED_HANDLER;
       handler: ExportedHandlerWithFetch;
     }
   | {
       type: HandlerType.WORKER_ENTRYPOINT;
-      handler: new (ctx: ExecutionContext, env: any) => WorkerEntrypointWithFetch;
+      handler: new (ctx: ExecutionContext, env: Env) => WorkerEntrypointWithFetch;
     };
 
 /**
  * Aliases for either type of Handler that makes .fetch required
  */
-type ExportedHandlerWithFetch = ExportedHandler & Pick<Required<ExportedHandler>, 'fetch'>;
-type WorkerEntrypointWithFetch = WorkerEntrypoint & Pick<Required<WorkerEntrypoint>, 'fetch'>;
+export type ExportedHandlerWithFetch = ExportedHandler & Pick<Required<ExportedHandler>, 'fetch'>;
+export type WorkerEntrypointWithFetch = WorkerEntrypoint & Pick<Required<WorkerEntrypoint>, 'fetch'>;
 
 /**
  * Configuration options for the OAuth Provider
@@ -42,7 +56,7 @@ export interface TokenExchangeCallbackResult {
    * If not provided but newProps is, the access token will use newProps.
    * If neither is provided, the original props will be used.
    */
-  accessTokenProps?: any;
+  accessTokenProps?: Record<string, unknown>;
 
   /**
    * New props to replace the props stored in the grant itself.
@@ -50,7 +64,7 @@ export interface TokenExchangeCallbackResult {
    * If accessTokenProps is not provided, these props will also be used for the current access token.
    * If not provided, the original props will be used.
    */
-  newProps?: any;
+  newProps?: Record<string, unknown>;
 
   /**
    * Override the default access token TTL (time-to-live) for this specific token.
@@ -90,10 +104,10 @@ export interface TokenExchangeCallbackOptions {
   /**
    * Application-specific properties currently associated with this grant
    */
-  props: any;
+  props: Record<string, unknown>;
 }
 
-export interface OAuthProviderOptions {
+export interface OAuthProviderOptions<Env extends RequiredEnv = DefaultEnv> {
   /**
    * URL(s) for API routes. Requests with URLs starting with any of these prefixes
    * will be treated as API requests and require a valid access token.
@@ -112,7 +126,7 @@ export interface OAuthProviderOptions {
    * Used with `apiRoute` for the single-handler configuration. This is incompatible with
    * the `apiHandlers` property. You must use either `apiRoute` + `apiHandler` OR `apiHandlers`, not both.
    */
-  apiHandler?: ExportedHandlerWithFetch | (new (ctx: ExecutionContext, env: any) => WorkerEntrypointWithFetch);
+  apiHandler?: ExportedHandlerWithFetch | (new (ctx: ExecutionContext, env: Env) => WorkerEntrypointWithFetch);
 
   /**
    * Map of API routes to their corresponding handlers for the multi-handler configuration.
@@ -126,14 +140,14 @@ export interface OAuthProviderOptions {
    */
   apiHandlers?: Record<
     string,
-    ExportedHandlerWithFetch | (new (ctx: ExecutionContext, env: any) => WorkerEntrypointWithFetch)
+    ExportedHandlerWithFetch | (new (ctx: ExecutionContext, env: Env) => WorkerEntrypointWithFetch)
   >;
 
   /**
    * Handler for all non-API requests or API requests without a valid token.
    * Can be either an ExportedHandler object with a fetch method or a class extending WorkerEntrypoint.
    */
-  defaultHandler: ExportedHandler | (new (ctx: ExecutionContext, env: any) => WorkerEntrypointWithFetch);
+  defaultHandler: ExportedHandler | (new (ctx: ExecutionContext, env: Env) => WorkerEntrypointWithFetch);
 
   /**
    * URL of the OAuth authorization endpoint where users can grant permissions.
@@ -191,6 +205,7 @@ export interface OAuthProviderOptions {
    */
   tokenExchangeCallback?: (
     options: TokenExchangeCallbackOptions
+    // biome-ignore lint/suspicious/noConfusingVoidType: this could've beeen undefined, but would be a breaking change if we changed it now, so it's fine
   ) => Promise<TokenExchangeCallbackResult | void> | TokenExchangeCallbackResult | void;
 
   /**
@@ -204,6 +219,7 @@ export interface OAuthProviderOptions {
     description: string;
     status: number;
     headers: Record<string, string>;
+    // biome-ignore lint/suspicious/noConfusingVoidType: this could've beeen undefined, but would be a breaking change if we changed it now, so it's fine
   }) => Response | void;
 }
 
@@ -422,7 +438,7 @@ export interface CompleteAuthorizationOptions {
   /**
    * Application-specific metadata to associate with this grant
    */
-  metadata: any;
+  metadata: Record<string, unknown>;
 
   /**
    * List of scopes that were actually granted (may differ from requested scopes)
@@ -433,7 +449,7 @@ export interface CompleteAuthorizationOptions {
    * Application-specific properties to include with API requests
    * authorized by this grant
    */
-  props: any;
+  props: Record<string, unknown>;
 }
 
 /**
@@ -463,7 +479,7 @@ export interface Grant {
   /**
    * Application-specific metadata associated with this grant
    */
-  metadata: any;
+  metadata: Record<string, unknown>;
 
   /**
    * Encrypted application-specific properties
@@ -637,7 +653,7 @@ export interface GrantSummary {
   /**
    * Application-specific metadata associated with this grant
    */
-  metadata: any;
+  metadata: Record<string, unknown>;
 
   /**
    * Unix timestamp when the grant was created
@@ -650,14 +666,14 @@ export interface GrantSummary {
  * Implements authorization code flow with support for refresh tokens
  * and dynamic client registration.
  */
-export class OAuthProvider {
-  #impl: OAuthProviderImpl;
+export class OAuthProvider<Env extends RequiredEnv = DefaultEnv> {
+  #impl: OAuthProviderImpl<Env>;
 
   /**
    * Creates a new OAuth provider instance
    * @param options - Configuration options for the provider
    */
-  constructor(options: OAuthProviderOptions) {
+  constructor(options: OAuthProviderOptions<Env>) {
     this.#impl = new OAuthProviderImpl(options);
   }
 
@@ -669,7 +685,7 @@ export class OAuthProvider {
    * @param ctx - Cloudflare Worker execution context
    * @returns A Promise resolving to an HTTP Response
    */
-  fetch(request: Request, env: any, ctx: ExecutionContext): Promise<Response> {
+  fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     return this.#impl.fetch(request, env, ctx);
   }
 }
@@ -682,29 +698,29 @@ export class OAuthProvider {
  * annotation, and does not actually prevent the method from being called from outside the class,
  * including over RPC.
  */
-class OAuthProviderImpl {
+class OAuthProviderImpl<Env extends RequiredEnv = DefaultEnv> {
   /**
    * Configuration options for the provider
    */
-  options: OAuthProviderOptions;
+  options: OAuthProviderOptions<Env>;
 
   /**
    * Represents the validated type of a handler (ExportedHandler or WorkerEntrypoint)
    */
-  private typedDefaultHandler: TypedHandler;
+  private typedDefaultHandler: TypedHandler<Env>;
 
   /**
    * Array of tuples of API routes and their validated handlers
    * In the simple case, this will be a single entry with the route and handler from options.apiRoute/apiHandler
    * In the advanced case, this will contain entries from options.apiHandlers
    */
-  private typedApiHandlers: Array<[string, TypedHandler]>;
+  private typedApiHandlers: Array<[string, TypedHandler<Env>]>;
 
   /**
    * Creates a new OAuth provider instance
    * @param options - Configuration options for the provider
    */
-  constructor(options: OAuthProviderOptions) {
+  constructor(options: OAuthProviderOptions<Env>) {
     // Initialize typedApiHandlers as an array
     this.typedApiHandlers = [];
 
@@ -783,6 +799,7 @@ class OAuthProviderImpl {
       try {
         new URL(endpoint);
       } catch (e) {
+        console.error('Error validating endpoint', e);
         throw new TypeError(`${name} must be either an absolute path starting with / or a valid URL`);
       }
     }
@@ -795,15 +812,18 @@ class OAuthProviderImpl {
    * @returns The type of the handler (EXPORTED_HANDLER or WORKER_ENTRYPOINT)
    * @throws TypeError if the handler is invalid
    */
-  private validateHandler(handler: any, name: string): TypedHandler {
-    if (typeof handler === 'object' && handler !== null && typeof handler.fetch === 'function') {
+  private validateHandler(handler: unknown, name: string): TypedHandler<Env> {
+    if (typeof handler === 'object' && handler !== null && 'fetch' in handler && typeof handler.fetch === 'function') {
       // It's an ExportedHandler object
-      return { type: HandlerType.EXPORTED_HANDLER, handler };
+      return { type: HandlerType.EXPORTED_HANDLER, handler: handler as ExportedHandlerWithFetch };
     }
 
     // Check if it's a class constructor extending WorkerEntrypoint
     if (typeof handler === 'function' && handler.prototype instanceof WorkerEntrypoint) {
-      return { type: HandlerType.WORKER_ENTRYPOINT, handler };
+      return {
+        type: HandlerType.WORKER_ENTRYPOINT,
+        handler: handler as new (ctx: ExecutionContext, env: Env) => WorkerEntrypointWithFetch,
+      };
     }
 
     throw new TypeError(
@@ -819,7 +839,7 @@ class OAuthProviderImpl {
    * @param ctx - Cloudflare Worker execution context
    * @returns A Promise resolving to an HTTP Response
    */
-  async fetch(request: Request, env: any, ctx: ExecutionContext): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
     // Special handling for OPTIONS requests (CORS preflight)
@@ -954,10 +974,10 @@ class OAuthProviderImpl {
    */
   private async parseTokenEndpointRequest(
     request: Request,
-    env: any
+    env: Env
   ): Promise<
     | {
-        body: any;
+        body: Record<string, string>;
         clientInfo: ClientInfo;
         isRevocationRequest: boolean;
       }
@@ -968,8 +988,8 @@ class OAuthProviderImpl {
       return this.createErrorResponse('invalid_request', 'Method not allowed', 405);
     }
 
-    let contentType = request.headers.get('Content-Type') || '';
-    let body: any = {};
+    const contentType = request.headers.get('Content-Type') || '';
+    const body: Record<string, string> = {};
 
     // According to OAuth 2.0 RFC 6749/7009, requests MUST use application/x-www-form-urlencoded
     if (!contentType.includes('application/x-www-form-urlencoded')) {
@@ -987,7 +1007,7 @@ class OAuthProviderImpl {
     let clientId = '';
     let clientSecret = '';
 
-    if (authHeader && authHeader.startsWith('Basic ')) {
+    if (authHeader?.startsWith('Basic ')) {
       // Basic auth
       const credentials = atob(authHeader.substring(6));
       const [id, secret] = credentials.split(':', 2);
@@ -1081,7 +1101,7 @@ class OAuthProviderImpl {
    * @param url - The URL to find a handler for
    * @returns The TypedHandler for the URL, or undefined if no handler matches
    */
-  private findApiHandlerForUrl(url: URL): TypedHandler | undefined {
+  private findApiHandlerForUrl(url: URL): TypedHandler<Env> | undefined {
     // Check each route in our array of validated API handlers
     for (const [route, handler] of this.typedApiHandlers) {
       if (this.matchApiRoute(url, route)) {
@@ -1148,7 +1168,7 @@ class OAuthProviderImpl {
     const tokenEndpoint = this.getFullEndpointUrl(this.options.tokenEndpoint, requestUrl);
     const authorizeEndpoint = this.getFullEndpointUrl(this.options.authorizeEndpoint, requestUrl);
 
-    let registrationEndpoint: string | undefined = undefined;
+    let registrationEndpoint: string | undefined;
     if (this.options.clientRegistrationEndpoint) {
       registrationEndpoint = this.getFullEndpointUrl(this.options.clientRegistrationEndpoint, requestUrl);
     }
@@ -1200,7 +1220,7 @@ class OAuthProviderImpl {
    * @param env - Cloudflare Worker environment variables
    * @returns Response with token data or error
    */
-  private async handleTokenRequest(body: any, clientInfo: ClientInfo, env: any): Promise<Response> {
+  private async handleTokenRequest(body: Record<string, string>, clientInfo: ClientInfo, env: Env): Promise<Response> {
     // Handle different grant types
     const grantType = body.grant_type;
 
@@ -1221,7 +1241,11 @@ class OAuthProviderImpl {
    * @param env - Cloudflare Worker environment variables
    * @returns Response with token data or error
    */
-  private async handleAuthorizationCodeGrant(body: any, clientInfo: ClientInfo, env: any): Promise<Response> {
+  private async handleAuthorizationCodeGrant(
+    body: Record<string, string>,
+    clientInfo: ClientInfo,
+    env: Env
+  ): Promise<Response> {
     const code = body.code;
     const redirectUri = body.redirect_uri;
     const codeVerifier = body.code_verifier;
@@ -1240,7 +1264,7 @@ class OAuthProviderImpl {
 
     // Get the grant
     const grantKey = `grant:${userId}:${grantId}`;
-    const grantData: Grant | null = await env.OAUTH_KV.get(grantKey, { type: 'json' });
+    const grantData = await env.OAUTH_KV.get<Grant>(grantKey, { type: 'json' });
 
     if (!grantData) {
       return this.createErrorResponse('invalid_grant', 'Grant not found or authorization code expired');
@@ -1456,7 +1480,11 @@ class OAuthProviderImpl {
    * @param env - Cloudflare Worker environment variables
    * @returns Response with token data or error
    */
-  private async handleRefreshTokenGrant(body: any, clientInfo: ClientInfo, env: any): Promise<Response> {
+  private async handleRefreshTokenGrant(
+    body: Record<string, string>,
+    clientInfo: ClientInfo,
+    env: Env
+  ): Promise<Response> {
     const refreshToken = body.refresh_token;
 
     if (!refreshToken) {
@@ -1476,7 +1504,7 @@ class OAuthProviderImpl {
 
     // Get the associated grant using userId in the key
     const grantKey = `grant:${userId}:${grantId}`;
-    const grantData: Grant | null = await env.OAUTH_KV.get(grantKey, { type: 'json' });
+    const grantData = await env.OAUTH_KV.get<Grant>(grantKey, { type: 'json' });
 
     if (!grantData) {
       return this.createErrorResponse('invalid_grant', 'Grant not found');
@@ -1666,7 +1694,7 @@ class OAuthProviderImpl {
    * @param env - Cloudflare Worker environment variables
    * @returns Response confirming revocation or error
    */
-  private async handleRevocationRequest(body: any, env: any): Promise<Response> {
+  private async handleRevocationRequest(body: Record<string, string>, env: Env): Promise<Response> {
     // Handle the revocation request
     return this.revokeToken(body, env);
   }
@@ -1678,7 +1706,7 @@ class OAuthProviderImpl {
    * @param env - Cloudflare Worker environment variables
    * @returns Response confirming revocation or error
    */
-  private async revokeToken(body: any, env: any): Promise<Response> {
+  private async revokeToken(body: Record<string, string>, env: Env): Promise<Response> {
     const token = body.token;
 
     if (!token) {
@@ -1710,7 +1738,7 @@ class OAuthProviderImpl {
    * @param grantId - The grant ID extracted from the token
    * @param env - Cloudflare Worker environment variables
    */
-  private async revokeSpecificAccessToken(tokenId: string, userId: string, grantId: string, env: any): Promise<void> {
+  private async revokeSpecificAccessToken(tokenId: string, userId: string, grantId: string, env: Env): Promise<void> {
     const tokenKey = `token:${userId}:${grantId}:${tokenId}`;
     await env.OAUTH_KV.delete(tokenKey);
   }
@@ -1723,9 +1751,9 @@ class OAuthProviderImpl {
    * @param env - Cloudflare Worker environment variables
    * @returns Promise<boolean> indicating if the token is valid
    */
-  private async validateAccessToken(tokenId: string, userId: string, grantId: string, env: any): Promise<boolean> {
+  private async validateAccessToken(tokenId: string, userId: string, grantId: string, env: Env): Promise<boolean> {
     const tokenKey = `token:${userId}:${grantId}:${tokenId}`;
-    const tokenData = await env.OAUTH_KV.get(tokenKey, { type: 'json' });
+    const tokenData = await env.OAUTH_KV.get<Token>(tokenKey, { type: 'json' });
 
     if (!tokenData) {
       return false;
@@ -1744,9 +1772,9 @@ class OAuthProviderImpl {
    * @param env - Cloudflare Worker environment variables
    * @returns Promise<boolean> indicating if the token is valid
    */
-  private async validateRefreshToken(tokenId: string, userId: string, grantId: string, env: any): Promise<boolean> {
+  private async validateRefreshToken(tokenId: string, userId: string, grantId: string, env: Env): Promise<boolean> {
     const grantKey = `grant:${userId}:${grantId}`;
-    const grantData = await env.OAUTH_KV.get(grantKey, { type: 'json' });
+    const grantData = await env.OAUTH_KV.get<Grant>(grantKey, { type: 'json' });
 
     if (!grantData) {
       return false;
@@ -1762,7 +1790,7 @@ class OAuthProviderImpl {
    * @param env - Cloudflare Worker environment variables
    * @returns Response with client registration data or error
    */
-  private async handleClientRegistration(request: Request, env: any): Promise<Response> {
+  private async handleClientRegistration(request: Request, env: Env): Promise<Response> {
     if (!this.options.clientRegistrationEndpoint) {
       return this.createErrorResponse('not_implemented', 'Client registration is not enabled', 501);
     }
@@ -1773,14 +1801,14 @@ class OAuthProviderImpl {
     }
 
     // Check content length to ensure it's not too large (1 MiB limit)
-    const contentLength = parseInt(request.headers.get('Content-Length') || '0', 10);
+    const contentLength = Number.parseInt(request.headers.get('Content-Length') || '0', 10);
     if (contentLength > 1048576) {
       // 1 MiB = 1048576 bytes
       return this.createErrorResponse('invalid_request', 'Request payload too large, must be under 1 MiB', 413);
     }
 
     // Parse client metadata with a size limitation
-    let clientMetadata;
+    let clientMetadata: Record<string, unknown>;
     try {
       const text = await request.text();
       if (text.length > 1048576) {
@@ -1789,11 +1817,12 @@ class OAuthProviderImpl {
       }
       clientMetadata = JSON.parse(text);
     } catch (error) {
+      console.error('Error parsing client metadata', error);
       return this.createErrorResponse('invalid_request', 'Invalid JSON payload', 400);
     }
 
     // Basic type validation functions
-    const validateStringField = (field: any): string | undefined => {
+    const validateStringField = (field: unknown): string | undefined => {
       if (field === undefined) {
         return undefined;
       }
@@ -1803,7 +1832,7 @@ class OAuthProviderImpl {
       return field;
     };
 
-    const validateStringArray = (arr: any): string[] | undefined => {
+    const validateStringArray = (arr: unknown): string[] | undefined => {
       if (arr === undefined) {
         return undefined;
       }
@@ -1881,7 +1910,7 @@ class OAuthProviderImpl {
     await env.OAUTH_KV.put(`client:${clientId}`, JSON.stringify(clientInfo));
 
     // Return client information with the original unhashed secret
-    const response: Record<string, any> = {
+    const response: Record<string, unknown> = {
       client_id: clientInfo.clientId,
       redirect_uris: clientInfo.redirectUris,
       client_name: clientInfo.clientName,
@@ -1916,7 +1945,7 @@ class OAuthProviderImpl {
    * @param ctx - Cloudflare Worker execution context
    * @returns Response from the API handler or error
    */
-  private async handleApiRequest(request: Request, env: any, ctx: ExecutionContext): Promise<Response> {
+  private async handleApiRequest(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     // Get access token from Authorization header
     const authHeader = request.headers.get('Authorization');
 
@@ -1944,7 +1973,7 @@ class OAuthProviderImpl {
 
     // Look up the token record, which now contains the denormalized grant information
     const tokenKey = `token:${userId}:${grantId}:${accessTokenId}`;
-    const tokenData: Token | null = await env.OAUTH_KV.get(tokenKey, { type: 'json' });
+    const tokenData = await env.OAUTH_KV.get<Token>(tokenKey, { type: 'json' });
 
     // Verify token
     if (!tokenData) {
@@ -2001,7 +2030,7 @@ class OAuthProviderImpl {
    * @param env - Cloudflare Worker environment variables
    * @returns An instance of OAuthHelpers
    */
-  private createOAuthHelpers(env: any): OAuthHelpers {
+  private createOAuthHelpers(env: Env): OAuthHelpers {
     return new OAuthHelpersImpl(env, this);
   }
 
@@ -2014,9 +2043,9 @@ class OAuthProviderImpl {
    * @param clientId - The client ID to look up
    * @returns The client information, or null if not found
    */
-  getClient(env: any, clientId: string): Promise<ClientInfo | null> {
+  getClient(env: Env, clientId: string): Promise<ClientInfo | null> {
     const clientKey = `client:${clientId}`;
-    return env.OAUTH_KV.get(clientKey, { type: 'json' });
+    return env.OAUTH_KV.get<ClientInfo>(clientKey, { type: 'json' });
   }
 
   /**
@@ -2030,7 +2059,7 @@ class OAuthProviderImpl {
   private createErrorResponse(
     code: string,
     description: string,
-    status: number = 400,
+    status = 400,
     headers: Record<string, string> = {}
   ): Response {
     // Notify the user of the error and allow them to override the response
@@ -2147,7 +2176,7 @@ function base64ToArrayBuffer(base64: string): ArrayBuffer {
  * @param data - The data to encrypt
  * @returns An object containing the encrypted data and the generated key
  */
-async function encryptProps(data: any): Promise<{ encryptedData: string; key: CryptoKey }> {
+async function encryptProps(data: Record<string, unknown>): Promise<{ encryptedData: string; key: CryptoKey }> {
   // Generate a new encryption key for this specific props data
   // @ts-ignore
   const key: CryptoKey = await crypto.subtle.generateKey(
@@ -2190,7 +2219,7 @@ async function encryptProps(data: any): Promise<{ encryptedData: string; key: Cr
  * @param encryptedData - The encrypted data as a base64 string
  * @returns The decrypted data object
  */
-async function decryptProps(key: CryptoKey, encryptedData: string): Promise<any> {
+async function decryptProps(key: CryptoKey, encryptedData: string): Promise<Record<string, unknown>> {
   // Convert base64 string back to ArrayBuffer
   const encryptedBuffer = base64ToArrayBuffer(encryptedData);
 
@@ -2299,16 +2328,16 @@ async function unwrapKeyWithToken(tokenStr: string, wrappedKeyBase64: string): P
  * Class that implements the OAuth helper methods
  * Provides methods for OAuth operations needed by handlers
  */
-class OAuthHelpersImpl implements OAuthHelpers {
-  private env: any;
-  private provider: OAuthProviderImpl;
+class OAuthHelpersImpl<Env extends RequiredEnv = DefaultEnv> implements OAuthHelpers {
+  private env: Env;
+  private provider: OAuthProviderImpl<Env>;
 
   /**
    * Creates a new OAuthHelpers instance
    * @param env - Cloudflare Worker environment variables
    * @param provider - Reference to the parent provider instance
    */
-  constructor(env: any, provider: OAuthProviderImpl) {
+  constructor(env: Env, provider: OAuthProviderImpl<Env>) {
     this.env = env;
     this.provider = provider;
   }
@@ -2338,15 +2367,13 @@ class OAuthHelpersImpl implements OAuthHelpers {
       const clientInfo = await this.lookupClient(clientId);
 
       if (!clientInfo) {
-        throw new Error(
-            `Invalid client. The clientId provided does not match to this client.`
-          );
+        throw new Error('Invalid client. The clientId provided does not match to this client.');
       }
       // If client exists, validate the redirect URI against registered URIs
       if (clientInfo && redirectUri) {
         if (!clientInfo.redirectUris.includes(redirectUri)) {
           throw new Error(
-            `Invalid redirect URI. The redirect URI provided does not match any registered URI for this client.`
+            'Invalid redirect URI. The redirect URI provided does not match any registered URI for this client.'
           );
         }
       }
@@ -2608,12 +2635,12 @@ class OAuthHelpersImpl implements OAuthHelpers {
     }
 
     // Determine token endpoint auth method
-    let authMethod = updates.tokenEndpointAuthMethod || client.tokenEndpointAuthMethod || 'client_secret_basic';
+    const authMethod = updates.tokenEndpointAuthMethod || client.tokenEndpointAuthMethod || 'client_secret_basic';
     const isPublicClient = authMethod === 'none';
 
     // Handle changes in auth method
     let secretToStore = client.clientSecret;
-    let originalSecret: string | undefined = undefined;
+    let originalSecret: string | undefined;
 
     if (isPublicClient) {
       // Public clients don't have secrets
@@ -2688,7 +2715,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
     // Fetch all grants in parallel and convert to grant summaries
     const grantSummaries: GrantSummary[] = [];
     const promises = response.keys.map(async (key: { name: string }) => {
-      const grantData: Grant | null = await this.env.OAUTH_KV.get(key.name, { type: 'json' });
+      const grantData = await this.env.OAUTH_KV.get<Grant>(key.name, { type: 'json' });
       if (grantData) {
         // Create a summary with only the public fields
         const summary: GrantSummary = {
