@@ -1,5 +1,11 @@
 # @cloudflare/workers-oauth-provider
 
+## 0.0.7
+
+### Patch Changes
+
+- [#62](https://github.com/cloudflare/workers-oauth-provider/pull/62) [`239e753`](https://github.com/cloudflare/workers-oauth-provider/commit/239e753b83091a32327f3b2a093e306bb6ee8498) Thanks [@whoiskatrin](https://github.com/whoiskatrin)! - token revocation endpoint support
+
 ## 0.0.6
 
 ### Patch Changes
