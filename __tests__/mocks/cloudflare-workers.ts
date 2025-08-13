@@ -2,6 +2,7 @@
  * Mock for cloudflare:workers module
  * Provides a minimal implementation of WorkerEntrypoint for testing
  */
+/** biome-ignore-all lint/suspicious/noExplicitAny: it's fine */
 
 export class WorkerEntrypoint {
   ctx: any;
@@ -12,7 +13,7 @@ export class WorkerEntrypoint {
     this.env = env;
   }
 
-  fetch(request: Request): Response | Promise<Response> {
+  fetch(_request: Request): Response | Promise<Response> {
     throw new Error('Method not implemented. This should be overridden by subclasses.');
   }
 }
