@@ -1113,6 +1113,368 @@ describe('OAuthProvider', () => {
     });
   });
 
+  describe('Refresh Token TTL', () => {
+    let clientId: string;
+    let clientSecret: string;
+    let redirectUri: string;
+
+    beforeEach(async () => {
+      // Create a client for testing
+      const clientData = {
+        redirect_uris: ['https://client.example.com/callback'],
+        client_name: 'Test Client',
+        token_endpoint_auth_method: 'client_secret_basic',
+      };
+
+      const registerRequest = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify(clientData)
+      );
+
+      const registerResponse = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
+      const client = await registerResponse.json<any>();
+      clientId = client.client_id;
+      clientSecret = client.client_secret;
+      redirectUri = 'https://client.example.com/callback';
+    });
+
+    it('should set refresh token expiration when global TTL is configured', async () => {
+      // Create provider with refresh token TTL
+      const providerWithTTL = new OAuthProvider({
+        apiRoute: ['/api/', 'https://api.example.com/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        accessTokenTTL: 3600,
+        refreshTokenTTL: 7200, // 2 hours
+      });
+
+      // Get an auth code
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123`
+      );
+
+      const authResponse = await providerWithTTL.fetch(authRequest, mockEnv, mockCtx);
+      const location = authResponse.headers.get('Location')!;
+      const code = new URL(location).searchParams.get('code')!;
+
+      // Exchange for tokens
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      );
+
+      const tokenResponse = await providerWithTTL.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokens = await tokenResponse.json<any>();
+
+      // Check that the grant has the refresh token expiration set
+      const grantEntries = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      const grantKey = grantEntries.keys[0].name;
+      const grant = await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' });
+
+      expect(grant.refreshTokenExpiresAt).toBeDefined();
+      const now = Math.floor(Date.now() / 1000);
+      expect(grant.refreshTokenExpiresAt).toBeGreaterThan(now);
+      expect(grant.refreshTokenExpiresAt).toBeLessThanOrEqual(now + 7200);
+    });
+
+    it('should reject expired refresh tokens', async () => {
+      // Create provider with very short refresh token TTL
+      const providerWithShortTTL = new OAuthProvider({
+        apiRoute: ['/api/', 'https://api.example.com/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        accessTokenTTL: 3600,
+        refreshTokenTTL: 1, // 1 second - very short for testing
+      });
+
+      // Get an auth code
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123`
+      );
+
+      const authResponse = await providerWithShortTTL.fetch(authRequest, mockEnv, mockCtx);
+      const location = authResponse.headers.get('Location')!;
+      const code = new URL(location).searchParams.get('code')!;
+
+      // Exchange for tokens
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      );
+
+      const tokenResponse = await providerWithShortTTL.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokens = await tokenResponse.json<any>();
+      const refreshToken = tokens.refresh_token;
+
+      // Wait for the token to expire
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+
+      // Try to use the expired refresh token
+      const refreshParams = new URLSearchParams();
+      refreshParams.append('grant_type', 'refresh_token');
+      refreshParams.append('refresh_token', refreshToken);
+      refreshParams.append('client_id', clientId);
+      refreshParams.append('client_secret', clientSecret);
+
+      const refreshRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        refreshParams.toString()
+      );
+
+      const refreshResponse = await providerWithShortTTL.fetch(refreshRequest, mockEnv, mockCtx);
+
+      expect(refreshResponse.status).toBe(400);
+      const error = await refreshResponse.json<any>();
+      expect(error.error).toBe('invalid_grant');
+      expect(error.error_description).toBe('Refresh token has expired');
+    });
+
+    it('should allow overriding refresh token TTL via callback', async () => {
+      // Create provider with callback that sets custom TTL
+      const providerWithCallback = new OAuthProvider({
+        apiRoute: ['/api/', 'https://api.example.com/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        accessTokenTTL: 3600,
+        refreshTokenTTL: 86400, // Default: 24 hours
+        tokenExchangeCallback: async (options) => {
+          if (options.grantType === 'authorization_code') {
+            // Set shorter TTL for authorization code exchange
+            return { refreshTokenTTL: 3600 }; // 1 hour
+          }
+          return {};
+        },
+      });
+
+      // Get an auth code
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123`
+      );
+
+      const authResponse = await providerWithCallback.fetch(authRequest, mockEnv, mockCtx);
+      const location = authResponse.headers.get('Location')!;
+      const code = new URL(location).searchParams.get('code')!;
+
+      // Exchange for tokens
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      );
+
+      const tokenResponse = await providerWithCallback.fetch(tokenRequest, mockEnv, mockCtx);
+      await tokenResponse.json<any>();
+
+      // Check that the grant has the custom TTL
+      const grantEntries = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      const grantKey = grantEntries.keys[0].name;
+      const grant = await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' });
+
+      expect(grant.refreshTokenExpiresAt).toBeDefined();
+      const now = Math.floor(Date.now() / 1000);
+      // Should be approximately 1 hour, not 24 hours
+      expect(grant.refreshTokenExpiresAt).toBeLessThanOrEqual(now + 3600);
+      expect(grant.refreshTokenExpiresAt).toBeGreaterThan(now + 3500); // Allow some margin
+    });
+
+    it('should preserve refresh token expiration during token rotation', async () => {
+      // Create provider with refresh token TTL
+      const providerWithTTL = new OAuthProvider({
+        apiRoute: ['/api/', 'https://api.example.com/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        accessTokenTTL: 3600,
+        refreshTokenTTL: 7200, // 2 hours
+      });
+
+      // Get initial tokens
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123`
+      );
+
+      const authResponse = await providerWithTTL.fetch(authRequest, mockEnv, mockCtx);
+      const location = authResponse.headers.get('Location')!;
+      const code = new URL(location).searchParams.get('code')!;
+
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      );
+
+      const tokenResponse = await providerWithTTL.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokens = await tokenResponse.json<any>();
+
+      // Get the original expiration time
+      const grantEntries1 = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      const grantKey = grantEntries1.keys[0].name;
+      const grant1 = await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' });
+      const originalExpiration = grant1.refreshTokenExpiresAt;
+
+      // Do a refresh without specifying new TTL
+      const refreshParams = new URLSearchParams();
+      refreshParams.append('grant_type', 'refresh_token');
+      refreshParams.append('refresh_token', tokens.refresh_token);
+      refreshParams.append('client_id', clientId);
+      refreshParams.append('client_secret', clientSecret);
+
+      const refreshRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        refreshParams.toString()
+      );
+
+      const refreshResponse = await providerWithTTL.fetch(refreshRequest, mockEnv, mockCtx);
+      expect(refreshResponse.status).toBe(200);
+
+      // Check that expiration is preserved
+      const grant2 = await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' });
+      expect(grant2.refreshTokenExpiresAt).toBe(originalExpiration);
+    });
+
+    it('should allow removing refresh token expiration via callback', async () => {
+      // Create provider with TTL that can be removed via callback
+      // The callback will set different TTLs based on the grant type
+      const providerWithCallback = new OAuthProvider({
+        apiRoute: ['/api/', 'https://api.example.com/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        accessTokenTTL: 3600,
+        refreshTokenTTL: 3600, // Default: 1 hour
+        tokenExchangeCallback: async (options) => {
+          if (options.grantType === 'authorization_code') {
+            // During initial auth, add a flag to props
+            return {
+              newProps: { ...options.props, canRemoveExpiration: true },
+              refreshTokenTTL: 3600, // Start with 1 hour expiration
+            };
+          } else if (options.grantType === 'refresh_token' && options.props?.canRemoveExpiration) {
+            // On refresh, if the flag is present, remove expiration
+            return { refreshTokenTTL: 0 }; // Remove expiration
+          }
+          return {};
+        },
+      });
+
+      // Get initial tokens with expiration
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123`
+      );
+
+      const authResponse = await providerWithCallback.fetch(authRequest, mockEnv, mockCtx);
+      const location = authResponse.headers.get('Location')!;
+      const code = new URL(location).searchParams.get('code')!;
+
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      );
+
+      const tokenResponse = await providerWithCallback.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokens = await tokenResponse.json<any>();
+
+      // Verify initial token has expiration
+      const grantEntries = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      const grantKey = grantEntries.keys[0].name;
+      const grant1 = await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' });
+      expect(grant1.refreshTokenExpiresAt).toBeDefined();
+
+      // Do a refresh which should remove expiration based on the canRemoveExpiration flag
+      const refreshParams = new URLSearchParams();
+      refreshParams.append('grant_type', 'refresh_token');
+      refreshParams.append('refresh_token', tokens.refresh_token);
+      refreshParams.append('client_id', clientId);
+      refreshParams.append('client_secret', clientSecret);
+
+      const refreshRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        refreshParams.toString()
+      );
+
+      const refreshResponse = await providerWithCallback.fetch(refreshRequest, mockEnv, mockCtx);
+      expect(refreshResponse.status).toBe(200);
+
+      // Check that expiration was removed
+      const grant2 = await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' });
+      expect(grant2.refreshTokenExpiresAt).toBeUndefined();
+    });
+  });
+
   describe('Token Validation and API Access', () => {
     let accessToken: string;
 
@@ -1243,10 +1605,14 @@ describe('OAuthProvider', () => {
     });
 
     it('should handle OPTIONS preflight for metadata discovery endpoint', async () => {
-      const preflightRequest = createMockRequest('https://example.com/.well-known/oauth-authorization-server', 'OPTIONS', {
-        Origin: 'https://spa.example.com',
-        'Access-Control-Request-Method': 'GET',
-      });
+      const preflightRequest = createMockRequest(
+        'https://example.com/.well-known/oauth-authorization-server',
+        'OPTIONS',
+        {
+          Origin: 'https://spa.example.com',
+          'Access-Control-Request-Method': 'GET',
+        }
+      );
 
       const response = await oauthProvider.fetch(preflightRequest, mockEnv, mockCtx);
 
@@ -1300,9 +1666,9 @@ describe('OAuthProvider', () => {
       const tokenRequest = createMockRequest(
         'https://example.com/oauth/token',
         'POST',
-        { 
+        {
           'Content-Type': 'application/x-www-form-urlencoded',
-          'Origin': 'https://webapp.example.com'
+          Origin: 'https://webapp.example.com',
         },
         params.toString()
       );
@@ -1342,9 +1708,9 @@ describe('OAuthProvider', () => {
       const request = createMockRequest(
         'https://example.com/oauth/register',
         'POST',
-        { 
+        {
           'Content-Type': 'application/json',
-          'Origin': 'https://admin.example.com'
+          Origin: 'https://admin.example.com',
         },
         JSON.stringify(clientData)
       );
@@ -1408,9 +1774,9 @@ describe('OAuthProvider', () => {
       const tokenRequest = createMockRequest(
         'https://example.com/oauth/token',
         'POST',
-        { 
+        {
           'Content-Type': 'application/x-www-form-urlencoded',
-          'Origin': 'https://evil.example.com'
+          Origin: 'https://evil.example.com',
         },
         params.toString()
       );
@@ -2557,7 +2923,7 @@ describe('OAuthProvider', () => {
       const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
       expect(apiResponse.status).toBe(401); // Access token should no longer work
 
-      // Step 4: Verify refresh token still works 
+      // Step 4: Verify refresh token still works
       const refreshRequest = createMockRequest(
         'https://example.com/oauth/token',
         'POST',

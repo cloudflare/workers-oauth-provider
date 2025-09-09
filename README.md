@@ -38,7 +38,7 @@ export default new OAuthProvider({
   // You can provide either an object with a fetch method (ExportedHandler)
   // or a class extending WorkerEntrypoint.
   apiHandler: ApiHandler, // Using a WorkerEntrypoint class
-  
+
   // For multi-handler setups, you can use apiHandlers instead of apiRoute+apiHandler.
   // This allows you to use different handlers for different API routes.
   // Note: You must use either apiRoute+apiHandler (single-handler) OR apiHandlers (multi-handler), not both.
@@ -87,7 +87,12 @@ export default new OAuthProvider({
   // Note: Creating public clients via the OAuthHelpers.createClient() method
   // is always allowed regardless of this setting.
   // Defaults to false.
-  disallowPublicClientRegistration: false
+  disallowPublicClientRegistration: false,
+
+  // Optional: Time-to-live for refresh tokens in seconds.
+  // If not specified, refresh tokens do not expire.
+  // For example: 3600 = 1 hour, 86400 = 1 day, 2592000 = 30 days
+  refreshTokenTTL: 2592000 // 30 days
 });
 
 // The default handler object - the OAuthProvider will pass through HTTP requests to this object's fetch method
@@ -261,11 +266,55 @@ The callback can:
 - Return only `accessTokenProps` to update just the current access token
 - Return only `newProps` to update both the grant and access token (the access token inherits these props)
 - Return `accessTokenTTL` to override the default TTL for this specific access token
+- Return `refreshTokenTTL` to override the default TTL for this specific refresh token
 - Return nothing to keep the original props unchanged
 
 The `accessTokenTTL` override is particularly useful when the application is also an OAuth client to another service and wants to match its access token TTL to the upstream access token TTL. This helps prevent situations where the downstream token is still valid but the upstream token has expired.
 
+The `refreshTokenTTL` override allows you to set different expiration times for refresh tokens based on user type, client application, or other factors. For example, you might want shorter-lived refresh tokens for sensitive operations or longer-lived ones for trusted applications.
+
 The `props` values are end-to-end encrypted, so they can safely contain sensitive information.
+
+## Refresh Token Expiration
+
+The OAuth provider supports configurable expiration for refresh tokens, addressing security requirements for applications that need to enforce reauthentication after a certain period.
+
+### Configuration Options
+
+1. **Global TTL**: Set a default refresh token TTL for all tokens via the `refreshTokenTTL` option in the provider configuration.
+2. **Per-Token TTL**: Override the TTL for specific tokens using the `tokenExchangeCallback`.
+3. **No Expiration**: Omit the `refreshTokenTTL` option to have refresh tokens that never expire (default behavior).
+
+### Example Use Cases
+
+#### Enforce reauthentication after 1 hour
+```ts
+new OAuthProvider({
+  // ... other config ...
+  refreshTokenTTL: 3600 // 1 hour in seconds
+});
+```
+
+#### Different TTLs based on user type
+```ts
+new OAuthProvider({
+  // ... other config ...
+  refreshTokenTTL: 86400, // Default: 24 hours
+  tokenExchangeCallback: async (options) => {
+    if (options.props.userType === 'admin') {
+      // Admins must reauthenticate more frequently
+      return { refreshTokenTTL: 3600 }; // 1 hour
+    }
+    if (options.props.userType === 'api') {
+      // API clients can have longer sessions
+      return { refreshTokenTTL: 2592000 }; // 30 days
+    }
+    // Use default for regular users
+  }
+});
+```
+
+When a refresh token expires, attempts to use it will result in an `invalid_grant` error, requiring the user to go through the authorization flow again.
 
 ## Custom Error Responses
 
