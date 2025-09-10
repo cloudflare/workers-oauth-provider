@@ -1140,6 +1140,129 @@ describe('OAuthProvider', () => {
       redirectUri = 'https://client.example.com/callback';
     });
 
+    it('should not issue refresh token when TTL is 0', async () => {
+      // Create provider with refreshTokenTTL = 0 (no refresh tokens)
+      const providerNoRefresh = new OAuthProvider({
+        apiRoute: ['/api/', 'https://api.example.com/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        accessTokenTTL: 3600,
+        refreshTokenTTL: 0, // No refresh tokens
+      });
+
+      // Get an auth code
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123`
+      );
+
+      const authResponse = await providerNoRefresh.fetch(authRequest, mockEnv, mockCtx);
+      const location = authResponse.headers.get('Location')!;
+      const code = new URL(location).searchParams.get('code')!;
+
+      // Exchange for tokens
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      );
+
+      const tokenResponse = await providerNoRefresh.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokens = await tokenResponse.json<any>();
+
+      // Should have access token but no refresh token
+      expect(tokens.access_token).toBeDefined();
+      expect(tokens.expires_in).toBe(3600);
+      expect(tokens.refresh_token).toBeUndefined();
+    });
+
+    it('should allow callback to enable refresh tokens when globally disabled', async () => {
+      // Create provider with globally disabled refresh tokens, but callback can enable them
+      const providerWithCallback = new OAuthProvider({
+        apiRoute: ['/api/', 'https://api.example.com/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        accessTokenTTL: 3600,
+        refreshTokenTTL: 0, // Globally disabled
+        tokenExchangeCallback: async (options) => {
+          if (options.grantType === 'authorization_code') {
+            // Enable refresh tokens for this specific case
+            return {
+              newProps: { ...options.props, specialUser: true },
+              refreshTokenTTL: 7200, // Enable with 2 hour TTL
+            };
+          }
+          return {};
+        },
+      });
+
+      // Get an auth code
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123`
+      );
+
+      const authResponse = await providerWithCallback.fetch(authRequest, mockEnv, mockCtx);
+      const location = authResponse.headers.get('Location')!;
+      const code = new URL(location).searchParams.get('code')!;
+
+      // Exchange for tokens
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      );
+
+      const tokenResponse = await providerWithCallback.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokens = await tokenResponse.json<any>();
+
+      // Should have both access token AND refresh token (callback enabled it)
+      expect(tokens.access_token).toBeDefined();
+      expect(tokens.expires_in).toBe(3600);
+      expect(tokens.refresh_token).toBeDefined(); // Callback override worked!
+
+      // Verify the grant has the correct TTL
+      const grantEntries = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      const grantKey = grantEntries.keys[0].name;
+      const grant = await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' });
+      expect(grant.expiresAt).toBeDefined();
+      const now = Math.floor(Date.now() / 1000);
+      expect(grant.expiresAt).toBeGreaterThan(now);
+      expect(grant.expiresAt).toBeLessThanOrEqual(now + 7200);
+
+      // Verify props were updated
+      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: `Bearer ${tokens.access_token}`,
+      });
+      const apiResponse = await providerWithCallback.fetch(apiRequest, mockEnv, mockCtx);
+      const apiData = await apiResponse.json<any>();
+      expect(apiData.user.specialUser).toBe(true);
+    });
+
     it('should set refresh token expiration when global TTL is configured', async () => {
       // Create provider with refresh token TTL
       const providerWithTTL = new OAuthProvider({
@@ -1187,10 +1310,10 @@ describe('OAuthProvider', () => {
       const grantKey = grantEntries.keys[0].name;
       const grant = await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' });
 
-      expect(grant.refreshTokenExpiresAt).toBeDefined();
+      expect(grant.expiresAt).toBeDefined();
       const now = Math.floor(Date.now() / 1000);
-      expect(grant.refreshTokenExpiresAt).toBeGreaterThan(now);
-      expect(grant.refreshTokenExpiresAt).toBeLessThanOrEqual(now + 7200);
+      expect(grant.expiresAt).toBeGreaterThan(now);
+      expect(grant.expiresAt).toBeLessThanOrEqual(now + 7200);
     });
 
     it('should reject expired refresh tokens', async () => {
@@ -1258,7 +1381,8 @@ describe('OAuthProvider', () => {
       expect(refreshResponse.status).toBe(400);
       const error = await refreshResponse.json<any>();
       expect(error.error).toBe('invalid_grant');
-      expect(error.error_description).toBe('Refresh token has expired');
+      // With KV TTL, expired grants are auto-deleted, so we get "Grant not found"
+      expect(error.error_description).toBe('Grant not found');
     });
 
     it('should allow overriding refresh token TTL via callback', async () => {
@@ -1315,11 +1439,11 @@ describe('OAuthProvider', () => {
       const grantKey = grantEntries.keys[0].name;
       const grant = await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' });
 
-      expect(grant.refreshTokenExpiresAt).toBeDefined();
+      expect(grant.expiresAt).toBeDefined();
       const now = Math.floor(Date.now() / 1000);
       // Should be approximately 1 hour, not 24 hours
-      expect(grant.refreshTokenExpiresAt).toBeLessThanOrEqual(now + 3600);
-      expect(grant.refreshTokenExpiresAt).toBeGreaterThan(now + 3500); // Allow some margin
+      expect(grant.expiresAt).toBeLessThanOrEqual(now + 3600);
+      expect(grant.expiresAt).toBeGreaterThan(now + 3500); // Allow some margin
     });
 
     it('should preserve refresh token expiration during token rotation', async () => {
@@ -1367,7 +1491,7 @@ describe('OAuthProvider', () => {
       const grantEntries1 = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
       const grantKey = grantEntries1.keys[0].name;
       const grant1 = await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' });
-      const originalExpiration = grant1.refreshTokenExpiresAt;
+      const originalExpiration = grant1.expiresAt;
 
       // Do a refresh without specifying new TTL
       const refreshParams = new URLSearchParams();
@@ -1388,7 +1512,357 @@ describe('OAuthProvider', () => {
 
       // Check that expiration is preserved
       const grant2 = await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' });
-      expect(grant2.refreshTokenExpiresAt).toBe(originalExpiration);
+      expect(grant2.expiresAt).toBe(originalExpiration);
+    });
+
+    it('should not issue new refresh token when callback returns TTL=0 during refresh', async () => {
+      // Basic test: callback returns TTL=0 to make it the final refresh
+      const providerWithCallback = new OAuthProvider({
+        apiRoute: ['/api/', 'https://api.example.com/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        accessTokenTTL: 3600,
+        refreshTokenTTL: 7200,
+        tokenExchangeCallback: async (options) => {
+          if (options.grantType === 'refresh_token') {
+            return { refreshTokenTTL: 0 }; // Final refresh
+          }
+          return {};
+        },
+      });
+
+      // Get initial tokens
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123`
+      );
+
+      const authResponse = await providerWithCallback.fetch(authRequest, mockEnv, mockCtx);
+      const location = authResponse.headers.get('Location')!;
+      const code = new URL(location).searchParams.get('code')!;
+
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      );
+
+      const tokenResponse = await providerWithCallback.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokens = await tokenResponse.json<any>();
+      const firstRefreshToken = tokens.refresh_token;
+      expect(firstRefreshToken).toBeDefined();
+
+      // Do a refresh - should be the final one
+      const refreshParams = new URLSearchParams();
+      refreshParams.append('grant_type', 'refresh_token');
+      refreshParams.append('refresh_token', firstRefreshToken);
+      refreshParams.append('client_id', clientId);
+      refreshParams.append('client_secret', clientSecret);
+
+      const refreshRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        refreshParams.toString()
+      );
+
+      const refreshResponse = await providerWithCallback.fetch(refreshRequest, mockEnv, mockCtx);
+      expect(refreshResponse.status).toBe(200);
+
+      const finalTokens = await refreshResponse.json<any>();
+
+      // Should have access token but no refresh token
+      expect(finalTokens.access_token).toBeDefined();
+      expect(finalTokens.expires_in).toBe(3600);
+      expect(finalTokens.refresh_token).toBeUndefined();
+
+      // The grant should still exist and the original refresh token should still work (for retry)
+      const grantEntries = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      const grantKey = grantEntries.keys[0].name;
+      const grant2 = await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' });
+      expect(grant2).toBeDefined();
+      expect(grant2.refreshTokenId).toBeDefined(); // Still has the original token
+
+      // Trying the same refresh again should still work (idempotent)
+      const retryRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        refreshParams.toString()
+      );
+
+      const retryResponse = await providerWithCallback.fetch(retryRequest, mockEnv, mockCtx);
+      expect(retryResponse.status).toBe(200);
+
+      const retryTokens = await retryResponse.json<any>();
+      expect(retryTokens.access_token).toBeDefined();
+      expect(retryTokens.refresh_token).toBeUndefined(); // Still no refresh token
+    });
+
+    it('should handle props change during final refresh with retries', async () => {
+      // Complex test: props change during final refresh and multiple retries
+      const providerWithCallback = new OAuthProvider({
+        apiRoute: ['/api/', 'https://api.example.com/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        accessTokenTTL: 3600,
+        refreshTokenTTL: 7200,
+        tokenExchangeCallback: async (options) => {
+          if (options.grantType === 'authorization_code') {
+            return { newProps: { ...options.props, refreshCount: 0 } };
+          } else if (options.grantType === 'refresh_token') {
+            // Final refresh with props change - but idempotent
+            const alreadyFinal = options.props?.finalRefresh;
+            if (alreadyFinal) {
+              // Already marked as final, don't change props again (idempotent)
+              return { refreshTokenTTL: 0 };
+            }
+            return {
+              refreshTokenTTL: 0,
+              newProps: { ...options.props, refreshCount: 1, finalRefresh: true },
+            };
+          }
+          return {};
+        },
+      });
+
+      // Get initial tokens
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123`
+      );
+
+      const authResponse = await providerWithCallback.fetch(authRequest, mockEnv, mockCtx);
+      const location = authResponse.headers.get('Location')!;
+      const code = new URL(location).searchParams.get('code')!;
+
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      );
+
+      const tokenResponse = await providerWithCallback.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokens = await tokenResponse.json<any>();
+      const firstRefreshToken = tokens.refresh_token;
+
+      // Do final refresh with props change
+      const refreshParams = new URLSearchParams();
+      refreshParams.append('grant_type', 'refresh_token');
+      refreshParams.append('refresh_token', firstRefreshToken);
+      refreshParams.append('client_id', clientId);
+      refreshParams.append('client_secret', clientSecret);
+
+      const refreshRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        refreshParams.toString()
+      );
+
+      const refreshResponse = await providerWithCallback.fetch(refreshRequest, mockEnv, mockCtx);
+      expect(refreshResponse.status).toBe(200);
+
+      const finalTokens = await refreshResponse.json<any>();
+      expect(finalTokens.access_token).toBeDefined();
+      expect(finalTokens.refresh_token).toBeUndefined();
+
+      // Verify the access token has updated props
+      const apiRequest1 = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: `Bearer ${finalTokens.access_token}`,
+      });
+      const apiResponse1 = await providerWithCallback.fetch(apiRequest1, mockEnv, mockCtx);
+      expect(apiResponse1.status).toBe(200);
+      const apiData1 = await apiResponse1.json<any>();
+      expect(apiData1.user.refreshCount).toBe(1);
+      expect(apiData1.user.finalRefresh).toBe(true);
+
+      // First retry - should work with same props
+      const retryRequest1 = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        refreshParams.toString()
+      );
+      const retryResponse1 = await providerWithCallback.fetch(retryRequest1, mockEnv, mockCtx);
+      expect(retryResponse1.status).toBe(200);
+      const retryTokens1 = await retryResponse1.json<any>();
+      expect(retryTokens1.refresh_token).toBeUndefined();
+
+      // Verify retry produces access token with same updated props
+      const apiRequest2 = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: `Bearer ${retryTokens1.access_token}`,
+      });
+      const apiResponse2 = await providerWithCallback.fetch(apiRequest2, mockEnv, mockCtx);
+      const apiData2 = await apiResponse2.json<any>();
+      expect(apiData2.user.refreshCount).toBe(1); // Count doesn't increment on retry
+      expect(apiData2.user.finalRefresh).toBe(true);
+
+      // Second retry - should still work
+      const retryRequest2 = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        refreshParams.toString()
+      );
+      const retryResponse2 = await providerWithCallback.fetch(retryRequest2, mockEnv, mockCtx);
+      expect(retryResponse2.status).toBe(200);
+      const retryTokens2 = await retryResponse2.json<any>();
+      expect(retryTokens2.refresh_token).toBeUndefined();
+    });
+
+    it('should handle final refresh using previous token after rotation', async () => {
+      // Test that final refresh WITH PROPS CHANGE works even when using the previous token
+      // This tests our wrapped key fix!
+      
+      // Track state outside of props to handle retries correctly
+      let refreshCount = 0;
+      let madeFinal = false;
+      
+      const providerWithCallback = new OAuthProvider({
+        apiRoute: ['/api/', 'https://api.example.com/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        accessTokenTTL: 3600,
+        refreshTokenTTL: 7200,
+        tokenExchangeCallback: async (options) => {
+          if (options.grantType === 'authorization_code') {
+            return { newProps: { ...options.props, refreshNumber: 0 } };
+          } else if (options.grantType === 'refresh_token') {
+            refreshCount++;
+            
+            if (refreshCount === 1) {
+              // First refresh - just increment counter
+              return { newProps: { ...options.props, refreshNumber: 1 } };
+            } else {
+              // Second refresh and beyond - make it final
+              madeFinal = true;
+              return {
+                refreshTokenTTL: 0,
+                newProps: { ...options.props, refreshNumber: 2, isFinal: true },
+              };
+            }
+          }
+          return {};
+        },
+      });
+
+      // Get initial tokens
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123`
+      );
+
+      const authResponse = await providerWithCallback.fetch(authRequest, mockEnv, mockCtx);
+      const location = authResponse.headers.get('Location')!;
+      const code = new URL(location).searchParams.get('code')!;
+
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      );
+
+      const tokenResponse = await providerWithCallback.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokens = await tokenResponse.json<any>();
+      const firstRefreshToken = tokens.refresh_token;
+
+      // First refresh - normal rotation
+      const refresh1Params = new URLSearchParams();
+      refresh1Params.append('grant_type', 'refresh_token');
+      refresh1Params.append('refresh_token', firstRefreshToken);
+      refresh1Params.append('client_id', clientId);
+      refresh1Params.append('client_secret', clientSecret);
+
+      const refresh1Request = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        refresh1Params.toString()
+      );
+
+      const refresh1Response = await providerWithCallback.fetch(refresh1Request, mockEnv, mockCtx);
+      const tokens1 = await refresh1Response.json<any>();
+      const secondRefreshToken = tokens1.refresh_token;
+      expect(secondRefreshToken).toBeDefined();
+
+      // Second refresh (final) - but using the PREVIOUS token
+      const refresh2Params = new URLSearchParams();
+      refresh2Params.append('grant_type', 'refresh_token');
+      refresh2Params.append('refresh_token', firstRefreshToken); // Use previous token!
+      refresh2Params.append('client_id', clientId);
+      refresh2Params.append('client_secret', clientSecret);
+
+      const refresh2Request = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        refresh2Params.toString()
+      );
+
+      const refresh2Response = await providerWithCallback.fetch(refresh2Request, mockEnv, mockCtx);
+      expect(refresh2Response.status).toBe(200);
+
+      const finalTokens = await refresh2Response.json<any>();
+      expect(finalTokens.access_token).toBeDefined();
+      expect(finalTokens.refresh_token).toBeUndefined(); // No new refresh token (final)
+
+      // Verify access token has correct props - should have the UPDATED props!
+      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: `Bearer ${finalTokens.access_token}`,
+      });
+      const apiResponse = await providerWithCallback.fetch(apiRequest, mockEnv, mockCtx);
+      const apiData = await apiResponse.json<any>();
+      expect(apiData.user.refreshNumber).toBe(2); // Props were updated during final refresh!
+      expect(apiData.user.isFinal).toBe(true);
+
+      // Retry with the same (previous) token should still work
+      const retryRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        refresh2Params.toString()
+      );
+      const retryResponse = await providerWithCallback.fetch(retryRequest, mockEnv, mockCtx);
+      expect(retryResponse.status).toBe(200);
+      const retryTokens = await retryResponse.json<any>();
+      expect(retryTokens.refresh_token).toBeUndefined();
     });
 
     it('should allow removing refresh token expiration via callback', async () => {
@@ -1411,8 +1885,8 @@ describe('OAuthProvider', () => {
               refreshTokenTTL: 3600, // Start with 1 hour expiration
             };
           } else if (options.grantType === 'refresh_token' && options.props?.canRemoveExpiration) {
-            // On refresh, if the flag is present, remove expiration
-            return { refreshTokenTTL: 0 }; // Remove expiration
+            // On refresh, if the flag is present, remove expiration by returning undefined
+            return { refreshTokenTTL: undefined }; // Remove expiration (make it never expire)
           }
           return {};
         },
@@ -1450,7 +1924,7 @@ describe('OAuthProvider', () => {
       const grantEntries = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
       const grantKey = grantEntries.keys[0].name;
       const grant1 = await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' });
-      expect(grant1.refreshTokenExpiresAt).toBeDefined();
+      expect(grant1.expiresAt).toBeDefined();
 
       // Do a refresh which should remove expiration based on the canRemoveExpiration flag
       const refreshParams = new URLSearchParams();
@@ -1471,7 +1945,7 @@ describe('OAuthProvider', () => {
 
       // Check that expiration was removed
       const grant2 = await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' });
-      expect(grant2.refreshTokenExpiresAt).toBeUndefined();
+      expect(grant2.expiresAt).toBeUndefined();
     });
   });
 
