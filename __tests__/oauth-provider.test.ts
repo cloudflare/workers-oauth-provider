@@ -1243,10 +1243,14 @@ describe('OAuthProvider', () => {
     });
 
     it('should handle OPTIONS preflight for metadata discovery endpoint', async () => {
-      const preflightRequest = createMockRequest('https://example.com/.well-known/oauth-authorization-server', 'OPTIONS', {
-        Origin: 'https://spa.example.com',
-        'Access-Control-Request-Method': 'GET',
-      });
+      const preflightRequest = createMockRequest(
+        'https://example.com/.well-known/oauth-authorization-server',
+        'OPTIONS',
+        {
+          Origin: 'https://spa.example.com',
+          'Access-Control-Request-Method': 'GET',
+        }
+      );
 
       const response = await oauthProvider.fetch(preflightRequest, mockEnv, mockCtx);
 
@@ -1300,9 +1304,9 @@ describe('OAuthProvider', () => {
       const tokenRequest = createMockRequest(
         'https://example.com/oauth/token',
         'POST',
-        { 
+        {
           'Content-Type': 'application/x-www-form-urlencoded',
-          'Origin': 'https://webapp.example.com'
+          Origin: 'https://webapp.example.com',
         },
         params.toString()
       );
@@ -1342,9 +1346,9 @@ describe('OAuthProvider', () => {
       const request = createMockRequest(
         'https://example.com/oauth/register',
         'POST',
-        { 
+        {
           'Content-Type': 'application/json',
-          'Origin': 'https://admin.example.com'
+          Origin: 'https://admin.example.com',
         },
         JSON.stringify(clientData)
       );
@@ -1408,9 +1412,9 @@ describe('OAuthProvider', () => {
       const tokenRequest = createMockRequest(
         'https://example.com/oauth/token',
         'POST',
-        { 
+        {
           'Content-Type': 'application/x-www-form-urlencoded',
-          'Origin': 'https://evil.example.com'
+          Origin: 'https://evil.example.com',
         },
         params.toString()
       );
@@ -2557,7 +2561,7 @@ describe('OAuthProvider', () => {
       const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
       expect(apiResponse.status).toBe(401); // Access token should no longer work
 
-      // Step 4: Verify refresh token still works 
+      // Step 4: Verify refresh token still works
       const refreshRequest = createMockRequest(
         'https://example.com/oauth/token',
         'POST',

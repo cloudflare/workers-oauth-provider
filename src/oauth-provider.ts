@@ -2338,9 +2338,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
       const clientInfo = await this.lookupClient(clientId);
 
       if (!clientInfo) {
-        throw new Error(
-            `Invalid client. The clientId provided does not match to this client.`
-          );
+        throw new Error(`Invalid client. The clientId provided does not match to this client.`);
       }
       // If client exists, validate the redirect URI against registered URIs
       if (clientInfo && redirectUri) {
