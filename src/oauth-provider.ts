@@ -1341,13 +1341,13 @@ class OAuthProviderImpl {
       }
     }
 
-    // Code is valid - generate tokens
+    // Code is valid - generate access token
     const accessTokenSecret = generateRandomString(TOKEN_LENGTH);
     const accessToken = `${userId}:${grantId}:${accessTokenSecret}`;
     const accessTokenId = await generateTokenId(accessToken);
 
-    // Always generate refresh token - callback may override TTL
-    // Will only be included in response/grant if final TTL !== 0
+    // Always generate refresh token - but include in response/grant only if
+    // final TTL !== 0 (either from `options.refreshTokenTTL` or callback).
     const refreshTokenSecret = generateRandomString(TOKEN_LENGTH);
     const refreshToken = `${userId}:${grantId}:${refreshTokenSecret}`;
     const refreshTokenId = await generateTokenId(refreshToken);
@@ -1441,7 +1441,7 @@ class OAuthProviderImpl {
 
     // Only wrap refresh token key if we're issuing a refresh token
     let refreshTokenWrappedKey: string | undefined;
-    if (refreshToken && refreshTokenTTL !== 0) {
+    if (refreshTokenTTL !== 0) {
       refreshTokenWrappedKey = await wrapKeyWithToken(refreshToken, grantEncryptionKey);
     }
 
@@ -1456,7 +1456,7 @@ class OAuthProviderImpl {
     delete grantData.codeChallengeMethod;
     delete grantData.authCodeWrappedKey;
 
-    if (refreshTokenId && refreshTokenWrappedKey && refreshTokenTTL !== 0) {
+    if (refreshTokenWrappedKey) {
       grantData.refreshTokenId = refreshTokenId;
       grantData.refreshTokenWrappedKey = refreshTokenWrappedKey;
       grantData.previousRefreshTokenId = undefined; // No previous token for first use
@@ -1496,8 +1496,8 @@ class OAuthProviderImpl {
       scope: grantData.scope.join(' '),
     };
 
-    // Only include refresh token if we issued one and final TTL is not 0
-    if (refreshToken && refreshTokenTTL !== 0) {
+    // Only include refresh token if final TTL is not 0
+    if (refreshTokenTTL !== 0) {
       tokenResponse.refresh_token = refreshToken;
     }
 
