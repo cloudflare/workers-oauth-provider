@@ -1700,7 +1700,7 @@ class OAuthProviderImpl {
     } else if (isRefreshToken) {
       await this.createOAuthHelpers(env).revokeGrant(grantId, userId);
     }
-    return new Response('', { status: 500 });
+    return new Response('', { status: 200 });
   }
 
   /**
