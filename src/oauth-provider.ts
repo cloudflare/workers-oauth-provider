@@ -2231,11 +2231,23 @@ async function hashSecret(secret: string): Promise<string> {
  */
 function generateRandomString(length: number): string {
   const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  // Discard bytes >= 62 * 4 = 248 so each maps to exactly
+  // 4 equally-likely byte values.
+  const acceptable = characters.length * 4;
   let result = '';
-  const values = new Uint8Array(length);
-  crypto.getRandomValues(values);
-  for (let i = 0; i < length; i++) {
-    result += characters.charAt(values[i] % characters.length);
+
+  // Minimize calls to crypto.getRandomValues() by batching.
+  // Rejection rate is ~3.1%, so 10% extra is comfortably safe
+  const batchSize = Math.ceil(length * 1.1);
+  const buffer = new Uint8Array(batchSize);
+
+  while (result.length < length) {
+    crypto.getRandomValues(buffer);
+    for (let i = 0; i < buffer.length && result.length < length; i++) {
+      const byte = buffer[i];
+      if (byte >= acceptable) continue; // reject
+      result += characters.charAt(byte % characters.length);
+    }
   }
   return result;
 }
