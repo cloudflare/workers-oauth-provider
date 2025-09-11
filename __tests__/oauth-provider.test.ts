@@ -2600,7 +2600,7 @@ describe('OAuthProvider', () => {
         scopesSupported: ['read', 'write'],
         resolveExternalToken: async (input) => {
           externalTokenCalls.push({ token: input.token });
-          
+
           // Simulate failed validation by returning null
           return null;
         },
@@ -2725,7 +2725,7 @@ describe('OAuthProvider', () => {
         scopesSupported: ['read', 'write'],
         resolveExternalToken: async (input) => {
           externalTokenCalls.push({ token: input.token });
-          
+
           // Even if token looks like internal format, treat it as external
           if (input.token === 'user123:grant456:secret789') {
             return {
@@ -2771,7 +2771,7 @@ describe('OAuthProvider', () => {
         scopesSupported: ['read', 'write'],
         resolveExternalToken: async (input) => {
           externalTokenCalls.push({ token: input.token });
-          
+
           // Handle JWT-like tokens
           if (input.token.startsWith('eyJ')) {
             return {
@@ -2836,10 +2836,10 @@ describe('OAuthProvider', () => {
         scopesSupported: ['read', 'write'],
         resolveExternalToken: async (input) => {
           externalTokenCalls.push({ token: input.token, startTime: Date.now() });
-          
+
           // Simulate async work (e.g., calling external API)
-          await new Promise(resolve => setTimeout(resolve, 10));
-          
+          await new Promise((resolve) => setTimeout(resolve, 10));
+
           if (input.token === 'async-valid-token') {
             return {
               props: {
