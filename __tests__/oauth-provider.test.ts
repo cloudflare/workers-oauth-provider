@@ -549,7 +549,22 @@ describe('OAuthProvider', () => {
       expect(grants.keys.length).toBe(0);
     });
 
-    // Add more tests for auth code flow...
+    it('should reject authorization request with javascript: redirect URI', async () => {
+      // Create an authorization request with a javascript: redirect URI
+      const javascriptRedirectUri = 'javascript:alert("xss")';
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(javascriptRedirectUri)}` +
+          `&scope=read%20write&state=xyz123`
+      );
+
+      // Expect the request to be rejected
+      await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid redirect URI');
+
+      // Verify no grant was created
+      const grants = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      expect(grants.keys.length).toBe(0);
+    });
   });
 
   describe('Implicit Flow', () => {

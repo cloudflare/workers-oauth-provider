@@ -2328,6 +2328,11 @@ class OAuthHelpersImpl implements OAuthHelpers {
     const codeChallenge = url.searchParams.get('code_challenge') || undefined;
     const codeChallengeMethod = url.searchParams.get('code_challenge_method') || 'plain';
 
+    // prevent javascript: URIs / XSS attacks
+    if (!redirectUri.startsWith('http://') && !redirectUri.startsWith('https://')) {
+      throw new Error('Invalid redirect URI');
+    }
+
     // Check if implicit flow is requested but not allowed
     if (responseType === 'token' && !this.provider.options.allowImplicitFlow) {
       throw new Error('The implicit grant flow is not enabled for this provider');
