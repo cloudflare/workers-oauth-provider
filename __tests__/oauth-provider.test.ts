@@ -2499,6 +2499,380 @@ describe('OAuthProvider', () => {
     });
   });
 
+  describe('External Token Resolution', () => {
+    it('should reject unknown tokens when no resolveExternalToken callback is provided', async () => {
+      // Create a provider without external token resolution
+      const providerWithoutExternalValidation = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        scopesSupported: ['read', 'write'],
+        // Intentionally no resolveExternalToken callback
+      });
+
+      // Try to access API with an unknown token format
+      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: 'Bearer external-token-from-another-service',
+      });
+
+      const apiResponse = await providerWithoutExternalValidation.fetch(apiRequest, mockEnv, mockCtx);
+
+      expect(apiResponse.status).toBe(401);
+      const error = await apiResponse.json<any>();
+      expect(error.error).toBe('invalid_token');
+      expect(error.error_description).toBe('Invalid access token');
+    });
+
+    it('should successfully resolve external tokens and set props correctly', async () => {
+      // Mock external token validation calls
+      const externalTokenCalls: any[] = [];
+
+      // Create a provider with external token resolution
+      const providerWithExternalValidation = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        scopesSupported: ['read', 'write'],
+        resolveExternalToken: async (input) => {
+          // Record the call for verification
+          externalTokenCalls.push({
+            token: input.token,
+            requestUrl: input.request.url,
+            hasEnv: !!input.env,
+          });
+
+          // Simulate successful external token validation
+          if (input.token === 'external-valid-token') {
+            return {
+              props: {
+                userId: 'external-user-456',
+                username: 'ExternalUser',
+                source: 'external-oauth-server',
+                permissions: ['read', 'write'],
+              },
+            };
+          }
+
+          // Return null for invalid tokens
+          return null;
+        },
+      });
+
+      // Try to access API with a valid external token
+      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: 'Bearer external-valid-token',
+      });
+
+      const apiResponse = await providerWithExternalValidation.fetch(apiRequest, mockEnv, mockCtx);
+
+      expect(apiResponse.status).toBe(200);
+      const responseData = await apiResponse.json<any>();
+      expect(responseData.success).toBe(true);
+      expect(responseData.user).toEqual({
+        userId: 'external-user-456',
+        username: 'ExternalUser',
+        source: 'external-oauth-server',
+        permissions: ['read', 'write'],
+      });
+
+      // Verify the external token callback was called correctly
+      expect(externalTokenCalls.length).toBe(1);
+      expect(externalTokenCalls[0].token).toBe('external-valid-token');
+      expect(externalTokenCalls[0].requestUrl).toBe('https://example.com/api/test');
+      expect(externalTokenCalls[0].hasEnv).toBe(true);
+    });
+
+    it('should reject external tokens when callback returns null', async () => {
+      // Mock external token validation calls
+      const externalTokenCalls: any[] = [];
+
+      // Create a provider with external token resolution that fails
+      const providerWithFailingValidation = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        scopesSupported: ['read', 'write'],
+        resolveExternalToken: async (input) => {
+          externalTokenCalls.push({ token: input.token });
+          
+          // Simulate failed validation by returning null
+          return null;
+        },
+      });
+
+      // Try to access API with an invalid external token
+      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: 'Bearer invalid-external-token',
+      });
+
+      const apiResponse = await providerWithFailingValidation.fetch(apiRequest, mockEnv, mockCtx);
+
+      expect(apiResponse.status).toBe(401);
+      const error = await apiResponse.json<any>();
+      expect(error.error).toBe('invalid_token');
+      expect(error.error_description).toBe('Invalid access token');
+
+      // Verify the external token callback was called
+      expect(externalTokenCalls.length).toBe(1);
+      expect(externalTokenCalls[0].token).toBe('invalid-external-token');
+    });
+
+    it('should prioritize internal tokens over external validation', async () => {
+      // Mock external token validation to track if it's called
+      const externalTokenCalls: any[] = [];
+
+      // Create a provider with external token resolution
+      const providerWithExternalValidation = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        scopesSupported: ['read', 'write'],
+        resolveExternalToken: async (input) => {
+          externalTokenCalls.push({ token: input.token });
+          return {
+            props: { source: 'external', shouldNeverSeeThis: true },
+          };
+        },
+      });
+
+      // First, create a valid internal token through normal OAuth flow
+      const clientData = {
+        redirect_uris: ['https://client.example.com/callback'],
+        client_name: 'Internal Token Test',
+        token_endpoint_auth_method: 'client_secret_basic',
+      };
+
+      const registerRequest = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify(clientData)
+      );
+
+      const registerResponse = await providerWithExternalValidation.fetch(registerRequest, mockEnv, mockCtx);
+      const client = await registerResponse.json<any>();
+      const clientId = client.client_id;
+      const clientSecret = client.client_secret;
+      const redirectUri = 'https://client.example.com/callback';
+
+      // Get auth code
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123`
+      );
+
+      const authResponse = await providerWithExternalValidation.fetch(authRequest, mockEnv, mockCtx);
+      const location = authResponse.headers.get('Location')!;
+      const code = new URL(location).searchParams.get('code')!;
+
+      // Exchange for tokens
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      );
+
+      const tokenResponse = await providerWithExternalValidation.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokens = await tokenResponse.json<any>();
+      const internalAccessToken = tokens.access_token;
+
+      // Now use the internal token - should NOT call external validation
+      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: `Bearer ${internalAccessToken}`,
+      });
+
+      const apiResponse = await providerWithExternalValidation.fetch(apiRequest, mockEnv, mockCtx);
+
+      expect(apiResponse.status).toBe(200);
+      const responseData = await apiResponse.json<any>();
+      expect(responseData.user).toEqual({
+        userId: 'test-user-123',
+        username: 'TestUser',
+      });
+
+      // Verify external validation was NOT called for internal token
+      expect(externalTokenCalls.length).toBe(0);
+    });
+
+    it('should handle external tokens that use the same format as internal tokens', async () => {
+      // Mock external token validation
+      const externalTokenCalls: any[] = [];
+
+      const providerWithExternalValidation = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        scopesSupported: ['read', 'write'],
+        resolveExternalToken: async (input) => {
+          externalTokenCalls.push({ token: input.token });
+          
+          // Even if token looks like internal format, treat it as external
+          if (input.token === 'user123:grant456:secret789') {
+            return {
+              props: {
+                userId: 'external-user-from-mimicked-token',
+                source: 'external-service',
+              },
+            };
+          }
+
+          return null;
+        },
+      });
+
+      // Use a token that mimics internal format but doesn't exist in KV
+      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: 'Bearer user123:grant456:secret789',
+      });
+
+      const apiResponse = await providerWithExternalValidation.fetch(apiRequest, mockEnv, mockCtx);
+
+      expect(apiResponse.status).toBe(200);
+      const responseData = await apiResponse.json<any>();
+      expect(responseData.user).toEqual({
+        userId: 'external-user-from-mimicked-token',
+        source: 'external-service',
+      });
+
+      // Verify external validation was called
+      expect(externalTokenCalls.length).toBe(1);
+      expect(externalTokenCalls[0].token).toBe('user123:grant456:secret789');
+    });
+
+    it('should call external validation for non-internal token formats', async () => {
+      const externalTokenCalls: any[] = [];
+
+      const providerWithExternalValidation = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        scopesSupported: ['read', 'write'],
+        resolveExternalToken: async (input) => {
+          externalTokenCalls.push({ token: input.token });
+          
+          // Handle JWT-like tokens
+          if (input.token.startsWith('eyJ')) {
+            return {
+              props: {
+                userId: 'jwt-user',
+                tokenType: 'jwt',
+                issuer: 'external-auth-server',
+              },
+            };
+          }
+
+          // Handle simple bearer tokens
+          if (input.token === 'simple-bearer-token') {
+            return {
+              props: {
+                userId: 'bearer-user',
+                tokenType: 'bearer',
+              },
+            };
+          }
+
+          return null;
+        },
+      });
+
+      // Test JWT-like token
+      const jwtRequest = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: 'Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.mock.token',
+      });
+
+      const jwtResponse = await providerWithExternalValidation.fetch(jwtRequest, mockEnv, mockCtx);
+      expect(jwtResponse.status).toBe(200);
+      const jwtData = await jwtResponse.json<any>();
+      expect(jwtData.user.tokenType).toBe('jwt');
+      expect(jwtData.user.issuer).toBe('external-auth-server');
+
+      // Test simple bearer token
+      const bearerRequest = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: 'Bearer simple-bearer-token',
+      });
+
+      const bearerResponse = await providerWithExternalValidation.fetch(bearerRequest, mockEnv, mockCtx);
+      expect(bearerResponse.status).toBe(200);
+      const bearerData = await bearerResponse.json<any>();
+      expect(bearerData.user.tokenType).toBe('bearer');
+
+      // Verify both external validations were called
+      expect(externalTokenCalls.length).toBe(2);
+      expect(externalTokenCalls[0].token).toBe('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.mock.token');
+      expect(externalTokenCalls[1].token).toBe('simple-bearer-token');
+    });
+
+    it('should handle async external token validation properly', async () => {
+      const externalTokenCalls: any[] = [];
+
+      const providerWithAsyncValidation = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        scopesSupported: ['read', 'write'],
+        resolveExternalToken: async (input) => {
+          externalTokenCalls.push({ token: input.token, startTime: Date.now() });
+          
+          // Simulate async work (e.g., calling external API)
+          await new Promise(resolve => setTimeout(resolve, 10));
+          
+          if (input.token === 'async-valid-token') {
+            return {
+              props: {
+                userId: 'async-user',
+                validatedAt: new Date().toISOString(),
+                asyncValidation: true,
+              },
+            };
+          }
+
+          return null;
+        },
+      });
+
+      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: 'Bearer async-valid-token',
+      });
+
+      const startTime = Date.now();
+      const apiResponse = await providerWithAsyncValidation.fetch(apiRequest, mockEnv, mockCtx);
+      const endTime = Date.now();
+
+      expect(apiResponse.status).toBe(200);
+      const responseData = await apiResponse.json<any>();
+      expect(responseData.user.asyncValidation).toBe(true);
+      expect(responseData.user.validatedAt).toBeDefined();
+
+      // Verify async call was made
+      expect(externalTokenCalls.length).toBe(1);
+      expect(endTime - startTime).toBeGreaterThanOrEqual(10); // Should take at least 10ms due to setTimeout
+    });
+  });
+
   describe('Token Revocation', () => {
     let clientId: string;
     let clientSecret: string;
