@@ -2329,7 +2329,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
     const codeChallengeMethod = url.searchParams.get('code_challenge_method') || 'plain';
 
     // prevent javascript: URIs / XSS attacks
-    if (redirectUri.trim().startsWith('javascript:')) {
+    if (!redirectUri.startsWith('http://') && !redirectUri.startsWith('https://')) {
       throw new Error('Invalid redirect URI');
     }
 
