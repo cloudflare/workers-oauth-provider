@@ -38,7 +38,7 @@ export default new OAuthProvider({
   // You can provide either an object with a fetch method (ExportedHandler)
   // or a class extending WorkerEntrypoint.
   apiHandler: ApiHandler, // Using a WorkerEntrypoint class
-  
+
   // For multi-handler setups, you can use apiHandlers instead of apiRoute+apiHandler.
   // This allows you to use different handlers for different API routes.
   // Note: You must use either apiRoute+apiHandler (single-handler) OR apiHandlers (multi-handler), not both.
@@ -87,7 +87,13 @@ export default new OAuthProvider({
   // Note: Creating public clients via the OAuthHelpers.createClient() method
   // is always allowed regardless of this setting.
   // Defaults to false.
-  disallowPublicClientRegistration: false
+  disallowPublicClientRegistration: false,
+
+  // Optional: Time-to-live for refresh tokens in seconds.
+  // If not specified, refresh tokens do not expire.
+  // Set to 0 to disable refresh tokens (only access tokens will be issued).
+  // For example: 3600 = 1 hour, 86400 = 1 day, 2592000 = 30 days
+  refreshTokenTTL: 2592000 // 30 days
 });
 
 // The default handler object - the OAuthProvider will pass through HTTP requests to this object's fetch method
@@ -261,6 +267,7 @@ The callback can:
 - Return only `accessTokenProps` to update just the current access token
 - Return only `newProps` to update both the grant and access token (the access token inherits these props)
 - Return `accessTokenTTL` to override the default TTL for this specific access token
+- Return `refreshTokenTTL` to override the default TTL for this specific refresh token
 - Return nothing to keep the original props unchanged
 
 The `accessTokenTTL` override is particularly useful when the application is also an OAuth client to another service and wants to match its access token TTL to the upstream access token TTL. This helps prevent situations where the downstream token is still valid but the upstream token has expired.
