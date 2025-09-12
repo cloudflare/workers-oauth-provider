@@ -1705,8 +1705,6 @@ class OAuthProviderImpl {
     grantData.refreshTokenId = newRefreshTokenId;
     grantData.refreshTokenWrappedKey = newRefreshTokenWrappedKey;
 
-    // Note: The refresh token expiration (if any) remains unchanged during refresh
-
     // Save the updated grant with TTL if applicable
     await this.saveGrantWithTTL(env, grantKey, grantData, now);
 
