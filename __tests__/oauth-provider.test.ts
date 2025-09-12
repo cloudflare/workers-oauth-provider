@@ -1513,6 +1513,77 @@ describe('OAuthProvider', () => {
       const grant2 = await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' });
       expect(grant2.expiresAt).toBe(originalExpiration);
     });
+
+    it('should reject callback attempts to change TTL during refresh', async () => {
+      // Create provider with callback that tries to change TTL during refresh
+      const providerWithBadCallback = new OAuthProvider({
+        apiRoute: ['/api/', 'https://api.example.com/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        accessTokenTTL: 3600,
+        refreshTokenTTL: 7200,
+        tokenExchangeCallback: async (options) => {
+          if (options.grantType === 'refresh_token') {
+            // This should cause an error
+            return { refreshTokenTTL: 3600 };
+          }
+          return {};
+        },
+      });
+
+      // Get initial tokens through the full flow
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123`
+      );
+
+      const authResponse = await providerWithBadCallback.fetch(authRequest, mockEnv, mockCtx);
+      const location = authResponse.headers.get('Location')!;
+      const code = new URL(location).searchParams.get('code')!;
+
+      const tokenParams = new URLSearchParams();
+      tokenParams.append('grant_type', 'authorization_code');
+      tokenParams.append('code', code);
+      tokenParams.append('redirect_uri', redirectUri);
+      tokenParams.append('client_id', clientId);
+      tokenParams.append('client_secret', clientSecret);
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        tokenParams.toString()
+      );
+
+      const tokenResponse = await providerWithBadCallback.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokens = await tokenResponse.json<any>();
+      expect(tokens.refresh_token).toBeDefined();
+
+      // Try to refresh - this should return an error
+      const refreshParams = new URLSearchParams();
+      refreshParams.append('grant_type', 'refresh_token');
+      refreshParams.append('refresh_token', tokens.refresh_token);
+      refreshParams.append('client_id', clientId);
+      refreshParams.append('client_secret', clientSecret);
+
+      const refreshRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        refreshParams.toString()
+      );
+
+      const refreshResponse = await providerWithBadCallback.fetch(refreshRequest, mockEnv, mockCtx);
+      expect(refreshResponse.status).toBe(400);
+
+      const error = await refreshResponse.json<any>();
+      expect(error.error).toBe('invalid_request');
+      expect(error.error_description).toBe('refreshTokenTTL cannot be changed during refresh token exchange');
+    });
   });
 
   describe('Token Validation and API Access', () => {

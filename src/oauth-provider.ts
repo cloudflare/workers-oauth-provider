@@ -1348,12 +1348,6 @@ class OAuthProviderImpl {
     const accessToken = `${userId}:${grantId}:${accessTokenSecret}`;
     const accessTokenId = await generateTokenId(accessToken);
 
-    // Always generate refresh token - but include in response/grant only if
-    // TTL !== 0 (either from `options.refreshTokenTTL` or callback).
-    const refreshTokenSecret = generateRandomString(TOKEN_LENGTH);
-    const refreshToken = `${userId}:${grantId}:${refreshTokenSecret}`;
-    const refreshTokenId = await generateTokenId(refreshToken);
-
     // Define the access token TTL, may be updated by callback if provided
     let accessTokenTTL = this.options.accessTokenTTL!;
     // Define the refresh token TTL, may be updated by callback if provided
@@ -1435,30 +1429,34 @@ class OAuthProviderImpl {
     const now = Math.floor(Date.now() / 1000);
     const accessTokenExpiresAt = now + accessTokenTTL;
 
-    // Calculate refresh token expiration time if TTL is configured
-    const expiresAt = refreshTokenTTL !== undefined && refreshTokenTTL > 0 ? now + refreshTokenTTL : undefined;
+    // Determine if we should issue a refresh token
+    const useRefreshToken = refreshTokenTTL !== 0;
 
     // Wrap the key for access token
     const accessTokenWrappedKey = await wrapKeyWithToken(accessToken, accessTokenEncryptionKey);
-
-    // Only wrap refresh token key if we're issuing a refresh token
-    let refreshTokenWrappedKey: string | undefined;
-    if (refreshTokenTTL !== 0) {
-      refreshTokenWrappedKey = await wrapKeyWithToken(refreshToken, grantEncryptionKey);
-    }
 
     // Update the grant:
     // - Remove the auth code hash (it's single-use)
     // - Remove PKCE-related fields (one-time use)
     // - Remove auth code wrapped key (no longer needed)
-    // - Add the refresh token hash and wrapped key (if issuing refresh token)
-    // - Make it permanent (no TTL)
     delete grantData.authCodeId;
     delete grantData.codeChallenge;
     delete grantData.codeChallengeMethod;
     delete grantData.authCodeWrappedKey;
 
-    if (refreshTokenWrappedKey) {
+    // Only generate refresh token if issuing one
+    let refreshToken: string | undefined;
+
+    if (useRefreshToken) {
+      const refreshTokenSecret = generateRandomString(TOKEN_LENGTH);
+      refreshToken = `${userId}:${grantId}:${refreshTokenSecret}`;
+      const refreshTokenId = await generateTokenId(refreshToken);
+      const refreshTokenWrappedKey = await wrapKeyWithToken(refreshToken, grantEncryptionKey);
+
+      // Calculate expiration if TTL is defined
+      const expiresAt = refreshTokenTTL !== undefined ? now + refreshTokenTTL : undefined;
+
+      // Add refresh token data to grant
       grantData.refreshTokenId = refreshTokenId;
       grantData.refreshTokenWrappedKey = refreshTokenWrappedKey;
       grantData.previousRefreshTokenId = undefined; // No previous token for first use
@@ -1466,8 +1464,7 @@ class OAuthProviderImpl {
       grantData.expiresAt = expiresAt;
     }
 
-    // Update the grant with the refresh token hash
-    // Set KV TTL to match refresh token expiration if configured
+    // Save the updated grant with TTL matching refresh token expiration (if any)
     await this.saveGrantWithTTL(env, grantKey, grantData, now);
 
     // Store access token with denormalized grant information
@@ -1498,8 +1495,7 @@ class OAuthProviderImpl {
       scope: grantData.scope.join(' '),
     };
 
-    // Only include refresh token if final TTL is not 0
-    if (refreshTokenTTL !== 0) {
+    if (refreshToken) {
       tokenResponse.refresh_token = refreshToken;
     }
 
@@ -1557,7 +1553,7 @@ class OAuthProviderImpl {
     }
 
     // Check if the refresh token has expired
-    if (grantData.expiresAt) {
+    if (grantData.expiresAt !== undefined) {
       const now = Math.floor(Date.now() / 1000);
       if (now >= grantData.expiresAt) {
         return this.createErrorResponse('invalid_grant', 'Refresh token has expired');
@@ -1633,7 +1629,13 @@ class OAuthProviderImpl {
           accessTokenTTL = callbackResult.accessTokenTTL;
         }
 
-        // Note: refreshTokenTTL changes are not supported during refresh token exchange
+        // refreshTokenTTL changes are not supported during refresh token exchange
+        if ('refreshTokenTTL' in callbackResult) {
+          return this.createErrorResponse(
+            'invalid_request',
+            'refreshTokenTTL cannot be changed during refresh token exchange'
+          );
+        }
       }
 
       // Only re-encrypt the grant props if they've changed
@@ -1667,7 +1669,7 @@ class OAuthProviderImpl {
     const now = Math.floor(Date.now() / 1000);
 
     // Clamp access token TTL to not exceed refresh token's remaining lifetime
-    if (grantData.expiresAt) {
+    if (grantData.expiresAt !== undefined) {
       const remainingRefreshTokenLifetime = grantData.expiresAt - now;
       if (remainingRefreshTokenLifetime > 0) {
         accessTokenTTL = Math.min(accessTokenTTL, remainingRefreshTokenLifetime);
@@ -2096,14 +2098,8 @@ class OAuthProviderImpl {
    * @param now - Current timestamp in seconds
    */
   private async saveGrantWithTTL(env: any, grantKey: string, grantData: Grant, now: number): Promise<void> {
-    // If grant has already expired, delete it instead of saving
-    if (grantData.expiresAt && grantData.expiresAt <= now) {
-      await env.OAUTH_KV.delete(grantKey);
-      return;
-    }
-
     // Use absolute expiration timestamp if grant has an expiration
-    const kvOptions = grantData.expiresAt ? { expiration: grantData.expiresAt } : {};
+    const kvOptions = grantData.expiresAt !== undefined ? { expiration: grantData.expiresAt } : {};
     await env.OAUTH_KV.put(grantKey, JSON.stringify(grantData), kvOptions);
   }
 
