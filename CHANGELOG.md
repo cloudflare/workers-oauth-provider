@@ -1,5 +1,15 @@
 # @cloudflare/workers-oauth-provider
 
+## 0.0.8
+
+### Patch Changes
+
+- [#74](https://github.com/cloudflare/workers-oauth-provider/pull/74) [`9d4b595`](https://github.com/cloudflare/workers-oauth-provider/commit/9d4b595f63d2aebd5700e4021967b98173cd3755) Thanks [@ghostwriternr](https://github.com/ghostwriternr)! - Add configurable refresh token expiration
+  - New `refreshTokenTTL` option to set global expiration for refresh tokens
+  - Support for per-token TTL override via `tokenExchangeCallback`
+  - Expired tokens return `invalid_grant` error, forcing reauthentication
+  - Backward compatible: tokens without TTL never expire
+
 ## 0.0.7
 
 ### Patch Changes
