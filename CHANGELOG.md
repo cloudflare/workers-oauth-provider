@@ -1,5 +1,13 @@
 # @cloudflare/workers-oauth-provider
 
+## 0.0.9
+
+### Patch Changes
+
+- [#81](https://github.com/cloudflare/workers-oauth-provider/pull/81) [`d18b865`](https://github.com/cloudflare/workers-oauth-provider/commit/d18b865bb21a669993424da89ebca47d391644ba) Thanks [@deathbyknowledge](https://github.com/deathbyknowledge)! - Add resolveExternalToken to support external token auth flows
+
+  Adds resolveExternalToken to support auth for external tokens. The callback only runs IF internal auth check fails. E.g. a canonical OAuth server is used by multiple services, allowing server-server communication with the same token.
+
 ## 0.0.8
 
 ### Patch Changes
