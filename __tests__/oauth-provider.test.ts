@@ -3311,7 +3311,7 @@ describe('OAuthProvider', () => {
           externalTokenCalls.push({ token: input.token, startTime: Date.now() });
 
           // Simulate async work (e.g., calling external API)
-          await new Promise((resolve) => setTimeout(resolve, 10));
+          await new Promise((resolve) => setTimeout(resolve, 15));
 
           if (input.token === 'async-valid-token') {
             return {
