@@ -230,7 +230,7 @@ export interface OAuthProviderOptions {
    * For example, if a request includes an authenticated token from a different OAuth authentication server,
    * the callback can be used to authenticate it and set the context props through it.
    *
-   * The callback can optionally return props values that will passed-through to the apiHandlers.  
+   * The callback can optionally return props values that will passed-through to the apiHandlers.
    * The callback can return `null` to signal resolution failure.
    */
   resolveExternalToken?: (input: ResolveExternalTokenInput) => Promise<ResolveExternalTokenResult | null>;
