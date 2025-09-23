@@ -1,5 +1,11 @@
 # @cloudflare/workers-oauth-provider
 
+## 0.0.11
+
+### Patch Changes
+
+- [#78](https://github.com/cloudflare/workers-oauth-provider/pull/78) [`32560d1`](https://github.com/cloudflare/workers-oauth-provider/commit/32560d1e45fd74db8129b5d10d668a82deaff7f2) Thanks [@rc4](https://github.com/rc4)! - Use rejection sampling to avoid bias in `generateRandomString()`
+
 ## 0.0.10
 
 ### Patch Changes
