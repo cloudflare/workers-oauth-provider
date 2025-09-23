@@ -2230,7 +2230,7 @@ async function hashSecret(secret: string): Promise<string> {
  * @returns A random string of the specified length
  */
 function generateRandomString(length: number): string {
-  const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
   let result = '';
   const values = new Uint8Array(length);
   crypto.getRandomValues(values);
