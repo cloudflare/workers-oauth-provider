@@ -76,9 +76,10 @@ export interface TokenExchangeCallbackOptions {
   /**
    * The type of grant being processed.
    * 'authorization_code' for initial code exchange,
-   * 'refresh_token' for refresh token exchange.
+   * 'refresh_token' for refresh token exchange,
+   * 'client_credentials' for machine-to-machine authentication.
    */
-  grantType: 'authorization_code' | 'refresh_token';
+  grantType: 'authorization_code' | 'refresh_token' | 'client_credentials';
 
   /**
    * Client that received this grant
@@ -1249,7 +1250,7 @@ class OAuthProviderImpl {
       scopes_supported: this.options.scopesSupported,
       response_types_supported: responseTypesSupported,
       response_modes_supported: ['query'],
-      grant_types_supported: ['authorization_code', 'refresh_token'],
+      grant_types_supported: ['authorization_code', 'refresh_token', 'client_credentials'],
       // Support "none" auth method for public clients
       token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post', 'none'],
       // not implemented: token_endpoint_auth_signing_alg_values_supported
@@ -1287,6 +1288,8 @@ class OAuthProviderImpl {
       return this.handleAuthorizationCodeGrant(body, clientInfo, env);
     } else if (grantType === 'refresh_token') {
       return this.handleRefreshTokenGrant(body, clientInfo, env);
+    } else if (grantType === 'client_credentials') {
+      return this.handleClientCredentialsGrant(body, clientInfo, env);
     } else {
       return this.createErrorResponse('unsupported_grant_type', 'Grant type not supported');
     }
@@ -1780,6 +1783,127 @@ class OAuthProviderImpl {
     };
 
     // Return the tokens
+    return new Response(JSON.stringify(tokenResponse), {
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  /**
+   * Handles the client credentials grant type
+   * Issues an access token for machine-to-machine (M2M) authentication
+   * @param body - The parsed request body
+   * @param clientInfo - The authenticated client information
+   * @param env - Cloudflare Worker environment variables
+   * @returns Response with token data or error
+   */
+  private async handleClientCredentialsGrant(body: any, clientInfo: ClientInfo, env: any): Promise<Response> {
+    // Extract optional scope parameter
+    const requestedScope = body.scope ? body.scope.split(' ') : [];
+
+    // Validate scopes if any were requested
+    if (requestedScope.length > 0 && this.options.scopesSupported) {
+      const invalidScopes = requestedScope.filter((s: string) => !this.options.scopesSupported!.includes(s));
+      if (invalidScopes.length > 0) {
+        return this.createErrorResponse('invalid_scope', `Invalid scope(s): ${invalidScopes.join(', ')}`);
+      }
+    }
+
+    // For client_credentials, use client ID prefixed with 'client_' as the "user" identifier
+    const userId = `client_${clientInfo.clientId}`;
+
+    // Generate a unique grant ID for this token
+    const grantId = generateRandomString(16);
+
+    // Generate access token
+    const accessTokenSecret = generateRandomString(TOKEN_LENGTH);
+    const accessToken = `${userId}:${grantId}:${accessTokenSecret}`;
+    const accessTokenId = await generateTokenId(accessToken);
+
+    // Define the access token TTL, may be updated by callback if provided
+    let accessTokenTTL = this.options.accessTokenTTL!;
+
+    // Create minimal props for client credentials flow
+    const now = Math.floor(Date.now() / 1000);
+    let props: any = {
+      claims: {
+        sub: userId,
+        client_id: clientInfo.clientId,
+        type: 'machine',
+        iat: now,
+        exp: now + accessTokenTTL,
+      },
+    };
+
+    // Process token exchange callback if provided
+    if (this.options.tokenExchangeCallback) {
+      const callbackOptions: TokenExchangeCallbackOptions = {
+        grantType: 'client_credentials',
+        clientId: clientInfo.clientId,
+        userId: userId,
+        scope: requestedScope,
+        props: props,
+      };
+
+      const callbackResult = await Promise.resolve(this.options.tokenExchangeCallback(callbackOptions));
+
+      if (callbackResult) {
+        // Use new props if provided
+        if (callbackResult.accessTokenProps) {
+          props = callbackResult.accessTokenProps;
+        } else if (callbackResult.newProps) {
+          props = callbackResult.newProps;
+        }
+
+        // If accessTokenTTL was specified, use that
+        if (callbackResult.accessTokenTTL !== undefined) {
+          accessTokenTTL = callbackResult.accessTokenTTL;
+        }
+
+        // Update expiration time if props contain claims
+        if (props.claims) {
+          props.claims.exp = now + accessTokenTTL;
+        }
+      }
+    }
+
+    // Encrypt the props
+    const { encryptedData, key: encryptionKey } = await encryptProps(props);
+
+    // Wrap the encryption key with the access token
+    const accessTokenWrappedKey = await wrapKeyWithToken(accessToken, encryptionKey);
+
+    // Calculate the access token expiration time
+    const accessTokenExpiresAt = now + accessTokenTTL;
+
+    // Store access token with minimal grant information
+    const accessTokenData: Token = {
+      id: accessTokenId,
+      grantId: grantId,
+      userId: userId,
+      createdAt: now,
+      expiresAt: accessTokenExpiresAt,
+      wrappedEncryptionKey: accessTokenWrappedKey,
+      grant: {
+        clientId: clientInfo.clientId,
+        scope: requestedScope,
+        encryptedProps: encryptedData,
+      },
+    };
+
+    // Save access token with TTL
+    await env.OAUTH_KV.put(`token:${userId}:${grantId}:${accessTokenId}`, JSON.stringify(accessTokenData), {
+      expirationTtl: accessTokenTTL,
+    });
+
+    // Build the response (no refresh token for client_credentials)
+    const tokenResponse: TokenResponse = {
+      access_token: accessToken,
+      token_type: 'bearer',
+      expires_in: accessTokenTTL,
+      scope: requestedScope.join(' '),
+    }
+
+    // Return the token
     return new Response(JSON.stringify(tokenResponse), {
       headers: { 'Content-Type': 'application/json' },
     });

@@ -219,7 +219,7 @@ To use this feature, provide a `tokenExchangeCallback` in your OAuthProvider opt
 new OAuthProvider({
   // ... other options ...
   tokenExchangeCallback: async (options) => {
-    // options.grantType is either 'authorization_code' or 'refresh_token'
+    // options.grantType is 'authorization_code', 'refresh_token', or 'client_credentials'
     // options.props contains the current props
     // options.clientId, options.userId, and options.scope are also available
 
@@ -273,6 +273,139 @@ The callback can:
 The `accessTokenTTL` override is particularly useful when the application is also an OAuth client to another service and wants to match its access token TTL to the upstream access token TTL. This helps prevent situations where the downstream token is still valid but the upstream token has expired.
 
 The `props` values are end-to-end encrypted, so they can safely contain sensitive information.
+
+## Client Credentials Grant (Machine-to-Machine Authentication)
+
+This library supports the OAuth 2.0 `client_credentials` grant type for machine-to-machine (M2M) authentication. This grant type allows clients to authenticate directly using their client credentials without requiring user interaction or browser-based flows.
+
+### Use Cases
+
+The `client_credentials` grant is ideal for:
+- Automated test suites that need to access your API
+- CI/CD pipelines
+- Background workers or scheduled tasks
+- Server-to-server API calls
+- CLI tools and agents
+
+### How It Works
+
+Unlike the `authorization_code` grant which requires user authorization:
+- No user interaction or redirect URIs are used
+- The client authenticates directly with its `client_id` and `client_secret`
+- Only an access token is issued (no refresh token)
+- The client can request a new access token anytime using its credentials
+- The token props contain machine identity rather than user identity
+
+### Example Usage
+
+#### 1. Register a Client
+
+First, register a confidential client (clients with secrets):
+
+```ts
+const helpers = env.OAUTH_PROVIDER;
+const client = await helpers.createClient({
+  redirectUris: ['http://127.0.0.1:1'], // Dummy URI (required by spec but not used)
+  clientName: 'Automated Test Suite',
+  tokenEndpointAuthMethod: 'client_secret_basic',
+});
+
+// Save client.clientId and client.clientSecret securely
+```
+
+#### 2. Request an Access Token
+
+The client can now obtain an access token:
+
+```bash
+curl -X POST https://example.com/oauth/token \
+  -u "CLIENT_ID:CLIENT_SECRET" \
+  -d "grant_type=client_credentials" \
+  -d "scope=api.read api.write"
+```
+
+Or in JavaScript:
+
+```ts
+const tokenResponse = await fetch('https://example.com/oauth/token', {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/x-www-form-urlencoded',
+    'Authorization': `Basic ${btoa(`${clientId}:${clientSecret}`)}`
+  },
+  body: 'grant_type=client_credentials&scope=api.read api.write'
+});
+
+const { access_token, token_type, expires_in } = await tokenResponse.json();
+```
+
+#### 3. Use the Access Token
+
+Use the token to access protected API endpoints:
+
+```ts
+const apiResponse = await fetch('https://api.example.com/data', {
+  headers: {
+    'Authorization': `Bearer ${access_token}`
+  }
+});
+```
+
+### Token Props for Client Credentials
+
+When a `client_credentials` token is used to access your API, the `this.ctx.props` in your API handler will contain:
+
+```ts
+{
+  claims: {
+    sub: `client_${clientId}`,  // Subject identifier
+    client_id: clientId,         // Client ID
+    type: 'machine',             // Indicates M2M authentication
+    iat: 1234567890,            // Issued at timestamp
+    exp: 1234571490             // Expiration timestamp
+  }
+}
+```
+
+You can distinguish machine clients from user clients by checking `props.claims.type === 'machine'`.
+
+### Customizing Client Credentials Tokens
+
+The `tokenExchangeCallback` also works with `client_credentials`:
+
+```ts
+new OAuthProvider({
+  // ... other options ...
+  tokenExchangeCallback: async (options) => {
+    if (options.grantType === 'client_credentials') {
+      // options.userId will be `client_${clientId}`
+      // options.clientId contains the client ID
+      // options.props contains the default machine props
+
+      // Add custom permissions or metadata for this client
+      return {
+        accessTokenProps: {
+          ...options.props,
+          permissions: await loadClientPermissions(options.clientId),
+          environment: 'production'
+        },
+        // Optionally customize the TTL
+        accessTokenTTL: 7200 // 2 hours
+      };
+    }
+  }
+});
+```
+
+### Key Differences from Authorization Code Flow
+
+| Feature | authorization_code | client_credentials |
+|---------|-------------------|-------------------|
+| User interaction | Required | None |
+| Refresh tokens | Yes | No (use credentials to get new token) |
+| Redirect URIs | Required and used | Not used |
+| Identity | User identity | Machine/client identity |
+| Use case | User-facing apps | Server-to-server |
 
 ## Custom Error Responses
 

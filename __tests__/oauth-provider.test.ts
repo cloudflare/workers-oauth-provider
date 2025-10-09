@@ -3441,4 +3441,264 @@ describe('OAuthProvider', () => {
       expect(newTokens.refresh_token).toBeDefined();
     });
   });
+
+  describe('Client Credentials Grant Type', () => {
+    let clientId: string;
+    let clientSecret: string;
+
+    beforeEach(async () => {
+      // Register a confidential client for M2M testing
+      // Using dummy redirect_uri as it's required by spec but not used for client_credentials
+      const clientResponse = await oauthProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          {
+            'Content-Type': 'application/json',
+          },
+          JSON.stringify({
+            redirect_uris: ['http://127.0.0.1:1'],
+            client_name: 'M2M Test Client',
+            token_endpoint_auth_method: 'client_secret_basic',
+          })
+        ),
+        mockEnv,
+        mockCtx
+      );
+
+      expect(clientResponse.status).toBe(201);
+      const client = await clientResponse.json<any>();
+      clientId = client.client_id;
+      clientSecret = client.client_secret;
+    });
+
+    it('should issue access token for client_credentials grant', async () => {
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+        },
+        'grant_type=client_credentials'
+      );
+
+      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      expect(tokenResponse.status).toBe(200);
+
+      const tokens = await tokenResponse.json<any>();
+      expect(tokens.access_token).toBeDefined();
+      expect(tokens.token_type).toBe('bearer');
+      expect(tokens.expires_in).toBe(3600); // Default TTL
+      expect(tokens.refresh_token).toBeUndefined(); // No refresh token for client_credentials
+      expect(tokens.scope).toBe(''); // Empty scope when none requested
+    });
+
+    it('should issue token with requested scopes', async () => {
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+        },
+        'grant_type=client_credentials&scope=read write'
+      );
+
+      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      expect(tokenResponse.status).toBe(200);
+
+      const tokens = await tokenResponse.json<any>();
+      expect(tokens.scope).toBe('read write');
+    });
+
+    it('should reject invalid scopes', async () => {
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+        },
+        'grant_type=client_credentials&scope=invalid_scope'
+      );
+
+      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      expect(tokenResponse.status).toBe(400);
+
+      const error = await tokenResponse.json<any>();
+      expect(error.error).toBe('invalid_scope');
+    });
+
+    it('should use client_credentials token to access API', async () => {
+      // Get client_credentials token
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+        },
+        'grant_type=client_credentials&scope=read'
+      );
+
+      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      expect(tokenResponse.status).toBe(200);
+      const tokens = await tokenResponse.json<any>();
+
+      // Use the access token to call the API
+      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: `Bearer ${tokens.access_token}`,
+      });
+
+      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+      expect(apiResponse.status).toBe(200);
+
+      const data = await apiResponse.json<any>();
+      expect(data.user).toBeDefined();
+      expect(data.user.claims).toBeDefined();
+      expect(data.user.claims.sub).toBe(`client_${clientId}`);
+      expect(data.user.claims.client_id).toBe(clientId);
+      expect(data.user.claims.type).toBe('machine');
+    });
+
+    it('should require client authentication for client_credentials', async () => {
+      // Try without credentials
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        'grant_type=client_credentials'
+      );
+
+      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      expect(tokenResponse.status).toBe(401);
+
+      const error = await tokenResponse.json<any>();
+      expect(error.error).toBe('invalid_client');
+    });
+
+    it('should reject client_credentials with invalid client secret', async () => {
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${clientId}:wrong-secret`)}`,
+        },
+        'grant_type=client_credentials'
+      );
+
+      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      expect(tokenResponse.status).toBe(401);
+
+      const error = await tokenResponse.json<any>();
+      expect(error.error).toBe('invalid_client');
+    });
+
+    it('should call tokenExchangeCallback for client_credentials', async () => {
+      const callbackMock = vi.fn((options) => {
+        expect(options.grantType).toBe('client_credentials');
+        expect(options.clientId).toBe(clientId);
+        expect(options.userId).toBe(`client_${clientId}`);
+        expect(options.props.claims.type).toBe('machine');
+
+        return {
+          accessTokenProps: {
+            ...options.props,
+            customData: 'from-callback',
+          },
+        };
+      });
+
+      const providerWithCallback = new OAuthProvider({
+        apiRoute: 'https://example.com/api',
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: 'https://example.com/authorize',
+        tokenEndpoint: 'https://example.com/oauth/token',
+        clientRegistrationEndpoint: 'https://example.com/oauth/register',
+        scopesSupported: ['read', 'write'],
+        tokenExchangeCallback: callbackMock,
+      });
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+        },
+        'grant_type=client_credentials&scope=read'
+      );
+
+      const tokenResponse = await providerWithCallback.fetch(tokenRequest, mockEnv, mockCtx);
+      expect(tokenResponse.status).toBe(200);
+      expect(callbackMock).toHaveBeenCalledTimes(1);
+
+      const tokens = await tokenResponse.json<any>();
+
+      // Verify the custom data is in the token
+      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: `Bearer ${tokens.access_token}`,
+      });
+
+      const apiResponse = await providerWithCallback.fetch(apiRequest, mockEnv, mockCtx);
+      expect(apiResponse.status).toBe(200);
+
+      const data = await apiResponse.json<any>();
+      expect(data.user.customData).toBe('from-callback');
+    });
+
+    it('should allow customizing access token TTL via callback for client_credentials', async () => {
+      const customTTL = 7200; // 2 hours
+
+      const providerWithCallback = new OAuthProvider({
+        apiRoute: 'https://example.com/api',
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: 'https://example.com/authorize',
+        tokenEndpoint: 'https://example.com/oauth/token',
+        clientRegistrationEndpoint: 'https://example.com/oauth/register',
+        scopesSupported: ['read', 'write'],
+        tokenExchangeCallback: (options) => {
+          if (options.grantType === 'client_credentials') {
+            return {
+              accessTokenTTL: customTTL,
+            };
+          }
+        },
+      });
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+        },
+        'grant_type=client_credentials'
+      );
+
+      const tokenResponse = await providerWithCallback.fetch(tokenRequest, mockEnv, mockCtx);
+      expect(tokenResponse.status).toBe(200);
+
+      const tokens = await tokenResponse.json<any>();
+      expect(tokens.expires_in).toBe(customTTL);
+    });
+
+    it('should include client_credentials in metadata grant_types_supported', async () => {
+      const metadataRequest = createMockRequest('https://example.com/.well-known/oauth-authorization-server');
+
+      const metadataResponse = await oauthProvider.fetch(metadataRequest, mockEnv, mockCtx);
+      expect(metadataResponse.status).toBe(200);
+
+      const metadata = await metadataResponse.json<any>();
+      expect(metadata.grant_types_supported).toContain('client_credentials');
+      expect(metadata.grant_types_supported).toContain('authorization_code');
+      expect(metadata.grant_types_supported).toContain('refresh_token');
+    });
+  });
 });
