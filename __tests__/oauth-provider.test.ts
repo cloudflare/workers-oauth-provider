@@ -565,6 +565,36 @@ describe('OAuthProvider', () => {
       const grants = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
       expect(grants.keys.length).toBe(0);
     });
+
+    it('should reject completeAuthorization if redirect_uri is invalid', async () => {
+      // This test ensures that completeAuthorization re-validates the redirect_uri.
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read&state=xyz123`
+      );
+
+      // Manually trigger the fetch to populate env.OAUTH_PROVIDER
+      await oauthProvider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
+      const helpers = mockEnv.OAUTH_PROVIDER!;
+
+      // Parse the request to get a valid AuthRequest object
+      const oauthReqInfo = await helpers.parseAuthRequest(authRequest);
+
+      // Manually tamper with the redirect_uri after parsing
+      const tamperedRequest = { ...oauthReqInfo, redirectUri: 'https://attacker.com' };
+
+      // Expect completeAuthorization to throw because the redirect_uri is not registered
+      await expect(
+        helpers.completeAuthorization({
+          request: tamperedRequest,
+          userId: 'test-user-123',
+          metadata: {},
+          scope: tamperedRequest.scope,
+          props: {},
+        })
+      ).rejects.toThrow('Invalid redirect URI');
+    });
   });
 
   describe('Implicit Flow', () => {
