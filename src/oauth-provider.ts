@@ -15,13 +15,13 @@ enum HandlerType {
  */
 type TypedHandler =
   | {
-    type: HandlerType.EXPORTED_HANDLER;
-    handler: ExportedHandlerWithFetch;
-  }
+      type: HandlerType.EXPORTED_HANDLER;
+      handler: ExportedHandlerWithFetch;
+    }
   | {
-    type: HandlerType.WORKER_ENTRYPOINT;
-    handler: new (ctx: ExecutionContext, env: any) => WorkerEntrypointWithFetch;
-  };
+      type: HandlerType.WORKER_ENTRYPOINT;
+      handler: new (ctx: ExecutionContext, env: any) => WorkerEntrypointWithFetch;
+    };
 
 /**
  * Aliases for either type of Handler that makes .fetch required
@@ -809,7 +809,7 @@ class OAuthProviderImpl {
     if (hasSingleHandlerConfig && hasMultiHandlerConfig) {
       throw new TypeError(
         'Cannot use both apiRoute/apiHandler and apiHandlers. ' +
-        'Use either apiRoute + apiHandler OR apiHandlers, not both.'
+          'Use either apiRoute + apiHandler OR apiHandlers, not both.'
       );
     }
 
@@ -1051,10 +1051,10 @@ class OAuthProviderImpl {
     env: any
   ): Promise<
     | {
-      body: any;
-      clientInfo: ClientInfo;
-      isRevocationRequest: boolean;
-    }
+        body: any;
+        clientInfo: ClientInfo;
+        isRevocationRequest: boolean;
+      }
     | Response
   > {
     // Only accept POST requests
