@@ -15,13 +15,13 @@ enum HandlerType {
  */
 type TypedHandler =
   | {
-      type: HandlerType.EXPORTED_HANDLER;
-      handler: ExportedHandlerWithFetch;
-    }
+    type: HandlerType.EXPORTED_HANDLER;
+    handler: ExportedHandlerWithFetch;
+  }
   | {
-      type: HandlerType.WORKER_ENTRYPOINT;
-      handler: new (ctx: ExecutionContext, env: any) => WorkerEntrypointWithFetch;
-    };
+    type: HandlerType.WORKER_ENTRYPOINT;
+    handler: new (ctx: ExecutionContext, env: any) => WorkerEntrypointWithFetch;
+  };
 
 /**
  * Aliases for either type of Handler that makes .fetch required
@@ -278,6 +278,21 @@ export interface OAuthHelpers {
    * @returns The parsed authorization request parameters
    */
   parseAuthRequest(request: Request): Promise<AuthRequest>;
+
+  /**
+   * Stores an OAuth authorization request in the internal KV store
+   * @param id - The ID used to identify the authorization request
+   * @param authRequest - The authorization request to store
+   * @returns A Promise resolving to void
+   */
+  storeAuthRequest(id: string, authRequest: Partial<AuthRequest>): Promise<void>;
+
+  /**
+   * Looks up an OAuth authorization request by its ID
+   * @param id - The ID of the authorization request to look up
+   * @returns A Promise resolving to the authorization request, or null if not found
+   */
+  getAuthRequest(id: string): Promise<Partial<AuthRequest> | null>;
 
   /**
    * Looks up a client by its client ID
@@ -794,7 +809,7 @@ class OAuthProviderImpl {
     if (hasSingleHandlerConfig && hasMultiHandlerConfig) {
       throw new TypeError(
         'Cannot use both apiRoute/apiHandler and apiHandlers. ' +
-          'Use either apiRoute + apiHandler OR apiHandlers, not both.'
+        'Use either apiRoute + apiHandler OR apiHandlers, not both.'
       );
     }
 
@@ -1036,10 +1051,10 @@ class OAuthProviderImpl {
     env: any
   ): Promise<
     | {
-        body: any;
-        clientInfo: ClientInfo;
-        isRevocationRequest: boolean;
-      }
+      body: any;
+      clientInfo: ClientInfo;
+      isRevocationRequest: boolean;
+    }
     | Response
   > {
     // Only accept POST requests
@@ -2521,6 +2536,26 @@ class OAuthHelpersImpl implements OAuthHelpers {
       codeChallenge,
       codeChallengeMethod,
     };
+  }
+
+  /**
+   * Stores the authorization request in the KV store
+   * @param id - The unique identifier for the request
+   * @param authRequest - The authorization request to store
+   * @returns A Promise resolving when the request is stored
+   */
+  async storeAuthRequest(id: string, authRequest: Partial<AuthRequest>): Promise<void> {
+    return await this.env.OAUTH_KV.put(`authRequest:${id}`, JSON.stringify(authRequest));
+  }
+
+  /**
+   * Retrieves an authorization request from the KV store
+   * @param id - The unique identifier for the request
+   * @returns A Promise resolving to the authorization request, or null if not found
+   */
+  async getAuthRequest(id: string): Promise<Partial<AuthRequest> | null> {
+    const authRequestStr = await this.env.OAUTH_KV.get(`authRequest:${id}`);
+    return authRequestStr ? JSON.parse(authRequestStr) : null;
   }
 
   /**

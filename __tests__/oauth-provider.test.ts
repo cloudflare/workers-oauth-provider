@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
-import { OAuthProvider, type OAuthHelpers } from '../src/oauth-provider';
+import { AuthRequest, OAuthProvider, type OAuthHelpers } from '../src/oauth-provider';
 import type { ExecutionContext } from '@cloudflare/workers-types';
 // We're importing WorkerEntrypoint from our mock implementation
 // The actual import is mocked in setup.ts
@@ -3469,6 +3469,68 @@ describe('OAuthProvider', () => {
       const newTokens = await refreshResponse.json<any>();
       expect(newTokens.access_token).toBeDefined();
       expect(newTokens.refresh_token).toBeDefined();
+    });
+  });
+
+  describe('Store and Retrieve AuthRequest', () => {
+    let clientId: string;
+    let clientSecret: string;
+    let redirectUri: string;
+
+    // Helper to create a test client before authorization tests
+    async function createTestClient() {
+      const clientData = {
+        redirect_uris: ['https://client.example.com/callback'],
+        client_name: 'Test Client',
+        token_endpoint_auth_method: 'client_secret_basic',
+      };
+
+      const request = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify(clientData)
+      );
+
+      const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
+      const client = await response.json<any>();
+
+      clientId = client.client_id;
+      clientSecret = client.client_secret;
+      redirectUri = 'https://client.example.com/callback';
+    }
+
+    beforeEach(async () => {
+      await createTestClient();
+    });
+
+    it('should store and retrieve an authorization request', async () => {
+      const authRequestId = 'test-auth-req-123';
+      const authRequestData: AuthRequest = {
+        responseType: 'code',
+        clientId: 'test-client',
+        redirectUri: 'https://client.example.com/callback',
+        scope: ['read', 'write'],
+        state: 'xyz123',
+      };
+
+      await oauthProvider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
+      const helpers = mockEnv.OAUTH_PROVIDER!;
+
+      await helpers.storeAuthRequest(authRequestId, authRequestData);
+      const retrievedRequest = await helpers.getAuthRequest(authRequestId);
+
+      expect(retrievedRequest).toEqual(authRequestData);
+      const kvData = await mockEnv.OAUTH_KV.get(`authRequest:${authRequestId}`, { type: 'json' });
+      expect(kvData).toEqual(authRequestData);
+    });
+
+    it('getAuthRequest should return null for a non-existent request', async () => {
+      await oauthProvider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
+      const helpers = mockEnv.OAUTH_PROVIDER!;
+
+      const retrievedRequest = await helpers.getAuthRequest('non-existent-id');
+      expect(retrievedRequest).toBeNull();
     });
   });
 });
