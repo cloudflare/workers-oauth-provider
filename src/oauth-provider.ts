@@ -2540,6 +2540,20 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * @returns A Promise resolving to an object containing the redirect URL
    */
   async completeAuthorization(options: CompleteAuthorizationOptions): Promise<{ redirectTo: string }> {
+    const { clientId, redirectUri } = options.request;
+
+    if (!clientId || !redirectUri) {
+      throw new Error('Client ID and Redirect URI are required in the authorization request.');
+    }
+
+    // Re-validate the redirectUri to prevent open redirect vulnerabilities
+    const clientInfo = await this.lookupClient(clientId);
+    if (!clientInfo || !clientInfo.redirectUris.includes(redirectUri)) {
+      throw new Error(
+        'Invalid redirect URI. The redirect URI provided does not match any registered URI for this client.'
+      );
+    }
+
     // Generate a unique grant ID
     const grantId = generateRandomString(16);
 
