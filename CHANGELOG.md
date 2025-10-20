@@ -1,5 +1,11 @@
 # @cloudflare/workers-oauth-provider
 
+## 0.0.12
+
+### Patch Changes
+
+- [#92](https://github.com/cloudflare/workers-oauth-provider/pull/92) [`5a59d78`](https://github.com/cloudflare/workers-oauth-provider/commit/5a59d780ee1285546216b21265ff9c7c8435a2ba) Thanks [@roerohan](https://github.com/roerohan)! - fix: open redirect vulnerability in completeAuthorization
+
 ## 0.0.11
 
 ### Patch Changes
