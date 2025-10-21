@@ -460,7 +460,7 @@ describe('OAuthProvider', () => {
 
         const response = await providerWithValidator.fetch(request, mockEnv, mockCtx);
         expect(response.status).toBe(201);
-        expect(validateClientRegistration).toHaveBeenCalledWith(clientData, expect.any(Request));
+        expect(validateClientRegistration).toHaveBeenCalledWith(expect.any(Request), clientData);
       });
 
       it('should deny registration when validator returns false', async () => {
@@ -491,7 +491,7 @@ describe('OAuthProvider', () => {
         const error = await response.json<any>();
         expect(error.error).toBe('access_denied');
         expect(error.error_description).toBe('Client registration denied by policy');
-        expect(validateClientRegistration).toHaveBeenCalledWith(clientData, expect.any(Request));
+        expect(validateClientRegistration).toHaveBeenCalledWith(expect.any(Request), clientData);
       });
 
       it('should allow registration with an async validator that returns true', async () => {
@@ -519,7 +519,7 @@ describe('OAuthProvider', () => {
 
         const response = await providerWithValidator.fetch(request, mockEnv, mockCtx);
         expect(response.status).toBe(201);
-        expect(validateClientRegistration).toHaveBeenCalledWith(clientData, expect.any(Request));
+        expect(validateClientRegistration).toHaveBeenCalledWith(expect.any(Request), clientData);
       });
     });
   });

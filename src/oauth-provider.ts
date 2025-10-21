@@ -248,7 +248,7 @@ export interface OAuthProviderOptions {
    * @param request - The original HTTP request
    * @returns Promise<boolean> indicating if the registration is allowed
    */
-  validateClientRegistration?: (clientMetadata: Partial<ClientInfo>, request: Request) => Promise<boolean> | boolean;
+  validateClientRegistration?: (request: Request, clientMetadata: Partial<ClientInfo>) => Promise<boolean> | boolean;
 
   /**
    * Optional callback function that is called when a provided token was not found in the internal KV.
@@ -1930,7 +1930,7 @@ class OAuthProviderImpl {
 
     // Validate the client registration if a validator function is provided
     if (this.options.validateClientRegistration) {
-      const isAllowed = await this.options.validateClientRegistration(clientMetadata, request);
+      const isAllowed = await this.options.validateClientRegistration(request, clientMetadata);
       if (!isAllowed) {
         return this.createErrorResponse('access_denied', 'Client registration denied by policy', 403);
       }

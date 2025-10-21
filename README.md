@@ -25,7 +25,7 @@ The library does not and cannot handle CSRF prevention on its own, as this requi
 
 The library supports dynamic client registration through the `clientRegistrationEndpoint` option. When this endpoint is enabled, anyone can register a client by default. It is your responsibility to restrict which clients can be registered.
 
-To control which clients can register, you can provide a `validateClientRegistration` callback in the `OAuthProvider` options. This function receives the client's metadata and the original request, and it should return `true` to allow registration or `false` to deny it.
+To control which clients can register, you can provide a `validateClientRegistration` callback in the `OAuthProvider` options. This function receives the request and the client's metadata, and it should return `true` to allow registration or `false` to deny it.
 
 Here is an example of how you can use this callback to restrict registration:
 
@@ -33,7 +33,7 @@ Here is an example of how you can use this callback to restrict registration:
 new OAuthProvider({
   // ... other options ...
   clientRegistrationEndpoint: "/oauth/register",
-  validateClientRegistration: (clientMetadata, request) => {
+  validateClientRegistration: (request, clientMetadata) => {
     // Example: Only allow clients with a specific contact email domain
     const allowedEmailDomain = "@example.com";
     if (!clientMetadata.contacts?.some((email) => email.endsWith(allowedEmailDomain))) {
