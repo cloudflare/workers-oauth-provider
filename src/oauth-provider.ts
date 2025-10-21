@@ -285,7 +285,11 @@ export interface OAuthHelpers {
    * @param authRequest - The authorization request to store
    * @returns A Promise resolving to void
    */
-  storeAuthRequest<T extends Partial<AuthRequest>>(id: string, authRequest: T): Promise<void>;
+  storeAuthRequest<T extends Partial<AuthRequest>>(
+    id: string,
+    authRequest: T,
+    options?: { ttl?: number }
+  ): Promise<void>;
 
   /**
    * Looks up an OAuth authorization request by its ID
@@ -2544,8 +2548,14 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * @param authRequest - The authorization request to store
    * @returns A Promise resolving when the request is stored
    */
-  async storeAuthRequest<T extends Partial<AuthRequest>>(id: string, authRequest: T): Promise<void> {
-    return await this.env.OAUTH_KV.put(`authRequest:${id}`, JSON.stringify(authRequest));
+  async storeAuthRequest<T extends Partial<AuthRequest>>(
+    id: string,
+    authRequest: T,
+    options: { ttl?: number } = { ttl: 60 * 10 }
+  ): Promise<void> {
+    return await this.env.OAUTH_KV.put(`authRequest:${id}`, JSON.stringify(authRequest), {
+      expirationTtl: options?.ttl,
+    });
   }
 
   /**

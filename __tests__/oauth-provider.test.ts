@@ -3532,5 +3532,37 @@ describe('OAuthProvider', () => {
       const retrievedRequest = await helpers.getAuthRequest('non-existent-id');
       expect(retrievedRequest).toBeNull();
     });
+
+    it('should expire a stored authorization request after the TTL', async () => {
+      const authRequestId = 'test-auth-req-ttl';
+      const authRequestData: AuthRequest = {
+        responseType: 'code',
+        clientId: 'test-client',
+        redirectUri: 'https://client.example.com/callback',
+        scope: ['read'],
+        state: 'ttl-test',
+      };
+
+      await oauthProvider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
+      const helpers = mockEnv.OAUTH_PROVIDER!;
+
+      // Store with a 1-second TTL
+      await helpers.storeAuthRequest(authRequestId, authRequestData, { ttl: 1 });
+
+      // Should be retrievable immediately
+      const immediateRetrieve = await helpers.getAuthRequest(authRequestId);
+      expect(immediateRetrieve).toEqual(authRequestData);
+
+      // Wait for 2 seconds for the item to expire
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+
+      // Should be null after expiration
+      const expiredRetrieve = await helpers.getAuthRequest(authRequestId);
+      expect(expiredRetrieve).toBeNull();
+
+      // Also check the underlying KV store to be sure
+      const kvData = await mockEnv.OAUTH_KV.get(`authRequest:${authRequestId}`);
+      expect(kvData).toBeNull();
+    });
   });
 });
