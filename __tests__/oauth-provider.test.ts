@@ -433,6 +433,95 @@ describe('OAuthProvider', () => {
       expect(savedClient).not.toBeNull();
       expect(savedClient.clientSecret).toBeUndefined(); // No secret stored
     });
+
+    describe('with validateClientRegistration callback', () => {
+      it('should allow registration when validator returns true', async () => {
+        const validateClientRegistration = vi.fn().mockReturnValue(true);
+        const providerWithValidator = new OAuthProvider({
+          apiRoute: ['/api/'],
+          apiHandler: TestApiHandler,
+          defaultHandler: testDefaultHandler,
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: '/oauth/token',
+          clientRegistrationEndpoint: '/oauth/register',
+          validateClientRegistration,
+        });
+
+        const clientData = {
+          redirect_uris: ['https://client.example.com/callback'],
+          client_name: 'Validated Client',
+        };
+        const request = createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify(clientData)
+        );
+
+        const response = await providerWithValidator.fetch(request, mockEnv, mockCtx);
+        expect(response.status).toBe(201);
+        expect(validateClientRegistration).toHaveBeenCalledWith(clientData, expect.any(Request));
+      });
+
+      it('should deny registration when validator returns false', async () => {
+        const validateClientRegistration = vi.fn().mockReturnValue(false);
+        const providerWithValidator = new OAuthProvider({
+          apiRoute: ['/api/'],
+          apiHandler: TestApiHandler,
+          defaultHandler: testDefaultHandler,
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: '/oauth/token',
+          clientRegistrationEndpoint: '/oauth/register',
+          validateClientRegistration,
+        });
+
+        const clientData = {
+          redirect_uris: ['https://client.example.com/callback'],
+          client_name: 'Denied Client',
+        };
+        const request = createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify(clientData)
+        );
+
+        const response = await providerWithValidator.fetch(request, mockEnv, mockCtx);
+        expect(response.status).toBe(403);
+        const error = await response.json<any>();
+        expect(error.error).toBe('access_denied');
+        expect(error.error_description).toBe('Client registration denied by policy');
+        expect(validateClientRegistration).toHaveBeenCalledWith(clientData, expect.any(Request));
+      });
+
+      it('should allow registration with an async validator that returns true', async () => {
+        const validateClientRegistration = vi.fn().mockResolvedValue(true);
+        const providerWithValidator = new OAuthProvider({
+          apiRoute: ['/api/'],
+          apiHandler: TestApiHandler,
+          defaultHandler: testDefaultHandler,
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: '/oauth/token',
+          clientRegistrationEndpoint: '/oauth/register',
+          validateClientRegistration,
+        });
+
+        const clientData = {
+          redirect_uris: ['https://client.example.com/callback'],
+          client_name: 'Async Validated Client',
+        };
+        const request = createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify(clientData)
+        );
+
+        const response = await providerWithValidator.fetch(request, mockEnv, mockCtx);
+        expect(response.status).toBe(201);
+        expect(validateClientRegistration).toHaveBeenCalledWith(clientData, expect.any(Request));
+      });
+    });
   });
 
   describe('Authorization Code Flow', () => {
