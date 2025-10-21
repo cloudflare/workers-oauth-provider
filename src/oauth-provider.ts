@@ -240,6 +240,17 @@ export interface OAuthProviderOptions {
   ) => Promise<TokenExchangeCallbackResult | void> | TokenExchangeCallbackResult | void;
 
   /**
+   * Optional callback function to validate dynamic client registration requests.
+   * If provided, this function is called before a new client is registered.
+   * It should return `true` to allow registration or `false` to deny it.
+   * This allows for custom logic to restrict which clients can be registered.
+   * @param clientMetadata - The metadata of the client being registered
+   * @param request - The original HTTP request
+   * @returns Promise<boolean> indicating if the registration is allowed
+   */
+  validateClientRegistration?: (clientMetadata: Partial<ClientInfo>, request: Request) => Promise<boolean> | boolean;
+
+  /**
    * Optional callback function that is called when a provided token was not found in the internal KV.
    * This allows authentication through external OAuth servers.
    * For example, if a request includes an authenticated token from a different OAuth authentication server,
@@ -1915,6 +1926,14 @@ class OAuthProviderImpl {
       clientMetadata = JSON.parse(text);
     } catch (error) {
       return this.createErrorResponse('invalid_request', 'Invalid JSON payload', 400);
+    }
+
+    // Validate the client registration if a validator function is provided
+    if (this.options.validateClientRegistration) {
+      const isAllowed = await this.options.validateClientRegistration(clientMetadata, request);
+      if (!isAllowed) {
+        return this.createErrorResponse('access_denied', 'Client registration denied by policy', 403);
+      }
     }
 
     // Basic type validation functions
