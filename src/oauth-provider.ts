@@ -283,6 +283,7 @@ export interface OAuthHelpers {
    * Stores an OAuth authorization request in the internal KV store
    * @param id - The ID used to identify the authorization request
    * @param authRequest - The authorization request to store
+   * @param options - Options for the storage operation
    * @returns A Promise resolving to void
    */
   storeAuthRequest<T extends Partial<AuthRequest>>(
@@ -2546,6 +2547,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * Stores the authorization request in the KV store
    * @param id - The unique identifier for the request
    * @param authRequest - The authorization request to store
+   * @param options - Options for the storage operation
    * @returns A Promise resolving when the request is stored
    */
   async storeAuthRequest<T extends Partial<AuthRequest>>(
