@@ -11,6 +11,53 @@ This is a TypeScript library that implements the provider side of the OAuth 2.1 
 * The library is agnostic to how you build your UI. Your authorization flow can be implemented using whatever UI framework you use for everything else.
 * The library's storage does not store any secrets, only hashes of them.
 
+## Security Note
+
+The library implements the OAuth 2.1 protocol with PKCE support. However, the following considerations should be taken into account:
+
+### CSRF Prevention
+
+To prevent Cross-Site Request Forgery (CSRF) attacks, it is crucial that your client application sends a unique and non-guessable `state` parameter in the authorization request. The library will include this `state` value when redirecting back to your application. Your application should then verify that the `state` value matches the one it originally sent.
+
+The library does not and cannot handle CSRF prevention on its own, as this requires state management on the client-side. For more details, refer to the [OAuth 2.1 RFC on the state parameter](https://datatracker.ietf.org/doc/html/rfc6749#section-10.12).
+
+### Dynamic Client Registration
+
+The library supports dynamic client registration through the `clientRegistrationEndpoint` option. When this endpoint is enabled, anyone can register a client by default. It is your responsibility to restrict which clients can be registered.
+
+To control which clients can register, you can provide a `validateClientRegistration` callback in the `OAuthProvider` options. This function receives the client's metadata and the original request, and it should return `true` to allow registration or `false` to deny it.
+
+Here is an example of how you can use this callback to restrict registration:
+
+```ts
+new OAuthProvider({
+  // ... other options ...
+  clientRegistrationEndpoint: "/oauth/register",
+  validateClientRegistration: (clientMetadata, request) => {
+    // Example: Only allow clients with a specific contact email domain
+    const allowedEmailDomain = "@example.com";
+    if (!clientMetadata.contacts?.some((email) => email.endsWith(allowedEmailDomain))) {
+      return false;
+    }
+
+    // Example: Check for an authorization token on the registration request
+    const authToken = request.headers.get("Authorization");
+    if (authToken !== "Bearer some-secret-token") {
+      return false;
+    }
+
+    // Example: Validate the client's redirect URIs against an allowlist
+    const allowedRedirectDomain = "myapp.com";
+    if (!clientMetadata.redirect_uris?.every((uri) => new URL(uri).hostname.endsWith(allowedRedirectDomain))) {
+      return false;
+    }
+
+    // If all checks pass, allow the registration
+    return true;
+  },
+});
+```
+
 ## Usage
 
 A Worker that uses the library might look like this:
