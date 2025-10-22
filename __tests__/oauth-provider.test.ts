@@ -3564,5 +3564,32 @@ describe('OAuthProvider', () => {
       const kvData = await mockEnv.OAUTH_KV.get(`authRequest:${authRequestId}`);
       expect(kvData).toBeNull();
     });
+
+    it('should delete a stored authorization request', async () => {
+      const authRequestId = 'test-auth-request-456';
+      const authRequestData: AuthRequest = {
+        responseType: 'code',
+        clientId: 'test-client-2',
+        redirectUri: 'https://client.example.com/callback2',
+        scope: ['profile'],
+        state: 'abc456',
+      };
+      await oauthProvider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
+      const helpers = mockEnv.OAUTH_PROVIDER!;
+
+      // Store the request first
+      await helpers.storeAuthRequest(authRequestId, authRequestData, { ttl: 600 });
+
+      // Verify it's stored
+      const storedRequest = await helpers.getAuthRequest(authRequestId);
+      expect(storedRequest).toEqual(authRequestData);
+
+      // Delete the request
+      await helpers.deleteAuthRequest(authRequestId);
+
+      // Verify it's deleted
+      const deletedRequest = await helpers.getAuthRequest(authRequestId);
+      expect(deletedRequest).toBeNull();
+    });
   });
 });
