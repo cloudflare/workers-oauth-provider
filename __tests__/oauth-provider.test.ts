@@ -734,6 +734,286 @@ describe('OAuthProvider', () => {
     });
   });
 
+  describe('Redirect URI Scheme Validation (Security)', () => {
+    let clientId: string;
+    let clientSecret: string;
+    let redirectUri: string;
+
+    // Helper to create a test client before authorization tests
+    async function createTestClient() {
+      const clientData = {
+        redirect_uris: ['https://client.example.com/callback'],
+        client_name: 'Test Client',
+        token_endpoint_auth_method: 'client_secret_basic',
+      };
+
+      const request = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify(clientData)
+      );
+
+      const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
+      const client = await response.json<any>();
+
+      clientId = client.client_id;
+      clientSecret = client.client_secret;
+      redirectUri = 'https://client.example.com/callback';
+    }
+
+    beforeEach(async () => {
+      await createTestClient();
+    });
+
+    describe('should reject dangerous pseudo-schemes (case-sensitive baseline)', () => {
+      const dangerousSchemes = [
+        'javascript:alert(1)',
+        'data:text/html,<script>alert(1)</script>',
+        'vbscript:msgbox(1)',
+        'file:///etc/passwd',
+        'mailto:attacker@evil.com',
+        'blob:https://example.com/uuid',
+      ];
+
+      dangerousSchemes.forEach((maliciousUri) => {
+        it(`should reject ${maliciousUri.split(':')[0]}: scheme`, async () => {
+          const authRequest = createMockRequest(
+            `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+              `&redirect_uri=${encodeURIComponent(maliciousUri)}` +
+              `&scope=read&state=xyz123`
+          );
+
+          await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
+            'Invalid redirect URI'
+          );
+
+          // Verify no grant was created
+          const grants = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+          expect(grants.keys.length).toBe(0);
+        });
+      });
+    });
+
+    describe('should block mixed-case scheme bypass attempts', () => {
+      const mixedCaseSchemes = [
+        'JaVaScRiPt:alert(1)',
+        'JAVASCRIPT:alert(1)',
+        'JavaScript:alert(1)',
+        'DaTa:text/html,<script>alert(1)</script>',
+        'DATA:text/html,<script>alert(1)</script>',
+        'VbScRiPt:msgbox(1)',
+        'VBSCRIPT:msgbox(1)',
+        'FiLe:///etc/passwd',
+        'FILE:///etc/passwd',
+        'MaIlTo:attacker@evil.com',
+        'MAILTO:attacker@evil.com',
+        'BlOb:https://example.com/uuid',
+        'BLOB:https://example.com/uuid',
+      ];
+
+      mixedCaseSchemes.forEach((maliciousUri) => {
+        it(`should reject ${maliciousUri}`, async () => {
+          const authRequest = createMockRequest(
+            `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+              `&redirect_uri=${encodeURIComponent(maliciousUri)}` +
+              `&scope=read&state=xyz123`
+          );
+
+          await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
+            'Invalid redirect URI'
+          );
+
+          // Verify no grant was created
+          const grants = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+          expect(grants.keys.length).toBe(0);
+        });
+      });
+    });
+
+    describe('should block leading whitespace/control character bypass attempts', () => {
+      const bypassAttempts = [
+        { desc: 'leading space', uri: ' javascript:alert(1)' },
+        { desc: 'leading tab', uri: '\tjavascript:alert(1)' },
+        { desc: 'leading newline', uri: '\njavascript:alert(1)' },
+        { desc: 'leading carriage return', uri: '\rjavascript:alert(1)' },
+        { desc: 'leading null byte', uri: '\x00javascript:alert(1)' },
+        { desc: 'multiple leading spaces', uri: '   javascript:alert(1)' },
+        { desc: 'leading vertical tab', uri: '\x0Bjavascript:alert(1)' },
+        { desc: 'leading form feed', uri: '\x0Cjavascript:alert(1)' },
+        { desc: 'trailing space with javascript', uri: ' javascript:alert(1) ' },
+      ];
+
+      bypassAttempts.forEach(({ desc, uri }) => {
+        it(`should reject URI with ${desc}`, async () => {
+          const authRequest = createMockRequest(
+            `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+              `&redirect_uri=${encodeURIComponent(uri)}` +
+              `&scope=read&state=xyz123`
+          );
+
+          await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
+            'Invalid redirect URI'
+          );
+
+          // Verify no grant was created
+          const grants = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+          expect(grants.keys.length).toBe(0);
+        });
+      });
+    });
+
+    describe('should block embedded control character bypass attempts', () => {
+      const bypassAttempts = [
+        { desc: 'tab in scheme name', uri: 'jav\tascript:alert(1)' },
+        { desc: 'newline in scheme name', uri: 'java\nscript:alert(1)' },
+        { desc: 'null byte in scheme name', uri: 'java\x00script:alert(1)' },
+        { desc: 'carriage return in scheme', uri: 'java\rscript:alert(1)' },
+        { desc: 'vertical tab in scheme', uri: 'java\x0Bscript:alert(1)' },
+        { desc: 'form feed in scheme', uri: 'java\x0Cscript:alert(1)' },
+        { desc: 'multiple control chars', uri: 'ja\x00va\tsc\nript:alert(1)' },
+      ];
+
+      bypassAttempts.forEach(({ desc, uri }) => {
+        it(`should reject URI with ${desc}`, async () => {
+          const authRequest = createMockRequest(
+            `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+              `&redirect_uri=${encodeURIComponent(uri)}` +
+              `&scope=read&state=xyz123`
+          );
+
+          await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
+            'Invalid redirect URI'
+          );
+
+          // Verify no grant was created
+          const grants = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+          expect(grants.keys.length).toBe(0);
+        });
+      });
+    });
+
+    describe('should block data: URI variations', () => {
+      const dataUriVariants = [
+        'data:text/html,<script>alert(1)</script>',
+        'DaTa:text/html,<script>alert(1)</script>',
+        ' data:text/html,<script>alert(1)</script>',
+        'da\tta:text/html,<script>alert(1)</script>',
+        'data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==',
+      ];
+
+      dataUriVariants.forEach((uri) => {
+        it(`should reject ${uri.substring(0, 30)}...`, async () => {
+          const authRequest = createMockRequest(
+            `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+              `&redirect_uri=${encodeURIComponent(uri)}` +
+              `&scope=read&state=xyz123`
+          );
+
+          await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
+            'Invalid redirect URI'
+          );
+
+          // Verify no grant was created
+          const grants = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+          expect(grants.keys.length).toBe(0);
+        });
+      });
+    });
+
+    describe('should allow legitimate URIs', () => {
+      const legitimateUris = [
+        'https://client.example.com/callback',
+        'https://client.example.com/callback?param=value',
+        'https://client.example.com:8080/callback',
+        'http://localhost:3000/callback',
+        'http://127.0.0.1:8080/callback',
+        'myapp://callback',
+        'com.example.app://oauth/callback',
+      ];
+
+      legitimateUris.forEach((uri) => {
+        it(`should allow ${uri}`, async () => {
+          // First, we need to register a client with this URI
+          const clientData = {
+            redirect_uris: [uri],
+            client_name: 'Test Client for ' + uri,
+            token_endpoint_auth_method: 'client_secret_basic',
+          };
+
+          const registerRequest = createMockRequest(
+            'https://example.com/oauth/register',
+            'POST',
+            { 'Content-Type': 'application/json' },
+            JSON.stringify(clientData)
+          );
+
+          const registerResponse = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
+          const client = await registerResponse.json<any>();
+
+          const authRequest = createMockRequest(
+            `https://example.com/authorize?response_type=code&client_id=${client.client_id}` +
+              `&redirect_uri=${encodeURIComponent(uri)}` +
+              `&scope=read&state=xyz123`
+          );
+
+          const response = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+
+          // Should get a redirect, not an error
+          expect(response.status).toBe(302);
+          const location = response.headers.get('Location');
+          expect(location).toBeDefined();
+          expect(location).toContain('code=');
+        });
+      });
+    });
+
+    describe('should handle edge cases', () => {
+      it('should reject empty redirect URI', async () => {
+        const authRequest = createMockRequest(
+          `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+            `&redirect_uri=&scope=read&state=xyz123`
+        );
+
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow();
+      });
+
+      it('should pass scheme validation for relative URI (but may fail elsewhere)', async () => {
+        // Note: Relative URIs will pass the scheme validator (no dangerous scheme)
+        // but OAuth spec requires absolute URIs, so they fail in URL parsing later
+        const relativeUri = '/callback';
+        
+        // For this test, we just verify the scheme validator doesn't block it
+        // (the actual failure will happen in URL construction, which is correct)
+        const clientData = {
+          redirect_uris: [relativeUri],
+          client_name: 'Test Client with Relative URI',
+          token_endpoint_auth_method: 'client_secret_basic',
+        };
+
+        const registerRequest = createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify(clientData)
+        );
+
+        const registerResponse = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
+        const client = await registerResponse.json<any>();
+
+        const authRequest = createMockRequest(
+          `https://example.com/authorize?response_type=code&client_id=${client.client_id}` +
+            `&redirect_uri=${encodeURIComponent(relativeUri)}` +
+            `&scope=read&state=xyz123`
+        );
+
+        // This will fail with "Invalid URL" rather than "Invalid redirect URI"
+        // proving the scheme validator passed but URL parsing failed (as expected)
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid URL');
+      });
+    });
+  });
+
   describe('Authorization Code Flow Exchange', () => {
     let clientId: string;
     let clientSecret: string;

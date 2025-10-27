@@ -2261,6 +2261,50 @@ async function generateTokenId(token: string): Promise<string> {
 }
 
 /**
+ * Validates that a redirect URI does not use a dangerous pseudo-scheme.
+ * Normalizes the URI by trimming whitespace, removing control characters,
+ * and checking the scheme in a case-insensitive manner to prevent bypass attacks.
+ * @param redirectUri - The redirect URI to validate
+ * @throws Error if the URI uses a blacklisted scheme
+ */
+function validateRedirectUriScheme(redirectUri: string): void {
+  // List of dangerous pseudo-schemes that should not be allowed
+  const dangerousSchemes = [
+    'javascript:',
+    'data:',
+    'vbscript:',
+    'file:',
+    'mailto:',
+    'blob:',
+  ];
+
+  // Normalize the URI:
+  // 1. Trim leading and trailing whitespace
+  let normalized = redirectUri.trim();
+  
+  // 2. Remove control characters (0x00-0x1F, 0x7F-0x9F)
+  // These include \t, \n, \r, and other control chars that could bypass validation
+  normalized = normalized.replace(/[\x00-\x1F\x7F-\x9F]/g, '');
+  
+  // 3. Extract the scheme by finding everything before the first ':'
+  const colonIndex = normalized.indexOf(':');
+  if (colonIndex === -1) {
+    // No scheme present, which is fine (relative URIs)
+    return;
+  }
+  
+  // Get the scheme and convert to lowercase for case-insensitive comparison
+  const scheme = normalized.substring(0, colonIndex + 1).toLowerCase();
+  
+  // Check against blacklist
+  for (const dangerousScheme of dangerousSchemes) {
+    if (scheme === dangerousScheme) {
+      throw new Error('Invalid redirect URI');
+    }
+  }
+}
+
+/**
  * Encodes a string as base64url (URL-safe base64)
  * @param str - The string to encode
  * @returns The base64url encoded string
@@ -2478,17 +2522,9 @@ class OAuthHelpersImpl implements OAuthHelpers {
     const codeChallenge = url.searchParams.get('code_challenge') || undefined;
     const codeChallengeMethod = url.searchParams.get('code_challenge_method') || 'plain';
 
-    // prevent javascript: URIs / XSS attacks
-    if (
-      redirectUri.startsWith('javascript:') ||
-      redirectUri.startsWith('data:') ||
-      redirectUri.startsWith('vbscript:') ||
-      redirectUri.startsWith('file:') ||
-      redirectUri.startsWith('mailto:') ||
-      redirectUri.startsWith('blob:')
-    ) {
-      throw new Error('Invalid redirect URI');
-    }
+    // Validate redirect URI to prevent javascript: URIs / XSS attacks
+    // Using helper function that normalizes and checks in a case-insensitive manner
+    validateRedirectUriScheme(redirectUri);
 
     // Check if implicit flow is requested but not allowed
     if (responseType === 'token' && !this.provider.options.allowImplicitFlow) {
