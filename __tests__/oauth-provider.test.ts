@@ -968,13 +968,10 @@ describe('OAuthProvider', () => {
         await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow();
       });
 
-      it('should pass scheme validation for relative URI (but may fail elsewhere)', async () => {
-        // Note: Relative URIs will pass the scheme validator (no dangerous scheme)
-        // but OAuth spec requires absolute URIs, so they fail in URL parsing later
+      it('should reject relative URIs', async () => {
+        // Relative URIs should be rejected at scheme validation
         const relativeUri = '/callback';
 
-        // For this test, we just verify the scheme validator doesn't block it
-        // (the actual failure will happen in URL construction, which is correct)
         const clientData = {
           redirect_uris: [relativeUri],
           client_name: 'Test Client with Relative URI',
@@ -988,18 +985,12 @@ describe('OAuthProvider', () => {
           JSON.stringify(clientData)
         );
 
-        const registerResponse = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
-        const client = await registerResponse.json<any>();
-
-        const authRequest = createMockRequest(
-          `https://example.com/authorize?response_type=code&client_id=${client.client_id}` +
-            `&redirect_uri=${encodeURIComponent(relativeUri)}` +
-            `&scope=read&state=xyz123`
-        );
-
-        // This will fail with "Invalid URL" rather than "Invalid redirect URI"
-        // proving the scheme validator passed but URL parsing failed (as expected)
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid URL');
+        // Should be rejected with "Invalid redirect URI" error
+        const response = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
+        expect(response.status).toBe(400);
+        const errorBody = await response.json<any>();
+        expect(errorBody.error).toBe('invalid_client_metadata');
+        expect(errorBody.error_description).toBe('Invalid redirect URI');
       });
     });
   });

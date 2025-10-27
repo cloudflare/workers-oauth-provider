@@ -1975,6 +1975,11 @@ class OAuthProviderImpl {
         throw new Error('At least one redirect URI is required');
       }
 
+      // Validate each redirect URI scheme
+      for (const uri of redirectUris) {
+        validateRedirectUriScheme(uri);
+      }
+
       clientInfo = {
         clientId,
         redirectUris,
@@ -2262,28 +2267,35 @@ async function generateTokenId(token: string): Promise<string> {
 
 /**
  * Validates that a redirect URI does not use a dangerous pseudo-scheme.
- * Normalizes the URI by trimming whitespace, removing control characters,
- * and checking the scheme in a case-insensitive manner to prevent bypass attacks.
+ * Normalizes the URI by trimming whitespace and checking the scheme in a
+ * case-insensitive manner to prevent bypass attacks.
+ * Per RFC 3986, control characters are explicitly disallowed in URIs and
+ * will cause rejection rather than silent removal.
  * @param redirectUri - The redirect URI to validate
- * @throws Error if the URI uses a blacklisted scheme
+ * @throws Error if the URI uses a blacklisted scheme or contains control characters
  */
 function validateRedirectUriScheme(redirectUri: string): void {
   // List of dangerous pseudo-schemes that should not be allowed
   const dangerousSchemes = ['javascript:', 'data:', 'vbscript:', 'file:', 'mailto:', 'blob:'];
 
-  // Normalize the URI:
-  // 1. Trim leading and trailing whitespace
-  let normalized = redirectUri.trim();
+  // 1. Trim leading and trailing whitespace (allowed per RFC 3986 preprocessing)
+  const normalized = redirectUri.trim();
 
-  // 2. Remove control characters (0x00-0x1F, 0x7F-0x9F)
-  // These include \t, \n, \r, and other control chars that could bypass validation
-  normalized = normalized.replace(/[\x00-\x1F\x7F-\x9F]/g, '');
+  // 2. Reject URIs containing control characters (RFC 3986 compliance)
+  // Control characters (0x00-0x1F, 0x7F-0x9F) are explicitly disallowed in URIs
+  // and their presence indicates a malformed or potentially malicious URI
+  for (let i = 0; i < normalized.length; i++) {
+    const code = normalized.charCodeAt(i);
+    if ((code >= 0x00 && code <= 0x1f) || (code >= 0x7f && code <= 0x9f)) {
+      throw new Error('Invalid redirect URI');
+    }
+  }
 
   // 3. Extract the scheme by finding everything before the first ':'
   const colonIndex = normalized.indexOf(':');
   if (colonIndex === -1) {
-    // No scheme present, which is fine (relative URIs)
-    return;
+    // No scheme present - reject relative URIs
+    throw new Error('Invalid redirect URI');
   }
 
   // Get the scheme and convert to lowercase for case-insensitive comparison
@@ -2735,6 +2747,11 @@ class OAuthHelpersImpl implements OAuthHelpers {
       registrationDate: Math.floor(Date.now() / 1000),
       tokenEndpointAuthMethod,
     };
+
+    // Validate each redirect URI scheme
+    for (const uri of newClient.redirectUris) {
+      validateRedirectUriScheme(uri);
+    }
 
     // Only generate and store client secret for confidential clients
     let clientSecret: string | undefined;
