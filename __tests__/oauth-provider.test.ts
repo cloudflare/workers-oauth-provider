@@ -784,9 +784,7 @@ describe('OAuthProvider', () => {
               `&scope=read&state=xyz123`
           );
 
-          await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
-            'Invalid redirect URI'
-          );
+          await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid redirect URI');
 
           // Verify no grant was created
           const grants = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
@@ -820,9 +818,7 @@ describe('OAuthProvider', () => {
               `&scope=read&state=xyz123`
           );
 
-          await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
-            'Invalid redirect URI'
-          );
+          await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid redirect URI');
 
           // Verify no grant was created
           const grants = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
@@ -852,9 +848,7 @@ describe('OAuthProvider', () => {
               `&scope=read&state=xyz123`
           );
 
-          await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
-            'Invalid redirect URI'
-          );
+          await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid redirect URI');
 
           // Verify no grant was created
           const grants = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
@@ -882,9 +876,7 @@ describe('OAuthProvider', () => {
               `&scope=read&state=xyz123`
           );
 
-          await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
-            'Invalid redirect URI'
-          );
+          await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid redirect URI');
 
           // Verify no grant was created
           const grants = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
@@ -910,9 +902,7 @@ describe('OAuthProvider', () => {
               `&scope=read&state=xyz123`
           );
 
-          await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
-            'Invalid redirect URI'
-          );
+          await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid redirect URI');
 
           // Verify no grant was created
           const grants = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
@@ -982,7 +972,7 @@ describe('OAuthProvider', () => {
         // Note: Relative URIs will pass the scheme validator (no dangerous scheme)
         // but OAuth spec requires absolute URIs, so they fail in URL parsing later
         const relativeUri = '/callback';
-        
+
         // For this test, we just verify the scheme validator doesn't block it
         // (the actual failure will happen in URL construction, which is correct)
         const clientData = {

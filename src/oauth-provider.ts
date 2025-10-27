@@ -2269,33 +2269,26 @@ async function generateTokenId(token: string): Promise<string> {
  */
 function validateRedirectUriScheme(redirectUri: string): void {
   // List of dangerous pseudo-schemes that should not be allowed
-  const dangerousSchemes = [
-    'javascript:',
-    'data:',
-    'vbscript:',
-    'file:',
-    'mailto:',
-    'blob:',
-  ];
+  const dangerousSchemes = ['javascript:', 'data:', 'vbscript:', 'file:', 'mailto:', 'blob:'];
 
   // Normalize the URI:
   // 1. Trim leading and trailing whitespace
   let normalized = redirectUri.trim();
-  
+
   // 2. Remove control characters (0x00-0x1F, 0x7F-0x9F)
   // These include \t, \n, \r, and other control chars that could bypass validation
   normalized = normalized.replace(/[\x00-\x1F\x7F-\x9F]/g, '');
-  
+
   // 3. Extract the scheme by finding everything before the first ':'
   const colonIndex = normalized.indexOf(':');
   if (colonIndex === -1) {
     // No scheme present, which is fine (relative URIs)
     return;
   }
-  
+
   // Get the scheme and convert to lowercase for case-insensitive comparison
   const scheme = normalized.substring(0, colonIndex + 1).toLowerCase();
-  
+
   // Check against blacklist
   for (const dangerousScheme of dangerousSchemes) {
     if (scheme === dangerousScheme) {
