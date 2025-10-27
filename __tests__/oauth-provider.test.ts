@@ -885,6 +885,37 @@ describe('OAuthProvider', () => {
       });
     });
 
+    describe('should block control characters in legitimate URIs', () => {
+      const controlCharVariants = [
+        { desc: 'DELETE char (0x7F) in path', uri: 'https://example.com\x7F/callback' },
+        { desc: 'null byte in path', uri: 'https://example.com/call\x00back' },
+        { desc: 'tab in path', uri: 'https://example.com/call\tback' },
+        { desc: 'newline after scheme', uri: 'https:\n//example.com/callback' },
+        { desc: 'C1 control (0x80) in host', uri: 'https://exam\x80ple.com/callback' },
+        { desc: 'C1 control (0x9F) in path', uri: 'https://example.com/call\x9Fback' },
+        { desc: 'boundary C0 (0x1F)', uri: 'https://example.com/call\x1Fback' },
+        { desc: 'boundary C1 (0x9F)', uri: 'https://example.com/call\x9Fback' },
+        { desc: 'control char in query', uri: 'https://example.com/callback?param=val\x00ue' },
+        { desc: 'control char in fragment', uri: 'https://example.com/callback#sec\x00tion' },
+      ];
+
+      controlCharVariants.forEach(({ desc, uri }) => {
+        it(`should reject URI with ${desc}`, async () => {
+          const authRequest = createMockRequest(
+            `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+              `&redirect_uri=${encodeURIComponent(uri)}` +
+              `&scope=read&state=xyz123`
+          );
+
+          await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid redirect URI');
+
+          // Verify no grant was created
+          const grants = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+          expect(grants.keys.length).toBe(0);
+        });
+      });
+    });
+
     describe('should block data: URI variations', () => {
       const dataUriVariants = [
         'data:text/html,<script>alert(1)</script>',
