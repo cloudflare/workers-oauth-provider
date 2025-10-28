@@ -1,7 +1,7 @@
 import { defineConfig } from 'tsup';
 
 export default defineConfig({
-  entry: ['src/oauth-provider.ts'],
+  entry: ['src/oauth-provider.ts', 'src/oauth-client.ts'],
   format: ['esm'],
   dts: true,
   clean: true,

@@ -4,6 +4,16 @@
   "description": "OAuth provider for Cloudflare Workers",
   "main": "dist/oauth-provider.js",
   "types": "dist/oauth-provider.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/oauth-provider.d.ts",
+      "import": "./dist/oauth-provider.js"
+    },
+    "./client": {
+      "types": "./dist/oauth-client.d.ts",
+      "import": "./dist/oauth-client.js"
+    }
+  },
   "author": "Kenton Varda <kenton@cloudflare.com>",
   "license": "MIT",
   "sideEffects": false,
