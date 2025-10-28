@@ -303,6 +303,32 @@ new OAuthProvider({
 
 By default, the `onError` callback is set to ``({ status, code, description }) => console.warn(`OAuth error response: ${status} ${code} - ${description}`)``.
 
+## OAuth Client
+
+The library also exports an `OAuthClient` class for managing OAuth client-side operations like CSRF protection, state management, and client approval tracking. Often you might want to secure a worker with the OAuthProvider and also authenticate with a 3rd party OAuth provider. The OAuthClient provides some best practise helper methods for this.
+
+```ts
+import { OAuthClient } from "@cloudflare/workers-oauth-provider/client";
+
+const oauthClient = new OAuthClient({
+  kv: env.OAUTH_KV,
+  cookieSecret: env.COOKIE_SECRET,
+  clientName: "mcp", // optional, defaults to "mcp"
+  stateTTL: 600 // optional, defaults to 600 seconds
+});
+```
+
+**Main methods:**
+
+- `generateCSRFProtection()` - Generates a CSRF token and cookie for form protection
+- `validateCSRFToken(request)` - Validates CSRF token from form submission
+- `createOAuthState(oauthReqInfo)` - Stores OAuth state and returns state token with cookie
+- `validateOAuthState(request)` - Validates state parameter and retrieves stored OAuth request
+- `isClientApproved(request, clientId)` - Checks if user has previously approved a client
+- `addApprovedClient(request, clientId)` - Adds client to user's approved list
+- `OAuthClient.sanitizeText(text)` - Static method to escape HTML special characters
+- `OAuthClient.sanitizeUrl(url)` - Static method to validate URLs for security
+
 ## Implementation Notes
 
 ### End-to-end encryption
