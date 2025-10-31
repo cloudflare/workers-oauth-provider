@@ -280,6 +280,33 @@ export interface OAuthHelpers {
   parseAuthRequest(request: Request): Promise<AuthRequest>;
 
   /**
+   * Stores an OAuth authorization request in the internal KV store
+   * @param id - The ID used to identify the authorization request
+   * @param authRequest - The authorization request to store
+   * @param options - Options for the storage operation
+   * @returns A Promise resolving to void
+   */
+  storeAuthRequest<T extends Partial<AuthRequest>>(
+    id: string,
+    authRequest: T,
+    options?: { ttl?: number }
+  ): Promise<void>;
+
+  /**
+   * Looks up an OAuth authorization request by its ID
+   * @param id - The ID of the authorization request to look up
+   * @returns A Promise resolving to the authorization request, or null if not found
+   */
+  getAuthRequest<T extends Partial<AuthRequest>>(id: string): Promise<T | null>;
+
+  /**
+   * Deletes an OAuth authorization request by its ID
+   * @param id - The ID of the authorization request to delete
+   * @returns A Promise resolving to void
+   */
+  deleteAuthRequest(id: string): Promise<void>;
+
+  /**
    * Looks up a client by its client ID
    * @param clientId - The client ID to look up
    * @returns A Promise resolving to the client info, or null if not found
@@ -2562,6 +2589,42 @@ class OAuthHelpersImpl implements OAuthHelpers {
       codeChallenge,
       codeChallengeMethod,
     };
+  }
+
+  /**
+   * Stores the authorization request in the KV store
+   * @param id - The unique identifier for the request
+   * @param authRequest - The authorization request to store
+   * @param options - Options for the storage operation
+   * @returns A Promise resolving when the request is stored
+   */
+  async storeAuthRequest<T extends Partial<AuthRequest>>(
+    id: string,
+    authRequest: T,
+    options: { ttl?: number } = { ttl: 60 * 10 }
+  ): Promise<void> {
+    return await this.env.OAUTH_KV.put(`authRequest:${id}`, JSON.stringify(authRequest), {
+      expirationTtl: options?.ttl,
+    });
+  }
+
+  /**
+   * Retrieves an authorization request from the KV store
+   * @param id - The unique identifier for the request
+   * @returns A Promise resolving to the authorization request, or null if not found
+   */
+  async getAuthRequest<T extends Partial<AuthRequest>>(id: string): Promise<T | null> {
+    const authRequestStr = await this.env.OAUTH_KV.get(`authRequest:${id}`);
+    return authRequestStr ? JSON.parse(authRequestStr) : null;
+  }
+
+  /**
+   * Deletes an authorization request from the KV store
+   * @param id - The unique identifier for the request
+   * @returns A Promise resolving when the request is deleted
+   */
+  async deleteAuthRequest(id: string): Promise<void> {
+    return await this.env.OAUTH_KV.delete(`authRequest:${id}`);
   }
 
   /**
