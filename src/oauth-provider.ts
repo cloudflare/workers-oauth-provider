@@ -628,6 +628,12 @@ export interface Token {
   expiresAt: number;
 
   /**
+   * Intended audience for this token (RFC 7519 Section 4.1.3)
+   * Can be a single string or array of strings
+   */
+  audience?: string | string[];
+
+  /**
    * The encryption key for props, wrapped with this token
    */
   wrappedEncryptionKey: string;
@@ -1509,6 +1515,9 @@ class OAuthProviderImpl {
     // Save the updated grant with TTL matching refresh token expiration (if any)
     await this.saveGrantWithTTL(env, grantKey, grantData, now);
 
+    // Parse resource parameter (RFC 8707) and map to audience claim (RFC 7519)
+    const audience = parseResourceParameter(body.resource);
+
     // Store access token with denormalized grant information
     const accessTokenData: Token = {
       id: accessTokenId,
@@ -1516,6 +1525,7 @@ class OAuthProviderImpl {
       userId: userId,
       createdAt: now,
       expiresAt: accessTokenExpiresAt,
+      audience: audience,
       wrappedEncryptionKey: accessTokenWrappedKey,
       grant: {
         clientId: grantData.clientId,
@@ -1750,6 +1760,9 @@ class OAuthProviderImpl {
     // Save the updated grant with TTL if applicable
     await this.saveGrantWithTTL(env, grantKey, grantData, now);
 
+    // Parse resource parameter (RFC 8707) and map to audience claim (RFC 7519)
+    const audience = parseResourceParameter(body.resource);
+
     // Store new access token with denormalized grant information
     const accessTokenData: Token = {
       id: accessTokenId,
@@ -1757,6 +1770,7 @@ class OAuthProviderImpl {
       userId: userId,
       createdAt: now,
       expiresAt: accessTokenExpiresAt,
+      audience: audience,
       wrappedEncryptionKey: accessTokenWrappedKey,
       grant: {
         clientId: grantData.clientId,
@@ -2089,6 +2103,20 @@ class OAuthProviderImpl {
         });
       }
 
+      // Validate audience according to RFC 7519 Section 4.1.3
+      // "If the principal processing the claim does not identify itself with a value in the
+      // 'aud' claim when this claim is present, then the JWT MUST be rejected."
+      if (tokenData.audience) {
+        const requestUrl = new URL(request.url);
+        const resourceServer = `${requestUrl.protocol}//${requestUrl.host}`;
+        const audiences = Array.isArray(tokenData.audience) ? tokenData.audience : [tokenData.audience];
+        if (!audiences.includes(resourceServer)) {
+          return this.createErrorResponse('invalid_token', 'Token audience does not match resource server', 401, {
+            'WWW-Authenticate': 'Bearer realm="OAuth", error="invalid_token", error_description="Invalid audience"',
+          });
+        }
+      }
+
       // Unwrap the encryption key using the access token
       const encryptionKey = await unwrapKeyWithToken(accessToken, tokenData.wrappedEncryptionKey);
 
@@ -2219,6 +2247,36 @@ const DEFAULT_ACCESS_TOKEN_TTL = 60 * 60;
 const TOKEN_LENGTH = 32;
 
 // Helper Functions
+/**
+ * Parses the resource parameter from a token request (RFC 8707)
+ * Handles both string and JSON-encoded array formats from application/x-www-form-urlencoded
+ * @param value - The resource parameter value from the request body
+ * @returns The parsed value as string, string array, or undefined
+ */
+function parseResourceParameter(value: string | string[] | undefined): string | string[] | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  // If it's already an array, return as-is
+  if (Array.isArray(value)) {
+    return value;
+  }
+
+  // Try to parse JSON-encoded arrays (e.g., '["https://api1.com","https://api2.com"]')
+  if (value.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : value;
+    } catch {
+      // If parsing fails, treat as literal string
+      return value;
+    }
+  }
+
+  return value;
+}
+
 /**
  * Hashes a secret value using SHA-256
  * @param secret - The secret value to hash

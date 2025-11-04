@@ -2022,6 +2022,171 @@ describe('OAuthProvider', () => {
     });
   });
 
+  describe('Audience Validation (RFC 7519 Section 4.1.3)', () => {
+    // Helper to get access token with resource parameter (RFC 8707)
+    async function getAccessTokenWithResource(resource?: string | string[]) {
+      // Create a client
+      const clientData = {
+        redirect_uris: ['https://client.example.com/callback'],
+        client_name: 'Test Client',
+        token_endpoint_auth_method: 'client_secret_basic',
+      };
+
+      const registerRequest = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify(clientData)
+      );
+
+      const registerResponse = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
+      const client = await registerResponse.json<any>();
+      const clientId = client.client_id;
+      const clientSecret = client.client_secret;
+      const redirectUri = 'https://client.example.com/callback';
+
+      // Get an auth code
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123`
+      );
+
+      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const location = authResponse.headers.get('Location')!;
+      const code = new URL(location).searchParams.get('code')!;
+
+      // Exchange for tokens with resource parameter (RFC 8707)
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+      if (resource !== undefined) {
+        params.append('resource', Array.isArray(resource) ? JSON.stringify(resource) : resource);
+      }
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      );
+
+      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokens = await tokenResponse.json<{ access_token: string }>();
+      return tokens.access_token;
+    }
+
+    it('should accept token with matching audience (string)', async () => {
+      const accessToken = await getAccessTokenWithResource('https://example.com');
+
+      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: `Bearer ${accessToken}`,
+      });
+
+      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+
+      expect(apiResponse.status).toBe(200);
+      const data = await apiResponse.json<any>();
+      expect(data.success).toBe(true);
+      expect(data.user).toEqual({ userId: 'test-user-123', username: 'TestUser' });
+    });
+
+    it('should accept token with matching audience in array', async () => {
+      const accessToken = await getAccessTokenWithResource(['https://example.com', 'https://other.example.com']);
+
+      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: `Bearer ${accessToken}`,
+      });
+
+      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+
+      expect(apiResponse.status).toBe(200);
+      const data = await apiResponse.json<{ success: boolean }>();
+      expect(data.success).toBe(true);
+    });
+
+    it('should accept token without audience claim (backward compatibility)', async () => {
+      const accessToken = await getAccessTokenWithResource(undefined);
+
+      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: `Bearer ${accessToken}`,
+      });
+
+      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+
+      expect(apiResponse.status).toBe(200);
+      const data = await apiResponse.json<{ success: boolean }>();
+      expect(data.success).toBe(true);
+    });
+
+    it('should reject token with wrong audience (HTTP 401)', async () => {
+      const accessToken = await getAccessTokenWithResource('https://wrong-server.com');
+
+      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: `Bearer ${accessToken}`,
+      });
+
+      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+
+      expect(apiResponse.status).toBe(401);
+
+      const wwwAuth = apiResponse.headers.get('WWW-Authenticate');
+      expect(wwwAuth).toContain('Bearer');
+      expect(wwwAuth).toContain('error="invalid_token"');
+      expect(wwwAuth).toContain('Invalid audience');
+
+      const error = await apiResponse.json<{ error: string; error_description: string }>();
+      expect(error.error).toBe('invalid_token');
+      expect(error.error_description).toContain('audience');
+    });
+
+    it('should reject token when resource server not in audience array', async () => {
+      const accessToken = await getAccessTokenWithResource(['https://other1.com', 'https://other2.com']);
+
+      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: `Bearer ${accessToken}`,
+      });
+
+      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+
+      expect(apiResponse.status).toBe(401);
+
+      const error = await apiResponse.json<{ error: string; error_description: string }>();
+      expect(error.error).toBe('invalid_token');
+    });
+
+    it('should reject token with audience mismatch on different host', async () => {
+      const accessToken = await getAccessTokenWithResource('https://api.example.com');
+
+      const apiRequest = createMockRequest('https://api2.example.com/api/test', 'GET', {
+        Authorization: `Bearer ${accessToken}`,
+      });
+
+      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+
+      expect(apiResponse.status).toBe(401);
+      const error = await apiResponse.json<{ error: string; error_description: string }>();
+      expect(error.error).toBe('invalid_token');
+    });
+
+    it('should reject token with audience mismatch on different protocol', async () => {
+      const accessToken = await getAccessTokenWithResource('http://example.com');
+
+      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: `Bearer ${accessToken}`,
+      });
+
+      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+
+      expect(apiResponse.status).toBe(401);
+      const error = await apiResponse.json<{ error: string; error_description: string }>();
+      expect(error.error).toBe('invalid_token');
+    });
+  });
+
   describe('CORS Support', () => {
     it('should handle CORS preflight for API requests', async () => {
       const preflightRequest = createMockRequest('https://example.com/api/test', 'OPTIONS', {
