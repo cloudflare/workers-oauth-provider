@@ -130,6 +130,13 @@ export interface ResolveExternalTokenResult {
    * These properties are set in the execution context (ctx.props) when the external token is validated
    */
   props: any;
+
+  /**
+   * Audience claim from the external token (RFC 7519 Section 4.1.3)
+   * If provided, will be validated against the resource server identity
+   *
+   */
+  audience?: string | string[];
 }
 
 export interface OAuthProviderOptions {
@@ -378,6 +385,11 @@ export interface AuthRequest {
    * PKCE code challenge method (plain or S256)
    */
   codeChallengeMethod?: string;
+
+  /**
+   * Resource parameter indicating target resource(s) (RFC 8707)
+   */
+  resource?: string | string[];
 }
 
 /**
@@ -581,6 +593,12 @@ export interface Grant {
    * Only present during the authorization code exchange process
    */
   codeChallengeMethod?: string;
+
+  /**
+   * Resource parameter from authorization request (RFC 8707 Section 2.1)
+   * Indicates the protected resource(s) for which access is requested
+   */
+  resource?: string | string[];
 }
 
 /**
@@ -1064,7 +1082,9 @@ class OAuthProviderImpl {
     // Process application/x-www-form-urlencoded
     const formData = await request.formData();
     for (const [key, value] of formData.entries()) {
-      body[key] = value;
+      // RFC 8707: resource parameter can appear multiple times
+      const allValues = formData.getAll(key);
+      body[key] = allValues.length > 1 ? allValues : value;
     }
 
     // Get client ID from request
@@ -1515,8 +1535,16 @@ class OAuthProviderImpl {
     // Save the updated grant with TTL matching refresh token expiration (if any)
     await this.saveGrantWithTTL(env, grantKey, grantData, now);
 
-    // Parse resource parameter (RFC 8707) and map to audience claim (RFC 7519)
-    const audience = parseResourceParameter(body.resource);
+    // Parse and validate resource parameter (RFC 8707)
+    // Use resource from token request if provided, otherwise use resource from grant
+    const audience = parseResourceParameter(body.resource || grantData.resource);
+    if ((body.resource || grantData.resource) && !audience) {
+      // RFC 8707 Section 2.1: invalid or unacceptable resource
+      return this.createErrorResponse(
+        'invalid_target',
+        'The resource parameter must be a valid absolute URI without a fragment'
+      );
+    }
 
     // Store access token with denormalized grant information
     const accessTokenData: Token = {
@@ -1760,8 +1788,16 @@ class OAuthProviderImpl {
     // Save the updated grant with TTL if applicable
     await this.saveGrantWithTTL(env, grantKey, grantData, now);
 
-    // Parse resource parameter (RFC 8707) and map to audience claim (RFC 7519)
-    const audience = parseResourceParameter(body.resource);
+    // Parse and validate resource parameter (RFC 8707)
+    // Use resource from token request if provided, otherwise use resource from grant
+    const audience = parseResourceParameter(body.resource || grantData.resource);
+    if ((body.resource || grantData.resource) && !audience) {
+      // RFC 8707 Section 2.1: invalid or unacceptable resource
+      return this.createErrorResponse(
+        'invalid_target',
+        'The resource parameter must be a valid absolute URI without a fragment'
+      );
+    }
 
     // Store new access token with denormalized grant information
     const accessTokenData: Token = {
@@ -2110,7 +2146,10 @@ class OAuthProviderImpl {
         const requestUrl = new URL(request.url);
         const resourceServer = `${requestUrl.protocol}//${requestUrl.host}`;
         const audiences = Array.isArray(tokenData.audience) ? tokenData.audience : [tokenData.audience];
-        if (!audiences.includes(resourceServer)) {
+
+        // Check if any audience matches (RFC 3986: case-insensitive hostname comparison)
+        const matches = audiences.some((aud) => audienceMatches(resourceServer, aud));
+        if (!matches) {
           return this.createErrorResponse('invalid_token', 'Token audience does not match resource server', 401, {
             'WWW-Authenticate': 'Bearer realm="OAuth", error="invalid_token", error_description="Invalid audience"',
           });
@@ -2134,6 +2173,21 @@ class OAuthProviderImpl {
         return this.createErrorResponse('invalid_token', 'Invalid access token', 401, {
           'WWW-Authenticate': 'Bearer realm="OAuth", error="invalid_token"',
         });
+      }
+
+      // Validate that tokens were issued specifically for them
+      if (ext.audience) {
+        const requestUrl = new URL(request.url);
+        const resourceServer = `${requestUrl.protocol}//${requestUrl.host}`;
+        const audiences = Array.isArray(ext.audience) ? ext.audience : [ext.audience];
+
+        // Check if any audience matches (RFC 3986: case-insensitive hostname comparison)
+        const matches = audiences.some((aud) => audienceMatches(resourceServer, aud));
+        if (!matches) {
+          return this.createErrorResponse('invalid_token', 'Token audience does not match resource server', 401, {
+            'WWW-Authenticate': 'Bearer realm="OAuth", error="invalid_token", error_description="Invalid audience"',
+          });
+        }
       }
 
       // Set the external props on the context object
@@ -2248,29 +2302,91 @@ const TOKEN_LENGTH = 32;
 
 // Helper Functions
 /**
- * Parses the resource parameter from a token request (RFC 8707)
- * Handles both string and JSON-encoded array formats from application/x-www-form-urlencoded
+ * Validates a resource URI per RFC 8707 Section 2
+ * @param uri - The URI string to validate
+ * @returns true if valid, false otherwise
+ */
+function validateResourceUri(uri: string): boolean {
+  if (!uri || typeof uri !== 'string') {
+    return false;
+  }
+
+  try {
+    const parsed = new URL(uri);
+
+    // RFC 8707: MUST be absolute URI (has protocol)
+    if (!parsed.protocol) {
+      return false;
+    }
+
+    // RFC 8707: MUST NOT include a fragment component
+    if (parsed.hash) {
+      return false;
+    }
+
+    // Must be http or https for security
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return false;
+    }
+
+    return true;
+  } catch {
+    // Invalid URI format
+    return false;
+  }
+}
+
+/**
+ * Checks if a resource server matches an audience claim
+ * Implements RFC 3986 Section 3.2.2: hostnames are case-insensitive
+ * @param resourceServerUrl - The resource server URL (from request)
+ * @param audienceValue - The audience value from token
+ * @returns true if they match, false otherwise
+ */
+function audienceMatches(resourceServerUrl: string, audienceValue: string): boolean {
+  try {
+    const serverUrl = new URL(resourceServerUrl);
+    const audUrl = new URL(audienceValue);
+
+    // Protocol comparison (case-insensitive per RFC 3986)
+    if (serverUrl.protocol.toLowerCase() !== audUrl.protocol.toLowerCase()) {
+      return false;
+    }
+
+    // Hostname comparison (case-insensitive per RFC 3986 Section 3.2.2)
+    if (serverUrl.hostname.toLowerCase() !== audUrl.hostname.toLowerCase()) {
+      return false;
+    }
+
+    // Port comparison (exact match)
+    if (serverUrl.port !== audUrl.port) {
+      return false;
+    }
+
+    return true;
+  } catch {
+    // If either URL is invalid, fall back to exact string comparison
+    return resourceServerUrl === audienceValue;
+  }
+}
+
+/**
+ * Parses and validates the resource parameter from a token request (RFC 8707)
+ * Handles single string or array of strings (from multiple form parameters)
  * @param value - The resource parameter value from the request body
- * @returns The parsed value as string, string array, or undefined
+ * @returns The validated value as string, string array, or undefined if validation fails
  */
 function parseResourceParameter(value: string | string[] | undefined): string | string[] | undefined {
   if (!value) {
     return undefined;
   }
 
-  // If it's already an array, return as-is
-  if (Array.isArray(value)) {
-    return value;
-  }
-
-  // Try to parse JSON-encoded arrays (e.g., '["https://api1.com","https://api2.com"]')
-  if (value.startsWith('[')) {
-    try {
-      const parsed = JSON.parse(value);
-      return Array.isArray(parsed) ? parsed : value;
-    } catch {
-      // If parsing fails, treat as literal string
-      return value;
+  // Validate all URIs (RFC 8707 Section 2)
+  const uris = Array.isArray(value) ? value : [value];
+  for (const uri of uris) {
+    if (typeof uri !== 'string' || !validateResourceUri(uri)) {
+      // Invalid resource URI - return undefined to trigger error
+      return undefined;
     }
   }
 
@@ -2584,10 +2700,17 @@ class OAuthHelpersImpl implements OAuthHelpers {
     const state = url.searchParams.get('state') || '';
     const codeChallenge = url.searchParams.get('code_challenge') || undefined;
     const codeChallengeMethod = url.searchParams.get('code_challenge_method') || 'plain';
+    const resourceParam = url.searchParams.get('resource') || undefined;
 
     // Validate redirect URI to prevent javascript: URIs / XSS attacks
     // Using helper function that normalizes and checks in a case-insensitive manner
     validateRedirectUriScheme(redirectUri);
+
+    // Parse and validate resource parameter (RFC 8707)
+    const resource = parseResourceParameter(resourceParam);
+    if (resourceParam && !resource) {
+      throw new Error('The resource parameter must be a valid absolute URI without a fragment');
+    }
 
     // Check if implicit flow is requested but not allowed
     if (responseType === 'token' && !this.provider.options.allowImplicitFlow) {
@@ -2619,6 +2742,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
       state,
       codeChallenge,
       codeChallengeMethod,
+      resource,
     };
   }
 
@@ -2687,6 +2811,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
         metadata: options.metadata,
         encryptedProps: encryptedData,
         createdAt: now,
+        resource: options.request.resource,
       };
 
       // Store the grant with a key that includes the user ID
@@ -2757,6 +2882,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
         // Store PKCE parameters if provided
         codeChallenge: options.request.codeChallenge,
         codeChallengeMethod: options.request.codeChallengeMethod,
+        resource: options.request.resource,
       };
 
       // Store the grant with a key that includes the user ID
