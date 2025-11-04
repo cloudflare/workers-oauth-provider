@@ -611,6 +611,11 @@ interface TokenResponse {
   expires_in: number;
   refresh_token?: string;
   scope: string;
+  /**
+   * Resource indicator(s) for the issued access token (RFC 8707 Section 2.2)
+   * SHOULD be included to indicate the resource server(s) for which the token is valid
+   */
+  resource?: string | string[];
 }
 
 /**
@@ -1536,6 +1541,22 @@ class OAuthProviderImpl {
     await this.saveGrantWithTTL(env, grantKey, grantData, now);
 
     // Parse and validate resource parameter (RFC 8707)
+    // Validate downscoping: token request resources must be subset of grant resources
+    if (body.resource && grantData.resource) {
+      const requestedResources = Array.isArray(body.resource) ? body.resource : [body.resource];
+      const grantedResources = Array.isArray(grantData.resource) ? grantData.resource : [grantData.resource];
+
+      // Check that all requested resources are in the granted resources
+      for (const requested of requestedResources) {
+        if (!grantedResources.includes(requested)) {
+          return this.createErrorResponse(
+            'invalid_target',
+            'Requested resource was not included in the authorization request'
+          );
+        }
+      }
+    }
+
     // Use resource from token request if provided, otherwise use resource from grant
     const audience = parseResourceParameter(body.resource || grantData.resource);
     if ((body.resource || grantData.resource) && !audience) {
@@ -1577,6 +1598,11 @@ class OAuthProviderImpl {
 
     if (refreshToken) {
       tokenResponse.refresh_token = refreshToken;
+    }
+
+    // RFC 8707 Section 2.2: SHOULD return resource parameter in response
+    if (audience) {
+      tokenResponse.resource = audience;
     }
 
     // Return the tokens
@@ -1789,6 +1815,22 @@ class OAuthProviderImpl {
     await this.saveGrantWithTTL(env, grantKey, grantData, now);
 
     // Parse and validate resource parameter (RFC 8707)
+    // Validate downscoping: token request resources must be subset of grant resources
+    if (body.resource && grantData.resource) {
+      const requestedResources = Array.isArray(body.resource) ? body.resource : [body.resource];
+      const grantedResources = Array.isArray(grantData.resource) ? grantData.resource : [grantData.resource];
+
+      // Check that all requested resources are in the granted resources
+      for (const requested of requestedResources) {
+        if (!grantedResources.includes(requested)) {
+          return this.createErrorResponse(
+            'invalid_target',
+            'Requested resource was not included in the authorization request'
+          );
+        }
+      }
+    }
+
     // Use resource from token request if provided, otherwise use resource from grant
     const audience = parseResourceParameter(body.resource || grantData.resource);
     if ((body.resource || grantData.resource) && !audience) {
@@ -1828,6 +1870,11 @@ class OAuthProviderImpl {
       refresh_token: newRefreshToken,
       scope: grantData.scope.join(' '),
     };
+
+    // RFC 8707 Section 2.2: SHOULD return resource parameter in response
+    if (audience) {
+      tokenResponse.resource = audience;
+    }
 
     // Return the tokens
     return new Response(JSON.stringify(tokenResponse), {
@@ -2338,36 +2385,14 @@ function validateResourceUri(uri: string): boolean {
 
 /**
  * Checks if a resource server matches an audience claim
- * Implements RFC 3986 Section 3.2.2: hostnames are case-insensitive
+ * RFC 7519 Section 4.1.3: audience values are case-sensitive strings
  * @param resourceServerUrl - The resource server URL (from request)
  * @param audienceValue - The audience value from token
  * @returns true if they match, false otherwise
  */
 function audienceMatches(resourceServerUrl: string, audienceValue: string): boolean {
-  try {
-    const serverUrl = new URL(resourceServerUrl);
-    const audUrl = new URL(audienceValue);
-
-    // Protocol comparison (case-insensitive per RFC 3986)
-    if (serverUrl.protocol.toLowerCase() !== audUrl.protocol.toLowerCase()) {
-      return false;
-    }
-
-    // Hostname comparison (case-insensitive per RFC 3986 Section 3.2.2)
-    if (serverUrl.hostname.toLowerCase() !== audUrl.hostname.toLowerCase()) {
-      return false;
-    }
-
-    // Port comparison (exact match)
-    if (serverUrl.port !== audUrl.port) {
-      return false;
-    }
-
-    return true;
-  } catch {
-    // If either URL is invalid, fall back to exact string comparison
-    return resourceServerUrl === audienceValue;
-  }
+  // RFC 7519 Section 4.1.3: "aud" value is an array of case-sensitive strings
+  return resourceServerUrl === audienceValue;
 }
 
 /**
@@ -2700,7 +2725,10 @@ class OAuthHelpersImpl implements OAuthHelpers {
     const state = url.searchParams.get('state') || '';
     const codeChallenge = url.searchParams.get('code_challenge') || undefined;
     const codeChallengeMethod = url.searchParams.get('code_challenge_method') || 'plain';
-    const resourceParam = url.searchParams.get('resource') || undefined;
+    // RFC 8707 Section 2.1: Multiple resource parameters MAY be used
+    const resourceParams = url.searchParams.getAll('resource');
+    const resourceParam =
+      resourceParams.length > 0 ? (resourceParams.length === 1 ? resourceParams[0] : resourceParams) : undefined;
 
     // Validate redirect URI to prevent javascript: URIs / XSS attacks
     // Using helper function that normalizes and checks in a case-insensitive manner
@@ -2802,6 +2830,12 @@ class OAuthHelpersImpl implements OAuthHelpers {
       // Wrap the encryption key with the access token
       const accessTokenWrappedKey = await wrapKeyWithToken(accessToken, encryptionKey);
 
+      // Parse and validate resource parameter (RFC 8707) for implicit flow
+      const audience = parseResourceParameter(options.request.resource);
+      if (options.request.resource && !audience) {
+        throw new Error('The resource parameter must be a valid absolute URI without a fragment');
+      }
+
       // Store the grant without an auth code (will be referenced by the access token)
       const grant: Grant = {
         id: grantId,
@@ -2825,6 +2859,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
         userId: options.userId,
         createdAt: now,
         expiresAt: accessTokenExpiresAt,
+        audience: audience,
         wrappedEncryptionKey: accessTokenWrappedKey,
         grant: {
           clientId: options.request.clientId,

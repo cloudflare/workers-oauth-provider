@@ -2223,38 +2223,6 @@ describe('OAuthProvider', () => {
       expect(error.error).toBe('invalid_token');
     });
 
-    it('should accept token with case-insensitive hostname match (RFC 3986)', async () => {
-      // Token issued for uppercase hostname
-      const accessToken = await getAccessTokenWithResource('https://EXAMPLE.COM');
-
-      // Request to lowercase hostname
-      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
-        Authorization: `Bearer ${accessToken}`,
-      });
-
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
-
-      expect(apiResponse.status).toBe(200);
-      const data = await apiResponse.json<any>();
-      expect(data.success).toBe(true);
-    });
-
-    it('should accept token with case-insensitive protocol match (RFC 3986)', async () => {
-      // Token issued for uppercase protocol
-      const accessToken = await getAccessTokenWithResource('HTTPS://example.com');
-
-      // Request with lowercase protocol
-      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
-        Authorization: `Bearer ${accessToken}`,
-      });
-
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
-
-      expect(apiResponse.status).toBe(200);
-      const data = await apiResponse.json<any>();
-      expect(data.success).toBe(true);
-    });
-
     it('should reject token with different port', async () => {
       // Token issued for port 8080
       const accessToken = await getAccessTokenWithResource('https://example.com:8080');
@@ -2593,6 +2561,121 @@ describe('OAuthProvider', () => {
       const error = await apiResponse.json<any>();
       expect(error.error).toBe('invalid_token');
       expect(error.error_description).toContain('audience');
+    });
+  });
+
+  describe('Resource Parameter Downscoping (RFC 8707)', () => {
+    it('should reject upscoping attempt (requesting resource not in authorization)', async () => {
+      // Create a client
+      const clientData = {
+        redirect_uris: ['https://client.example.com/callback'],
+        client_name: 'Test Client',
+        token_endpoint_auth_method: 'client_secret_basic',
+      };
+
+      const registerRequest = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify(clientData)
+      );
+
+      const registerResponse = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
+      const client = await registerResponse.json<any>();
+      const clientId = client.client_id;
+      const clientSecret = client.client_secret;
+      const redirectUri = 'https://client.example.com/callback';
+
+      // Get an auth code with resource=https://api1.example.com
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123&resource=https://api1.example.com`
+      );
+
+      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const location = authResponse.headers.get('Location')!;
+      const code = new URL(location).searchParams.get('code')!;
+
+      // Try to exchange with resource=https://api2.example.com (not in authorization!)
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+      params.append('resource', 'https://api2.example.com'); // Different resource - upscoping!
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      );
+
+      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+
+      expect(tokenResponse.status).toBe(400);
+      const error = await tokenResponse.json<any>();
+      expect(error.error).toBe('invalid_target');
+      expect(error.error_description).toContain('not included in the authorization request');
+    });
+
+    it('should allow downscoping (requesting subset of authorized resources)', async () => {
+      // Create a client
+      const clientData = {
+        redirect_uris: ['https://client.example.com/callback'],
+        client_name: 'Test Client',
+        token_endpoint_auth_method: 'client_secret_basic',
+      };
+
+      const registerRequest = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify(clientData)
+      );
+
+      const registerResponse = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
+      const client = await registerResponse.json<any>();
+      const clientId = client.client_id;
+      const clientSecret = client.client_secret;
+      const redirectUri = 'https://client.example.com/callback';
+
+      // Get an auth code with TWO resources
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123` +
+          `&resource=https://api1.example.com&resource=https://api2.example.com`
+      );
+
+      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const location = authResponse.headers.get('Location')!;
+      const code = new URL(location).searchParams.get('code')!;
+
+      // Exchange with only ONE resource (downscoping - subset of original)
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+      params.append('resource', 'https://api1.example.com'); // Subset - downscoping allowed!
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      );
+
+      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+
+      expect(tokenResponse.status).toBe(200);
+      const tokens = await tokenResponse.json<any>();
+      expect(tokens.access_token).toBeDefined();
+      expect(tokens.resource).toBe('https://api1.example.com');
     });
   });
 
