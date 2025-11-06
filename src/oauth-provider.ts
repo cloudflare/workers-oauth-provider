@@ -130,6 +130,13 @@ export interface ResolveExternalTokenResult {
    * These properties are set in the execution context (ctx.props) when the external token is validated
    */
   props: any;
+
+  /**
+   * Audience claim from the external token (RFC 7519 Section 4.1.3)
+   * If provided, will be validated against the resource server identity
+   *
+   */
+  audience?: string | string[];
 }
 
 export interface OAuthProviderOptions {
@@ -378,6 +385,11 @@ export interface AuthRequest {
    * PKCE code challenge method (plain or S256)
    */
   codeChallengeMethod?: string;
+
+  /**
+   * Resource parameter indicating target resource(s) (RFC 8707)
+   */
+  resource?: string | string[];
 }
 
 /**
@@ -581,6 +593,12 @@ export interface Grant {
    * Only present during the authorization code exchange process
    */
   codeChallengeMethod?: string;
+
+  /**
+   * Resource parameter from authorization request (RFC 8707 Section 2.1)
+   * Indicates the protected resource(s) for which access is requested
+   */
+  resource?: string | string[];
 }
 
 /**
@@ -593,6 +611,11 @@ interface TokenResponse {
   expires_in: number;
   refresh_token?: string;
   scope: string;
+  /**
+   * Resource indicator(s) for the issued access token (RFC 8707 Section 2.2)
+   * SHOULD be included to indicate the resource server(s) for which the token is valid
+   */
+  resource?: string | string[];
 }
 
 /**
@@ -626,6 +649,12 @@ export interface Token {
    * Unix timestamp when the token expires
    */
   expiresAt: number;
+
+  /**
+   * Intended audience for this token (RFC 7519 Section 4.1.3)
+   * Can be a single string or array of strings
+   */
+  audience?: string | string[];
 
   /**
    * The encryption key for props, wrapped with this token
@@ -1058,7 +1087,9 @@ class OAuthProviderImpl {
     // Process application/x-www-form-urlencoded
     const formData = await request.formData();
     for (const [key, value] of formData.entries()) {
-      body[key] = value;
+      // RFC 8707: resource parameter can appear multiple times
+      const allValues = formData.getAll(key);
+      body[key] = allValues.length > 1 ? allValues : value;
     }
 
     // Get client ID from request
@@ -1509,6 +1540,33 @@ class OAuthProviderImpl {
     // Save the updated grant with TTL matching refresh token expiration (if any)
     await this.saveGrantWithTTL(env, grantKey, grantData, now);
 
+    // Parse and validate resource parameter (RFC 8707)
+    // Validate downscoping: token request resources must be subset of grant resources
+    if (body.resource && grantData.resource) {
+      const requestedResources = Array.isArray(body.resource) ? body.resource : [body.resource];
+      const grantedResources = Array.isArray(grantData.resource) ? grantData.resource : [grantData.resource];
+
+      // Check that all requested resources are in the granted resources
+      for (const requested of requestedResources) {
+        if (!grantedResources.includes(requested)) {
+          return this.createErrorResponse(
+            'invalid_target',
+            'Requested resource was not included in the authorization request'
+          );
+        }
+      }
+    }
+
+    // Use resource from token request if provided, otherwise use resource from grant
+    const audience = parseResourceParameter(body.resource || grantData.resource);
+    if ((body.resource || grantData.resource) && !audience) {
+      // RFC 8707 Section 2.1: invalid or unacceptable resource
+      return this.createErrorResponse(
+        'invalid_target',
+        'The resource parameter must be a valid absolute URI without a fragment'
+      );
+    }
+
     // Store access token with denormalized grant information
     const accessTokenData: Token = {
       id: accessTokenId,
@@ -1516,6 +1574,7 @@ class OAuthProviderImpl {
       userId: userId,
       createdAt: now,
       expiresAt: accessTokenExpiresAt,
+      audience: audience,
       wrappedEncryptionKey: accessTokenWrappedKey,
       grant: {
         clientId: grantData.clientId,
@@ -1539,6 +1598,11 @@ class OAuthProviderImpl {
 
     if (refreshToken) {
       tokenResponse.refresh_token = refreshToken;
+    }
+
+    // RFC 8707 Section 2.2: SHOULD return resource parameter in response
+    if (audience) {
+      tokenResponse.resource = audience;
     }
 
     // Return the tokens
@@ -1750,6 +1814,33 @@ class OAuthProviderImpl {
     // Save the updated grant with TTL if applicable
     await this.saveGrantWithTTL(env, grantKey, grantData, now);
 
+    // Parse and validate resource parameter (RFC 8707)
+    // Validate downscoping: token request resources must be subset of grant resources
+    if (body.resource && grantData.resource) {
+      const requestedResources = Array.isArray(body.resource) ? body.resource : [body.resource];
+      const grantedResources = Array.isArray(grantData.resource) ? grantData.resource : [grantData.resource];
+
+      // Check that all requested resources are in the granted resources
+      for (const requested of requestedResources) {
+        if (!grantedResources.includes(requested)) {
+          return this.createErrorResponse(
+            'invalid_target',
+            'Requested resource was not included in the authorization request'
+          );
+        }
+      }
+    }
+
+    // Use resource from token request if provided, otherwise use resource from grant
+    const audience = parseResourceParameter(body.resource || grantData.resource);
+    if ((body.resource || grantData.resource) && !audience) {
+      // RFC 8707 Section 2.1: invalid or unacceptable resource
+      return this.createErrorResponse(
+        'invalid_target',
+        'The resource parameter must be a valid absolute URI without a fragment'
+      );
+    }
+
     // Store new access token with denormalized grant information
     const accessTokenData: Token = {
       id: accessTokenId,
@@ -1757,6 +1848,7 @@ class OAuthProviderImpl {
       userId: userId,
       createdAt: now,
       expiresAt: accessTokenExpiresAt,
+      audience: audience,
       wrappedEncryptionKey: accessTokenWrappedKey,
       grant: {
         clientId: grantData.clientId,
@@ -1778,6 +1870,11 @@ class OAuthProviderImpl {
       refresh_token: newRefreshToken,
       scope: grantData.scope.join(' '),
     };
+
+    // RFC 8707 Section 2.2: SHOULD return resource parameter in response
+    if (audience) {
+      tokenResponse.resource = audience;
+    }
 
     // Return the tokens
     return new Response(JSON.stringify(tokenResponse), {
@@ -2089,6 +2186,23 @@ class OAuthProviderImpl {
         });
       }
 
+      // Validate audience according to RFC 7519 Section 4.1.3
+      // "If the principal processing the claim does not identify itself with a value in the
+      // 'aud' claim when this claim is present, then the JWT MUST be rejected."
+      if (tokenData.audience) {
+        const requestUrl = new URL(request.url);
+        const resourceServer = `${requestUrl.protocol}//${requestUrl.host}`;
+        const audiences = Array.isArray(tokenData.audience) ? tokenData.audience : [tokenData.audience];
+
+        // Check if any audience matches (RFC 3986: case-insensitive hostname comparison)
+        const matches = audiences.some((aud) => audienceMatches(resourceServer, aud));
+        if (!matches) {
+          return this.createErrorResponse('invalid_token', 'Token audience does not match resource server', 401, {
+            'WWW-Authenticate': 'Bearer realm="OAuth", error="invalid_token", error_description="Invalid audience"',
+          });
+        }
+      }
+
       // Unwrap the encryption key using the access token
       const encryptionKey = await unwrapKeyWithToken(accessToken, tokenData.wrappedEncryptionKey);
 
@@ -2106,6 +2220,21 @@ class OAuthProviderImpl {
         return this.createErrorResponse('invalid_token', 'Invalid access token', 401, {
           'WWW-Authenticate': 'Bearer realm="OAuth", error="invalid_token"',
         });
+      }
+
+      // Validate that tokens were issued specifically for them
+      if (ext.audience) {
+        const requestUrl = new URL(request.url);
+        const resourceServer = `${requestUrl.protocol}//${requestUrl.host}`;
+        const audiences = Array.isArray(ext.audience) ? ext.audience : [ext.audience];
+
+        // Check if any audience matches (RFC 3986: case-insensitive hostname comparison)
+        const matches = audiences.some((aud) => audienceMatches(resourceServer, aud));
+        if (!matches) {
+          return this.createErrorResponse('invalid_token', 'Token audience does not match resource server', 401, {
+            'WWW-Authenticate': 'Bearer realm="OAuth", error="invalid_token", error_description="Invalid audience"',
+          });
+        }
       }
 
       // Set the external props on the context object
@@ -2219,6 +2348,76 @@ const DEFAULT_ACCESS_TOKEN_TTL = 60 * 60;
 const TOKEN_LENGTH = 32;
 
 // Helper Functions
+/**
+ * Validates a resource URI per RFC 8707 Section 2
+ * @param uri - The URI string to validate
+ * @returns true if valid, false otherwise
+ */
+function validateResourceUri(uri: string): boolean {
+  if (!uri || typeof uri !== 'string') {
+    return false;
+  }
+
+  try {
+    const parsed = new URL(uri);
+
+    // RFC 8707: MUST be absolute URI (has protocol)
+    if (!parsed.protocol) {
+      return false;
+    }
+
+    // RFC 8707: MUST NOT include a fragment component
+    if (parsed.hash) {
+      return false;
+    }
+
+    // Must be http or https for security
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return false;
+    }
+
+    return true;
+  } catch {
+    // Invalid URI format
+    return false;
+  }
+}
+
+/**
+ * Checks if a resource server matches an audience claim
+ * RFC 7519 Section 4.1.3: audience values are case-sensitive strings
+ * @param resourceServerUrl - The resource server URL (from request)
+ * @param audienceValue - The audience value from token
+ * @returns true if they match, false otherwise
+ */
+function audienceMatches(resourceServerUrl: string, audienceValue: string): boolean {
+  // RFC 7519 Section 4.1.3: "aud" value is an array of case-sensitive strings
+  return resourceServerUrl === audienceValue;
+}
+
+/**
+ * Parses and validates the resource parameter from a token request (RFC 8707)
+ * Handles single string or array of strings (from multiple form parameters)
+ * @param value - The resource parameter value from the request body
+ * @returns The validated value as string, string array, or undefined if validation fails
+ */
+function parseResourceParameter(value: string | string[] | undefined): string | string[] | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  // Validate all URIs (RFC 8707 Section 2)
+  const uris = Array.isArray(value) ? value : [value];
+  for (const uri of uris) {
+    if (typeof uri !== 'string' || !validateResourceUri(uri)) {
+      // Invalid resource URI - return undefined to trigger error
+      return undefined;
+    }
+  }
+
+  return value;
+}
+
 /**
  * Hashes a secret value using SHA-256
  * @param secret - The secret value to hash
@@ -2526,10 +2725,20 @@ class OAuthHelpersImpl implements OAuthHelpers {
     const state = url.searchParams.get('state') || '';
     const codeChallenge = url.searchParams.get('code_challenge') || undefined;
     const codeChallengeMethod = url.searchParams.get('code_challenge_method') || 'plain';
+    // RFC 8707 Section 2.1: Multiple resource parameters MAY be used
+    const resourceParams = url.searchParams.getAll('resource');
+    const resourceParam =
+      resourceParams.length > 0 ? (resourceParams.length === 1 ? resourceParams[0] : resourceParams) : undefined;
 
     // Validate redirect URI to prevent javascript: URIs / XSS attacks
     // Using helper function that normalizes and checks in a case-insensitive manner
     validateRedirectUriScheme(redirectUri);
+
+    // Parse and validate resource parameter (RFC 8707)
+    const resource = parseResourceParameter(resourceParam);
+    if (resourceParam && !resource) {
+      throw new Error('The resource parameter must be a valid absolute URI without a fragment');
+    }
 
     // Check if implicit flow is requested but not allowed
     if (responseType === 'token' && !this.provider.options.allowImplicitFlow) {
@@ -2561,6 +2770,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
       state,
       codeChallenge,
       codeChallengeMethod,
+      resource,
     };
   }
 
@@ -2620,6 +2830,12 @@ class OAuthHelpersImpl implements OAuthHelpers {
       // Wrap the encryption key with the access token
       const accessTokenWrappedKey = await wrapKeyWithToken(accessToken, encryptionKey);
 
+      // Parse and validate resource parameter (RFC 8707) for implicit flow
+      const audience = parseResourceParameter(options.request.resource);
+      if (options.request.resource && !audience) {
+        throw new Error('The resource parameter must be a valid absolute URI without a fragment');
+      }
+
       // Store the grant without an auth code (will be referenced by the access token)
       const grant: Grant = {
         id: grantId,
@@ -2629,6 +2845,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
         metadata: options.metadata,
         encryptedProps: encryptedData,
         createdAt: now,
+        resource: options.request.resource,
       };
 
       // Store the grant with a key that includes the user ID
@@ -2642,6 +2859,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
         userId: options.userId,
         createdAt: now,
         expiresAt: accessTokenExpiresAt,
+        audience: audience,
         wrappedEncryptionKey: accessTokenWrappedKey,
         grant: {
           clientId: options.request.clientId,
@@ -2699,6 +2917,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
         // Store PKCE parameters if provided
         codeChallenge: options.request.codeChallenge,
         codeChallengeMethod: options.request.codeChallengeMethod,
+        resource: options.request.resource,
       };
 
       // Store the grant with a key that includes the user ID

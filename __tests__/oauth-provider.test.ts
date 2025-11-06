@@ -2022,6 +2022,663 @@ describe('OAuthProvider', () => {
     });
   });
 
+  describe('Audience Validation (RFC 7519 Section 4.1.3)', () => {
+    // Helper to get access token with resource parameter (RFC 8707)
+    async function getAccessTokenWithResource(resource?: string | string[]) {
+      // Create a client
+      const clientData = {
+        redirect_uris: ['https://client.example.com/callback'],
+        client_name: 'Test Client',
+        token_endpoint_auth_method: 'client_secret_basic',
+      };
+
+      const registerRequest = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify(clientData)
+      );
+
+      const registerResponse = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
+      const client = await registerResponse.json<any>();
+      const clientId = client.client_id;
+      const clientSecret = client.client_secret;
+      const redirectUri = 'https://client.example.com/callback';
+
+      // Get an auth code
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123`
+      );
+
+      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const location = authResponse.headers.get('Location')!;
+      const code = new URL(location).searchParams.get('code')!;
+
+      // Exchange for tokens with resource parameter (RFC 8707)
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+      if (resource !== undefined) {
+        // RFC 8707: multiple resources are sent as separate parameters
+        if (Array.isArray(resource)) {
+          resource.forEach((r) => params.append('resource', r));
+        } else {
+          params.append('resource', resource);
+        }
+      }
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      );
+
+      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokens = await tokenResponse.json<{ access_token: string }>();
+      return tokens.access_token;
+    }
+
+    it('should accept token with matching audience (string)', async () => {
+      const accessToken = await getAccessTokenWithResource('https://example.com');
+
+      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: `Bearer ${accessToken}`,
+      });
+
+      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+
+      expect(apiResponse.status).toBe(200);
+      const data = await apiResponse.json<any>();
+      expect(data.success).toBe(true);
+      expect(data.user).toEqual({ userId: 'test-user-123', username: 'TestUser' });
+    });
+
+    it('should accept token with matching audience in array', async () => {
+      const accessToken = await getAccessTokenWithResource(['https://example.com', 'https://other.example.com']);
+
+      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: `Bearer ${accessToken}`,
+      });
+
+      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+
+      expect(apiResponse.status).toBe(200);
+      const data = await apiResponse.json<{ success: boolean }>();
+      expect(data.success).toBe(true);
+    });
+
+    it('should accept token with multiple resources at all specified resource servers (E2E)', async () => {
+      // Request token for two resource servers
+      const accessToken = await getAccessTokenWithResource(['https://api1.example.com', 'https://api2.example.com']);
+
+      // Should work at first resource server
+      const api1Request = createMockRequest('https://api1.example.com/api/test', 'GET', {
+        Authorization: `Bearer ${accessToken}`,
+      });
+      const api1Response = await oauthProvider.fetch(api1Request, mockEnv, mockCtx);
+      expect(api1Response.status).toBe(200);
+      const api1Data = await api1Response.json<{ success: boolean }>();
+      expect(api1Data.success).toBe(true);
+
+      // Should also work at second resource server
+      const api2Request = createMockRequest('https://api2.example.com/api/test', 'GET', {
+        Authorization: `Bearer ${accessToken}`,
+      });
+      const api2Response = await oauthProvider.fetch(api2Request, mockEnv, mockCtx);
+      expect(api2Response.status).toBe(200);
+      const api2Data = await api2Response.json<{ success: boolean }>();
+      expect(api2Data.success).toBe(true);
+
+      // Should fail at third resource server not in audience
+      const api3Request = createMockRequest('https://api3.example.com/api/test', 'GET', {
+        Authorization: `Bearer ${accessToken}`,
+      });
+      const api3Response = await oauthProvider.fetch(api3Request, mockEnv, mockCtx);
+      expect(api3Response.status).toBe(401);
+      const api3Error = await api3Response.json<{ error: string }>();
+      expect(api3Error.error).toBe('invalid_token');
+    });
+
+    it('should accept token without audience claim (backward compatibility)', async () => {
+      const accessToken = await getAccessTokenWithResource(undefined);
+
+      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: `Bearer ${accessToken}`,
+      });
+
+      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+
+      expect(apiResponse.status).toBe(200);
+      const data = await apiResponse.json<{ success: boolean }>();
+      expect(data.success).toBe(true);
+    });
+
+    it('should reject token with wrong audience (HTTP 401)', async () => {
+      const accessToken = await getAccessTokenWithResource('https://wrong-server.com');
+
+      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: `Bearer ${accessToken}`,
+      });
+
+      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+
+      expect(apiResponse.status).toBe(401);
+
+      const wwwAuth = apiResponse.headers.get('WWW-Authenticate');
+      expect(wwwAuth).toContain('Bearer');
+      expect(wwwAuth).toContain('error="invalid_token"');
+      expect(wwwAuth).toContain('Invalid audience');
+
+      const error = await apiResponse.json<{ error: string; error_description: string }>();
+      expect(error.error).toBe('invalid_token');
+      expect(error.error_description).toContain('audience');
+    });
+
+    it('should reject token when resource server not in audience array', async () => {
+      const accessToken = await getAccessTokenWithResource(['https://other1.com', 'https://other2.com']);
+
+      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: `Bearer ${accessToken}`,
+      });
+
+      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+
+      expect(apiResponse.status).toBe(401);
+
+      const error = await apiResponse.json<{ error: string; error_description: string }>();
+      expect(error.error).toBe('invalid_token');
+    });
+
+    it('should reject token with audience mismatch on different host', async () => {
+      const accessToken = await getAccessTokenWithResource('https://api.example.com');
+
+      const apiRequest = createMockRequest('https://api2.example.com/api/test', 'GET', {
+        Authorization: `Bearer ${accessToken}`,
+      });
+
+      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+
+      expect(apiResponse.status).toBe(401);
+      const error = await apiResponse.json<{ error: string; error_description: string }>();
+      expect(error.error).toBe('invalid_token');
+    });
+
+    it('should reject token with audience mismatch on different protocol', async () => {
+      const accessToken = await getAccessTokenWithResource('http://example.com');
+
+      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: `Bearer ${accessToken}`,
+      });
+
+      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+
+      expect(apiResponse.status).toBe(401);
+      const error = await apiResponse.json<{ error: string; error_description: string }>();
+      expect(error.error).toBe('invalid_token');
+    });
+
+    it('should reject token with different port', async () => {
+      // Token issued for port 8080
+      const accessToken = await getAccessTokenWithResource('https://example.com:8080');
+
+      // Request to default port (443)
+      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: `Bearer ${accessToken}`,
+      });
+
+      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+
+      expect(apiResponse.status).toBe(401);
+      const error = await apiResponse.json<any>();
+      expect(error.error).toBe('invalid_token');
+    });
+
+    it('should reject token when ports do not match', async () => {
+      // Token issued for default port
+      const accessToken = await getAccessTokenWithResource('https://example.com');
+
+      // Request to explicit port 8443
+      const apiRequest = createMockRequest('https://example.com:8443/api/test', 'GET', {
+        Authorization: `Bearer ${accessToken}`,
+      });
+
+      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+
+      expect(apiResponse.status).toBe(401);
+      const error = await apiResponse.json<any>();
+      expect(error.error).toBe('invalid_token');
+    });
+
+    it('should accept token with IPv6 resource URI', async () => {
+      const accessToken = await getAccessTokenWithResource('https://[2001:db8::1]:8080');
+
+      const apiRequest = createMockRequest('https://[2001:db8::1]:8080/api/test', 'GET', {
+        Authorization: `Bearer ${accessToken}`,
+      });
+
+      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+
+      expect(apiResponse.status).toBe(200);
+      const data = await apiResponse.json<any>();
+      expect(data.success).toBe(true);
+    });
+
+    it('should reject token request with resource containing fragment (RFC 8707)', async () => {
+      // Create a client
+      const clientData = {
+        redirect_uris: ['https://client.example.com/callback'],
+        client_name: 'Test Client',
+        token_endpoint_auth_method: 'client_secret_basic',
+      };
+
+      const registerRequest = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify(clientData)
+      );
+
+      const registerResponse = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
+      const client = await registerResponse.json<any>();
+      const clientId = client.client_id;
+      const clientSecret = client.client_secret;
+      const redirectUri = 'https://client.example.com/callback';
+
+      // Get an auth code
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123`
+      );
+
+      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const location = authResponse.headers.get('Location')!;
+      const code = new URL(location).searchParams.get('code')!;
+
+      // Try to exchange with resource containing fragment
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+      params.append('resource', 'https://example.com/api#fragment');
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      );
+
+      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+
+      expect(tokenResponse.status).toBe(400);
+      const error = await tokenResponse.json<any>();
+      expect(error.error).toBe('invalid_target');
+      expect(error.error_description).toContain('fragment');
+    });
+
+    it('should reject token request with javascript: resource scheme', async () => {
+      // Create a client
+      const clientData = {
+        redirect_uris: ['https://client.example.com/callback'],
+        client_name: 'Test Client',
+        token_endpoint_auth_method: 'client_secret_basic',
+      };
+
+      const registerRequest = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify(clientData)
+      );
+
+      const registerResponse = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
+      const client = await registerResponse.json<any>();
+      const clientId = client.client_id;
+      const clientSecret = client.client_secret;
+      const redirectUri = 'https://client.example.com/callback';
+
+      // Get an auth code
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123`
+      );
+
+      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const location = authResponse.headers.get('Location')!;
+      const code = new URL(location).searchParams.get('code')!;
+
+      // Try to exchange with javascript: resource
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+      params.append('resource', 'javascript:alert(1)');
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      );
+
+      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+
+      expect(tokenResponse.status).toBe(400);
+      const error = await tokenResponse.json<any>();
+      expect(error.error).toBe('invalid_target');
+    });
+
+    it('should reject token request with relative URI resource', async () => {
+      // Create a client
+      const clientData = {
+        redirect_uris: ['https://client.example.com/callback'],
+        client_name: 'Test Client',
+        token_endpoint_auth_method: 'client_secret_basic',
+      };
+
+      const registerRequest = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify(clientData)
+      );
+
+      const registerResponse = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
+      const client = await registerResponse.json<any>();
+      const clientId = client.client_id;
+      const clientSecret = client.client_secret;
+      const redirectUri = 'https://client.example.com/callback';
+
+      // Get an auth code
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123`
+      );
+
+      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const location = authResponse.headers.get('Location')!;
+      const code = new URL(location).searchParams.get('code')!;
+
+      // Try to exchange with relative URI resource
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+      params.append('resource', '/api/resource');
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      );
+
+      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+
+      expect(tokenResponse.status).toBe(400);
+      const error = await tokenResponse.json<any>();
+      expect(error.error).toBe('invalid_target');
+    });
+
+    it('should use resource from authorization request when not provided in token request', async () => {
+      // Create a client
+      const clientData = {
+        redirect_uris: ['https://client.example.com/callback'],
+        client_name: 'Test Client',
+        token_endpoint_auth_method: 'client_secret_basic',
+      };
+
+      const registerRequest = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify(clientData)
+      );
+
+      const registerResponse = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
+      const client = await registerResponse.json<any>();
+      const clientId = client.client_id;
+      const clientSecret = client.client_secret;
+      const redirectUri = 'https://client.example.com/callback';
+
+      // Get an auth code WITH resource parameter
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&resource=${encodeURIComponent('https://api.example.com')}` +
+          `&scope=read%20write&state=xyz123`
+      );
+
+      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const location = authResponse.headers.get('Location')!;
+      const code = new URL(location).searchParams.get('code')!;
+
+      // Exchange WITHOUT resource parameter in token request
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+      // No resource parameter here!
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      );
+
+      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      expect(tokenResponse.status).toBe(200);
+      const tokens = await tokenResponse.json<any>();
+      const accessToken = tokens.access_token;
+
+      // Use token at the resource server specified in authorization request
+      const apiRequest = createMockRequest('https://api.example.com/api/test', 'GET', {
+        Authorization: `Bearer ${accessToken}`,
+      });
+
+      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+      expect(apiResponse.status).toBe(200);
+      const data = await apiResponse.json<any>();
+      expect(data.success).toBe(true);
+    });
+
+    it('should validate audience for external tokens with matching audience', async () => {
+      const externalProvider = new OAuthProvider({
+        apiRoute: ['/api/', 'https://example.com/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        scopesSupported: ['read', 'write', 'profile'],
+        resolveExternalToken: async ({ token }) => {
+          if (token === 'external-token-with-audience') {
+            return {
+              props: { userId: 'external-user', source: 'external' },
+              audience: 'https://example.com',
+            };
+          }
+          return null;
+        },
+      });
+
+      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: 'Bearer external-token-with-audience',
+      });
+
+      const apiResponse = await externalProvider.fetch(apiRequest, mockEnv, mockCtx);
+
+      expect(apiResponse.status).toBe(200);
+      const data = await apiResponse.json<any>();
+      expect(data.success).toBe(true);
+    });
+
+    it('should reject external tokens with wrong audience', async () => {
+      const externalProvider = new OAuthProvider({
+        apiRoute: ['/api/', 'https://example.com/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        scopesSupported: ['read', 'write', 'profile'],
+        resolveExternalToken: async ({ token }) => {
+          if (token === 'external-token-wrong-audience') {
+            return {
+              props: { userId: 'external-user', source: 'external' },
+              audience: 'https://wrong-server.com',
+            };
+          }
+          return null;
+        },
+      });
+
+      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: 'Bearer external-token-wrong-audience',
+      });
+
+      const apiResponse = await externalProvider.fetch(apiRequest, mockEnv, mockCtx);
+
+      expect(apiResponse.status).toBe(401);
+      const error = await apiResponse.json<any>();
+      expect(error.error).toBe('invalid_token');
+      expect(error.error_description).toContain('audience');
+    });
+  });
+
+  describe('Resource Parameter Downscoping (RFC 8707)', () => {
+    it('should reject upscoping attempt (requesting resource not in authorization)', async () => {
+      // Create a client
+      const clientData = {
+        redirect_uris: ['https://client.example.com/callback'],
+        client_name: 'Test Client',
+        token_endpoint_auth_method: 'client_secret_basic',
+      };
+
+      const registerRequest = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify(clientData)
+      );
+
+      const registerResponse = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
+      const client = await registerResponse.json<any>();
+      const clientId = client.client_id;
+      const clientSecret = client.client_secret;
+      const redirectUri = 'https://client.example.com/callback';
+
+      // Get an auth code with resource=https://api1.example.com
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123&resource=https://api1.example.com`
+      );
+
+      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const location = authResponse.headers.get('Location')!;
+      const code = new URL(location).searchParams.get('code')!;
+
+      // Try to exchange with resource=https://api2.example.com (not in authorization!)
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+      params.append('resource', 'https://api2.example.com'); // Different resource - upscoping!
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      );
+
+      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+
+      expect(tokenResponse.status).toBe(400);
+      const error = await tokenResponse.json<any>();
+      expect(error.error).toBe('invalid_target');
+      expect(error.error_description).toContain('not included in the authorization request');
+    });
+
+    it('should allow downscoping (requesting subset of authorized resources)', async () => {
+      // Create a client
+      const clientData = {
+        redirect_uris: ['https://client.example.com/callback'],
+        client_name: 'Test Client',
+        token_endpoint_auth_method: 'client_secret_basic',
+      };
+
+      const registerRequest = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify(clientData)
+      );
+
+      const registerResponse = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
+      const client = await registerResponse.json<any>();
+      const clientId = client.client_id;
+      const clientSecret = client.client_secret;
+      const redirectUri = 'https://client.example.com/callback';
+
+      // Get an auth code with TWO resources
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123` +
+          `&resource=https://api1.example.com&resource=https://api2.example.com`
+      );
+
+      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const location = authResponse.headers.get('Location')!;
+      const code = new URL(location).searchParams.get('code')!;
+
+      // Exchange with only ONE resource (downscoping - subset of original)
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+      params.append('resource', 'https://api1.example.com'); // Subset - downscoping allowed!
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      );
+
+      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+
+      expect(tokenResponse.status).toBe(200);
+      const tokens = await tokenResponse.json<any>();
+      expect(tokens.access_token).toBeDefined();
+      expect(tokens.resource).toBe('https://api1.example.com');
+    });
+  });
+
   describe('CORS Support', () => {
     it('should handle CORS preflight for API requests', async () => {
       const preflightRequest = createMockRequest('https://example.com/api/test', 'OPTIONS', {
