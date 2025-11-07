@@ -1,5 +1,11 @@
 # @cloudflare/workers-oauth-provider
 
+## 0.1.0
+
+### Minor Changes
+
+- [#103](https://github.com/cloudflare/workers-oauth-provider/pull/103) [`818a557`](https://github.com/cloudflare/workers-oauth-provider/commit/818a557a0042b99282397cbaf12bff84487a737a) Thanks [@mattzcarey](https://github.com/mattzcarey)! - feat: add audience validation for OAuth tokens per RFC 7519
+
 ## 0.0.13
 
 ### Patch Changes
