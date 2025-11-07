@@ -99,6 +99,12 @@ export interface TokenExchangeCallbackOptions {
    * Application-specific properties currently associated with this grant
    */
   props: any;
+
+  /**
+   * PKCE code verifier that was passed to the token endpoint.
+   * This is only available for the 'authorization_code' grant type.
+   */
+  codeVerifier?: string;
 }
 
 /**
@@ -1449,6 +1455,7 @@ class OAuthProviderImpl {
         userId: userId,
         scope: grantData.scope,
         props: decryptedProps,
+        codeVerifier: codeVerifier,
       };
 
       const callbackResult = await Promise.resolve(this.options.tokenExchangeCallback(callbackOptions));
