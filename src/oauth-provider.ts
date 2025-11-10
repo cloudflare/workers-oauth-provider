@@ -2191,7 +2191,7 @@ class OAuthProviderImpl {
       // 'aud' claim when this claim is present, then the JWT MUST be rejected."
       if (tokenData.audience) {
         const requestUrl = new URL(request.url);
-        const resourceServer = `${requestUrl.protocol}//${requestUrl.host}`;
+        const resourceServer = `${requestUrl.protocol}//${requestUrl.host}${requestUrl.pathname}`;
         const audiences = Array.isArray(tokenData.audience) ? tokenData.audience : [tokenData.audience];
 
         // Check if any audience matches (RFC 3986: case-insensitive hostname comparison)
@@ -2225,7 +2225,7 @@ class OAuthProviderImpl {
       // Validate that tokens were issued specifically for them
       if (ext.audience) {
         const requestUrl = new URL(request.url);
-        const resourceServer = `${requestUrl.protocol}//${requestUrl.host}`;
+        const resourceServer = `${requestUrl.protocol}//${requestUrl.host}${requestUrl.pathname}`;
         const audiences = Array.isArray(ext.audience) ? ext.audience : [ext.audience];
 
         // Check if any audience matches (RFC 3986: case-insensitive hostname comparison)
