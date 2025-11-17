@@ -96,7 +96,7 @@ class TestApiHandler extends WorkerEntrypoint {
   fetch(request: Request) {
     const url = new URL(request.url);
 
-    if (url.pathname === '/api/test') {
+    if (url.pathname.startsWith('/api/')) {
       // Return authenticated user info from ctx.props
       return new Response(
         JSON.stringify({
@@ -2561,6 +2561,56 @@ describe('OAuthProvider', () => {
       const error = await apiResponse.json<any>();
       expect(error.error).toBe('invalid_token');
       expect(error.error_description).toContain('audience');
+    });
+
+    it('should accept token with path-aware audience at matching path (RFC 8707)', async () => {
+      // Request token with path-specific resource indicator
+      const accessToken = await getAccessTokenWithResource('https://example.com/api/test');
+
+      // Request to exact matching path should succeed
+      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: `Bearer ${accessToken}`,
+      });
+
+      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+
+      expect(apiResponse.status).toBe(200);
+      const data = await apiResponse.json<any>();
+      expect(data.success).toBe(true);
+    });
+
+    it('should reject token with path-aware audience at different path (RFC 8707)', async () => {
+      // Request token with path-specific resource indicator
+      const accessToken = await getAccessTokenWithResource('https://example.com/api/test');
+
+      // Request to different path should fail (strict path matching)
+      const apiRequest = createMockRequest('https://example.com/api/other', 'GET', {
+        Authorization: `Bearer ${accessToken}`,
+      });
+
+      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+
+      expect(apiResponse.status).toBe(401);
+      const error = await apiResponse.json<any>();
+      expect(error.error).toBe('invalid_token');
+      expect(error.error_description).toContain('audience');
+    });
+
+    it('should accept token with path-aware audience for ChatGPT connector use case (RFC 8707)', async () => {
+      // Simulates ChatGPT custom connector flow (issue #108)
+      // ChatGPT sends resource=https://server/api/connector with path component
+      const accessToken = await getAccessTokenWithResource('https://example.com/api/connector');
+
+      // API request to exact matching path should succeed
+      const apiRequest = createMockRequest('https://example.com/api/connector', 'GET', {
+        Authorization: `Bearer ${accessToken}`,
+      });
+
+      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+
+      expect(apiResponse.status).toBe(200);
+      const data = await apiResponse.json<any>();
+      expect(data.success).toBe(true);
     });
   });
 
