@@ -2392,7 +2392,31 @@ function validateResourceUri(uri: string): boolean {
  */
 function audienceMatches(resourceServerUrl: string, audienceValue: string): boolean {
   // RFC 7519 Section 4.1.3: "aud" value is an array of case-sensitive strings
-  return resourceServerUrl === audienceValue;
+
+  // Exact match (fast path)
+  if (resourceServerUrl === audienceValue) {
+    return true;
+  }
+
+  // Smart matching for backward compatibility with origin-only audiences
+  // while supporting RFC 8707 path-aware resource indicators
+  try {
+    const audienceUrl = new URL(audienceValue);
+    const resourceUrl = new URL(resourceServerUrl);
+
+    // If audience is origin-only (no path or just '/'), match by origin
+    // This maintains backward compatibility with existing code
+    if (audienceUrl.pathname === '/' || audienceUrl.pathname === '') {
+      return audienceUrl.origin === resourceUrl.origin;
+    }
+
+    // If audience has a path component, require exact match
+    // This supports RFC 8707 path-aware resource indicators
+  } catch {
+    // If URL parsing fails, no match
+  }
+
+  return false;
 }
 
 /**
