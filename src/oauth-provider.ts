@@ -1295,6 +1295,9 @@ class OAuthProviderImpl {
       // not implemented: introspection_endpoint_auth_methods_supported
       // not implemented: introspection_endpoint_auth_signing_alg_values_supported
       code_challenge_methods_supported: ['plain', 'S256'], // PKCE support
+      // MCP Client ID Metadata Document support (CIMD)
+      // When true, clients can use HTTPS URLs as client_id, pointing to metadata documents
+      client_id_metadata_document_supported: true,
     };
 
     return new Response(JSON.stringify(metadata), {
@@ -2290,17 +2293,111 @@ class OAuthProviderImpl {
   }
 
   /**
-   * Fetches client information from KV storage
+   * Fetches client information from KV storage or via CIMD (Client ID Metadata Document)
    * This method is not private because `OAuthHelpers` needs to call it. Note that since
    * `OAuthProviderImpl` is not exposed outside this module, this is still effectively
    * module-private.
+   *
+   * Supports CIMD: If clientId is an HTTPS URL with a non-root path, the metadata
+   * document will be fetched from that URL instead of looking up in KV storage.
+   *
    * @param env - Cloudflare Worker environment variables
-   * @param clientId - The client ID to look up
+   * @param clientId - The client ID to look up (can be a regular ID or an HTTPS URL for CIMD)
    * @returns The client information, or null if not found
    */
-  getClient(env: any, clientId: string): Promise<ClientInfo | null> {
+  async getClient(env: any, clientId: string): Promise<ClientInfo | null> {
+    // Check if this is a CIMD (Client ID Metadata Document) URL
+    if (this.isClientMetadataUrl(clientId)) {
+      return this.fetchClientMetadataDocument(clientId);
+    }
+
+    // Standard KV lookup
     const clientKey = `client:${clientId}`;
     return env.OAUTH_KV.get(clientKey, { type: 'json' });
+  }
+
+  /**
+   * Checks if a client_id is a valid CIMD URL
+   * Must be HTTPS with a non-root pathname
+   */
+  private isClientMetadataUrl(clientId: string): boolean {
+    try {
+      const url = new URL(clientId);
+      return url.protocol === 'https:' && url.pathname !== '/';
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Fetches and validates a Client ID Metadata Document from the given URL
+   * Per the MCP spec, the client_id in the document must match the URL exactly
+   */
+  private async fetchClientMetadataDocument(metadataUrl: string): Promise<ClientInfo | null> {
+    try {
+      const response = await fetch(metadataUrl, {
+        headers: {
+          Accept: 'application/json',
+        },
+      });
+
+      if (!response.ok) {
+        console.error(`CIMD fetch failed: HTTP ${response.status} from ${metadataUrl}`);
+        return null;
+      }
+
+      const metadata = (await response.json()) as {
+        client_id?: string;
+        client_name?: string;
+        client_uri?: string;
+        logo_uri?: string;
+        redirect_uris?: string[];
+        grant_types?: string[];
+        response_types?: string[];
+        token_endpoint_auth_method?: string;
+        contacts?: string[];
+        policy_uri?: string;
+        tos_uri?: string;
+        jwks_uri?: string;
+      };
+
+      // Validate that client_id matches the URL (required by spec)
+      if (metadata.client_id !== metadataUrl) {
+        console.error(
+          `CIMD validation failed: client_id "${metadata.client_id}" does not match URL "${metadataUrl}"`
+        );
+        return null;
+      }
+
+      // Validate redirect_uris is present and non-empty
+      if (!metadata.redirect_uris || metadata.redirect_uris.length === 0) {
+        console.error(`CIMD validation failed: redirect_uris is required`);
+        return null;
+      }
+
+      // Convert to ClientInfo format
+      // CIMD clients are always treated as public clients (no secret)
+      const clientInfo: ClientInfo = {
+        clientId: metadata.client_id,
+        clientName: metadata.client_name,
+        clientUri: metadata.client_uri,
+        logoUri: metadata.logo_uri,
+        redirectUris: metadata.redirect_uris,
+        grantTypes: metadata.grant_types || ['authorization_code'],
+        responseTypes: metadata.response_types || ['code'],
+        tokenEndpointAuthMethod: metadata.token_endpoint_auth_method || 'none',
+        contacts: metadata.contacts,
+        policyUri: metadata.policy_uri,
+        tosUri: metadata.tos_uri,
+        jwksUri: metadata.jwks_uri,
+        // No client secret for CIMD clients (public clients)
+      };
+
+      return clientInfo;
+    } catch (error) {
+      console.error(`CIMD fetch error for ${metadataUrl}:`, error);
+      return null;
+    }
   }
 
   /**
