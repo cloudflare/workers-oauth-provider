@@ -818,6 +818,16 @@ export class OAuthProvider {
   fetch(request: Request, env: any, ctx: ExecutionContext): Promise<Response> {
     return this.#impl.fetch(request, env, ctx);
   }
+  
+    /**
+   * Extracts and decrypts props from a token
+   * @param token - The token
+   * @param env - Cloudflare Worker environment variables
+   * @returns Promise resolving to the decrypted props, or null if token is invalid
+   */
+  extractTokenProps<T = any>(token: string, env: any): Promise<T | null> {
+    return this.#impl.extractTokenProps(token, env);
+  }
 }
 
 /**
