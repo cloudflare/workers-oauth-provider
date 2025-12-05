@@ -345,6 +345,13 @@ export interface OAuthHelpers {
    * @returns A Promise resolving when the revocation is confirmed.
    */
   revokeGrant(grantId: string, userId: string): Promise<void>;
+
+  /**
+   * Extracts and decrypts props from a token
+   * @param token - The token
+   * @returns Promise resolving to the decrypted props, or null if token is invalid
+   */
+  extractTokenProps<T = any>(token: string): Promise<T | null>;
 }
 
 /**
@@ -780,6 +787,16 @@ export class OAuthProvider {
   fetch(request: Request, env: any, ctx: ExecutionContext): Promise<Response> {
     return this.#impl.fetch(request, env, ctx);
   }
+  
+    /**
+   * Extracts and decrypts props from a token
+   * @param token - The token
+   * @param env - Cloudflare Worker environment variables
+   * @returns Promise resolving to the decrypted props, or null if token is invalid
+   */
+  extractTokenProps<T = any>(token: string, env: any): Promise<T | null> {
+    return this.#impl.extractTokenProps(token, env);
+  }
 }
 
 /**
@@ -1008,6 +1025,37 @@ class OAuthProviderImpl {
       const handler = new this.typedDefaultHandler.handler(ctx, env);
       return handler.fetch(request);
     }
+  }
+
+  /**
+   * Extracts and decrypts props from a granted token
+   * @param token - The granted token
+   * @param env - Cloudflare Worker environment variables
+   * @returns Promise resolving to the decrypted props, or null if token is invalid
+   */
+  async extractTokenProps<T = any>(token: string, env: any): Promise<T | null> {
+    const parts = token.split(":");
+    const isPossiblyInternalFormat = parts.length === 3;
+
+    if (!isPossiblyInternalFormat) {
+      return null;
+    }
+
+    const [userId, grantId] = parts;
+    const id = await generateTokenId(token);
+    const tokenData = await env.OAUTH_KV.get(`token:${userId}:${grantId}:${id}`, { type: "json" });
+    
+    if (!tokenData) {
+      return null;
+    }
+    const now = Math.floor(Date.now() / 1e3);
+    if (tokenData.expiresAt < now) {
+      return null;
+    }
+
+    const encryptionKey = await unwrapKeyWithToken(token, tokenData.wrappedEncryptionKey);
+    const decryptedProps = await decryptProps(encryptionKey, tokenData.grant.encryptedProps);
+    return decryptedProps as T;
   }
 
   /**
@@ -3201,6 +3249,15 @@ class OAuthHelpersImpl implements OAuthHelpers {
     // After all tokens are deleted, delete the grant itself
     await this.env.OAUTH_KV.delete(grantKey);
   }
+
+  /**
+   * Extracts and decrypts props from a token
+   * @param accessToken - The token
+   * @returns Promise resolving to the decrypted props, or null if token is invalid
+   */
+    async extractTokenProps<T = any>(token: string): Promise<T | null> {
+      return await this.provider.extractTokenProps(token, this.env);
+    }
 }
 
 /**
