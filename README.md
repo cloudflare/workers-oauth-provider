@@ -322,6 +322,24 @@ This requirement is seemingly fundamentally flawed as it assumes that every refr
 
 This library implements a compromise: At any particular time, a grant may have two valid refresh tokens. When the client uses one of them, the other one is invalidated, and a new one is generated and returned. Thus, if the client correctly uses the new refresh token each time, then older refresh tokens are continuously invalidated. But if a transient failure prevents the client from updating its token, it can always retry the request with the token it used previously.
 
+## Client ID Metadata Document (CIMD) Support
+
+This library supports [Client ID Metadata Documents](https://www.ietf.org/archive/id/draft-parecki-oauth-client-id-metadata-document-03.html), which allow clients to use HTTPS URLs as their `client_id`. When a client presents an HTTPS URL with a non-root path as its `client_id`, the library will fetch and validate the metadata document from that URL.
+
+### Enabling CIMD
+
+To enable CIMD support, you must add the `global_fetch_strictly_public` compatibility flag to your `wrangler.jsonc`:
+
+```jsonc
+{
+  "compatibility_flags": ["global_fetch_strictly_public"]
+}
+```
+
+This flag is required for SSRF (Server-Side Request Forgery) protection. Due to a legacy quirk, `fetch()` requests to URLs within your zone's domain are sent directly to the origin server, bypassing Cloudflare. The `global_fetch_strictly_public` flag disables this behavior. See [Cloudflare's blog post](https://blog.cloudflare.com/workers-environment-live-object-bindings/) and [documentation](https://developers.cloudflare.com/workers/configuration/compatibility-flags/#global-fetch-strictly-public) for more details.
+
+When this flag is not enabled, the OAuth metadata endpoint will report `client_id_metadata_document_supported: false` and MCP Clients should use DCR instead.
+
 ## Written using Claude
 
 This library (including the schema documentation) was largely written with the help of [Claude](https://claude.ai), the AI model by Anthropic. Claude's output was thoroughly reviewed by Cloudflare engineers with careful attention paid to security and compliance with standards. Many improvements were made on the initial output, mostly again by prompting Claude (and reviewing the results). Check out the commit history to see how Claude was prompted and what code it produced.
