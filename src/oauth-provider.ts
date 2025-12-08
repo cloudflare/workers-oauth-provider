@@ -2318,7 +2318,7 @@ class OAuthProviderImpl {
    */
   async getClient(env: any, clientId: string): Promise<ClientInfo | null> {
     // Check if this is a CIMD (Client ID Metadata Document) URL
-    if (this.isClientMetadataUrl(clientId) && this.hasGlobalFetchStrictlyPublic();) {
+    if (this.isClientMetadataUrl(clientId) && this.hasGlobalFetchStrictlyPublic()) {
       return this.fetchClientMetadataDocument(env, clientId);
     }
 
