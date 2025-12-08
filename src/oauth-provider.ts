@@ -1,5 +1,10 @@
 import { WorkerEntrypoint } from 'cloudflare:workers';
 
+/**
+ * Track whether we've already warned about CIMD being disabled (to avoid spamming logs)
+ */
+let hasWarnedAboutCimdDisabled = false;
+
 // Types
 
 /**
@@ -1296,8 +1301,8 @@ class OAuthProviderImpl {
       // not implemented: introspection_endpoint_auth_signing_alg_values_supported
       code_challenge_methods_supported: ['plain', 'S256'], // PKCE support
       // MCP Client ID Metadata Document support (CIMD)
-      // When true, clients can use HTTPS URLs as client_id, pointing to metadata documents
-      client_id_metadata_document_supported: true,
+      // Only enabled when global_fetch_strictly_public compat flag is set (for SSRF protection)
+      client_id_metadata_document_supported: this.hasSsrfProtection(),
     };
 
     return new Response(JSON.stringify(metadata), {
@@ -2307,7 +2312,7 @@ class OAuthProviderImpl {
    */
   async getClient(env: any, clientId: string): Promise<ClientInfo | null> {
     // Check if this is a CIMD (Client ID Metadata Document) URL
-    if (this.isClientMetadataUrl(clientId)) {
+    if (this.shouldUseCimd(clientId)) {
       return this.fetchClientMetadataDocument(env, clientId);
     }
 
@@ -2317,8 +2322,18 @@ class OAuthProviderImpl {
   }
 
   /**
-   * Checks if a client_id is a valid CIMD URL
-   * Must be HTTPS with a non-root pathname
+   * Checks if the global_fetch_strictly_public compatibility flag is enabled.
+   * This flag is required for CIMD to prevent SSRF attacks.
+   * See: https://developers.cloudflare.com/workers/configuration/compatibility-flags/#global-fetch-strictly-public
+   */
+  private hasSsrfProtection(): boolean {
+    const compatFlags =
+      typeof Cloudflare !== 'undefined' && Cloudflare.compatibilityFlags ? Cloudflare.compatibilityFlags : null;
+    return !!compatFlags?.global_fetch_strictly_public;
+  }
+
+  /**
+   * Checks if a client_id is a CIMD URL (HTTPS with non-root path)
    */
   private isClientMetadataUrl(clientId: string): boolean {
     try {
@@ -2327,6 +2342,31 @@ class OAuthProviderImpl {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * Checks if a client_id should use CIMD (Client ID Metadata Document)
+   * Returns true if the clientId is a valid CIMD URL and SSRF protection is enabled
+   */
+  private shouldUseCimd(clientId: string): boolean {
+    if (!this.isClientMetadataUrl(clientId)) {
+      return false;
+    }
+
+    // CIMD requires the global_fetch_strictly_public flag for SSRF protection
+    if (!this.hasSsrfProtection()) {
+      if (!hasWarnedAboutCimdDisabled) {
+        hasWarnedAboutCimdDisabled = true;
+        console.warn(
+          `CIMD is disabled: The 'global_fetch_strictly_public' compatibility flag must be enabled to use Client ID Metadata Documents. ` +
+            `Add 'compatibility_flags = ["global_fetch_strictly_public"]' to your wrangler.toml. ` +
+            `See: https://developers.cloudflare.com/workers/configuration/compatibility-flags/#global-fetch-strictly-public`
+        );
+      }
+      return false;
+    }
+
+    return true;
   }
 
   /**

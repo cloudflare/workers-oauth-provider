@@ -4423,13 +4423,22 @@ describe('OAuthProvider', () => {
 
   describe('Client ID Metadata Document (CIMD)', () => {
     let originalFetch: typeof globalThis.fetch;
+    let originalCloudflare: Cloudflare | undefined;
 
     beforeEach(() => {
       originalFetch = globalThis.fetch;
+      originalCloudflare = (globalThis as { Cloudflare?: Cloudflare }).Cloudflare;
+      // Mock the Cloudflare global with the required compatibility flag for SSRF protection
+      (globalThis as any).Cloudflare = {
+        compatibilityFlags: {
+          global_fetch_strictly_public: true,
+        },
+      };
     });
 
     afterEach(() => {
       globalThis.fetch = originalFetch;
+      (globalThis as any).Cloudflare = originalCloudflare;
     });
 
     function createMockFetchResponse(
@@ -4920,6 +4929,111 @@ describe('OAuthProvider', () => {
         );
 
         await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+      });
+    });
+
+    describe('SSRF Protection', () => {
+      it('should reject CIMD fetch when global_fetch_strictly_public is not enabled', async () => {
+        // Remove the compatibility flag to simulate it not being enabled
+        (globalThis as any).Cloudflare = {
+          compatibilityFlags: {
+            global_fetch_strictly_public: false,
+          },
+        };
+
+        const cimdUrl = 'https://client.example.com/oauth/metadata.json';
+        const validMetadata = {
+          client_id: cimdUrl,
+          client_name: 'CIMD Test Client',
+          redirect_uris: ['https://client.example.com/callback'],
+          token_endpoint_auth_method: 'none',
+        };
+
+        // Fetch should not even be called
+        const fetchSpy = vi.fn().mockResolvedValue(
+          new Response(JSON.stringify(validMetadata), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        );
+        globalThis.fetch = fetchSpy;
+
+        const authRequest = createMockRequest(
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          'GET'
+        );
+
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        expect(fetchSpy).not.toHaveBeenCalled();
+      });
+
+      it('should reject CIMD fetch when Cloudflare global is undefined', async () => {
+        // Remove the Cloudflare global entirely
+        delete (globalThis as any).Cloudflare;
+
+        const cimdUrl = 'https://client.example.com/oauth/metadata.json';
+
+        const fetchSpy = vi.fn();
+        globalThis.fetch = fetchSpy;
+
+        const authRequest = createMockRequest(
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          'GET'
+        );
+
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        expect(fetchSpy).not.toHaveBeenCalled();
+      });
+
+      it('should reject CIMD fetch when compatibilityFlags is undefined', async () => {
+        // Cloudflare exists but without compatibilityFlags
+        (globalThis as any).Cloudflare = {};
+
+        const cimdUrl = 'https://client.example.com/oauth/metadata.json';
+
+        const fetchSpy = vi.fn();
+        globalThis.fetch = fetchSpy;
+
+        const authRequest = createMockRequest(
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          'GET'
+        );
+
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        expect(fetchSpy).not.toHaveBeenCalled();
+      });
+
+      it('should report client_id_metadata_document_supported as true when flag is enabled', async () => {
+        // Flag is enabled in beforeEach
+        const metadataRequest = createMockRequest('https://example.com/.well-known/oauth-authorization-server', 'GET');
+        const response = await oauthProvider.fetch(metadataRequest, mockEnv, mockCtx);
+        const metadata = (await response.json()) as { client_id_metadata_document_supported: boolean };
+
+        expect(metadata.client_id_metadata_document_supported).toBe(true);
+      });
+
+      it('should report client_id_metadata_document_supported as false when flag is not enabled', async () => {
+        (globalThis as any).Cloudflare = {
+          compatibilityFlags: {
+            global_fetch_strictly_public: false,
+          },
+        };
+
+        const metadataRequest = createMockRequest('https://example.com/.well-known/oauth-authorization-server', 'GET');
+        const response = await oauthProvider.fetch(metadataRequest, mockEnv, mockCtx);
+        const metadata = (await response.json()) as { client_id_metadata_document_supported: boolean };
+
+        expect(metadata.client_id_metadata_document_supported).toBe(false);
+      });
+
+      it('should report client_id_metadata_document_supported as false when Cloudflare global is undefined', async () => {
+        delete (globalThis as any).Cloudflare;
+
+        const metadataRequest = createMockRequest('https://example.com/.well-known/oauth-authorization-server', 'GET');
+        const response = await oauthProvider.fetch(metadataRequest, mockEnv, mockCtx);
+        const metadata = (await response.json()) as { client_id_metadata_document_supported: boolean };
+
+        expect(metadata.client_id_metadata_document_supported).toBe(false);
       });
     });
   });
