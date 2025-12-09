@@ -102,6 +102,26 @@ export interface TokenExchangeCallbackOptions {
 }
 
 /**
+ * Options for client registration callback functions
+ * Derived from ClientInfo using utility types to ensure type safety
+ */
+export type ClientRegistrationCallbackOptions = Pick<
+  ClientInfo,
+  'clientId' | 'redirectUris' | 'clientName' | 'clientUri' | 'metadata'
+>;
+
+/**
+ * Result of a client registration callback function.
+ * Allows adding metadata to the client during registration.
+ */
+export interface ClientRegistrationCallbackResult {
+  /**
+   * Metadata to be stored with the client
+   */
+  metadata?: any;
+}
+
+/**
  * Input parameters for the resolveExternalToken callback function
  */
 export interface ResolveExternalTokenInput {
@@ -245,6 +265,17 @@ export interface OAuthProviderOptions {
   tokenExchangeCallback?: (
     options: TokenExchangeCallbackOptions
   ) => Promise<TokenExchangeCallbackResult | void> | TokenExchangeCallbackResult | void;
+
+  /**
+   * Optional callback function that is called during client registration.
+   * This allows adding metadata to the client when it is created through the client registration endpoint.
+   *
+   * The callback can return metadata that will be stored with the client.
+   * If the callback returns nothing or undefined, no metadata will be added.
+   */
+  clientRegistrationCallback?: (
+    options: ClientRegistrationCallbackOptions
+  ) => Promise<ClientRegistrationCallbackResult | void> | ClientRegistrationCallbackResult | void;
 
   /**
    * Optional callback function that is called when a provided token was not found in the internal KV.
@@ -2101,6 +2132,23 @@ class OAuthProviderImpl {
       // Add client secret only for confidential clients
       if (!isPublicClient && hashedSecret) {
         clientInfo.clientSecret = hashedSecret;
+      }
+
+      // Process client registration callback if provided
+      if (this.options.clientRegistrationCallback) {
+        const callbackOptions: ClientRegistrationCallbackOptions = {
+          clientId: clientId,
+          redirectUris: redirectUris,
+          clientName: clientInfo.clientName,
+          clientUri: clientInfo.clientUri,
+          metadata: clientInfo.metadata,
+        };
+
+        const callbackResult = await Promise.resolve(this.options.clientRegistrationCallback(callbackOptions));
+
+        if (callbackResult && callbackResult.metadata !== undefined) {
+          clientInfo.metadata = callbackResult.metadata;
+        }
       }
     } catch (error) {
       return this.createErrorResponse(

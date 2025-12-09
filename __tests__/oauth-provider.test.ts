@@ -433,6 +433,92 @@ describe('OAuthProvider', () => {
       expect(savedClient).not.toBeNull();
       expect(savedClient.clientSecret).toBeUndefined(); // No secret stored
     });
+
+    it('should add metadata via clientRegistrationCallback', async () => {
+      const callbackMetadata = { test: 'new' };
+      
+      const providerWithCallback = new OAuthProvider({
+        apiRoute: ['/api/', 'https://api.example.com/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        clientRegistrationCallback: async (options) => {
+          expect(options.clientId).toBeDefined();
+          expect(options.redirectUris).toEqual(['https://client.example.com/callback']);
+          expect(options.clientName).toBe('Test Client with Metadata');
+          expect(options.metadata).toBeUndefined();
+          return {
+            metadata: callbackMetadata,
+          };
+        },
+      });
+
+      const clientData = {
+        redirect_uris: ['https://client.example.com/callback'],
+        client_name: 'Test Client with Metadata',
+        token_endpoint_auth_method: 'client_secret_basic',
+      };
+
+      const request = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify(clientData)
+      );
+
+      const response = await providerWithCallback.fetch(request, mockEnv, mockCtx);
+
+      expect(response.status).toBe(201);
+
+      const registeredClient = await response.json<any>();
+      expect(registeredClient.client_id).toBeDefined();
+
+      // Verify the client was saved to KV with metadata
+      const savedClient = await mockEnv.OAUTH_KV.get(`client:${registeredClient.client_id}`, { type: 'json' });
+      expect(savedClient).not.toBeNull();
+      expect(savedClient.metadata).toEqual(callbackMetadata);
+    });
+
+    it('should not add metadata if clientRegistrationCallback returns undefined', async () => {
+      const providerWithCallback = new OAuthProvider({
+        apiRoute: ['/api/', 'https://api.example.com/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        clientRegistrationCallback: async () => {
+          // Return undefined - no metadata should be added
+          return undefined;
+        },
+      });
+
+      const clientData = {
+        redirect_uris: ['https://client.example.com/callback'],
+        client_name: 'Test Client',
+        token_endpoint_auth_method: 'client_secret_basic',
+      };
+
+      const request = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify(clientData)
+      );
+
+      const response = await providerWithCallback.fetch(request, mockEnv, mockCtx);
+
+      expect(response.status).toBe(201);
+
+      const registeredClient = await response.json<any>();
+      
+      // Verify the client was saved to KV without metadata
+      const savedClient = await mockEnv.OAUTH_KV.get(`client:${registeredClient.client_id}`, { type: 'json' });
+      expect(savedClient).not.toBeNull();
+      expect(savedClient.metadata).toBeUndefined();
+    });
   });
 
   describe('Authorization Code Flow', () => {

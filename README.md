@@ -274,6 +274,46 @@ The `accessTokenTTL` override is particularly useful when the application is als
 
 The `props` values are end-to-end encrypted, so they can safely contain sensitive information.
 
+## Client Registration Callback
+
+This library allows you to add application-specific metadata to clients when they are created through the dynamic client registration endpoint by configuring a callback function. This is useful for scenarios where you need to store additional information about clients that isn't part of the standard OAuth client registration fields.
+
+To use this feature, provide a `clientRegistrationCallback` in your OAuthProvider options:
+
+```ts
+new OAuthProvider({
+  // ... other options ...
+  clientRegistrationEndpoint: "https://example.com/oauth/register",
+  clientRegistrationCallback: async (options) => {
+    // options.clientId contains the newly created client ID
+    // options.redirectUris, options.clientName, options.clientUri are available
+    // options.metadata contains any existing metadata (undefined for new clients)
+
+    // You can add custom metadata based on the client information
+    return {
+      metadata: {
+        appId: generateAppId(),
+        environment: determineEnvironment(options.redirectUris),
+        registeredAt: new Date().toISOString()
+      }
+    };
+  }
+});
+```
+
+The callback receives:
+- `clientId`: The newly created client ID
+- `redirectUris`: Array of redirect URIs for the client
+- `clientName`: Client name, if provided
+- `clientUri`: Client URI, if provided
+- `metadata`: Any existing metadata on the client (undefined for new clients)
+
+The callback can:
+- Return `metadata` to store application-specific data with the client
+- Return nothing or `undefined` to not add any metadata
+
+The `metadata` field is stored with the client and can be retrieved later using the `OAuthHelpers` methods like `lookupClient()` or `listClients()`.
+
 ## Custom Error Responses
 
 By using the `onError` option, you can emit notifications or take other actions when an error response was to be emitted:
