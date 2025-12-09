@@ -626,12 +626,9 @@ interface TokenResponse {
 }
 
 /**
- * Token record stored in KV
- * Note: The actual token format is "{userId}:{grantId}:{random-secret}"
- * but we still only store the hash of the full token string.
- * This contains only access tokens; refresh tokens are stored within the grant records.
+ * Shared fields for Token and TokenSummary
  */
-export interface Token {
+export interface TokenBase {
   /**
    * Unique identifier for the token (hash of the actual token)
    */
@@ -662,7 +659,15 @@ export interface Token {
    * Can be a single string or array of strings
    */
   audience?: string | string[];
+}
 
+/**
+ * Token record stored in KV
+ * Note: The actual token format is "{userId}:{grantId}:{random-secret}"
+ * but we still only store the hash of the full token string.
+ * This contains only access tokens; refresh tokens are stored within the grant records.
+ */
+export interface Token extends TokenBase {
   /**
    * The encryption key for props, wrapped with this token
    */
@@ -691,14 +696,27 @@ export interface Token {
 
 /**
  * Token record with decrypted properties
- * Derived from Token but with wrappedEncryptionKey removed and encryptedProps replaced with metadata
+ * Derived from Token but with wrappedEncryptionKey removed and encryptedProps replaced with props
  */
-export type TokenSummary<T = any> = Omit<Token, 'wrappedEncryptionKey' | 'grant'> & {
-  grant: Omit<Token['grant'], 'encryptedProps'> & {
+export interface TokenSummary<T = any> extends TokenBase {
+  /**
+   * Denormalized grant information for faster access
+   */
+  grant: {
+    /**
+     * Client that received this grant
+     */
+    clientId: string;
+
+    /**
+     * List of scopes that were granted
+     */
+    scope: string[];
+
     /**
      * Decrypted application-specific properties
      */
-    metadata: T;
+    props: T;
   };
 };
 
@@ -1063,14 +1081,18 @@ class OAuthProviderImpl {
     const decryptedProps = await decryptProps(encryptionKey, tokenData.grant.encryptedProps);
     
     // Return the token data with decrypted instead of encrypted props
-    const { wrappedEncryptionKey, grant, ...tokenFields } = tokenData;
-    const { encryptedProps, ...grantFields } = grant;
-    
+    const { grant } = tokenData;
     return {
-      ...tokenFields,
+      id: tokenData.id,
+      grantId: tokenData.grantId,
+      userId: tokenData.userId,
+      createdAt: tokenData.createdAt,
+      expiresAt: tokenData.expiresAt,
+      audience: tokenData.audience,
       grant: {
-        ...grantFields,
-        metadata: decryptedProps as T,
+        clientId: grant.clientId,
+        scope: grant.scope,
+        props: decryptedProps as T
       },
     };
   }
