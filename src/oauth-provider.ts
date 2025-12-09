@@ -2028,37 +2028,8 @@ class OAuthProviderImpl {
       return this.createErrorResponse('invalid_request', 'Invalid JSON payload', 400);
     }
 
-    // Basic type validation functions
-    const validateStringField = (field: any): string | undefined => {
-      if (field === undefined) {
-        return undefined;
-      }
-      if (typeof field !== 'string') {
-        throw new Error('Field must be a string');
-      }
-      return field;
-    };
-
-    const validateStringArray = (arr: any): string[] | undefined => {
-      if (arr === undefined) {
-        return undefined;
-      }
-      if (!Array.isArray(arr)) {
-        throw new Error('Field must be an array');
-      }
-
-      // Validate all elements are strings
-      for (const item of arr) {
-        if (typeof item !== 'string') {
-          throw new Error('All array elements must be strings');
-        }
-      }
-
-      return arr;
-    };
-
     // Get token endpoint auth method, default to client_secret_basic
-    const authMethod = validateStringField(clientMetadata.token_endpoint_auth_method) || 'client_secret_basic';
+    const authMethod = OAuthProviderImpl.validateStringField(clientMetadata.token_endpoint_auth_method) || 'client_secret_basic';
     const isPublicClient = authMethod === 'none';
 
     // Check if public client registrations are disallowed
@@ -2081,7 +2052,7 @@ class OAuthProviderImpl {
     let clientInfo: ClientInfo;
     try {
       // Validate redirect URIs - must exist and have at least one entry
-      const redirectUris = validateStringArray(clientMetadata.redirect_uris);
+      const redirectUris = OAuthProviderImpl.validateStringArray(clientMetadata.redirect_uris);
       if (!redirectUris || redirectUris.length === 0) {
         throw new Error('At least one redirect URI is required');
       }
@@ -2094,15 +2065,15 @@ class OAuthProviderImpl {
       clientInfo = {
         clientId,
         redirectUris,
-        clientName: validateStringField(clientMetadata.client_name),
-        logoUri: validateStringField(clientMetadata.logo_uri),
-        clientUri: validateStringField(clientMetadata.client_uri),
-        policyUri: validateStringField(clientMetadata.policy_uri),
-        tosUri: validateStringField(clientMetadata.tos_uri),
-        jwksUri: validateStringField(clientMetadata.jwks_uri),
-        contacts: validateStringArray(clientMetadata.contacts),
-        grantTypes: validateStringArray(clientMetadata.grant_types) || ['authorization_code', 'refresh_token'],
-        responseTypes: validateStringArray(clientMetadata.response_types) || ['code'],
+        clientName: OAuthProviderImpl.validateStringField(clientMetadata.client_name),
+        logoUri: OAuthProviderImpl.validateStringField(clientMetadata.logo_uri),
+        clientUri: OAuthProviderImpl.validateStringField(clientMetadata.client_uri),
+        policyUri: OAuthProviderImpl.validateStringField(clientMetadata.policy_uri),
+        tosUri: OAuthProviderImpl.validateStringField(clientMetadata.tos_uri),
+        jwksUri: OAuthProviderImpl.validateStringField(clientMetadata.jwks_uri),
+        contacts: OAuthProviderImpl.validateStringArray(clientMetadata.contacts),
+        grantTypes: OAuthProviderImpl.validateStringArray(clientMetadata.grant_types) || ['authorization_code', 'refresh_token'],
+        responseTypes: OAuthProviderImpl.validateStringArray(clientMetadata.response_types) || ['code'],
         registrationDate: Math.floor(Date.now() / 1000),
         tokenEndpointAuthMethod: authMethod,
       };
@@ -2318,8 +2289,14 @@ class OAuthProviderImpl {
    */
   async getClient(env: any, clientId: string): Promise<ClientInfo | null> {
     // Check if this is a CIMD (Client ID Metadata Document) URL
-    if (this.isClientMetadataUrl(clientId) && this.hasGlobalFetchStrictlyPublic()) {
-      return this.fetchClientMetadataDocument(env, clientId);
+    if (this.isClientMetadataUrl(clientId)) {
+      if (!this.hasGlobalFetchStrictlyPublic()) {
+        throw new Error(
+          `Client ID "${clientId}" appears to be a CIMD URL, but the 'global_fetch_strictly_public' ` +
+            `compatibility flag is not enabled. Add this flag to your wrangler.jsonc to enable CIMD support.`
+        );
+      }
+      return this.fetchClientMetadataDocument(clientId);
     }
 
     // Standard KV lookup
@@ -2356,158 +2333,129 @@ class OAuthProviderImpl {
   private static readonly CIMD_MAX_SIZE_BYTES = 5 * 1024;
 
   /**
-   * Default cache TTL for CIMD metadata (1 hour in seconds)
-   */
-  private static readonly CIMD_DEFAULT_CACHE_TTL = 3600;
-
-  /**
-   * Maximum cache TTL for CIMD metadata (24 hours in seconds, per spec recommendation)
-   */
-  private static readonly CIMD_MAX_CACHE_TTL = 24 * 60 * 60;
-
-  /**
    * Request timeout for CIMD metadata fetches (10 seconds)
    * Prevents slow-loris style attacks
    */
   private static readonly CIMD_FETCH_TIMEOUT_MS = 10_000;
 
   /**
-   * Prohibited authentication methods for CIMD clients (per IETF spec)
+   * Allowed authentication methods for CIMD clients (per IETF spec)
    * CIMD clients cannot use symmetric secrets since there's no pre-shared secret
    */
-  private static readonly CIMD_PROHIBITED_AUTH_METHODS = [
-    'client_secret_post',
-    'client_secret_basic',
-    'client_secret_jwt',
-  ];
+  private static readonly CIMD_ALLOWED_AUTH_METHODS = ['none', 'private_key_jwt'];
+
+  /**
+   * Validates that a field is a string or undefined
+   * @param field - The field value to validate
+   * @param fieldName - Name of the field for error messages
+   * @returns The validated string or undefined
+   * @throws Error if field is not a string or undefined
+   */
+  private static validateStringField(field: unknown, fieldName?: string): string | undefined {
+    if (field === undefined) return undefined;
+    if (typeof field !== 'string') {
+      throw new Error(fieldName ? `Invalid ${fieldName}: expected string, got ${typeof field}` : 'Field must be a string');
+    }
+    return field;
+  }
+
+  /**
+   * Validates that a field is a string array or undefined
+   * @param arr - The array to validate
+   * @param fieldName - Name of the field for error messages
+   * @returns The validated string array or undefined
+   * @throws Error if field is not a string array or undefined
+   */
+  private static validateStringArray(arr: unknown, fieldName?: string): string[] | undefined {
+    if (arr === undefined) return undefined;
+    if (!Array.isArray(arr)) {
+      throw new Error(fieldName ? `Invalid ${fieldName}: expected array, got ${typeof arr}` : 'Field must be an array');
+    }
+    if (!arr.every((item) => typeof item === 'string')) {
+      throw new Error(fieldName ? `Invalid ${fieldName}: array must contain only strings` : 'All array elements must be strings');
+    }
+    return arr;
+  }
 
   /**
    * Fetches and validates a Client ID Metadata Document from the given URL
    * Per the MCP spec, the client_id in the document must match the URL exactly
    *
-   * Features:
-   * - KV caching with TTL (respects Cache-Control, max 24h)
-   * - Response size limit (5KB per IETF spec)
-   * - Does NOT cache errors or invalid documents
+   * Uses Cloudflare HTTP cache for caching (via cacheEverything option).
+   * Response size is limited to 5KB per IETF spec.
    *
-   * @param env - Cloudflare Worker environment variables (for KV access)
    * @param metadataUrl - The HTTPS URL to fetch metadata from
-   * @returns The client information, or null if not found/invalid
+   * @returns The client information
+   * @throws Error if fetch fails or validation fails
    */
-  private async fetchClientMetadataDocument(env: any, metadataUrl: string): Promise<ClientInfo | null> {
-    const cacheKey = `cimd:${metadataUrl}`;
-
-    try {
-      const cached = await env.OAUTH_KV.get(cacheKey, { type: 'json' });
-      if (cached) {
-        return cached as ClientInfo;
-      }
-    } catch {
-      // Cache miss or error, continue to fetch
-    }
-
+  private async fetchClientMetadataDocument(metadataUrl: string): Promise<ClientInfo> {
     const abortController = new AbortController();
     const timeoutId = setTimeout(() => abortController.abort(), OAuthProviderImpl.CIMD_FETCH_TIMEOUT_MS);
 
     try {
       const response = await fetch(metadataUrl, {
-        headers: {
-          Accept: 'application/json',
-        },
+        headers: { Accept: 'application/json' },
         signal: abortController.signal,
+        cf: { cacheEverything: true },
       });
 
       clearTimeout(timeoutId);
 
       if (!response.ok) {
-        console.error(`CIMD fetch failed: HTTP ${response.status} from ${metadataUrl}`);
-        return null;
+        throw new Error(`Failed to fetch client metadata: HTTP ${response.status}`);
       }
 
       const contentLength = response.headers.get('content-length');
       if (contentLength && parseInt(contentLength, 10) > OAuthProviderImpl.CIMD_MAX_SIZE_BYTES) {
-        console.error(
-          `CIMD fetch failed: Content-Length ${contentLength} exceeds limit of ${OAuthProviderImpl.CIMD_MAX_SIZE_BYTES} bytes`
+        throw new Error(
+          `Client metadata exceeds size limit: ${contentLength} bytes (max ${OAuthProviderImpl.CIMD_MAX_SIZE_BYTES})`
         );
-        return null;
       }
 
       const rawMetadata = await this.readJsonWithSizeLimit(response, OAuthProviderImpl.CIMD_MAX_SIZE_BYTES);
 
-      if (!rawMetadata) {
-        return null;
-      }
-
-      const metadata = rawMetadata as {
-        client_id?: string;
-        client_name?: string;
-        client_uri?: string;
-        logo_uri?: string;
-        redirect_uris?: string[];
-        grant_types?: string[];
-        response_types?: string[];
-        token_endpoint_auth_method?: string;
-        contacts?: string[];
-        policy_uri?: string;
-        tos_uri?: string;
-        jwks_uri?: string;
-      };
+      const clientId = OAuthProviderImpl.validateStringField(rawMetadata.client_id, 'client_id');
+      const redirectUris = OAuthProviderImpl.validateStringArray(rawMetadata.redirect_uris, 'redirect_uris');
+      const tokenEndpointAuthMethod = OAuthProviderImpl.validateStringField(
+        rawMetadata.token_endpoint_auth_method,
+        'token_endpoint_auth_method'
+      );
 
       // Validate that client_id matches the URL (required by spec)
-      if (metadata.client_id !== metadataUrl) {
-        console.error(`CIMD validation failed: client_id "${metadata.client_id}" does not match URL "${metadataUrl}"`);
-        return null;
+      if (clientId !== metadataUrl) {
+        throw new Error(`client_id "${clientId}" does not match metadata URL "${metadataUrl}"`);
       }
 
-      if (!metadata.redirect_uris || metadata.redirect_uris.length === 0) {
-        console.error(`CIMD validation failed: redirect_uris is required`);
-        return null;
+      if (!redirectUris || redirectUris.length === 0) {
+        throw new Error('redirect_uris is required and must not be empty');
       }
 
       if (
-        metadata.token_endpoint_auth_method &&
-        OAuthProviderImpl.CIMD_PROHIBITED_AUTH_METHODS.includes(metadata.token_endpoint_auth_method)
+        tokenEndpointAuthMethod &&
+        !OAuthProviderImpl.CIMD_ALLOWED_AUTH_METHODS.includes(tokenEndpointAuthMethod)
       ) {
-        console.error(
-          `CIMD validation failed: token_endpoint_auth_method "${metadata.token_endpoint_auth_method}" is not allowed for CIMD clients`
+        throw new Error(
+          `token_endpoint_auth_method "${tokenEndpointAuthMethod}" is not allowed for CIMD clients. ` +
+            `Allowed methods: ${OAuthProviderImpl.CIMD_ALLOWED_AUTH_METHODS.join(', ')}`
         );
-        return null;
       }
 
-      const clientInfo: ClientInfo = {
-        clientId: metadata.client_id,
-        clientName: metadata.client_name,
-        clientUri: metadata.client_uri,
-        logoUri: metadata.logo_uri,
-        redirectUris: metadata.redirect_uris,
-        grantTypes: metadata.grant_types || ['authorization_code'],
-        responseTypes: metadata.response_types || ['code'],
-        tokenEndpointAuthMethod: metadata.token_endpoint_auth_method || 'none',
-        contacts: metadata.contacts,
-        policyUri: metadata.policy_uri,
-        tosUri: metadata.tos_uri,
-        jwksUri: metadata.jwks_uri,
+      return {
+        clientId,
+        redirectUris,
+        clientName: OAuthProviderImpl.validateStringField(rawMetadata.client_name, 'client_name'),
+        clientUri: OAuthProviderImpl.validateStringField(rawMetadata.client_uri, 'client_uri'),
+        logoUri: OAuthProviderImpl.validateStringField(rawMetadata.logo_uri, 'logo_uri'),
+        policyUri: OAuthProviderImpl.validateStringField(rawMetadata.policy_uri, 'policy_uri'),
+        tosUri: OAuthProviderImpl.validateStringField(rawMetadata.tos_uri, 'tos_uri'),
+        jwksUri: OAuthProviderImpl.validateStringField(rawMetadata.jwks_uri, 'jwks_uri'),
+        contacts: OAuthProviderImpl.validateStringArray(rawMetadata.contacts, 'contacts'),
+        grantTypes: OAuthProviderImpl.validateStringArray(rawMetadata.grant_types, 'grant_types') || ['authorization_code'],
+        responseTypes: OAuthProviderImpl.validateStringArray(rawMetadata.response_types, 'response_types') || ['code'],
+        tokenEndpointAuthMethod: tokenEndpointAuthMethod || 'none',
       };
-
-      const cacheTtl = this.parseCacheControlMaxAge(
-        response.headers.get('cache-control'),
-        OAuthProviderImpl.CIMD_DEFAULT_CACHE_TTL,
-        OAuthProviderImpl.CIMD_MAX_CACHE_TTL
-      );
-
-      try {
-        await env.OAUTH_KV.put(cacheKey, JSON.stringify(clientInfo), {
-          expirationTtl: cacheTtl,
-        });
-      } catch (cacheError) {
-        console.error(`CIMD cache write failed for ${metadataUrl}:`, cacheError);
-      }
-
-      return clientInfo;
-    } catch (error) {
+    } finally {
       clearTimeout(timeoutId);
-      console.error(`CIMD fetch error for ${metadataUrl}:`, error);
-      return null;
     }
   }
 
@@ -2517,79 +2465,46 @@ class OAuthProviderImpl {
    *
    * @param response - The fetch response
    * @param maxBytes - Maximum allowed size in bytes
-   * @returns Parsed JSON object or null if size exceeded or parse failed
+   * @returns Parsed JSON object
+   * @throws Error if response body is null, size exceeded, or JSON parse failed
    */
-  private async readJsonWithSizeLimit(response: Response, maxBytes: number): Promise<Record<string, unknown> | null> {
+  private async readJsonWithSizeLimit(response: Response, maxBytes: number): Promise<Record<string, unknown>> {
     const reader = response.body?.getReader();
     if (!reader) {
-      console.error('CIMD fetch failed: Response body is null');
-      return null;
+      throw new Error('Response body is null');
     }
 
     const chunks: Uint8Array[] = [];
     let totalSize = 0;
 
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
+    while (true) {
+      const { done, value } = await reader.read();
 
-        if (done) {
-          break;
-        }
-
-        if (value) {
-          totalSize += value.length;
-
-          if (totalSize > maxBytes) {
-            await reader.cancel();
-            console.error(`CIMD fetch failed: Response exceeded size limit of ${maxBytes} bytes`);
-            return null;
-          }
-
-          chunks.push(value);
-        }
+      if (done) {
+        break;
       }
 
-      const allChunks = new Uint8Array(totalSize);
-      let position = 0;
-      for (const chunk of chunks) {
-        allChunks.set(chunk, position);
-        position += chunk.length;
+      if (value) {
+        totalSize += value.length;
+
+        if (totalSize > maxBytes) {
+          await reader.cancel();
+          throw new Error(`Response exceeded size limit of ${maxBytes} bytes`);
+        }
+
+        chunks.push(value);
       }
-
-      const text = new TextDecoder().decode(allChunks);
-      return JSON.parse(text);
-    } catch (error) {
-      console.error('CIMD fetch failed: Error reading response body:', error);
-      return null;
-    }
-  }
-
-  /**
-   * Parses Cache-Control header to extract max-age value.
-   * Returns a TTL within the allowed bounds.
-   *
-   * @param cacheControl - The Cache-Control header value
-   * @param defaultTtl - Default TTL if no max-age found
-   * @param maxTtl - Maximum allowed TTL
-   * @returns TTL in seconds
-   */
-  private parseCacheControlMaxAge(cacheControl: string | null, defaultTtl: number, maxTtl: number): number {
-    if (!cacheControl) {
-      return defaultTtl;
     }
 
-    const maxAgeMatch = cacheControl.match(/max-age\s*=\s*(\d+)/i);
-    if (!maxAgeMatch) {
-      return defaultTtl;
+    const allChunks = new Uint8Array(totalSize);
+    let position = 0;
+    for (const chunk of chunks) {
+      allChunks.set(chunk, position);
+      position += chunk.length;
     }
 
-    const maxAge = parseInt(maxAgeMatch[1], 10);
-    if (isNaN(maxAge) || maxAge <= 0) {
-      return defaultTtl;
-    }
-
-    return Math.min(maxAge, maxTtl);
+    const text = new TextDecoder().decode(allChunks);
+    return JSON.parse(text);
   }
 
   /**
