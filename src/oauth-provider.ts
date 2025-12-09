@@ -322,7 +322,7 @@ export interface OAuthHelpers {
    * @param clientId - The client ID to look up
    * @returns A Promise resolving to the client info, or null if not found
    */
-  lookupClient<Metadata = any>(clientId: string): Promise<ClientInfo<Metadata> | null>;
+  lookupClient<Props = any>(clientId: string): Promise<ClientInfo<Props> | null>;
 
   /**
    * Completes an authorization request by creating a grant and authorization code
@@ -336,14 +336,14 @@ export interface OAuthHelpers {
    * @param clientInfo - Partial client information to create the client with
    * @returns A Promise resolving to the created client info
    */
-  createClient<Metadata = any>(clientInfo: Partial<ClientInfo<Metadata>>): Promise<ClientInfo<Metadata>>;
+  createClient<Props = any>(clientInfo: Partial<ClientInfo<Props>>): Promise<ClientInfo<Props>>;
 
   /**
    * Lists all registered OAuth clients with pagination support
    * @param options - Optional pagination parameters (limit and cursor)
    * @returns A Promise resolving to the list result with items and optional cursor
    */
-  listClients<Metadata = any>(options?: ListOptions): Promise<ListResult<ClientInfo<Metadata>>>;
+  listClients<Props = any>(options?: ListOptions): Promise<ListResult<ClientInfo<Props>>>;
 
   /**
    * Updates an existing OAuth client
@@ -351,7 +351,7 @@ export interface OAuthHelpers {
    * @param updates - Partial client information with fields to update
    * @returns A Promise resolving to the updated client info, or null if not found
    */
-  updateClient<Metadata = any>(clientId: string, updates: Partial<ClientInfo<Metadata>>): Promise<ClientInfo<Metadata> | null>;
+  updateClient<Props = any>(clientId: string, updates: Partial<ClientInfo<Props>>): Promise<ClientInfo<Props> | null>;
 
   /**
    * Deletes an OAuth client
@@ -426,7 +426,7 @@ export interface AuthRequest {
 /**
  * OAuth client registration information
  */
-export interface ClientInfo<Metadata = any> {
+export interface ClientInfo<Props = any> {
   /**
    * Unique identifier for the client
    */
@@ -2351,7 +2351,7 @@ class OAuthProviderImpl {
    * @param clientId - The client ID to look up
    * @returns The client information, or null if not found
    */
-  getClient<Metadata = any>(env: any, clientId: string): Promise<ClientInfo<Metadata> | null> {
+  getClient<Props = any>(env: any, clientId: string): Promise<ClientInfo<Props> | null> {
     const clientKey = `client:${clientId}`;
     return env.OAUTH_KV.get(clientKey, { type: 'json' });
   }
@@ -2832,8 +2832,8 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * @param clientId - The client ID to look up
    * @returns A Promise resolving to the client info, or null if not found
    */
-  async lookupClient<Metadata = any>(clientId: string): Promise<ClientInfo<Metadata> | null> {
-    return await this.provider.getClient<Metadata>(this.env, clientId);
+  async lookupClient<Props = any>(clientId: string): Promise<ClientInfo<Props> | null> {
+    return await this.provider.getClient<Props>(this.env, clientId);
   }
 
   /**
@@ -2996,7 +2996,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * @param clientInfo - Partial client information to create the client with
    * @returns A Promise resolving to the created client info
    */
-  async createClient<Metadata = any>(clientInfo: Partial<ClientInfo<Metadata>>): Promise<ClientInfo<Metadata>> {
+  async createClient<Props = any>(clientInfo: Partial<ClientInfo<Props>>): Promise<ClientInfo<Props>> {
     const clientId = generateRandomString(16);
 
     // Determine token endpoint auth method
@@ -3004,7 +3004,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
     const isPublicClient = tokenEndpointAuthMethod === 'none';
 
     // Create a new client object
-    const newClient: ClientInfo<Metadata> = {
+    const newClient: ClientInfo<Props> = {
       clientId,
       redirectUris: clientInfo.redirectUris || [],
       clientName: clientInfo.clientName,
@@ -3052,7 +3052,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * @param options - Optional pagination parameters (limit and cursor)
    * @returns A Promise resolving to the list result with items and optional cursor
    */
-  async listClients<Metadata = any>(options?: ListOptions): Promise<ListResult<ClientInfo<Metadata>>> {
+  async listClients<Props = any>(options?: ListOptions): Promise<ListResult<ClientInfo<Props>>> {
     // Prepare list options for KV
     const listOptions: { limit?: number; cursor?: string; prefix: string } = {
       prefix: 'client:',
@@ -3070,10 +3070,10 @@ class OAuthHelpersImpl implements OAuthHelpers {
     const response = await this.env.OAUTH_KV.list(listOptions);
 
     // Fetch all clients in parallel
-    const clients: ClientInfo<Metadata>[] = [];
+    const clients: ClientInfo<Props>[] = [];
     const promises = response.keys.map(async (key: { name: string }) => {
       const clientId = key.name.substring('client:'.length);
-      const client = await this.provider.getClient<Metadata>(this.env, clientId);
+      const client = await this.provider.getClient<Props>(this.env, clientId);
       if (client) {
         clients.push(client);
       }
@@ -3094,8 +3094,8 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * @param updates - Partial client information with fields to update
    * @returns A Promise resolving to the updated client info, or null if not found
    */
-  async updateClient<Metadata = any>(clientId: string, updates: Partial<ClientInfo<Metadata>>): Promise<ClientInfo<Metadata> | null> {
-    const client = await this.provider.getClient<Metadata>(this.env, clientId);
+  async updateClient<Props = any>(clientId: string, updates: Partial<ClientInfo<Props>>): Promise<ClientInfo<Props> | null> {
+    const client = await this.provider.getClient<Props>(this.env, clientId);
     if (!client) {
       return null;
     }
@@ -3117,7 +3117,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
       secretToStore = await hashSecret(updates.clientSecret);
     }
 
-    const updatedClient: ClientInfo<Metadata> = {
+    const updatedClient: ClientInfo<Props> = {
       ...client,
       ...updates,
       clientId: client.clientId, // Ensure clientId doesn't change
