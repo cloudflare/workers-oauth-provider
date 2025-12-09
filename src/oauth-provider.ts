@@ -2029,7 +2029,8 @@ class OAuthProviderImpl {
     }
 
     // Get token endpoint auth method, default to client_secret_basic
-    const authMethod = OAuthProviderImpl.validateStringField(clientMetadata.token_endpoint_auth_method) || 'client_secret_basic';
+    const authMethod =
+      OAuthProviderImpl.validateStringField(clientMetadata.token_endpoint_auth_method) || 'client_secret_basic';
     const isPublicClient = authMethod === 'none';
 
     // Check if public client registrations are disallowed
@@ -2072,7 +2073,10 @@ class OAuthProviderImpl {
         tosUri: OAuthProviderImpl.validateStringField(clientMetadata.tos_uri),
         jwksUri: OAuthProviderImpl.validateStringField(clientMetadata.jwks_uri),
         contacts: OAuthProviderImpl.validateStringArray(clientMetadata.contacts),
-        grantTypes: OAuthProviderImpl.validateStringArray(clientMetadata.grant_types) || ['authorization_code', 'refresh_token'],
+        grantTypes: OAuthProviderImpl.validateStringArray(clientMetadata.grant_types) || [
+          'authorization_code',
+          'refresh_token',
+        ],
         responseTypes: OAuthProviderImpl.validateStringArray(clientMetadata.response_types) || ['code'],
         registrationDate: Math.floor(Date.now() / 1000),
         tokenEndpointAuthMethod: authMethod,
@@ -2354,7 +2358,9 @@ class OAuthProviderImpl {
   private static validateStringField(field: unknown, fieldName?: string): string | undefined {
     if (field === undefined) return undefined;
     if (typeof field !== 'string') {
-      throw new Error(fieldName ? `Invalid ${fieldName}: expected string, got ${typeof field}` : 'Field must be a string');
+      throw new Error(
+        fieldName ? `Invalid ${fieldName}: expected string, got ${typeof field}` : 'Field must be a string'
+      );
     }
     return field;
   }
@@ -2372,7 +2378,9 @@ class OAuthProviderImpl {
       throw new Error(fieldName ? `Invalid ${fieldName}: expected array, got ${typeof arr}` : 'Field must be an array');
     }
     if (!arr.every((item) => typeof item === 'string')) {
-      throw new Error(fieldName ? `Invalid ${fieldName}: array must contain only strings` : 'All array elements must be strings');
+      throw new Error(
+        fieldName ? `Invalid ${fieldName}: array must contain only strings` : 'All array elements must be strings'
+      );
     }
     return arr;
   }
@@ -2430,10 +2438,7 @@ class OAuthProviderImpl {
         throw new Error('redirect_uris is required and must not be empty');
       }
 
-      if (
-        tokenEndpointAuthMethod &&
-        !OAuthProviderImpl.CIMD_ALLOWED_AUTH_METHODS.includes(tokenEndpointAuthMethod)
-      ) {
+      if (tokenEndpointAuthMethod && !OAuthProviderImpl.CIMD_ALLOWED_AUTH_METHODS.includes(tokenEndpointAuthMethod)) {
         throw new Error(
           `token_endpoint_auth_method "${tokenEndpointAuthMethod}" is not allowed for CIMD clients. ` +
             `Allowed methods: ${OAuthProviderImpl.CIMD_ALLOWED_AUTH_METHODS.join(', ')}`
@@ -2450,7 +2455,9 @@ class OAuthProviderImpl {
         tosUri: OAuthProviderImpl.validateStringField(rawMetadata.tos_uri, 'tos_uri'),
         jwksUri: OAuthProviderImpl.validateStringField(rawMetadata.jwks_uri, 'jwks_uri'),
         contacts: OAuthProviderImpl.validateStringArray(rawMetadata.contacts, 'contacts'),
-        grantTypes: OAuthProviderImpl.validateStringArray(rawMetadata.grant_types, 'grant_types') || ['authorization_code'],
+        grantTypes: OAuthProviderImpl.validateStringArray(rawMetadata.grant_types, 'grant_types') || [
+          'authorization_code',
+        ],
         responseTypes: OAuthProviderImpl.validateStringArray(rawMetadata.response_types, 'response_types') || ['code'],
         tokenEndpointAuthMethod: tokenEndpointAuthMethod || 'none',
       };

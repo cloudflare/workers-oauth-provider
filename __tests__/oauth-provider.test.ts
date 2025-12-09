@@ -4463,9 +4463,7 @@ describe('OAuthProvider', () => {
           token_endpoint_auth_method: 'none',
         };
 
-        globalThis.fetch = vi.fn().mockImplementation(() =>
-          Promise.resolve(createMockFetchResponse(validMetadata))
-        );
+        globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(createMockFetchResponse(validMetadata)));
 
         const authRequest = createMockRequest(
           `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
@@ -4553,9 +4551,7 @@ describe('OAuthProvider', () => {
           token_endpoint_auth_method: 'none',
         };
 
-        globalThis.fetch = vi.fn().mockImplementation(() =>
-          Promise.resolve(createMockFetchResponse(validMetadata))
-        );
+        globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(createMockFetchResponse(validMetadata)));
 
         const authRequest = createMockRequest(
           `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
@@ -4721,9 +4717,7 @@ describe('OAuthProvider', () => {
           token_endpoint_auth_method: 'none',
         };
 
-        globalThis.fetch = vi.fn().mockImplementation(() =>
-          Promise.resolve(createMockFetchResponse(validMetadata))
-        );
+        globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(createMockFetchResponse(validMetadata)));
 
         const authRequest = createMockRequest(
           `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
@@ -4746,9 +4740,7 @@ describe('OAuthProvider', () => {
           jwks_uri: 'https://client.example.com/.well-known/jwks.json',
         };
 
-        globalThis.fetch = vi.fn().mockImplementation(() =>
-          Promise.resolve(createMockFetchResponse(validMetadata))
-        );
+        globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(createMockFetchResponse(validMetadata)));
 
         const authRequest = createMockRequest(
           `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
@@ -4916,9 +4908,7 @@ describe('OAuthProvider', () => {
           token_endpoint_auth_method: 'none',
         };
 
-        globalThis.fetch = vi.fn().mockImplementation(() =>
-          Promise.resolve(createMockFetchResponse(validMetadata))
-        );
+        globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(createMockFetchResponse(validMetadata)));
 
         const authRequest = createMockRequest(
           `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
