@@ -291,7 +291,7 @@ export interface OAuthHelpers {
    * @param clientId - The client ID to look up
    * @returns A Promise resolving to the client info, or null if not found
    */
-  lookupClient(clientId: string): Promise<ClientInfo | null>;
+  lookupClient<Metadata = any>(clientId: string): Promise<ClientInfo<Metadata> | null>;
 
   /**
    * Completes an authorization request by creating a grant and authorization code
@@ -305,14 +305,14 @@ export interface OAuthHelpers {
    * @param clientInfo - Partial client information to create the client with
    * @returns A Promise resolving to the created client info
    */
-  createClient(clientInfo: Partial<ClientInfo>): Promise<ClientInfo>;
+  createClient<Metadata = any>(clientInfo: Partial<ClientInfo<Metadata>>): Promise<ClientInfo<Metadata>>;
 
   /**
    * Lists all registered OAuth clients with pagination support
    * @param options - Optional pagination parameters (limit and cursor)
    * @returns A Promise resolving to the list result with items and optional cursor
    */
-  listClients(options?: ListOptions): Promise<ListResult<ClientInfo>>;
+  listClients<Metadata = any>(options?: ListOptions): Promise<ListResult<ClientInfo<Metadata>>>;
 
   /**
    * Updates an existing OAuth client
@@ -320,7 +320,7 @@ export interface OAuthHelpers {
    * @param updates - Partial client information with fields to update
    * @returns A Promise resolving to the updated client info, or null if not found
    */
-  updateClient(clientId: string, updates: Partial<ClientInfo>): Promise<ClientInfo | null>;
+  updateClient<Metadata = any>(clientId: string, updates: Partial<ClientInfo<Metadata>>): Promise<ClientInfo<Metadata> | null>;
 
   /**
    * Deletes an OAuth client
@@ -395,7 +395,7 @@ export interface AuthRequest {
 /**
  * OAuth client registration information
  */
-export interface ClientInfo {
+export interface ClientInfo<Metadata = any> {
   /**
    * Unique identifier for the client
    */
@@ -472,6 +472,11 @@ export interface ClientInfo {
    * Public clients use 'none', while confidential clients use either 'client_secret_basic' or 'client_secret_post'.
    */
   tokenEndpointAuthMethod: string;
+
+  /**
+   * Application-specific metadata associated with this client
+   */
+  metadata?: Metadata;
 }
 
 /**
@@ -2298,7 +2303,7 @@ class OAuthProviderImpl {
    * @param clientId - The client ID to look up
    * @returns The client information, or null if not found
    */
-  getClient(env: any, clientId: string): Promise<ClientInfo | null> {
+  getClient<Metadata = any>(env: any, clientId: string): Promise<ClientInfo<Metadata> | null> {
     const clientKey = `client:${clientId}`;
     return env.OAUTH_KV.get(clientKey, { type: 'json' });
   }
@@ -2779,8 +2784,8 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * @param clientId - The client ID to look up
    * @returns A Promise resolving to the client info, or null if not found
    */
-  async lookupClient(clientId: string): Promise<ClientInfo | null> {
-    return await this.provider.getClient(this.env, clientId);
+  async lookupClient<Metadata = any>(clientId: string): Promise<ClientInfo<Metadata> | null> {
+    return await this.provider.getClient<Metadata>(this.env, clientId);
   }
 
   /**
@@ -2943,7 +2948,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * @param clientInfo - Partial client information to create the client with
    * @returns A Promise resolving to the created client info
    */
-  async createClient(clientInfo: Partial<ClientInfo>): Promise<ClientInfo> {
+  async createClient<Metadata = any>(clientInfo: Partial<ClientInfo<Metadata>>): Promise<ClientInfo<Metadata>> {
     const clientId = generateRandomString(16);
 
     // Determine token endpoint auth method
@@ -2951,7 +2956,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
     const isPublicClient = tokenEndpointAuthMethod === 'none';
 
     // Create a new client object
-    const newClient: ClientInfo = {
+    const newClient: ClientInfo<Metadata> = {
       clientId,
       redirectUris: clientInfo.redirectUris || [],
       clientName: clientInfo.clientName,
@@ -2965,6 +2970,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
       responseTypes: clientInfo.responseTypes || ['code'],
       registrationDate: Math.floor(Date.now() / 1000),
       tokenEndpointAuthMethod,
+      metadata: clientInfo.metadata
     };
 
     // Validate each redirect URI scheme
@@ -2998,7 +3004,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * @param options - Optional pagination parameters (limit and cursor)
    * @returns A Promise resolving to the list result with items and optional cursor
    */
-  async listClients(options?: ListOptions): Promise<ListResult<ClientInfo>> {
+  async listClients<Metadata = any>(options?: ListOptions): Promise<ListResult<ClientInfo<Metadata>>> {
     // Prepare list options for KV
     const listOptions: { limit?: number; cursor?: string; prefix: string } = {
       prefix: 'client:',
@@ -3016,10 +3022,10 @@ class OAuthHelpersImpl implements OAuthHelpers {
     const response = await this.env.OAUTH_KV.list(listOptions);
 
     // Fetch all clients in parallel
-    const clients: ClientInfo[] = [];
+    const clients: ClientInfo<Metadata>[] = [];
     const promises = response.keys.map(async (key: { name: string }) => {
       const clientId = key.name.substring('client:'.length);
-      const client = await this.provider.getClient(this.env, clientId);
+      const client = await this.provider.getClient<Metadata>(this.env, clientId);
       if (client) {
         clients.push(client);
       }
@@ -3040,8 +3046,8 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * @param updates - Partial client information with fields to update
    * @returns A Promise resolving to the updated client info, or null if not found
    */
-  async updateClient(clientId: string, updates: Partial<ClientInfo>): Promise<ClientInfo | null> {
-    const client = await this.provider.getClient(this.env, clientId);
+  async updateClient<Metadata = any>(clientId: string, updates: Partial<ClientInfo<Metadata>>): Promise<ClientInfo<Metadata> | null> {
+    const client = await this.provider.getClient<Metadata>(this.env, clientId);
     if (!client) {
       return null;
     }
@@ -3063,7 +3069,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
       secretToStore = await hashSecret(updates.clientSecret);
     }
 
-    const updatedClient: ClientInfo = {
+    const updatedClient: ClientInfo<Metadata> = {
       ...client,
       ...updates,
       clientId: client.clientId, // Ensure clientId doesn't change

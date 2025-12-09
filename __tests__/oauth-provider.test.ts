@@ -3920,10 +3920,11 @@ describe('OAuthProvider', () => {
       expect(mockEnv.OAUTH_PROVIDER).not.toBeNull();
 
       // Create a client
-      const client = await mockEnv.OAUTH_PROVIDER!.createClient({
+      const client = await mockEnv.OAUTH_PROVIDER!.createClient<{ test: string }>({
         redirectUris: ['https://client.example.com/callback'],
         clientName: 'Test Client',
         tokenEndpointAuthMethod: 'client_secret_basic',
+        metadata: { test: 'test' },
       });
 
       expect(client.clientId).toBeDefined();
@@ -3933,7 +3934,8 @@ describe('OAuthProvider', () => {
       const clients = await mockEnv.OAUTH_PROVIDER!.listClients();
       expect(clients.items.length).toBe(1);
       expect(clients.items[0].clientId).toBe(client.clientId);
-
+      expect(clients.items[0].metadata).toEqual({ test: 'test' });
+      
       // Update client
       const updatedClient = await mockEnv.OAUTH_PROVIDER!.updateClient(client.clientId, {
         clientName: 'Updated Client Name',
