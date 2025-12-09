@@ -347,11 +347,11 @@ export interface OAuthHelpers {
   revokeGrant(grantId: string, userId: string): Promise<void>;
 
   /**
-   * Extracts and decrypts props from a token
+   * Decodes a token and returns token data with decrypted props
    * @param token - The token
-   * @returns Promise resolving to the decrypted props, or null if token is invalid
+   * @returns Promise resolving to token data with decrypted props, or null if token is invalid
    */
-  extractTokenProps<T = any>(token: string): Promise<T | null>;
+  decodeToken<T = any>(token: string): Promise<TokenSummary<T> | null>;
 }
 
 /**
@@ -690,6 +690,19 @@ export interface Token {
 }
 
 /**
+ * Token record with decrypted properties
+ * Derived from Token but with wrappedEncryptionKey removed and encryptedProps replaced with metadata
+ */
+export type TokenSummary<T = any> = Omit<Token, 'wrappedEncryptionKey' | 'grant'> & {
+  grant: Omit<Token['grant'], 'encryptedProps'> & {
+    /**
+     * Decrypted application-specific properties
+     */
+    metadata: T;
+  };
+};
+
+/**
  * Options for listing operations that support pagination
  */
 export interface ListOptions {
@@ -1018,12 +1031,12 @@ class OAuthProviderImpl {
   }
 
   /**
-   * Extracts and decrypts props from a granted token
+   * Decodes a token and returns token data with decrypted props
    * @param token - The granted token
    * @param env - Cloudflare Worker environment variables
-   * @returns Promise resolving to the decrypted props, or null if token is invalid
+   * @returns Promise resolving to token data with decrypted props, or null if token is invalid
    */
-  async extractTokenProps<T = any>(token: string, env: any): Promise<T | null> {
+  async decodeToken<T = any>(token: string, env: any): Promise<TokenSummary<T> | null> {
     const parts = token.split(":");
     const isPossiblyInternalFormat = parts.length === 3;
 
@@ -1031,10 +1044,12 @@ class OAuthProviderImpl {
       return null;
     }
 
+    // Retrieve the token from KV
     const [userId, grantId] = parts;
     const id = await generateTokenId(token);
-    const tokenData = await env.OAUTH_KV.get(`token:${userId}:${grantId}:${id}`, { type: "json" });
+    const tokenData: Token | null = await env.OAUTH_KV.get(`token:${userId}:${grantId}:${id}`, { type: "json" });
     
+    // Return null if missing or expired
     if (!tokenData) {
       return null;
     }
@@ -1043,9 +1058,21 @@ class OAuthProviderImpl {
       return null;
     }
 
+    // Decrypt the props
     const encryptionKey = await unwrapKeyWithToken(token, tokenData.wrappedEncryptionKey);
     const decryptedProps = await decryptProps(encryptionKey, tokenData.grant.encryptedProps);
-    return decryptedProps as T;
+    
+    // Return the token data with decrypted instead of encrypted props
+    const { wrappedEncryptionKey, grant, ...tokenFields } = tokenData;
+    const { encryptedProps, ...grantFields } = grant;
+    
+    return {
+      ...tokenFields,
+      grant: {
+        ...grantFields,
+        metadata: decryptedProps as T,
+      },
+    };
   }
 
   /**
@@ -3241,13 +3268,13 @@ class OAuthHelpersImpl implements OAuthHelpers {
   }
 
   /**
-   * Extracts and decrypts props from a token
-   * @param accessToken - The token
-   * @returns Promise resolving to the decrypted props, or null if token is invalid
+   * Decodes a token and returns token data with decrypted props
+   * @param token - The token
+   * @returns Promise resolving to token data with decrypted props, or null if token is invalid
    */
-    async extractTokenProps<T = any>(token: string): Promise<T | null> {
-      return await this.provider.extractTokenProps(token, this.env);
-    }
+  async decodeToken<T = any>(token: string): Promise<TokenSummary<T> | null> {
+    return await this.provider.decodeToken(token, this.env);
+  }
 }
 
 /**
