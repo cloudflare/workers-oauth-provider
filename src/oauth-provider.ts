@@ -107,18 +107,18 @@ export interface TokenExchangeCallbackOptions {
  */
 export type ClientRegistrationCallbackOptions = Pick<
   ClientInfo,
-  'clientId' | 'redirectUris' | 'clientName' | 'clientUri' | 'metadata'
+  'clientId' | 'redirectUris' | 'clientName' | 'clientUri' | 'props'
 >;
 
 /**
  * Result of a client registration callback function.
- * Allows adding metadata to the client during registration.
+ * Allows adding props to the client during registration.
  */
 export interface ClientRegistrationCallbackResult {
   /**
-   * Metadata to be stored with the client
+   * Props to be stored with the client
    */
-  metadata?: any;
+  props?: any;
 }
 
 /**
@@ -268,10 +268,10 @@ export interface OAuthProviderOptions {
 
   /**
    * Optional callback function that is called during client registration.
-   * This allows adding metadata to the client when it is created through the client registration endpoint.
+   * This allows adding props to the client when it is created through the client registration endpoint.
    *
-   * The callback can return metadata that will be stored with the client.
-   * If the callback returns nothing or undefined, no metadata will be added.
+   * The callback can return props that will be stored with the client.
+   * If the callback returns nothing or undefined, no props will be added.
    */
   clientRegistrationCallback?: (
     options: ClientRegistrationCallbackOptions
@@ -505,9 +505,9 @@ export interface ClientInfo<Metadata = any> {
   tokenEndpointAuthMethod: string;
 
   /**
-   * Application-specific metadata associated with this client
+   * Application-specific props associated with this client
    */
-  metadata?: Metadata;
+  props?: Metadata;
 }
 
 /**
@@ -2141,13 +2141,13 @@ class OAuthProviderImpl {
           redirectUris: redirectUris,
           clientName: clientInfo.clientName,
           clientUri: clientInfo.clientUri,
-          metadata: clientInfo.metadata,
+          props: clientInfo.props,
         };
 
         const callbackResult = await Promise.resolve(this.options.clientRegistrationCallback(callbackOptions));
 
-        if (callbackResult && callbackResult.metadata !== undefined) {
-          clientInfo.metadata = callbackResult.metadata;
+        if (callbackResult && callbackResult.props !== undefined) {
+          clientInfo.props = callbackResult.props;
         }
       }
     } catch (error) {
@@ -3018,7 +3018,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
       responseTypes: clientInfo.responseTypes || ['code'],
       registrationDate: Math.floor(Date.now() / 1000),
       tokenEndpointAuthMethod,
-      metadata: clientInfo.metadata
+      props: clientInfo.props
     };
 
     // Validate each redirect URI scheme

@@ -434,8 +434,8 @@ describe('OAuthProvider', () => {
       expect(savedClient.clientSecret).toBeUndefined(); // No secret stored
     });
 
-    it('should add metadata via clientRegistrationCallback', async () => {
-      const callbackMetadata = { test: 'new' };
+    it('should add props via clientRegistrationCallback', async () => {
+      const callbackProps = { test: 'new' };
       
       const providerWithCallback = new OAuthProvider({
         apiRoute: ['/api/', 'https://api.example.com/'],
@@ -447,17 +447,17 @@ describe('OAuthProvider', () => {
         clientRegistrationCallback: async (options) => {
           expect(options.clientId).toBeDefined();
           expect(options.redirectUris).toEqual(['https://client.example.com/callback']);
-          expect(options.clientName).toBe('Test Client with Metadata');
-          expect(options.metadata).toBeUndefined();
+          expect(options.clientName).toBe('Test Client with Props');
+          expect(options.props).toBeUndefined();
           return {
-            metadata: callbackMetadata,
+            props: callbackProps,
           };
         },
       });
 
       const clientData = {
         redirect_uris: ['https://client.example.com/callback'],
-        client_name: 'Test Client with Metadata',
+        client_name: 'Test Client with Props',
         token_endpoint_auth_method: 'client_secret_basic',
       };
 
@@ -475,13 +475,13 @@ describe('OAuthProvider', () => {
       const registeredClient = await response.json<any>();
       expect(registeredClient.client_id).toBeDefined();
 
-      // Verify the client was saved to KV with metadata
+      // Verify the client was saved to KV with props
       const savedClient = await mockEnv.OAUTH_KV.get(`client:${registeredClient.client_id}`, { type: 'json' });
       expect(savedClient).not.toBeNull();
-      expect(savedClient.metadata).toEqual(callbackMetadata);
+      expect(savedClient.props).toEqual(callbackProps);
     });
 
-    it('should not add metadata if clientRegistrationCallback returns undefined', async () => {
+    it('should not add props if clientRegistrationCallback returns undefined', async () => {
       const providerWithCallback = new OAuthProvider({
         apiRoute: ['/api/', 'https://api.example.com/'],
         apiHandler: TestApiHandler,
@@ -490,7 +490,7 @@ describe('OAuthProvider', () => {
         tokenEndpoint: '/oauth/token',
         clientRegistrationEndpoint: '/oauth/register',
         clientRegistrationCallback: async () => {
-          // Return undefined - no metadata should be added
+          // Return undefined - no props should be added
           return undefined;
         },
       });
@@ -514,10 +514,10 @@ describe('OAuthProvider', () => {
 
       const registeredClient = await response.json<any>();
       
-      // Verify the client was saved to KV without metadata
+      // Verify the client was saved to KV without props
       const savedClient = await mockEnv.OAUTH_KV.get(`client:${registeredClient.client_id}`, { type: 'json' });
       expect(savedClient).not.toBeNull();
-      expect(savedClient.metadata).toBeUndefined();
+      expect(savedClient.props).toBeUndefined();
     });
   });
 
@@ -4010,7 +4010,7 @@ describe('OAuthProvider', () => {
         redirectUris: ['https://client.example.com/callback'],
         clientName: 'Test Client',
         tokenEndpointAuthMethod: 'client_secret_basic',
-        metadata: { test: 'test' },
+        props: { test: 'test' },
       });
 
       expect(client.clientId).toBeDefined();
@@ -4020,7 +4020,7 @@ describe('OAuthProvider', () => {
       const clients = await mockEnv.OAUTH_PROVIDER!.listClients();
       expect(clients.items.length).toBe(1);
       expect(clients.items[0].clientId).toBe(client.clientId);
-      expect(clients.items[0].metadata).toEqual({ test: 'test' });
+      expect(clients.items[0].props).toEqual({ test: 'test' });
       
       // Update client
       const updatedClient = await mockEnv.OAUTH_PROVIDER!.updateClient(client.clientId, {
