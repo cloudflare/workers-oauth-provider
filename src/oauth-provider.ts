@@ -507,7 +507,7 @@ export interface ClientInfo<Props = any> {
   /**
    * Application-specific props associated with this client
    */
-  props?: Metadata;
+  props?: Props;
 }
 
 /**
