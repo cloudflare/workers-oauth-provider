@@ -351,7 +351,7 @@ export interface OAuthHelpers {
    * @param token - The token
    * @returns Promise resolving to token data with decrypted props, or null if token is invalid
    */
-  decodeToken<T = any>(token: string): Promise<TokenSummary<T> | null>;
+  unwrapToken<T = any>(token: string): Promise<TokenSummary<T> | null>;
 }
 
 /**
@@ -1054,7 +1054,7 @@ class OAuthProviderImpl {
    * @param env - Cloudflare Worker environment variables
    * @returns Promise resolving to token data with decrypted props, or null if token is invalid
    */
-  async decodeToken<T = any>(token: string, env: any): Promise<TokenSummary<T> | null> {
+  async unwrapToken<T = any>(token: string, env: any): Promise<TokenSummary<T> | null> {
     const parts = token.split(":");
     const isPossiblyInternalFormat = parts.length === 3;
 
@@ -3294,8 +3294,8 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * @param token - The token
    * @returns Promise resolving to token data with decrypted props, or null if token is invalid
    */
-  async decodeToken<T = any>(token: string): Promise<TokenSummary<T> | null> {
-    return await this.provider.decodeToken(token, this.env);
+  async unwrapToken<T = any>(token: string): Promise<TokenSummary<T> | null> {
+    return await this.provider.unwrapToken(token, this.env);
   }
 }
 
