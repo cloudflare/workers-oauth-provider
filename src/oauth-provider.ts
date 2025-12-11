@@ -11,6 +11,15 @@ enum HandlerType {
 }
 
 /**
+ * Enum representing OAuth grant types
+ */
+enum GrantType {
+  AUTHORIZATION_CODE = 'authorization_code',
+  REFRESH_TOKEN = 'refresh_token',
+  TOKEN_EXCHANGE = 'urn:ietf:params:oauth:grant-type:token-exchange',
+}
+
+/**
  * Discriminated union type for handlers
  */
 type TypedHandler =
@@ -75,11 +84,8 @@ export interface TokenExchangeCallbackResult {
 export interface TokenExchangeCallbackOptions {
   /**
    * The type of grant being processed.
-   * 'authorization_code' for initial code exchange,
-   * 'refresh_token' for refresh token exchange,
-   * 'urn:ietf:params:oauth:grant-type:token-exchange' for OAuth 2.0 token exchange (RFC 8693).
    */
-  grantType: 'authorization_code' | 'refresh_token' | 'urn:ietf:params:oauth:grant-type:token-exchange';
+  grantType: GrantType;
 
   /**
    * Client that received this grant
@@ -1451,7 +1457,7 @@ class OAuthProviderImpl {
       scopes_supported: this.options.scopesSupported,
       response_types_supported: responseTypesSupported,
       response_modes_supported: ['query'],
-      grant_types_supported: ['authorization_code', 'refresh_token', 'urn:ietf:params:oauth:grant-type:token-exchange'],
+      grant_types_supported: [GrantType.AUTHORIZATION_CODE, GrantType.REFRESH_TOKEN, GrantType.TOKEN_EXCHANGE],
       // Support "none" auth method for public clients
       token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post', 'none'],
       // not implemented: token_endpoint_auth_signing_alg_values_supported
@@ -1485,11 +1491,11 @@ class OAuthProviderImpl {
     // Handle different grant types
     const grantType = body.grant_type;
 
-    if (grantType === 'authorization_code') {
+    if (grantType === GrantType.AUTHORIZATION_CODE) {
       return this.handleAuthorizationCodeGrant(body, clientInfo, env);
-    } else if (grantType === 'refresh_token') {
+    } else if (grantType === GrantType.REFRESH_TOKEN) {
       return this.handleRefreshTokenGrant(body, clientInfo, env);
-    } else if (grantType === 'urn:ietf:params:oauth:grant-type:token-exchange') {
+    } else if (grantType === GrantType.TOKEN_EXCHANGE) {
       return this.handleTokenExchangeGrant(body, clientInfo, env);
     } else {
       return this.createErrorResponse('unsupported_grant_type', 'Grant type not supported');
@@ -1612,7 +1618,7 @@ class OAuthProviderImpl {
       let accessTokenProps = decryptedProps;
 
       const callbackOptions: TokenExchangeCallbackOptions = {
-        grantType: 'authorization_code',
+        grantType: GrantType.AUTHORIZATION_CODE,
         clientId: clientInfo.clientId,
         userId: userId,
         scope: grantData.scope,
@@ -1859,7 +1865,7 @@ class OAuthProviderImpl {
       let accessTokenProps = decryptedProps;
 
       const callbackOptions: TokenExchangeCallbackOptions = {
-        grantType: 'refresh_token',
+        grantType: GrantType.REFRESH_TOKEN,
         clientId: clientInfo.clientId,
         userId: userId,
         scope: grantData.scope,
@@ -2144,7 +2150,7 @@ class OAuthProviderImpl {
       const decryptedProps = await decryptProps(encryptionKey, subjectTokenData.grant.encryptedProps);
 
       const callbackOptions: TokenExchangeCallbackOptions = {
-        grantType: 'urn:ietf:params:oauth:grant-type:token-exchange',
+        grantType: GrantType.TOKEN_EXCHANGE,
         clientId: clientInfo.clientId,
         userId: tokenSummary.userId,
         scope: newScopes,
@@ -2497,7 +2503,7 @@ class OAuthProviderImpl {
         tosUri: validateStringField(clientMetadata.tos_uri),
         jwksUri: validateStringField(clientMetadata.jwks_uri),
         contacts: validateStringArray(clientMetadata.contacts),
-        grantTypes: validateStringArray(clientMetadata.grant_types) || ['authorization_code', 'refresh_token'],
+        grantTypes: validateStringArray(clientMetadata.grant_types) || [GrantType.AUTHORIZATION_CODE, GrantType.REFRESH_TOKEN, GrantType.TOKEN_EXCHANGE],
         responseTypes: validateStringArray(clientMetadata.response_types) || ['code'],
         registrationDate: Math.floor(Date.now() / 1000),
         tokenEndpointAuthMethod: authMethod,
@@ -3425,7 +3431,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
       tosUri: clientInfo.tosUri,
       jwksUri: clientInfo.jwksUri,
       contacts: clientInfo.contacts,
-      grantTypes: clientInfo.grantTypes || ['authorization_code', 'refresh_token'],
+      grantTypes: clientInfo.grantTypes || [GrantType.AUTHORIZATION_CODE, GrantType.REFRESH_TOKEN, GrantType.TOKEN_EXCHANGE],
       responseTypes: clientInfo.responseTypes || ['code'],
       registrationDate: Math.floor(Date.now() / 1000),
       tokenEndpointAuthMethod,
