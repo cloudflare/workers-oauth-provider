@@ -193,6 +193,7 @@ describe('OAuthProvider', () => {
       scopesSupported: ['read', 'write', 'profile'],
       accessTokenTTL: 3600,
       allowImplicitFlow: true, // Enable implicit flow for tests
+      allowTokenExchangeGrant: true, // Enable token exchange for tests
     });
   });
 
@@ -1977,6 +1978,7 @@ describe('OAuthProvider', () => {
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
         clientRegistrationEndpoint: '/oauth/register',
+        allowTokenExchangeGrant: true,
         tokenExchangeCallback: async (options) => {
           callbackInvoked = true;
           callbackOptions = options;
@@ -2015,6 +2017,10 @@ describe('OAuthProvider', () => {
       const tokens = await tokenResponse.json<any>();
       const tokenToExchange = tokens.access_token;
 
+      // Reset callback tracking before token exchange
+      callbackInvoked = false;
+      callbackOptions = null;
+
       // Now exchange it
       const params2 = new URLSearchParams();
       params2.append('grant_type', 'urn:ietf:params:oauth:grant-type:token-exchange');
@@ -2037,7 +2043,8 @@ describe('OAuthProvider', () => {
       expect(callbackInvoked).toBe(true);
       expect(callbackOptions).toBeDefined();
       expect(callbackOptions.grantType).toBe('urn:ietf:params:oauth:grant-type:token-exchange');
-      expect(callbackOptions.scope).toEqual(['read', 'write']);
+      expect(callbackOptions.scope).toEqual(['read', 'write']); // Grant scopes
+      expect(callbackOptions.tokenScope).toEqual(['read', 'write']); // Token scopes (no downscoping in this test)
     });
   });
 
