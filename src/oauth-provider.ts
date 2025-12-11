@@ -76,6 +76,12 @@ export interface TokenExchangeCallbackResult {
    * refresh token exchange, it will be ignored.
    */
   refreshTokenTTL?: number;
+
+  /**
+   * List of scopes authorized for the new access token
+   * (If undefined, the granted scopes will be used)
+   */
+  accessTokenScope?: string[];
 }
 
 /**
@@ -106,7 +112,7 @@ export interface TokenExchangeCallbackOptions {
    * List of scopes that were requested for this token by the client
    * (Will be the same as granted scopes unless client specifically requested a downscoping)
    */
-  tokenScope: string[];
+  requestedScope: string[];
 
   /**
    * Application-specific properties currently associated with this grant
@@ -1636,7 +1642,7 @@ class OAuthProviderImpl {
 
     // Parse and validate scope parameter for downscoping (RFC 6749 Section 3.3)
     // The token request can include a scope parameter to request a subset of the granted scopes
-    const tokenScopes = this.downscope(body.scope, grantData.scope);
+    let tokenScopes: string[] = this.downscope(body.scope, grantData.scope);
 
     // Process token exchange callback if provided
     if (this.options.tokenExchangeCallback) {
@@ -1652,7 +1658,7 @@ class OAuthProviderImpl {
         clientId: clientInfo.clientId,
         userId: userId,
         scope: grantData.scope,
-        tokenScope: tokenScopes,
+        requestedScope: tokenScopes,
         props: decryptedProps,
       };
 
@@ -1683,6 +1689,11 @@ class OAuthProviderImpl {
         // If refreshTokenTTL was specified, use that for this grant
         if ('refreshTokenTTL' in callbackResult) {
           refreshTokenTTL = callbackResult.refreshTokenTTL;
+        }
+
+        // If accessTokenScope was specified, use it for this token
+        if (callbackResult.accessTokenScope) {
+          tokenScopes = this.downscope(callbackResult.accessTokenScope, grantData.scope);
         }
       }
 
@@ -1886,7 +1897,7 @@ class OAuthProviderImpl {
 
     // Parse and validate scope parameter for downscoping (RFC 6749 Section 3.3)
     // The token request can include a scope parameter to request a subset of the granted scopes
-    const tokenScopes = this.downscope(body.scope, grantData.scope);
+    let tokenScopes = this.downscope(body.scope, grantData.scope);
 
     // Track whether grant props changed
     let grantPropsChanged = false;
@@ -1905,7 +1916,7 @@ class OAuthProviderImpl {
         clientId: clientInfo.clientId,
         userId: userId,
         scope: grantData.scope,
-        tokenScope: tokenScopes,
+        requestedScope: tokenScopes,
         props: decryptedProps,
       };
 
@@ -1940,6 +1951,11 @@ class OAuthProviderImpl {
             'invalid_request',
             'refreshTokenTTL cannot be changed during refresh token exchange'
           );
+        }
+
+        // If accessTokenScope was specified, use it for this token
+        if (callbackResult.accessTokenScope) {
+          tokenScopes = this.downscope(callbackResult.accessTokenScope, grantData.scope);
         }
       }
 
@@ -2052,7 +2068,7 @@ class OAuthProviderImpl {
       wrappedEncryptionKey: accessTokenWrappedKey,
       grant: {
         clientId: grantData.clientId,
-        scope: tokenScopes,
+        scope: grantData.scope,
         encryptedProps: encryptedAccessTokenProps,
       },
     };
@@ -2111,23 +2127,15 @@ class OAuthProviderImpl {
       throw new OAuthError('invalid_grant', 'Invalid or expired subject token');
     }
 
-    // If scopes are requested, validate they are a subset of the original grant scopes
-    let newScopes: string[] = tokenSummary.grant.scope;
-    if (requestedScopes?.length) {
-      const originalScopes = tokenSummary.grant.scope;
-      const allScopesValid = requestedScopes.every((scope) => originalScopes.includes(scope));
-      if (!allScopesValid) {
-        throw new OAuthError('invalid_scope', 'Requested scope exceeds parent grant');
-      }
-      newScopes = requestedScopes;
-    }
-
     // Get the grant to access resource information
     const grantKey = `grant:${tokenSummary.userId}:${tokenSummary.grantId}`;
     const grantData: Grant | null = await env.OAUTH_KV.get(grantKey, { type: 'json' });
     if (!grantData) {
       throw new OAuthError('invalid_grant', 'Grant not found');
     }
+
+    // If scopes are requested, validate they are a subset of the original grant scopes
+    let tokenScopes: string[] = this.downscope(requestedScopes, grantData.scope);
 
     // Parse and validate resource parameter (RFC 8707) if provided
     let newAudience: string | string[] | undefined = tokenSummary.audience;
@@ -2192,7 +2200,7 @@ class OAuthProviderImpl {
         clientId: clientInfo.clientId,
         userId: tokenSummary.userId,
         scope: tokenSummary.grant.scope,
-        tokenScope: newScopes,
+        requestedScope: tokenScopes,
         props: decryptedProps,
       };
 
@@ -2223,6 +2231,11 @@ class OAuthProviderImpl {
           encryptedAccessTokenProps = tokenResult.encryptedData;
           accessTokenEncryptionKey = tokenResult.key;
         }
+
+        // If accessTokenScope was specified, use it for this token
+        if (callbackResult.accessTokenScope) {
+          tokenScopes = this.downscope(callbackResult.accessTokenScope, grantData.scope);
+        }
       }
     }
 
@@ -2231,7 +2244,7 @@ class OAuthProviderImpl {
       userId: tokenSummary.userId,
       grantId: tokenSummary.grantId,
       clientId: tokenSummary.grant.clientId,
-      scope: newScopes,
+      scope: tokenScopes,
       encryptedProps: encryptedAccessTokenProps,
       encryptionKey: accessTokenEncryptionKey,
       expiresIn: accessTokenTTL,
@@ -2245,7 +2258,7 @@ class OAuthProviderImpl {
       issued_token_type: 'urn:ietf:params:oauth:token-type:access_token',
       token_type: 'bearer',
       expires_in: accessTokenTTL,
-      scope: newScopes.join(' '),
+      scope: tokenScopes.join(' '),
     };
 
     // RFC 8707 Section 2.2: SHOULD return resource parameter in response
