@@ -1450,6 +1450,597 @@ describe('OAuthProvider', () => {
     });
   });
 
+  describe('Token Exchange Flow', () => {
+    let clientId: string;
+    let clientSecret: string;
+    let accessToken: string;
+    let originalClientId: string;
+    let originalClientSecret: string;
+
+    // Helper to get an access token for testing
+    async function getAccessToken() {
+      // Create the original client (the one that got the token)
+      const originalClientData = {
+        redirect_uris: ['https://original.example.com/callback'],
+        client_name: 'Original Client',
+        token_endpoint_auth_method: 'client_secret_basic',
+      };
+
+      const registerRequest1 = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify(originalClientData)
+      );
+
+      const registerResponse1 = await oauthProvider.fetch(registerRequest1, mockEnv, mockCtx);
+      const originalClient = await registerResponse1.json<any>();
+      originalClientId = originalClient.client_id;
+      originalClientSecret = originalClient.client_secret;
+
+      // Get an auth code
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${originalClientId}` +
+          `&redirect_uri=${encodeURIComponent('https://original.example.com/callback')}` +
+          `&scope=read%20write%20admin&state=xyz123`
+      );
+
+      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const location = authResponse.headers.get('Location')!;
+      const code = new URL(location).searchParams.get('code')!;
+
+      // Exchange for tokens
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', 'https://original.example.com/callback');
+      params.append('client_id', originalClientId);
+      params.append('client_secret', originalClientSecret);
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      );
+
+      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokens = await tokenResponse.json<any>();
+      accessToken = tokens.access_token;
+    }
+
+    // Helper to create a different client (the one making the exchange request)
+    async function createExchangeClient() {
+      const clientData = {
+        redirect_uris: ['https://exchange.example.com/callback'],
+        client_name: 'Exchange Client',
+        token_endpoint_auth_method: 'client_secret_basic',
+      };
+
+      const registerRequest = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify(clientData)
+      );
+
+      const registerResponse = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
+      const client = await registerResponse.json<any>();
+      clientId = client.client_id;
+      clientSecret = client.client_secret;
+    }
+
+    beforeEach(async () => {
+      await getAccessToken();
+      await createExchangeClient();
+    });
+
+    it('should exchange an access token for a new one via HTTP endpoint', async () => {
+      const params = new URLSearchParams();
+      params.append('grant_type', 'urn:ietf:params:oauth:grant-type:token-exchange');
+      params.append('subject_token', accessToken);
+      params.append('subject_token_type', 'urn:ietf:params:oauth:token-type:access_token');
+      params.append('requested_token_type', 'urn:ietf:params:oauth:token-type:access_token');
+
+      const exchangeRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+        },
+        params.toString()
+      );
+
+      const exchangeResponse = await oauthProvider.fetch(exchangeRequest, mockEnv, mockCtx);
+
+      expect(exchangeResponse.status).toBe(200);
+
+      const newTokens = await exchangeResponse.json<any>();
+      expect(newTokens.access_token).toBeDefined();
+      expect(newTokens.access_token).not.toBe(accessToken); // Should be a new token
+      expect(newTokens.token_type).toBe('bearer');
+      expect(newTokens.issued_token_type).toBe('urn:ietf:params:oauth:token-type:access_token');
+      expect(newTokens.expires_in).toBeDefined();
+      expect(newTokens.scope).toBe('read write admin'); // Should preserve original scopes
+
+      // Verify new token works
+      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: `Bearer ${newTokens.access_token}`,
+      });
+      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+      expect(apiResponse.status).toBe(200);
+
+      // Verify original token still works
+      const originalApiRequest = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: `Bearer ${accessToken}`,
+      });
+      const originalApiResponse = await oauthProvider.fetch(originalApiRequest, mockEnv, mockCtx);
+      expect(originalApiResponse.status).toBe(200);
+    });
+
+    it('should exchange token with narrowed scopes', async () => {
+      const params = new URLSearchParams();
+      params.append('grant_type', 'urn:ietf:params:oauth:grant-type:token-exchange');
+      params.append('subject_token', accessToken);
+      params.append('subject_token_type', 'urn:ietf:params:oauth:token-type:access_token');
+      params.append('requested_token_type', 'urn:ietf:params:oauth:token-type:access_token');
+      params.append('scope', 'read write'); // Narrow from 'read write admin'
+
+      const exchangeRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+        },
+        params.toString()
+      );
+
+      const exchangeResponse = await oauthProvider.fetch(exchangeRequest, mockEnv, mockCtx);
+
+      expect(exchangeResponse.status).toBe(200);
+
+      const newTokens = await exchangeResponse.json<any>();
+      expect(newTokens.scope).toBe('read write'); // Should have narrowed scopes
+    });
+
+    it('should reject token exchange with invalid scopes', async () => {
+      const params = new URLSearchParams();
+      params.append('grant_type', 'urn:ietf:params:oauth:grant-type:token-exchange');
+      params.append('subject_token', accessToken);
+      params.append('subject_token_type', 'urn:ietf:params:oauth:token-type:access_token');
+      params.append('requested_token_type', 'urn:ietf:params:oauth:token-type:access_token');
+      params.append('scope', 'read write admin delete'); // Invalid: 'delete' not in original
+
+      const exchangeRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+        },
+        params.toString()
+      );
+
+      const exchangeResponse = await oauthProvider.fetch(exchangeRequest, mockEnv, mockCtx);
+
+      expect(exchangeResponse.status).toBe(400);
+
+      const error = await exchangeResponse.json<any>();
+      expect(error.error).toBe('invalid_scope');
+    });
+
+    it('should exchange token with different audience/resource', async () => {
+      // First, get a token with a resource
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${originalClientId}` +
+          `&redirect_uri=${encodeURIComponent('https://original.example.com/callback')}` +
+          `&scope=read%20write&resource=${encodeURIComponent('https://api1.example.com')}` +
+          `&resource=${encodeURIComponent('https://api2.example.com')}&state=xyz123`
+      );
+
+      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const location = authResponse.headers.get('Location')!;
+      const code = new URL(location).searchParams.get('code')!;
+
+      const params1 = new URLSearchParams();
+      params1.append('grant_type', 'authorization_code');
+      params1.append('code', code);
+      params1.append('redirect_uri', 'https://original.example.com/callback');
+      params1.append('client_id', originalClientId);
+      params1.append('client_secret', originalClientSecret);
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params1.toString()
+      );
+
+      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokens = await tokenResponse.json<any>();
+      const tokenWithResource = tokens.access_token;
+
+      // Now exchange with a narrowed resource
+      const params2 = new URLSearchParams();
+      params2.append('grant_type', 'urn:ietf:params:oauth:grant-type:token-exchange');
+      params2.append('subject_token', tokenWithResource);
+      params2.append('subject_token_type', 'urn:ietf:params:oauth:token-type:access_token');
+      params2.append('requested_token_type', 'urn:ietf:params:oauth:token-type:access_token');
+      params2.append('resource', 'https://api1.example.com'); // Narrow to one resource
+
+      const exchangeRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+        },
+        params2.toString()
+      );
+
+      const exchangeResponse = await oauthProvider.fetch(exchangeRequest, mockEnv, mockCtx);
+
+      expect(exchangeResponse.status).toBe(200);
+
+      const newTokens = await exchangeResponse.json<any>();
+      expect(newTokens.resource).toBe('https://api1.example.com');
+    });
+
+    it('should reject token exchange with invalid resource', async () => {
+      // Get a token with a resource
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${originalClientId}` +
+          `&redirect_uri=${encodeURIComponent('https://original.example.com/callback')}` +
+          `&scope=read%20write&resource=${encodeURIComponent('https://api1.example.com')}&state=xyz123`
+      );
+
+      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const location = authResponse.headers.get('Location')!;
+      const code = new URL(location).searchParams.get('code')!;
+
+      const params1 = new URLSearchParams();
+      params1.append('grant_type', 'authorization_code');
+      params1.append('code', code);
+      params1.append('redirect_uri', 'https://original.example.com/callback');
+      params1.append('client_id', originalClientId);
+      params1.append('client_secret', originalClientSecret);
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params1.toString()
+      );
+
+      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokens = await tokenResponse.json<any>();
+      const tokenWithResource = tokens.access_token;
+
+      // Try to exchange with a resource not in the original grant
+      const params2 = new URLSearchParams();
+      params2.append('grant_type', 'urn:ietf:params:oauth:grant-type:token-exchange');
+      params2.append('subject_token', tokenWithResource);
+      params2.append('subject_token_type', 'urn:ietf:params:oauth:token-type:access_token');
+      params2.append('requested_token_type', 'urn:ietf:params:oauth:token-type:access_token');
+      params2.append('resource', 'https://api2.example.com'); // Not in original grant
+
+      const exchangeRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+        },
+        params2.toString()
+      );
+
+      const exchangeResponse = await oauthProvider.fetch(exchangeRequest, mockEnv, mockCtx);
+
+      expect(exchangeResponse.status).toBe(400);
+
+      const error = await exchangeResponse.json<any>();
+      expect(error.error).toBe('invalid_target');
+    });
+
+    it('should exchange token with shorter TTL', async () => {
+      const params = new URLSearchParams();
+      params.append('grant_type', 'urn:ietf:params:oauth:grant-type:token-exchange');
+      params.append('subject_token', accessToken);
+      params.append('subject_token_type', 'urn:ietf:params:oauth:token-type:access_token');
+      params.append('requested_token_type', 'urn:ietf:params:oauth:token-type:access_token');
+      params.append('expires_in', '1800'); // 30 minutes instead of default 1 hour
+
+      const exchangeRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+        },
+        params.toString()
+      );
+
+      const exchangeResponse = await oauthProvider.fetch(exchangeRequest, mockEnv, mockCtx);
+
+      expect(exchangeResponse.status).toBe(200);
+
+      const newTokens = await exchangeResponse.json<any>();
+      expect(newTokens.expires_in).toBe(1800);
+    });
+
+    it('should reject token exchange with invalid subject token', async () => {
+      const params = new URLSearchParams();
+      params.append('grant_type', 'urn:ietf:params:oauth:grant-type:token-exchange');
+      params.append('subject_token', 'invalid:token:here');
+      params.append('subject_token_type', 'urn:ietf:params:oauth:token-type:access_token');
+      params.append('requested_token_type', 'urn:ietf:params:oauth:token-type:access_token');
+
+      const exchangeRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+        },
+        params.toString()
+      );
+
+      const exchangeResponse = await oauthProvider.fetch(exchangeRequest, mockEnv, mockCtx);
+
+      expect(exchangeResponse.status).toBe(400);
+
+      const error = await exchangeResponse.json<any>();
+      expect(error.error).toBe('invalid_grant');
+    });
+
+    it('should reject token exchange without subject_token', async () => {
+      const params = new URLSearchParams();
+      params.append('grant_type', 'urn:ietf:params:oauth:grant-type:token-exchange');
+      params.append('subject_token_type', 'urn:ietf:params:oauth:token-type:access_token');
+      params.append('requested_token_type', 'urn:ietf:params:oauth:token-type:access_token');
+
+      const exchangeRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+        },
+        params.toString()
+      );
+
+      const exchangeResponse = await oauthProvider.fetch(exchangeRequest, mockEnv, mockCtx);
+
+      expect(exchangeResponse.status).toBe(400);
+
+      const error = await exchangeResponse.json<any>();
+      expect(error.error).toBe('invalid_request');
+    });
+
+    it('should reject token exchange with unsupported subject_token_type', async () => {
+      const params = new URLSearchParams();
+      params.append('grant_type', 'urn:ietf:params:oauth:grant-type:token-exchange');
+      params.append('subject_token', accessToken);
+      params.append('subject_token_type', 'urn:ietf:params:oauth:token-type:refresh_token');
+      params.append('requested_token_type', 'urn:ietf:params:oauth:token-type:access_token');
+
+      const exchangeRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+        },
+        params.toString()
+      );
+
+      const exchangeResponse = await oauthProvider.fetch(exchangeRequest, mockEnv, mockCtx);
+
+      expect(exchangeResponse.status).toBe(400);
+
+      const error = await exchangeResponse.json<any>();
+      expect(error.error).toBe('invalid_request');
+    });
+
+    it('should reject token exchange with unsupported requested_token_type', async () => {
+      const params = new URLSearchParams();
+      params.append('grant_type', 'urn:ietf:params:oauth:grant-type:token-exchange');
+      params.append('subject_token', accessToken);
+      params.append('subject_token_type', 'urn:ietf:params:oauth:token-type:access_token');
+      params.append('requested_token_type', 'urn:ietf:params:oauth:token-type:refresh_token');
+
+      const exchangeRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+        },
+        params.toString()
+      );
+
+      const exchangeResponse = await oauthProvider.fetch(exchangeRequest, mockEnv, mockCtx);
+
+      expect(exchangeResponse.status).toBe(400);
+
+      const error = await exchangeResponse.json<any>();
+      expect(error.error).toBe('invalid_request');
+    });
+
+    it('should exchange token via OAuthHelpers.exchangeToken', async () => {
+      const helpers = mockEnv.OAUTH_PROVIDER as OAuthHelpers;
+
+      const newToken = await helpers.exchangeToken({
+        subjectToken: accessToken,
+      });
+
+      expect(newToken.access_token).toBeDefined();
+      expect(newToken.access_token).not.toBe(accessToken);
+      expect(newToken.token_type).toBe('bearer');
+      expect(newToken.expires_in).toBeDefined();
+    });
+
+    it('should exchange token via OAuthHelpers with narrowed scopes', async () => {
+      const helpers = mockEnv.OAUTH_PROVIDER as OAuthHelpers;
+
+      const newToken = await helpers.exchangeToken({
+        subjectToken: accessToken,
+        scope: ['read', 'write'],
+      });
+
+      expect(newToken.scope).toBe('read write');
+    });
+
+    it('should exchange token via OAuthHelpers with different audience', async () => {
+      // Get a token with resource first
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${originalClientId}` +
+          `&redirect_uri=${encodeURIComponent('https://original.example.com/callback')}` +
+          `&scope=read%20write&resource=${encodeURIComponent('https://api1.example.com')}` +
+          `&resource=${encodeURIComponent('https://api2.example.com')}&state=xyz123`
+      );
+
+      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const location = authResponse.headers.get('Location')!;
+      const code = new URL(location).searchParams.get('code')!;
+
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', 'https://original.example.com/callback');
+      params.append('client_id', originalClientId);
+      params.append('client_secret', originalClientSecret);
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      );
+
+      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokens = await tokenResponse.json<any>();
+      const tokenWithResource = tokens.access_token;
+
+      const helpers = mockEnv.OAUTH_PROVIDER as OAuthHelpers;
+
+      const newToken = await helpers.exchangeToken({
+        subjectToken: tokenWithResource,
+        aud: 'https://api1.example.com',
+      });
+
+      expect(newToken.resource).toBe('https://api1.example.com');
+    });
+
+    it('should exchange token via OAuthHelpers with custom TTL', async () => {
+      const helpers = mockEnv.OAUTH_PROVIDER as OAuthHelpers;
+
+      const newToken = await helpers.exchangeToken({
+        subjectToken: accessToken,
+        expiresIn: 1800,
+      });
+
+      expect(newToken.expires_in).toBe(1800);
+    });
+
+    it('should reject OAuthHelpers.exchangeToken with invalid token', async () => {
+      const helpers = mockEnv.OAUTH_PROVIDER as OAuthHelpers;
+
+      await expect(
+        helpers.exchangeToken({
+          subjectToken: 'invalid:token:here',
+        })
+      ).rejects.toThrow();
+    });
+
+    it('should reject OAuthHelpers.exchangeToken with invalid scopes', async () => {
+      const helpers = mockEnv.OAUTH_PROVIDER as OAuthHelpers;
+
+      await expect(
+        helpers.exchangeToken({
+          subjectToken: accessToken,
+          scope: ['read', 'write', 'admin', 'delete'], // 'delete' not in original
+        })
+      ).rejects.toThrow();
+    });
+
+    it('should call tokenExchangeCallback during token exchange', async () => {
+      let callbackInvoked = false;
+      let callbackOptions: any = null;
+
+      const providerWithCallback = new OAuthProvider({
+        apiRoute: ['/api/', 'https://api.example.com/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        tokenExchangeCallback: async (options) => {
+          callbackInvoked = true;
+          callbackOptions = options;
+          return {
+            accessTokenProps: { ...options.props, exchanged: true },
+          };
+        },
+      });
+
+      // Get a token with this provider
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${originalClientId}` +
+          `&redirect_uri=${encodeURIComponent('https://original.example.com/callback')}` +
+          `&scope=read%20write&state=xyz123`
+      );
+
+      const authResponse = await providerWithCallback.fetch(authRequest, mockEnv, mockCtx);
+      const location = authResponse.headers.get('Location')!;
+      const code = new URL(location).searchParams.get('code')!;
+
+      const params1 = new URLSearchParams();
+      params1.append('grant_type', 'authorization_code');
+      params1.append('code', code);
+      params1.append('redirect_uri', 'https://original.example.com/callback');
+      params1.append('client_id', originalClientId);
+      params1.append('client_secret', originalClientSecret);
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params1.toString()
+      );
+
+      const tokenResponse = await providerWithCallback.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokens = await tokenResponse.json<any>();
+      const tokenToExchange = tokens.access_token;
+
+      // Now exchange it
+      const params2 = new URLSearchParams();
+      params2.append('grant_type', 'urn:ietf:params:oauth:grant-type:token-exchange');
+      params2.append('subject_token', tokenToExchange);
+      params2.append('subject_token_type', 'urn:ietf:params:oauth:token-type:access_token');
+      params2.append('requested_token_type', 'urn:ietf:params:oauth:token-type:access_token');
+
+      const exchangeRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+        },
+        params2.toString()
+      );
+
+      await providerWithCallback.fetch(exchangeRequest, mockEnv, mockCtx);
+
+      expect(callbackInvoked).toBe(true);
+      expect(callbackOptions).toBeDefined();
+      expect(callbackOptions.grantType).toBe('urn:ietf:params:oauth:grant-type:token-exchange');
+      expect(callbackOptions.scope).toEqual(['read', 'write']);
+    });
+  });
+
   describe('Refresh Token TTL', () => {
     let clientId: string;
     let clientSecret: string;
