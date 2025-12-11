@@ -707,6 +707,11 @@ export interface TokenBase {
    * Can be a single string or array of strings
    */
   audience?: string | string[];
+
+  /**
+   * List of scopes on this token
+   */
+  scope: string[];
 }
 
 /**
@@ -1187,6 +1192,7 @@ class OAuthProviderImpl {
       createdAt: tokenData.createdAt,
       expiresAt: tokenData.expiresAt,
       audience: tokenData.audience,
+      scope: tokenData.scope || grant.scope, // Use token scope if available, fallback to grant scope for backward compatibility
       grant: {
         clientId: grant.clientId,
         scope: grant.scope,
@@ -1724,6 +1730,10 @@ class OAuthProviderImpl {
     // Save the updated grant with TTL matching refresh token expiration (if any)
     await this.saveGrantWithTTL(env, grantKey, grantData, now);
 
+    // Parse and validate scope parameter for downscoping (RFC 6749 Section 3.3)
+    // The token request can include a scope parameter to request a subset of the granted scopes
+    const tokenScopes = this.downscope(body.scope, grantData.scope);
+
     // Parse and validate resource parameter (RFC 8707)
     // Validate downscoping: token request resources must be subset of grant resources
     if (body.resource && grantData.resource) {
@@ -1751,12 +1761,12 @@ class OAuthProviderImpl {
       );
     }
 
-    // Create and store access token
+    // Create and store access token with potentially narrowed scopes
     const accessToken = await this.createAccessToken({
       userId,
       grantId,
       clientId: grantData.clientId,
-      scope: grantData.scope,
+      scope: tokenScopes,
       encryptedProps: encryptedAccessTokenProps,
       encryptionKey: accessTokenEncryptionKey,
       expiresIn: accessTokenTTL,
@@ -1769,7 +1779,7 @@ class OAuthProviderImpl {
       access_token: accessToken,
       token_type: 'bearer',
       expires_in: accessTokenTTL,
-      scope: grantData.scope.join(' '),
+      scope: tokenScopes.join(' '),
     };
 
     if (refreshToken) {
@@ -1990,6 +2000,10 @@ class OAuthProviderImpl {
     // Save the updated grant with TTL if applicable
     await this.saveGrantWithTTL(env, grantKey, grantData, now);
 
+    // Parse and validate scope parameter for downscoping (RFC 6749 Section 3.3)
+    // The token request can include a scope parameter to request a subset of the granted scopes
+    const tokenScopes = this.downscope(body.scope, grantData.scope);
+
     // Parse and validate resource parameter (RFC 8707)
     // Validate downscoping: token request resources must be subset of grant resources
     if (body.resource && grantData.resource) {
@@ -2025,10 +2039,11 @@ class OAuthProviderImpl {
       createdAt: now,
       expiresAt: accessTokenExpiresAt,
       audience: audience,
+      scope: tokenScopes,
       wrappedEncryptionKey: accessTokenWrappedKey,
       grant: {
         clientId: grantData.clientId,
-        scope: grantData.scope,
+        scope: tokenScopes,
         encryptedProps: encryptedAccessTokenProps,
       },
     };
@@ -2044,7 +2059,7 @@ class OAuthProviderImpl {
       token_type: 'bearer',
       expires_in: accessTokenTTL,
       refresh_token: newRefreshToken,
-      scope: grantData.scope.join(' '),
+      scope: tokenScopes.join(' '),
     };
 
     // RFC 8707 Section 2.2: SHOULD return resource parameter in response
@@ -2760,6 +2775,7 @@ class OAuthProviderImpl {
       createdAt: now,
       expiresAt: accessTokenExpiresAt,
       audience: audience,
+      scope: scope,
       wrappedEncryptionKey: accessTokenWrappedKey,
       grant: {
         clientId: clientId,
@@ -2774,6 +2790,22 @@ class OAuthProviderImpl {
     });
 
     return accessToken;
+  }
+
+  /**
+   * Downscopes requested scopes to only include those that are in the grant
+   * Filters out any requested scopes that are not in the granted scopes
+   * @param requestedScope - The scope parameter from the request (string or array)
+   * @param grantedScopes - The scopes that were granted in the authorization
+   * @returns The filtered scopes that are a subset of the granted scopes
+   */
+  private downscope(requestedScope: string | string[] | undefined, grantedScopes: string[]): string[] {
+    if (!requestedScope) return grantedScopes;
+
+    const requestedScopes: string[] = typeof requestedScope === 'string' ? requestedScope.split(' ').filter(Boolean) : requestedScope;
+    
+    // Filter out any requested scopes that are not in the grant
+    return requestedScopes.filter((scope: string) => grantedScopes.includes(scope));
   }
 
   /**
@@ -3344,6 +3376,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
         createdAt: now,
         expiresAt: accessTokenExpiresAt,
         audience: audience,
+        scope: options.scope,
         wrappedEncryptionKey: accessTokenWrappedKey,
         grant: {
           clientId: options.request.clientId,
