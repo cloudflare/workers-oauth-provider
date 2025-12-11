@@ -826,6 +826,56 @@ export interface GrantSummary {
 }
 
 /**
+ * Options for creating an access token
+ */
+interface CreateAccessTokenOptions {
+  /**
+   * User ID
+   */
+  userId: string;
+
+  /**
+   * Grant ID
+   */
+  grantId: string;
+
+  /**
+   * Client ID
+   */
+  clientId: string;
+
+  /**
+   * Token scopes
+   */
+  scope: string[];
+
+  /**
+   * Encrypted props for the token
+   */
+  encryptedProps: string;
+
+  /**
+   * Encryption key for the props
+   */
+  encryptionKey: CryptoKey;
+
+  /**
+   * TTL for the access token in seconds
+   */
+  expiresIn: number;
+
+  /**
+   * Optional audience/resource
+   */
+  audience?: string | string[];
+
+  /**
+   * Cloudflare Worker environment variables
+   */
+  env: any;
+}
+
+/**
  * OAuth 2.0 Provider implementation for Cloudflare Workers
  * Implements authorization code flow with support for refresh tokens
  * and dynamic client registration.
@@ -1539,11 +1589,6 @@ class OAuthProviderImpl {
       }
     }
 
-    // Code is valid - generate access token
-    const accessTokenSecret = generateRandomString(TOKEN_LENGTH);
-    const accessToken = `${userId}:${grantId}:${accessTokenSecret}`;
-    const accessTokenId = await generateTokenId(accessToken);
-
     // Define the access token TTL, may be updated by callback if provided
     let accessTokenTTL = this.options.accessTokenTTL!;
     // Define the refresh token TTL, may be updated by callback if provided
@@ -1623,13 +1668,9 @@ class OAuthProviderImpl {
 
     // Calculate the access token expiration time (after callback might have updated TTL)
     const now = Math.floor(Date.now() / 1000);
-    const accessTokenExpiresAt = now + accessTokenTTL;
 
     // Determine if we should issue a refresh token
     const useRefreshToken = refreshTokenTTL !== 0;
-
-    // Wrap the key for access token
-    const accessTokenWrappedKey = await wrapKeyWithToken(accessToken, accessTokenEncryptionKey);
 
     // Update the grant:
     // - Remove the auth code hash (it's single-use)
@@ -1690,25 +1731,17 @@ class OAuthProviderImpl {
       );
     }
 
-    // Store access token with denormalized grant information
-    const accessTokenData: Token = {
-      id: accessTokenId,
-      grantId: grantId,
-      userId: userId,
-      createdAt: now,
-      expiresAt: accessTokenExpiresAt,
-      audience: audience,
-      wrappedEncryptionKey: accessTokenWrappedKey,
-      grant: {
-        clientId: grantData.clientId,
-        scope: grantData.scope,
-        encryptedProps: encryptedAccessTokenProps,
-      },
-    };
-
-    // Save access token with TTL (using the potentially callback-provided TTL)
-    await env.OAUTH_KV.put(`token:${userId}:${grantId}:${accessTokenId}`, JSON.stringify(accessTokenData), {
-      expirationTtl: accessTokenTTL,
+    // Create and store access token
+    const accessToken = await this.createAccessToken({
+      userId,
+      grantId,
+      clientId: grantData.clientId,
+      scope: grantData.scope,
+      encryptedProps: encryptedAccessTokenProps,
+      encryptionKey: accessTokenEncryptionKey,
+      expiresIn: accessTokenTTL,
+      audience,
+      env,
     });
 
     // Build the response
@@ -2092,12 +2125,6 @@ class OAuthProviderImpl {
       accessTokenTTL = Math.min(accessTokenTTL, subjectTokenRemainingLifetime);
     }
 
-    // Generate new access token with same userId and grantId but new secret
-    const accessTokenSecret = generateRandomString(TOKEN_LENGTH);
-    const newAccessToken = `${tokenSummary.userId}:${tokenSummary.grantId}:${accessTokenSecret}`;
-    const accessTokenId = await generateTokenId(newAccessToken);
-    let accessTokenExpiresAt = now + accessTokenTTL;
-
     // Get the subject token data to access encryption key
     const subjectTokenData: Token | null = await env.OAUTH_KV.get(`token:${tokenSummary.userId}:${tokenSummary.grantId}:${tokenSummary.id}`, { type: 'json' });
 
@@ -2143,7 +2170,6 @@ class OAuthProviderImpl {
         if (callbackResult.accessTokenTTL !== undefined) {
           // Clamp to subject token's remaining lifetime
           accessTokenTTL = Math.min(callbackResult.accessTokenTTL, subjectTokenRemainingLifetime);
-          accessTokenExpiresAt = now + accessTokenTTL;
         }
 
         // Re-encrypt the access token props if they changed
@@ -2155,33 +2181,18 @@ class OAuthProviderImpl {
       }
     }
 
-    // Wrap the key for the new access token
-    const accessTokenWrappedKey = await wrapKeyWithToken(newAccessToken, accessTokenEncryptionKey);
-
-    // Store new access token with denormalized grant information
-    const accessTokenData: Token = {
-      id: accessTokenId,
-      grantId: tokenSummary.grantId,
+    // Create and store access token
+    const newAccessToken = await this.createAccessToken({
       userId: tokenSummary.userId,
-      createdAt: now,
-      expiresAt: accessTokenExpiresAt,
+      grantId: tokenSummary.grantId,
+      clientId: tokenSummary.grant.clientId,
+      scope: newScopes,
+      encryptedProps: encryptedAccessTokenProps,
+      encryptionKey: accessTokenEncryptionKey,
+      expiresIn: accessTokenTTL,
       audience: newAudience,
-      wrappedEncryptionKey: accessTokenWrappedKey,
-      grant: {
-        clientId: tokenSummary.grant.clientId,
-        scope: newScopes,
-        encryptedProps: encryptedAccessTokenProps,
-      },
-    };
-
-    // Save access token with TTL
-    await env.OAUTH_KV.put(
-      `token:${tokenSummary.userId}:${tokenSummary.grantId}:${accessTokenId}`,
-      JSON.stringify(accessTokenData),
-      {
-        expirationTtl: accessTokenTTL,
-      }
-    );
+      env,
+    });
 
     // Build the response per RFC 8693
     const tokenResponse: TokenResponse & { issued_token_type?: string } = {
@@ -2700,6 +2711,49 @@ class OAuthProviderImpl {
   getClient(env: any, clientId: string): Promise<ClientInfo | null> {
     const clientKey = `client:${clientId}`;
     return env.OAUTH_KV.get(clientKey, { type: 'json' });
+  }
+
+  /**
+   * Creates and stores an access token
+   * @param params - Options for creating the access token
+   * @returns The access token string
+   */
+  private async createAccessToken(params: CreateAccessTokenOptions): Promise<string> {
+    const { userId, grantId, clientId, scope, encryptedProps, encryptionKey, expiresIn, audience, env } = params;
+
+    // Generate access token
+    const accessTokenSecret = generateRandomString(TOKEN_LENGTH);
+    const accessToken = `${userId}:${grantId}:${accessTokenSecret}`;
+
+    const now = Math.floor(Date.now() / 1000);
+    const accessTokenId = await generateTokenId(accessToken);
+    const accessTokenExpiresAt = now + expiresIn;
+
+    // Wrap the key for the access token
+    const accessTokenWrappedKey = await wrapKeyWithToken(accessToken, encryptionKey);
+
+    // Store access token with denormalized grant information
+    const accessTokenData: Token = {
+      id: accessTokenId,
+      grantId: grantId,
+      userId: userId,
+      createdAt: now,
+      expiresAt: accessTokenExpiresAt,
+      audience: audience,
+      wrappedEncryptionKey: accessTokenWrappedKey,
+      grant: {
+        clientId: clientId,
+        scope: scope,
+        encryptedProps: encryptedProps,
+      },
+    };
+
+    // Save access token with TTL
+    await env.OAUTH_KV.put(`token:${userId}:${grantId}:${accessTokenId}`, JSON.stringify(accessTokenData), {
+      expirationTtl: expiresIn,
+    });
+
+    return accessToken;
   }
 
   /**
