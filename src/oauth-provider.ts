@@ -103,6 +103,12 @@ export interface TokenExchangeCallbackOptions {
   scope: string[];
 
   /**
+   * List of scopes that were requested for this token by the client
+   * (Will be the same as granted scopes unless client specifically requested a downscoping)
+   */
+  tokenScope: string[];
+
+  /**
    * Application-specific properties currently associated with this grant
    */
   props: any;
@@ -1628,6 +1634,10 @@ class OAuthProviderImpl {
     let accessTokenEncryptionKey = encryptionKey;
     let encryptedAccessTokenProps = grantData.encryptedProps;
 
+    // Parse and validate scope parameter for downscoping (RFC 6749 Section 3.3)
+    // The token request can include a scope parameter to request a subset of the granted scopes
+    const tokenScopes = this.downscope(body.scope, grantData.scope);
+
     // Process token exchange callback if provided
     if (this.options.tokenExchangeCallback) {
       // Decrypt the existing props to provide them to the callback
@@ -1642,6 +1652,7 @@ class OAuthProviderImpl {
         clientId: clientInfo.clientId,
         userId: userId,
         scope: grantData.scope,
+        tokenScope: tokenScopes,
         props: decryptedProps,
       };
 
@@ -1730,9 +1741,6 @@ class OAuthProviderImpl {
     // Save the updated grant with TTL matching refresh token expiration (if any)
     await this.saveGrantWithTTL(env, grantKey, grantData, now);
 
-    // Parse and validate scope parameter for downscoping (RFC 6749 Section 3.3)
-    // The token request can include a scope parameter to request a subset of the granted scopes
-    const tokenScopes = this.downscope(body.scope, grantData.scope);
 
     // Parse and validate resource parameter (RFC 8707)
     // Validate downscoping: token request resources must be subset of grant resources
@@ -1876,6 +1884,10 @@ class OAuthProviderImpl {
     let accessTokenEncryptionKey = encryptionKey;
     let encryptedAccessTokenProps = grantData.encryptedProps;
 
+    // Parse and validate scope parameter for downscoping (RFC 6749 Section 3.3)
+    // The token request can include a scope parameter to request a subset of the granted scopes
+    const tokenScopes = this.downscope(body.scope, grantData.scope);
+
     // Track whether grant props changed
     let grantPropsChanged = false;
 
@@ -1893,6 +1905,7 @@ class OAuthProviderImpl {
         clientId: clientInfo.clientId,
         userId: userId,
         scope: grantData.scope,
+        tokenScope: tokenScopes,
         props: decryptedProps,
       };
 
@@ -1999,10 +2012,6 @@ class OAuthProviderImpl {
 
     // Save the updated grant with TTL if applicable
     await this.saveGrantWithTTL(env, grantKey, grantData, now);
-
-    // Parse and validate scope parameter for downscoping (RFC 6749 Section 3.3)
-    // The token request can include a scope parameter to request a subset of the granted scopes
-    const tokenScopes = this.downscope(body.scope, grantData.scope);
 
     // Parse and validate resource parameter (RFC 8707)
     // Validate downscoping: token request resources must be subset of grant resources
@@ -2182,7 +2191,8 @@ class OAuthProviderImpl {
         grantType: GrantType.TOKEN_EXCHANGE,
         clientId: clientInfo.clientId,
         userId: tokenSummary.userId,
-        scope: newScopes,
+        scope: tokenSummary.grant.scope,
+        tokenScope: newScopes,
         props: decryptedProps,
       };
 
