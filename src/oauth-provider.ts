@@ -233,6 +233,14 @@ export interface OAuthProviderOptions {
   allowImplicitFlow?: boolean;
 
   /**
+   * Controls whether OAuth 2.0 Token Exchange (RFC 8693) is allowed.
+   * When false, the token exchange grant type will not be advertised in metadata
+   * and token exchange requests will be rejected.
+   * Defaults to false.
+   */
+  allowTokenExchangeGrant?: boolean;
+
+  /**
    * Controls whether public clients (clients without a secret, like SPAs) can register via the
    * dynamic client registration endpoint. When true, only confidential clients can register.
    * Note: Creating public clients via the OAuthHelpers.createClient() method is always allowed.
@@ -1448,6 +1456,12 @@ class OAuthProviderImpl {
       responseTypesSupported.push('token');
     }
 
+    // Determine supported grant types
+    const grantTypesSupported = [GrantType.AUTHORIZATION_CODE, GrantType.REFRESH_TOKEN];
+    if (this.options.allowTokenExchangeGrant) {
+      grantTypesSupported.push(GrantType.TOKEN_EXCHANGE);
+    }
+
     const metadata = {
       issuer: new URL(tokenEndpoint).origin,
       authorization_endpoint: authorizeEndpoint,
@@ -1457,7 +1471,7 @@ class OAuthProviderImpl {
       scopes_supported: this.options.scopesSupported,
       response_types_supported: responseTypesSupported,
       response_modes_supported: ['query'],
-      grant_types_supported: [GrantType.AUTHORIZATION_CODE, GrantType.REFRESH_TOKEN, GrantType.TOKEN_EXCHANGE],
+      grant_types_supported: grantTypesSupported,
       // Support "none" auth method for public clients
       token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post', 'none'],
       // not implemented: token_endpoint_auth_signing_alg_values_supported
@@ -1495,7 +1509,7 @@ class OAuthProviderImpl {
       return this.handleAuthorizationCodeGrant(body, clientInfo, env);
     } else if (grantType === GrantType.REFRESH_TOKEN) {
       return this.handleRefreshTokenGrant(body, clientInfo, env);
-    } else if (grantType === GrantType.TOKEN_EXCHANGE) {
+    } else if (grantType === GrantType.TOKEN_EXCHANGE && this.options.allowTokenExchangeGrant) {
       return this.handleTokenExchangeGrant(body, clientInfo, env);
     } else {
       return this.createErrorResponse('unsupported_grant_type', 'Grant type not supported');
