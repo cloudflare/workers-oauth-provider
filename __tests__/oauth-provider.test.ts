@@ -1606,13 +1606,13 @@ describe('OAuthProvider', () => {
       expect(newTokens.scope).toBe('read write'); // Should have narrowed scopes
     });
 
-    it('should reject token exchange with invalid scopes', async () => {
+    it('should silently remove invalid scopes from token exchange', async () => {
       const params = new URLSearchParams();
       params.append('grant_type', 'urn:ietf:params:oauth:grant-type:token-exchange');
       params.append('subject_token', accessToken);
       params.append('subject_token_type', 'urn:ietf:params:oauth:token-type:access_token');
       params.append('requested_token_type', 'urn:ietf:params:oauth:token-type:access_token');
-      params.append('scope', 'read write admin delete'); // Invalid: 'delete' not in original
+      params.append('scope', 'read write admin delete'); // 'delete' not in original, should be silently removed
 
       const exchangeRequest = createMockRequest(
         'https://example.com/oauth/token',
@@ -1626,10 +1626,11 @@ describe('OAuthProvider', () => {
 
       const exchangeResponse = await oauthProvider.fetch(exchangeRequest, mockEnv, mockCtx);
 
-      expect(exchangeResponse.status).toBe(400);
+      expect(exchangeResponse.status).toBe(200);
 
-      const error = await exchangeResponse.json<any>();
-      expect(error.error).toBe('invalid_scope');
+      const newTokens = await exchangeResponse.json<any>();
+      // Should return only valid scopes, invalid 'delete' scope should be silently removed
+      expect(newTokens.scope).toBe('read write admin');
     });
 
     it('should exchange token with different audience/resource', async () => {
@@ -1956,15 +1957,16 @@ describe('OAuthProvider', () => {
       ).rejects.toThrow();
     });
 
-    it('should reject OAuthHelpers.exchangeToken with invalid scopes', async () => {
+    it('should silently remove invalid scopes from OAuthHelpers.exchangeToken', async () => {
       const helpers = mockEnv.OAUTH_PROVIDER as OAuthHelpers;
 
-      await expect(
-        helpers.exchangeToken({
-          subjectToken: accessToken,
-          scope: ['read', 'write', 'admin', 'delete'], // 'delete' not in original
-        })
-      ).rejects.toThrow();
+      const tokenResponse = await helpers.exchangeToken({
+        subjectToken: accessToken,
+        scope: ['read', 'write', 'admin', 'delete'], // 'delete' not in original, should be silently removed
+      });
+
+      // Should return only valid scopes, invalid 'delete' scope should be silently removed
+      expect(tokenResponse.scope).toBe('read write admin');
     });
 
     it('should call tokenExchangeCallback during token exchange', async () => {
@@ -2044,7 +2046,7 @@ describe('OAuthProvider', () => {
       expect(callbackOptions).toBeDefined();
       expect(callbackOptions.grantType).toBe('urn:ietf:params:oauth:grant-type:token-exchange');
       expect(callbackOptions.scope).toEqual(['read', 'write']); // Grant scopes
-      expect(callbackOptions.tokenScope).toEqual(['read', 'write']); // Token scopes (no downscoping in this test)
+      expect(callbackOptions.requestedScope).toEqual(['read', 'write']); // Requested scopes (no downscoping in this test)
     });
   });
 
