@@ -780,6 +780,19 @@ export class OAuthProvider {
   fetch(request: Request, env: any, ctx: ExecutionContext): Promise<Response> {
     return this.#impl.fetch(request, env, ctx);
   }
+
+  /**
+   * Gets OAuthHelpers for the given environment, setting env.OAUTH_PROVIDER if not already set
+   * This is a getter property that returns a function, allowing it to be accessed like a normal class member
+   * without being exposed as an RPC method.
+   * @param env - Cloudflare Worker environment variables
+   * @returns An instance of OAuthHelpers
+   */
+  get getOAuthHelpers(): (env: any) => OAuthHelpers {
+    return (env: any) => {
+      return this.#impl.getOAuthHelpers(env);
+    };
+  }
 }
 
 /**
@@ -990,9 +1003,7 @@ class OAuthProviderImpl {
     }
 
     // Inject OAuth helpers into env if not already present
-    if (!env.OAUTH_PROVIDER) {
-      env.OAUTH_PROVIDER = this.createOAuthHelpers(env);
-    }
+    this.getOAuthHelpers(env);
 
     // Call the default handler based on its type
     // Note: We don't add CORS headers to default handler responses
@@ -2242,9 +2253,7 @@ class OAuthProviderImpl {
     }
 
     // Inject OAuth helpers into env if not already present
-    if (!env.OAUTH_PROVIDER) {
-      env.OAUTH_PROVIDER = this.createOAuthHelpers(env);
-    }
+    this.getOAuthHelpers(env);
 
     // Find the appropriate API handler for this URL
     const url = new URL(request.url);
@@ -2274,6 +2283,18 @@ class OAuthProviderImpl {
    */
   private createOAuthHelpers(env: any): OAuthHelpers {
     return new OAuthHelpersImpl(env, this);
+  }
+
+  /**
+   * Gets OAuthHelpers for the given environment, setting env.OAUTH_PROVIDER if not already set
+   * @param env - Cloudflare Worker environment variables
+   * @returns An instance of OAuthHelpers
+   */
+  getOAuthHelpers(env: any): OAuthHelpers {
+    if (!env.OAUTH_PROVIDER) {
+      env.OAUTH_PROVIDER = this.createOAuthHelpers(env);
+    }
+    return env.OAUTH_PROVIDER;
   }
 
   /**
