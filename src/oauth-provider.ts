@@ -718,7 +718,7 @@ export interface TokenSummary<T = any> extends TokenBase {
      */
     props: T;
   };
-};
+}
 
 /**
  * Options for listing operations that support pagination
@@ -1055,7 +1055,7 @@ class OAuthProviderImpl {
    * @returns Promise resolving to token data with decrypted props, or null if token is invalid
    */
   async unwrapToken<T = any>(token: string, env: any): Promise<TokenSummary<T> | null> {
-    const parts = token.split(":");
+    const parts = token.split(':');
     const isPossiblyInternalFormat = parts.length === 3;
 
     if (!isPossiblyInternalFormat) {
@@ -1065,8 +1065,8 @@ class OAuthProviderImpl {
     // Retrieve the token from KV
     const [userId, grantId] = parts;
     const id = await generateTokenId(token);
-    const tokenData: Token | null = await env.OAUTH_KV.get(`token:${userId}:${grantId}:${id}`, { type: "json" });
-    
+    const tokenData: Token | null = await env.OAUTH_KV.get(`token:${userId}:${grantId}:${id}`, { type: 'json' });
+
     // Return null if missing or expired
     if (!tokenData) {
       return null;
@@ -1079,7 +1079,7 @@ class OAuthProviderImpl {
     // Decrypt the props
     const encryptionKey = await unwrapKeyWithToken(token, tokenData.wrappedEncryptionKey);
     const decryptedProps = await decryptProps(encryptionKey, tokenData.grant.encryptedProps);
-    
+
     // Return the token data with decrypted instead of encrypted props
     const { grant } = tokenData;
     return {
@@ -1092,7 +1092,7 @@ class OAuthProviderImpl {
       grant: {
         clientId: grant.clientId,
         scope: grant.scope,
-        props: decryptedProps as T
+        props: decryptedProps as T,
       },
     };
   }
