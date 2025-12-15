@@ -1,5 +1,11 @@
 # @cloudflare/workers-oauth-provider
 
+## 0.1.1
+
+### Patch Changes
+
+- [#114](https://github.com/cloudflare/workers-oauth-provider/pull/114) [`768cd6c`](https://github.com/cloudflare/workers-oauth-provider/commit/768cd6c9d34488f653a678b08f33070b31c071e5) Thanks [@DeanMauro](https://github.com/DeanMauro)! - adds a method `decodeToken` that retrieves a granted access token from the KV and returns the user-defined props attached to it. This permits token decoding outside of a fetch call, e.g. an RPC call from another worker.
+
 ## 0.1.0
 
 ### Minor Changes
