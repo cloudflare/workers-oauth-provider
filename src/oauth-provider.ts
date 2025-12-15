@@ -345,6 +345,13 @@ export interface OAuthHelpers {
    * @returns A Promise resolving when the revocation is confirmed.
    */
   revokeGrant(grantId: string, userId: string): Promise<void>;
+
+  /**
+   * Decodes a token and returns token data with decrypted props
+   * @param token - The token
+   * @returns Promise resolving to token data with decrypted props, or null if token is invalid
+   */
+  unwrapToken<T = any>(token: string): Promise<TokenSummary<T> | null>;
 }
 
 /**
@@ -619,12 +626,9 @@ interface TokenResponse {
 }
 
 /**
- * Token record stored in KV
- * Note: The actual token format is "{userId}:{grantId}:{random-secret}"
- * but we still only store the hash of the full token string.
- * This contains only access tokens; refresh tokens are stored within the grant records.
+ * Shared fields for Token and TokenSummary
  */
-export interface Token {
+export interface TokenBase {
   /**
    * Unique identifier for the token (hash of the actual token)
    */
@@ -655,7 +659,15 @@ export interface Token {
    * Can be a single string or array of strings
    */
   audience?: string | string[];
+}
 
+/**
+ * Token record stored in KV
+ * Note: The actual token format is "{userId}:{grantId}:{random-secret}"
+ * but we still only store the hash of the full token string.
+ * This contains only access tokens; refresh tokens are stored within the grant records.
+ */
+export interface Token extends TokenBase {
   /**
    * The encryption key for props, wrapped with this token
    */
@@ -679,6 +691,32 @@ export interface Token {
      * Encrypted application-specific properties
      */
     encryptedProps: string;
+  };
+}
+
+/**
+ * Token record with decrypted properties
+ * Derived from Token but with wrappedEncryptionKey removed and encryptedProps replaced with props
+ */
+export interface TokenSummary<T = any> extends TokenBase {
+  /**
+   * Denormalized grant information for faster access
+   */
+  grant: {
+    /**
+     * Client that received this grant
+     */
+    clientId: string;
+
+    /**
+     * List of scopes that were granted
+     */
+    scope: string[];
+
+    /**
+     * Decrypted application-specific properties
+     */
+    props: T;
   };
 }
 
@@ -1008,6 +1046,55 @@ class OAuthProviderImpl {
       const handler = new this.typedDefaultHandler.handler(ctx, env);
       return handler.fetch(request);
     }
+  }
+
+  /**
+   * Decodes a token and returns token data with decrypted props
+   * @param token - The granted token
+   * @param env - Cloudflare Worker environment variables
+   * @returns Promise resolving to token data with decrypted props, or null if token is invalid
+   */
+  async unwrapToken<T = any>(token: string, env: any): Promise<TokenSummary<T> | null> {
+    const parts = token.split(':');
+    const isPossiblyInternalFormat = parts.length === 3;
+
+    if (!isPossiblyInternalFormat) {
+      return null;
+    }
+
+    // Retrieve the token from KV
+    const [userId, grantId] = parts;
+    const id = await generateTokenId(token);
+    const tokenData: Token | null = await env.OAUTH_KV.get(`token:${userId}:${grantId}:${id}`, { type: 'json' });
+
+    // Return null if missing or expired
+    if (!tokenData) {
+      return null;
+    }
+    const now = Math.floor(Date.now() / 1e3);
+    if (tokenData.expiresAt < now) {
+      return null;
+    }
+
+    // Decrypt the props
+    const encryptionKey = await unwrapKeyWithToken(token, tokenData.wrappedEncryptionKey);
+    const decryptedProps = await decryptProps(encryptionKey, tokenData.grant.encryptedProps);
+
+    // Return the token data with decrypted instead of encrypted props
+    const { grant } = tokenData;
+    return {
+      id: tokenData.id,
+      grantId: tokenData.grantId,
+      userId: tokenData.userId,
+      createdAt: tokenData.createdAt,
+      expiresAt: tokenData.expiresAt,
+      audience: tokenData.audience,
+      grant: {
+        clientId: grant.clientId,
+        scope: grant.scope,
+        props: decryptedProps as T,
+      },
+    };
   }
 
   /**
@@ -3200,6 +3287,15 @@ class OAuthHelpersImpl implements OAuthHelpers {
 
     // After all tokens are deleted, delete the grant itself
     await this.env.OAUTH_KV.delete(grantKey);
+  }
+
+  /**
+   * Decodes a token and returns token data with decrypted props
+   * @param token - The token
+   * @returns Promise resolving to token data with decrypted props, or null if token is invalid
+   */
+  async unwrapToken<T = any>(token: string): Promise<TokenSummary<T> | null> {
+    return await this.provider.unwrapToken(token, this.env);
   }
 }
 
