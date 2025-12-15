@@ -719,7 +719,15 @@ export interface TokenBase {
    * Can be a single string or array of strings
    */
   audience?: string | string[];
+}
 
+/**
+ * Token record stored in KV
+ * Note: The actual token format is "{userId}:{grantId}:{random-secret}"
+ * but we still only store the hash of the full token string.
+ * This contains only access tokens; refresh tokens are stored within the grant records.
+ */
+export interface Token extends TokenBase {
   /**
    * List of scopes on this token
    */
