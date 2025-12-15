@@ -1,6 +1,6 @@
 {
   "name": "@cloudflare/workers-oauth-provider",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "OAuth provider for Cloudflare Workers",
   "main": "dist/oauth-provider.js",
   "types": "dist/oauth-provider.d.ts",
@@ -21,6 +21,7 @@
     "typecheck": "tsc",
     "test": "vitest run",
     "test:watch": "vitest",
+    "prepare": "npm run build",
     "prepublishOnly": "npm run build",
     "prettier": "prettier -w ."
   },
