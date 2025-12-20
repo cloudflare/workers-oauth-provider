@@ -4,12 +4,12 @@ This is a TypeScript library that implements the provider side of the OAuth 2.1 
 
 ## Benefits of this library
 
-* The library acts as a wrapper around your Worker code, which adds authorization for your API endpoints.
-* All token management is handled automatically.
-* Your API handler is written like a regular fetch handler, but receives the already-authenticated user details as a parameter. No need to perform any checks of your own.
-* The library is agnostic to how you manage and authenticate users.
-* The library is agnostic to how you build your UI. Your authorization flow can be implemented using whatever UI framework you use for everything else.
-* The library's storage does not store any secrets, only hashes of them.
+- The library acts as a wrapper around your Worker code, which adds authorization for your API endpoints.
+- All token management is handled automatically.
+- Your API handler is written like a regular fetch handler, but receives the already-authenticated user details as a parameter. No need to perform any checks of your own.
+- The library is agnostic to how you manage and authenticate users.
+- The library is agnostic to how you build your UI. Your authorization flow can be implemented using whatever UI framework you use for everything else.
+- The library's storage does not store any secrets, only hashes of them.
 
 ## Usage
 
@@ -201,9 +201,9 @@ This implementation requires that your worker is configured with a Workers KV na
 
 The `env.OAUTH_PROVIDER` object available to the fetch handlers provides some methods to query the storage, including:
 
-* Create, list, modify, and delete client_id registrations (in addition to `lookupClient()`, already shown in the example code).
-* List all active authorization grants for a particular user.
-* Revoke (delete) an authorization grant.
+- Create, list, modify, and delete client_id registrations (in addition to `lookupClient()`, already shown in the example code).
+- List all active authorization grants for a particular user.
+- Revoke (delete) an authorization grant.
 
 See the `OAuthHelpers` interface definition for full API details.
 
@@ -263,6 +263,7 @@ new OAuthProvider({
 ```
 
 The callback can:
+
 - Return both `accessTokenProps` and `newProps` to update both
 - Return only `accessTokenProps` to update just the current access token
 - Return only `newProps` to update both the grant and access token (the access token inherits these props)
@@ -309,8 +310,8 @@ By default, the `onError` callback is set to ``({ status, code, description }) =
 
 This library stores records about authorization tokens in KV. The storage schema is carefully designed such that a complete leak of the storage only reveals mundane metadata about what has been granted. In particular:
 
-* Secrets (including access tokens, refresh tokens, authorization codes, and client secrets) are stored only by hash. Hence, such secrets cannot be derived from the storage alone.
-* The `props` associated with a grant (which are passed back to the application when API requests are performed) are stored encrypted with the secret token as key material. Hence, the contents of `props` are impossible to derive from storage unless a valid token is provided.
+- Secrets (including access tokens, refresh tokens, authorization codes, and client secrets) are stored only by hash. Hence, such secrets cannot be derived from the storage alone.
+- The `props` associated with a grant (which are passed back to the application when API requests are performed) are stored encrypted with the secret token as key material. Hence, the contents of `props` are impossible to derive from storage unless a valid token is provided.
 
 Note that the `userId` and the `metadata` associated with each grant are not encrypted, because the purpose of these values is to allow grants to be enumerated for audit and revocation purposes. However, these values are completely opaque to the library. An application is free to omit them or apply its own encryption to them before passing them into the library, if it desires.
 
@@ -332,7 +333,7 @@ To enable CIMD support, you must add the `global_fetch_strictly_public` compatib
 
 ```jsonc
 {
-  "compatibility_flags": ["global_fetch_strictly_public"]
+  "compatibility_flags": ["global_fetch_strictly_public"],
 }
 ```
 
@@ -350,6 +351,6 @@ This library (including the schema documentation) was largely written with the h
 
 In all seriousness, two months ago (January 2025), I ([@kentonv](https://github.com/kentonv)) would have agreed. I was an AI skeptic. I thought LLMs were glorified Markov chain generators that didn't actually understand code and couldn't produce anything novel. I started this project on a lark, fully expecting the AI to produce terrible code for me to laugh at. And then, uh... the code actually looked pretty good. Not perfect, but I just told the AI to fix things, and it did. I was shocked.
 
-To emphasize, **this is not "vibe coded"**. Every line was thoroughly reviewed and cross-referenced with relevant RFCs, by security experts with previous experience with those RFCs. I was *trying* to validate my skepticism. I ended up proving myself wrong.
+To emphasize, **this is not "vibe coded"**. Every line was thoroughly reviewed and cross-referenced with relevant RFCs, by security experts with previous experience with those RFCs. I was _trying_ to validate my skepticism. I ended up proving myself wrong.
 
 Again, please check out the commit history -- especially early commits -- to understand how this went.
