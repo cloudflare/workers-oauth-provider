@@ -2286,6 +2286,7 @@ class OAuthProviderImpl {
       const decryptedProps = await decryptProps(encryptionKey, tokenData.grant.encryptedProps);
 
       // Set the decrypted props on the context object
+      // @ts-expect-error - ctx.props is actually writable https://github.com/cloudflare/workers-oauth-provider/issues/124
       ctx.props = decryptedProps;
     } else if (this.options.resolveExternalToken) {
       // No token data was found, so we validate the provided token with the provided validator
@@ -2314,6 +2315,7 @@ class OAuthProviderImpl {
       }
 
       // Set the external props on the context object
+      // @ts-expect-error - ctx.props is actually writable https://github.com/cloudflare/workers-oauth-provider/issues/124
       ctx.props = ext.props;
     }
 
