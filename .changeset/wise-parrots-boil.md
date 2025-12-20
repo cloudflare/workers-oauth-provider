@@ -2,7 +2,7 @@
 '@cloudflare/workers-oauth-provider': minor
 ---
 
-feat: add Client ID Metadata Document (CIMD) support 
+feat: add Client ID Metadata Document (CIMD) support
 
 (by @mattzcarey in https://github.com/cloudflare/workers-oauth-provider/issues/112)
 
