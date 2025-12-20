@@ -1,4 +1,4 @@
-import { defineConfig } from 'tsup';
+import { defineConfig } from 'tsdown';
 
 export default defineConfig({
   entry: ['src/oauth-provider.ts'],
@@ -7,4 +7,5 @@ export default defineConfig({
   clean: true,
   outDir: 'dist',
   external: ['cloudflare:workers'],
+  fixedExtension: false,
 });
