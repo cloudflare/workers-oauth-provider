@@ -4,20 +4,20 @@ This is a TypeScript library that implements the provider side of the OAuth 2.1 
 
 ## Benefits of this library
 
-* The library acts as a wrapper around your Worker code, which adds authorization for your API endpoints.
-* All token management is handled automatically.
-* Your API handler is written like a regular fetch handler, but receives the already-authenticated user details as a parameter. No need to perform any checks of your own.
-* The library is agnostic to how you manage and authenticate users.
-* The library is agnostic to how you build your UI. Your authorization flow can be implemented using whatever UI framework you use for everything else.
-* The library's storage does not store any secrets, only hashes of them.
+- The library acts as a wrapper around your Worker code, which adds authorization for your API endpoints.
+- All token management is handled automatically.
+- Your API handler is written like a regular fetch handler, but receives the already-authenticated user details as a parameter. No need to perform any checks of your own.
+- The library is agnostic to how you manage and authenticate users.
+- The library is agnostic to how you build your UI. Your authorization flow can be implemented using whatever UI framework you use for everything else.
+- The library's storage does not store any secrets, only hashes of them.
 
 ## Usage
 
 A Worker that uses the library might look like this:
 
 ```ts
-import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
-import { WorkerEntrypoint } from "cloudflare:workers";
+import { OAuthProvider } from '@cloudflare/workers-oauth-provider';
+import { WorkerEntrypoint } from 'cloudflare:workers';
 
 // We export the OAuthProvider instance as the entrypoint to our Worker. This means it
 // implements the `fetch()` handler, receiving all HTTP requests.
@@ -29,8 +29,8 @@ export default new OAuthProvider({
   // - A single route (string) or multiple routes (array)
   // - Full URLs (which will match the hostname) or just paths (which will match any hostname)
   apiRoute: [
-    "/api/", // Path only - will match any hostname
-    "https://api.example.com/" // Full URL - will check hostname
+    '/api/', // Path only - will match any hostname
+    'https://api.example.com/', // Full URL - will check hostname
   ],
 
   // When the OAuth system receives an API request with a valid access token, it passes the request
@@ -58,23 +58,23 @@ export default new OAuthProvider({
   // this URL is given to the OAuthProvider is so that it can implement the RFC-8414 metadata
   // discovery endpoint, i.e. `.well-known/oauth-authorization-server`.
   // Can also be specified as just a path (e.g., "/authorize").
-  authorizeEndpoint: "https://example.com/authorize",
+  authorizeEndpoint: 'https://example.com/authorize',
 
   // This specifies the OAuth 2 token exchange endpoint. The OAuthProvider will implement this
   // endpoint (by directly responding to requests with a matching URL).
   // Can also be specified as just a path (e.g., "/oauth/token").
-  tokenEndpoint: "https://example.com/oauth/token",
+  tokenEndpoint: 'https://example.com/oauth/token',
 
   // This specifies the RFC-7591 dynamic client registration endpoint. This setting is optional,
   // but if provided, the OAuthProvider will implement this endpoint to allow dynamic client
   // registration.
   // Can also be specified as just a path (e.g., "/oauth/register").
-  clientRegistrationEndpoint: "https://example.com/oauth/register",
+  clientRegistrationEndpoint: 'https://example.com/oauth/register',
 
   // Optional list of scopes supported by this OAuth provider.
   // If provided, this will be included in the RFC 8414 metadata as 'scopes_supported'.
   // If not provided, the 'scopes_supported' field will be omitted from the metadata.
-  scopesSupported: ["document.read", "document.write", "profile"],
+  scopesSupported: ['document.read', 'document.write', 'profile'],
 
   // Optional: Controls whether the OAuth implicit flow is allowed.
   // The implicit flow is discouraged in OAuth 2.1 but may be needed for some clients.
@@ -93,7 +93,7 @@ export default new OAuthProvider({
   // If not specified, refresh tokens do not expire.
   // Set to 0 to disable refresh tokens (only access tokens will be issued).
   // For example: 3600 = 1 hour, 86400 = 1 day, 2592000 = 30 days
-  refreshTokenTTL: 2592000 // 30 days
+  refreshTokenTTL: 2592000, // 30 days
 });
 
 // The default handler object - the OAuthProvider will pass through HTTP requests to this object's fetch method
@@ -110,7 +110,7 @@ const defaultHandler = {
   async fetch(request: Request, env, ctx) {
     let url = new URL(request.url);
 
-    if (url.pathname == "/authorize") {
+    if (url.pathname == '/authorize') {
       // This is a request for our OAuth authorization flow UI. It is up to the application to
       // implement this. However, the OAuthProvider library provides some helpers to assist.
 
@@ -129,7 +129,7 @@ const defaultHandler = {
 
       // After the user has granted consent, the application calls `env.OAUTH_PROVIDER.completeAuthorization()` to
       // grant the authorization.
-      let {redirectTo} = await env.OAUTH_PROVIDER.completeAuthorization({
+      let { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
         // The application passes back the original OAuth request info that was returned by
         // `parseAuthRequest()` earlier.
         request: oauthReqInfo,
@@ -137,24 +137,24 @@ const defaultHandler = {
         // The application must specify the user's ID, which is some sort of string. This is needed
         // so that the application can later query the OAuthProvider to enumerate all grants
         // belonging to a particular user, e.g. to implement an audit and revocation UI.
-        userId: "1234",
+        userId: '1234',
 
         // The application can specify some arbitary metadata which describes this grant. The
         // metadata can contain any JSON-serializable content. This metadata is not used by the
         // OAuthProvider, but the application can read back the metadata attached to specific
         // grants when enumerating them later, again e.g. to implement an udit and revocation UI.
-        metadata: {label: "foo"},
+        metadata: { label: 'foo' },
 
         // The application specifies the list of OAuth scope identifiers that were granted. This
         // may or may not be the same as was requested in `oauthReqInfo.scope`.
-        scope: ["document.read", "document.write"],
+        scope: ['document.read', 'document.write'],
 
         // `props` is an arbitrary JSON-serializable object which will be passed back to the API
         // handler for every request authorized by this grant.
         props: {
           userId: 1234,
-          username: "Bob"
-        }
+          username: 'Bob',
+        },
       });
 
       // `completeAuthorization()` will have returned the URL to which the user should be redirected
@@ -166,8 +166,8 @@ const defaultHandler = {
 
     // ... the application can implement other non-API HTTP endpoints here ...
 
-    return new Response("Not found", {status: 404});
-  }
+    return new Response('Not found', { status: 404 });
+  },
 };
 
 // The API handler object - the OAuthProivder will pass authorized API requests to this object's fetch method
@@ -186,24 +186,24 @@ class ApiHandler extends WorkerEntrypoint {
     // endpoint, `/api/whoami`, which returns the user's authenticated identity.
 
     let url = new URL(request.url);
-    if (url.pathname == "/api/whoami") {
+    if (url.pathname == '/api/whoami') {
       // Since the username is embedded in `ctx.props`, which came from the access token that the
       // OAuthProivder already verified, we don't need to do any other authentication steps.
       return new Response(`You are authenticated as: ${this.ctx.props.username}`);
     }
 
-    return new Response("Not found", {status: 404});
+    return new Response('Not found', { status: 404 });
   }
-};
+}
 ```
 
 This implementation requires that your worker is configured with a Workers KV namespace binding called `OAUTH_KV`, which is used to store token information. See the file `storage-schema.md` for details on the schema of this namespace.
 
 The `env.OAUTH_PROVIDER` object available to the fetch handlers provides some methods to query the storage, including:
 
-* Create, list, modify, and delete client_id registrations (in addition to `lookupClient()`, already shown in the example code).
-* List all active authorization grants for a particular user.
-* Revoke (delete) an authorization grant.
+- Create, list, modify, and delete client_id registrations (in addition to `lookupClient()`, already shown in the example code).
+- List all active authorization grants for a particular user.
+- Revoke (delete) an authorization grant.
 
 See the `OAuthHelpers` interface definition for full API details.
 
@@ -231,13 +231,13 @@ new OAuthProvider({
         // Update the props stored in the access token
         accessTokenProps: {
           ...options.props,
-          upstreamAccessToken: upstreamTokens.access_token
+          upstreamAccessToken: upstreamTokens.access_token,
         },
         // Update the props stored in the grant (for future token refreshes)
         newProps: {
           ...options.props,
-          upstreamRefreshToken: upstreamTokens.refresh_token
-        }
+          upstreamRefreshToken: upstreamTokens.refresh_token,
+        },
       };
     }
 
@@ -248,21 +248,22 @@ new OAuthProvider({
       return {
         accessTokenProps: {
           ...options.props,
-          upstreamAccessToken: upstreamTokens.access_token
+          upstreamAccessToken: upstreamTokens.access_token,
         },
         newProps: {
           ...options.props,
-          upstreamRefreshToken: upstreamTokens.refresh_token || options.props.upstreamRefreshToken
+          upstreamRefreshToken: upstreamTokens.refresh_token || options.props.upstreamRefreshToken,
         },
         // Optionally override the default access token TTL to match the upstream token
-        accessTokenTTL: upstreamTokens.expires_in
+        accessTokenTTL: upstreamTokens.expires_in,
       };
     }
-  }
+  },
 });
 ```
 
 The callback can:
+
 - Return both `accessTokenProps` and `newProps` to update both
 - Return only `accessTokenProps` to update just the current access token
 - Return only `newProps` to update both the grant and access token (the access token inherits these props)
@@ -282,9 +283,9 @@ By using the `onError` option, you can emit notifications or take other actions 
 new OAuthProvider({
   // ... other options ...
   onError({ code, description, status, headers }) {
-    Sentry.captureMessage(/* ... */)
-  }
-})
+    Sentry.captureMessage(/* ... */);
+  },
+});
 ```
 
 By returning a `Response` you can also override what the OAuthProvider returns to your users:
@@ -294,11 +295,11 @@ new OAuthProvider({
   // ... other options ...
   onError({ code, description, status, headers }) {
     if (code === 'unsupported_grant_type') {
-      return new Response('...', { status, headers })
+      return new Response('...', { status, headers });
     }
     // returning undefined (i.e. void) uses the default Response generation
-  }
-})
+  },
+});
 ```
 
 By default, the `onError` callback is set to ``({ status, code, description }) => console.warn(`OAuth error response: ${status} ${code} - ${description}`)``.
@@ -309,8 +310,8 @@ By default, the `onError` callback is set to ``({ status, code, description }) =
 
 This library stores records about authorization tokens in KV. The storage schema is carefully designed such that a complete leak of the storage only reveals mundane metadata about what has been granted. In particular:
 
-* Secrets (including access tokens, refresh tokens, authorization codes, and client secrets) are stored only by hash. Hence, such secrets cannot be derived from the storage alone.
-* The `props` associated with a grant (which are passed back to the application when API requests are performed) are stored encrypted with the secret token as key material. Hence, the contents of `props` are impossible to derive from storage unless a valid token is provided.
+- Secrets (including access tokens, refresh tokens, authorization codes, and client secrets) are stored only by hash. Hence, such secrets cannot be derived from the storage alone.
+- The `props` associated with a grant (which are passed back to the application when API requests are performed) are stored encrypted with the secret token as key material. Hence, the contents of `props` are impossible to derive from storage unless a valid token is provided.
 
 Note that the `userId` and the `metadata` associated with each grant are not encrypted, because the purpose of these values is to allow grants to be enumerated for audit and revocation purposes. However, these values are completely opaque to the library. An application is free to omit them or apply its own encryption to them before passing them into the library, if it desires.
 
@@ -332,7 +333,7 @@ To enable CIMD support, you must add the `global_fetch_strictly_public` compatib
 
 ```jsonc
 {
-  "compatibility_flags": ["global_fetch_strictly_public"]
+  "compatibility_flags": ["global_fetch_strictly_public"],
 }
 ```
 
@@ -350,6 +351,6 @@ This library (including the schema documentation) was largely written with the h
 
 In all seriousness, two months ago (January 2025), I ([@kentonv](https://github.com/kentonv)) would have agreed. I was an AI skeptic. I thought LLMs were glorified Markov chain generators that didn't actually understand code and couldn't produce anything novel. I started this project on a lark, fully expecting the AI to produce terrible code for me to laugh at. And then, uh... the code actually looked pretty good. Not perfect, but I just told the AI to fix things, and it did. I was shocked.
 
-To emphasize, **this is not "vibe coded"**. Every line was thoroughly reviewed and cross-referenced with relevant RFCs, by security experts with previous experience with those RFCs. I was *trying* to validate my skepticism. I ended up proving myself wrong.
+To emphasize, **this is not "vibe coded"**. Every line was thoroughly reviewed and cross-referenced with relevant RFCs, by security experts with previous experience with those RFCs. I was _trying_ to validate my skepticism. I ended up proving myself wrong.
 
 Again, please check out the commit history -- especially early commits -- to understand how this went.
