@@ -1,6 +1,6 @@
 {
   "name": "@cloudflare/workers-oauth-provider",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "OAuth provider for Cloudflare Workers",
   "main": "dist/oauth-provider.js",
   "types": "dist/oauth-provider.d.ts",
