@@ -31,7 +31,6 @@
     "pkg-pr-new": "^0.0.62",
     "prettier": "^3.7.4",
     "tsdown": "^0.18.1",
-    "tsx": "^4.21.0",
     "typescript": "^5.9.3",
     "vitest": "^3.2.4"
   },
