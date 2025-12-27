@@ -754,11 +754,6 @@ export interface GrantSummary {
 }
 
 /**
- * Private Symbol used to access the getOAuthHelpers function from OAuthProvider
- */
-const getOAuthHelpersSymbol = Symbol('getOAuthHelpers');
-
-/**
  * OAuth 2.0 Provider implementation for Cloudflare Workers
  * Implements authorization code flow with support for refresh tokens
  * and dynamic client registration.
@@ -785,26 +780,17 @@ export class OAuthProvider {
   fetch(request: Request, env: any, ctx: ExecutionContext): Promise<Response> {
     return this.#impl.fetch(request, env, ctx);
   }
-
-  /**
-   * Gets OAuthHelpers for the given environment, setting env.OAUTH_PROVIDER if not already set.
-   * This method uses a Symbol as its name, which prevents it from being exposed as an RPC method
-   * @param env - Cloudflare Worker environment variables
-   * @returns An instance of OAuthHelpers
-   */
-  [getOAuthHelpersSymbol](env: any): OAuthHelpers {
-    return this.#impl.getOAuthHelpers(env);
-  }
 }
 
 /**
- * Gets OAuthHelpers for the given environment, setting env.OAUTH_PROVIDER if not already set
- * @param provider - The OAuthProvider instance
+ * Gets OAuthHelpers for the given environment
+ * @param options - Configuration options for the OAuth provider
  * @param env - Cloudflare Worker environment variables
  * @returns An instance of OAuthHelpers
  */
-export function getOAuthHelpers(provider: OAuthProvider, env: any): OAuthHelpers {
-  return provider[getOAuthHelpersSymbol](env);
+export function getOAuthHelpers(options: OAuthProviderOptions, env: any): OAuthHelpers {
+  const impl = new OAuthProviderImpl(options);
+  return impl.getOAuthHelpers(env);
 }
 
 /**
