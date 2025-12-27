@@ -790,7 +790,7 @@ export class OAuthProvider {
  */
 export function getOAuthHelpers(options: OAuthProviderOptions, env: any): OAuthHelpers {
   const impl = new OAuthProviderImpl(options);
-  return impl.getOAuthHelpers(env);
+  return impl.createOAuthHelpers(env);
 }
 
 /**
@@ -1001,7 +1001,9 @@ class OAuthProviderImpl {
     }
 
     // Inject OAuth helpers into env if not already present
-    this.getOAuthHelpers(env);
+    if (!env.OAUTH_PROVIDER) {
+      env.OAUTH_PROVIDER = this.createOAuthHelpers(env);
+    }
 
     // Call the default handler based on its type
     // Note: We don't add CORS headers to default handler responses
@@ -2251,7 +2253,9 @@ class OAuthProviderImpl {
     }
 
     // Inject OAuth helpers into env if not already present
-    this.getOAuthHelpers(env);
+    if (!env.OAUTH_PROVIDER) {
+      env.OAUTH_PROVIDER = this.createOAuthHelpers(env);
+    }
 
     // Find the appropriate API handler for this URL
     const url = new URL(request.url);
@@ -2279,20 +2283,8 @@ class OAuthProviderImpl {
    * @param env - Cloudflare Worker environment variables
    * @returns An instance of OAuthHelpers
    */
-  private createOAuthHelpers(env: any): OAuthHelpers {
+  public createOAuthHelpers(env: any): OAuthHelpers {
     return new OAuthHelpersImpl(env, this);
-  }
-
-  /**
-   * Gets OAuthHelpers for the given environment, setting env.OAUTH_PROVIDER if not already set
-   * @param env - Cloudflare Worker environment variables
-   * @returns An instance of OAuthHelpers
-   */
-  getOAuthHelpers(env: any): OAuthHelpers {
-    if (!env.OAUTH_PROVIDER) {
-      env.OAUTH_PROVIDER = this.createOAuthHelpers(env);
-    }
-    return env.OAUTH_PROVIDER;
   }
 
   /**
