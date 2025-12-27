@@ -788,7 +788,7 @@ export class OAuthProvider {
  * @param env - Cloudflare Worker environment variables
  * @returns An instance of OAuthHelpers
  */
-export function getOAuthHelpers(options: OAuthProviderOptions, env: any): OAuthHelpers {
+export function getOAuthApi(options: OAuthProviderOptions, env: any): OAuthHelpers {
   const impl = new OAuthProviderImpl(options);
   return impl.createOAuthHelpers(env);
 }
