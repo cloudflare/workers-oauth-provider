@@ -1,5 +1,11 @@
 # @cloudflare/workers-oauth-provider
 
+## 0.2.3
+
+### Patch Changes
+
+- [#117](https://github.com/cloudflare/workers-oauth-provider/pull/117) [`b2c5877`](https://github.com/cloudflare/workers-oauth-provider/commit/b2c5877617809107ea4759b22c4994f0711affe4) Thanks [@DeanMauro](https://github.com/DeanMauro)! - Add `getOAuthApi` helper function to access OAuthHelpers outside of the `fetch` method. This enables OAuth functionality in worker RPC methods and other entry points.
+
 ## 0.2.2
 
 ### Patch Changes
