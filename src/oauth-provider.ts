@@ -832,6 +832,17 @@ export class OAuthProvider {
 }
 
 /**
+ * Gets OAuthHelpers for the given environment
+ * @param options - Configuration options for the OAuth provider
+ * @param env - Cloudflare Worker environment variables
+ * @returns An instance of OAuthHelpers
+ */
+export function getOAuthApi(options: OAuthProviderOptions, env: any): OAuthHelpers {
+  const impl = new OAuthProviderImpl(options);
+  return impl.createOAuthHelpers(env);
+}
+
+/**
  * Implementation class backing OAuthProvider.
  *
  * We use a PImpl pattern in `OAuthProvider` to make sure we don't inadvertently export any private
@@ -2350,7 +2361,7 @@ class OAuthProviderImpl {
    * @param env - Cloudflare Worker environment variables
    * @returns An instance of OAuthHelpers
    */
-  private createOAuthHelpers(env: any): OAuthHelpers {
+  public createOAuthHelpers(env: any): OAuthHelpers {
     return new OAuthHelpersImpl(env, this);
   }
 
