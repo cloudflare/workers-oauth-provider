@@ -1766,7 +1766,6 @@ class OAuthProviderImpl {
     // Save the updated grant with TTL matching refresh token expiration (if any)
     await this.saveGrantWithTTL(env, grantKey, grantData, now);
 
-
     // Parse and validate resource parameter (RFC 8707)
     // Validate downscoping: token request resources must be subset of grant resources
     if (body.resource && grantData.resource) {
@@ -2170,7 +2169,10 @@ class OAuthProviderImpl {
       // Parse and validate the resource parameter
       const parsedResource = parseResourceParameter(requestedResource);
       if (!parsedResource) {
-        throw new OAuthError('invalid_target', 'The resource parameter must be a valid absolute URI without a fragment');
+        throw new OAuthError(
+          'invalid_target',
+          'The resource parameter must be a valid absolute URI without a fragment'
+        );
       }
       newAudience = parsedResource;
     }
@@ -2192,7 +2194,10 @@ class OAuthProviderImpl {
     }
 
     // Get the subject token data to access encryption key
-    const subjectTokenData: Token | null = await env.OAUTH_KV.get(`token:${tokenSummary.userId}:${tokenSummary.grantId}:${tokenSummary.id}`, { type: 'json' });
+    const subjectTokenData: Token | null = await env.OAUTH_KV.get(
+      `token:${tokenSummary.userId}:${tokenSummary.grantId}:${tokenSummary.id}`,
+      { type: 'json' }
+    );
 
     if (!subjectTokenData) {
       throw new OAuthError('invalid_grant', 'Subject token data not found');
@@ -2541,7 +2546,11 @@ class OAuthProviderImpl {
         tosUri: OAuthProviderImpl.validateStringField(clientMetadata.tos_uri),
         jwksUri: OAuthProviderImpl.validateStringField(clientMetadata.jwks_uri),
         contacts: OAuthProviderImpl.validateStringArray(clientMetadata.contacts),
-        grantTypes: OAuthProviderImpl.validateStringArray(clientMetadata.grant_types) || [GrantType.AUTHORIZATION_CODE, GrantType.REFRESH_TOKEN, GrantType.TOKEN_EXCHANGE],
+        grantTypes: OAuthProviderImpl.validateStringArray(clientMetadata.grant_types) || [
+          GrantType.AUTHORIZATION_CODE,
+          GrantType.REFRESH_TOKEN,
+          GrantType.TOKEN_EXCHANGE,
+        ],
         responseTypes: OAuthProviderImpl.validateStringArray(clientMetadata.response_types) || ['code'],
         registrationDate: Math.floor(Date.now() / 1000),
         tokenEndpointAuthMethod: authMethod,
@@ -2829,8 +2838,9 @@ class OAuthProviderImpl {
   private downscope(requestedScope: string | string[] | undefined, grantedScopes: string[]): string[] {
     if (!requestedScope) return grantedScopes;
 
-    const requestedScopes: string[] = typeof requestedScope === 'string' ? requestedScope.split(' ').filter(Boolean) : requestedScope;
-    
+    const requestedScopes: string[] =
+      typeof requestedScope === 'string' ? requestedScope.split(' ').filter(Boolean) : requestedScope;
+
     // Filter out any requested scopes that are not in the grant
     return requestedScopes.filter((scope: string) => grantedScopes.includes(scope));
   }
@@ -3080,7 +3090,10 @@ class OAuthProviderImpl {
  * Carries OAuth error code and description for proper error responses
  */
 class OAuthError extends Error {
-  constructor(public code: string, message: string) {
+  constructor(
+    public code: string,
+    message: string
+  ) {
     super(message);
     this.name = 'OAuthError';
   }
@@ -3711,7 +3724,11 @@ class OAuthHelpersImpl implements OAuthHelpers {
       tosUri: clientInfo.tosUri,
       jwksUri: clientInfo.jwksUri,
       contacts: clientInfo.contacts,
-      grantTypes: clientInfo.grantTypes || [GrantType.AUTHORIZATION_CODE, GrantType.REFRESH_TOKEN, GrantType.TOKEN_EXCHANGE],
+      grantTypes: clientInfo.grantTypes || [
+        GrantType.AUTHORIZATION_CODE,
+        GrantType.REFRESH_TOKEN,
+        GrantType.TOKEN_EXCHANGE,
+      ],
       responseTypes: clientInfo.responseTypes || ['code'],
       registrationDate: Math.floor(Date.now() / 1000),
       tokenEndpointAuthMethod,
