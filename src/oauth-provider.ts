@@ -2549,7 +2549,7 @@ class OAuthProviderImpl {
         grantTypes: OAuthProviderImpl.validateStringArray(clientMetadata.grant_types) || [
           GrantType.AUTHORIZATION_CODE,
           GrantType.REFRESH_TOKEN,
-          GrantType.TOKEN_EXCHANGE,
+          ...(this.options.allowTokenExchangeGrant ? [GrantType.TOKEN_EXCHANGE] : []),
         ],
         responseTypes: OAuthProviderImpl.validateStringArray(clientMetadata.response_types) || ['code'],
         registrationDate: Math.floor(Date.now() / 1000),
@@ -3727,7 +3727,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
       grantTypes: clientInfo.grantTypes || [
         GrantType.AUTHORIZATION_CODE,
         GrantType.REFRESH_TOKEN,
-        GrantType.TOKEN_EXCHANGE,
+        ...(this.provider.options.allowTokenExchangeGrant ? [GrantType.TOKEN_EXCHANGE] : []),
       ],
       responseTypes: clientInfo.responseTypes || ['code'],
       registrationDate: Math.floor(Date.now() / 1000),
