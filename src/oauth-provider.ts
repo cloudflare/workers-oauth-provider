@@ -2665,7 +2665,7 @@ class OAuthProviderImpl {
       // 'aud' claim when this claim is present, then the JWT MUST be rejected."
       if (tokenData.audience) {
         const requestUrl = new URL(request.url);
-        const resourceServer = `${requestUrl.protocol}//${requestUrl.host}`;
+        const resourceServer = `${requestUrl.protocol}//${requestUrl.host}${requestUrl.pathname}`;
         const audiences = Array.isArray(tokenData.audience) ? tokenData.audience : [tokenData.audience];
 
         // Check if any audience matches (RFC 3986: case-insensitive hostname comparison)
@@ -2700,7 +2700,7 @@ class OAuthProviderImpl {
       // Validate that tokens were issued specifically for them
       if (ext.audience) {
         const requestUrl = new URL(request.url);
-        const resourceServer = `${requestUrl.protocol}//${requestUrl.host}`;
+        const resourceServer = `${requestUrl.protocol}//${requestUrl.host}${requestUrl.pathname}`;
         const audiences = Array.isArray(ext.audience) ? ext.audience : [ext.audience];
 
         // Check if any audience matches (RFC 3986: case-insensitive hostname comparison)
@@ -3157,15 +3157,35 @@ function validateResourceUri(uri: string): boolean {
 }
 
 /**
- * Checks if a resource server matches an audience claim
- * RFC 7519 Section 4.1.3: audience values are case-sensitive strings
+ * Checks if a resource server matches an audience claim.
+ * Uses origin comparison (case-insensitive hostname via URL normalization)
+ * and path-prefix matching on path boundaries for RFC 8707 resource indicators.
  * @param resourceServerUrl - The resource server URL (from request)
  * @param audienceValue - The audience value from token
  * @returns true if they match, false otherwise
  */
 function audienceMatches(resourceServerUrl: string, audienceValue: string): boolean {
-  // RFC 7519 Section 4.1.3: "aud" value is an array of case-sensitive strings
-  return resourceServerUrl === audienceValue;
+  try {
+    const resource = new URL(resourceServerUrl);
+    const audience = new URL(audienceValue);
+
+    // Origins must always match (case-insensitive via URL normalization)
+    if (resource.origin !== audience.origin) {
+      return false;
+    }
+
+    // Origin-only audience matches any path (backward compatibility)
+    if (audience.pathname === '/' || audience.pathname === '') {
+      return true;
+    }
+
+    // Path-aware audience: prefix match on path boundary (RFC 8707)
+    // e.g. audience "/api" matches request "/api", "/api/", "/api/users"
+    // but does NOT match "/api-v2" or "/apiary"
+    return resource.pathname === audience.pathname || resource.pathname.startsWith(audience.pathname + '/');
+  } catch {
+    return false;
+  }
 }
 
 /**
