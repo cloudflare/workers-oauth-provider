@@ -1,5 +1,16 @@
 import { WorkerEntrypoint } from 'cloudflare:workers';
 
+// Log CIMD status on module load
+const hasStrictlyPublicFetch =
+  typeof Cloudflare !== 'undefined' && Cloudflare.compatibilityFlags?.global_fetch_strictly_public === true;
+
+if (!hasStrictlyPublicFetch) {
+  console.warn(
+    `CIMD (Client ID Metadata Document) is disabled: add '"compatibility_flags": ["global_fetch_strictly_public"]' to your wrangler.jsonc to enable. ` +
+      `See: https://developers.cloudflare.com/workers/configuration/compatibility-flags/#global-fetch-strictly-public`
+  );
+}
+
 // Types
 
 /**
@@ -8,6 +19,15 @@ import { WorkerEntrypoint } from 'cloudflare:workers';
 enum HandlerType {
   EXPORTED_HANDLER,
   WORKER_ENTRYPOINT,
+}
+
+/**
+ * Enum representing OAuth grant types
+ */
+export enum GrantType {
+  AUTHORIZATION_CODE = 'authorization_code',
+  REFRESH_TOKEN = 'refresh_token',
+  TOKEN_EXCHANGE = 'urn:ietf:params:oauth:grant-type:token-exchange',
 }
 
 /**
@@ -67,6 +87,12 @@ export interface TokenExchangeCallbackResult {
    * refresh token exchange, it will be ignored.
    */
   refreshTokenTTL?: number;
+
+  /**
+   * List of scopes authorized for the new access token
+   * (If undefined, the granted scopes will be used)
+   */
+  accessTokenScope?: string[];
 }
 
 /**
@@ -75,10 +101,8 @@ export interface TokenExchangeCallbackResult {
 export interface TokenExchangeCallbackOptions {
   /**
    * The type of grant being processed.
-   * 'authorization_code' for initial code exchange,
-   * 'refresh_token' for refresh token exchange.
    */
-  grantType: 'authorization_code' | 'refresh_token';
+  grantType: GrantType;
 
   /**
    * Client that received this grant
@@ -94,6 +118,12 @@ export interface TokenExchangeCallbackOptions {
    * List of scopes that were granted
    */
   scope: string[];
+
+  /**
+   * List of scopes that were requested for this token by the client
+   * (Will be the same as granted scopes unless client specifically requested a downscoping)
+   */
+  requestedScope: string[];
 
   /**
    * Application-specific properties currently associated with this grant
@@ -226,6 +256,14 @@ export interface OAuthProviderOptions {
   allowImplicitFlow?: boolean;
 
   /**
+   * Controls whether OAuth 2.0 Token Exchange (RFC 8693) is allowed.
+   * When false, the token exchange grant type will not be advertised in metadata
+   * and token exchange requests will be rejected.
+   * Defaults to false.
+   */
+  allowTokenExchangeGrant?: boolean;
+
+  /**
    * Controls whether public clients (clients without a secret, like SPAs) can register via the
    * dynamic client registration endpoint. When true, only confidential clients can register.
    * Note: Creating public clients via the OAuthHelpers.createClient() method is always allowed.
@@ -345,6 +383,46 @@ export interface OAuthHelpers {
    * @returns A Promise resolving when the revocation is confirmed.
    */
   revokeGrant(grantId: string, userId: string): Promise<void>;
+
+  /**
+   * Decodes a token and returns token data with decrypted props
+   * @param token - The token
+   * @returns Promise resolving to token data with decrypted props, or null if token is invalid
+   */
+  unwrapToken<T = any>(token: string): Promise<TokenSummary<T> | null>;
+
+  /**
+   * Exchanges an existing access token for a new one with modified characteristics
+   * Implements OAuth 2.0 Token Exchange (RFC 8693)
+   * @param options - Options for token exchange including subject token and optional modifications
+   * @returns Promise resolving to token response with new access token
+   */
+  exchangeToken(options: ExchangeTokenOptions): Promise<TokenResponse>;
+}
+
+/**
+ * Options for token exchange operations (RFC 8693)
+ */
+export interface ExchangeTokenOptions {
+  /**
+   * The subject token to exchange (existing access token)
+   */
+  subjectToken: string;
+
+  /**
+   * Optional narrowed set of scopes for the new token (must be subset of original grant scopes)
+   */
+  scope?: string[];
+
+  /**
+   * Optional target audience/resource for the new token (maps to resource parameter per RFC 8707)
+   */
+  aud?: string | string[];
+
+  /**
+   * Optional TTL override for the new token in seconds (must not exceed subject token's remaining lifetime)
+   */
+  expiresIn?: number;
 }
 
 /**
@@ -619,12 +697,9 @@ interface TokenResponse {
 }
 
 /**
- * Token record stored in KV
- * Note: The actual token format is "{userId}:{grantId}:{random-secret}"
- * but we still only store the hash of the full token string.
- * This contains only access tokens; refresh tokens are stored within the grant records.
+ * Shared fields for Token and TokenSummary
  */
-export interface Token {
+export interface TokenBase {
   /**
    * Unique identifier for the token (hash of the actual token)
    */
@@ -657,6 +732,19 @@ export interface Token {
   audience?: string | string[];
 
   /**
+   * List of scopes on this token
+   */
+  scope: string[];
+}
+
+/**
+ * Token record stored in KV
+ * Note: The actual token format is "{userId}:{grantId}:{random-secret}"
+ * but we still only store the hash of the full token string.
+ * This contains only access tokens; refresh tokens are stored within the grant records.
+ */
+export interface Token extends TokenBase {
+  /**
    * The encryption key for props, wrapped with this token
    */
   wrappedEncryptionKey: string;
@@ -679,6 +767,32 @@ export interface Token {
      * Encrypted application-specific properties
      */
     encryptedProps: string;
+  };
+}
+
+/**
+ * Token record with decrypted properties
+ * Derived from Token but with wrappedEncryptionKey removed and encryptedProps replaced with props
+ */
+export interface TokenSummary<T = any> extends TokenBase {
+  /**
+   * Denormalized grant information for faster access
+   */
+  grant: {
+    /**
+     * Client that received this grant
+     */
+    clientId: string;
+
+    /**
+     * List of scopes that were granted
+     */
+    scope: string[];
+
+    /**
+     * Decrypted application-specific properties
+     */
+    props: T;
   };
 }
 
@@ -754,6 +868,56 @@ export interface GrantSummary {
 }
 
 /**
+ * Options for creating an access token
+ */
+interface CreateAccessTokenOptions {
+  /**
+   * User ID
+   */
+  userId: string;
+
+  /**
+   * Grant ID
+   */
+  grantId: string;
+
+  /**
+   * Client ID
+   */
+  clientId: string;
+
+  /**
+   * Token scopes
+   */
+  scope: string[];
+
+  /**
+   * Encrypted props for the token
+   */
+  encryptedProps: string;
+
+  /**
+   * Encryption key for the props
+   */
+  encryptionKey: CryptoKey;
+
+  /**
+   * TTL for the access token in seconds
+   */
+  expiresIn: number;
+
+  /**
+   * Optional audience/resource
+   */
+  audience?: string | string[];
+
+  /**
+   * Cloudflare Worker environment variables
+   */
+  env: any;
+}
+
+/**
  * OAuth 2.0 Provider implementation for Cloudflare Workers
  * Implements authorization code flow with support for refresh tokens
  * and dynamic client registration.
@@ -780,6 +944,17 @@ export class OAuthProvider {
   fetch(request: Request, env: any, ctx: ExecutionContext): Promise<Response> {
     return this.#impl.fetch(request, env, ctx);
   }
+}
+
+/**
+ * Gets OAuthHelpers for the given environment
+ * @param options - Configuration options for the OAuth provider
+ * @param env - Cloudflare Worker environment variables
+ * @returns An instance of OAuthHelpers
+ */
+export function getOAuthApi(options: OAuthProviderOptions, env: any): OAuthHelpers {
+  const impl = new OAuthProviderImpl(options);
+  return impl.createOAuthHelpers(env);
 }
 
 /**
@@ -1008,6 +1183,56 @@ class OAuthProviderImpl {
       const handler = new this.typedDefaultHandler.handler(ctx, env);
       return handler.fetch(request);
     }
+  }
+
+  /**
+   * Decodes a token and returns token data with decrypted props
+   * @param token - The granted token
+   * @param env - Cloudflare Worker environment variables
+   * @returns Promise resolving to token data with decrypted props, or null if token is invalid
+   */
+  async unwrapToken<T = any>(token: string, env: any): Promise<TokenSummary<T> | null> {
+    const parts = token.split(':');
+    const isPossiblyInternalFormat = parts.length === 3;
+
+    if (!isPossiblyInternalFormat) {
+      return null;
+    }
+
+    // Retrieve the token from KV
+    const [userId, grantId] = parts;
+    const id = await generateTokenId(token);
+    const tokenData: Token | null = await env.OAUTH_KV.get(`token:${userId}:${grantId}:${id}`, { type: 'json' });
+
+    // Return null if missing or expired
+    if (!tokenData) {
+      return null;
+    }
+    const now = Math.floor(Date.now() / 1e3);
+    if (tokenData.expiresAt < now) {
+      return null;
+    }
+
+    // Decrypt the props
+    const encryptionKey = await unwrapKeyWithToken(token, tokenData.wrappedEncryptionKey);
+    const decryptedProps = await decryptProps(encryptionKey, tokenData.grant.encryptedProps);
+
+    // Return the token data with decrypted instead of encrypted props
+    const { grant } = tokenData;
+    return {
+      id: tokenData.id,
+      grantId: tokenData.grantId,
+      userId: tokenData.userId,
+      createdAt: tokenData.createdAt,
+      expiresAt: tokenData.expiresAt,
+      audience: tokenData.audience,
+      scope: tokenData.scope || grant.scope, // Use token scope if available, fallback to grant scope for backward compatibility
+      grant: {
+        clientId: grant.clientId,
+        scope: grant.scope,
+        props: decryptedProps as T,
+      },
+    };
   }
 
   /**
@@ -1271,6 +1496,12 @@ class OAuthProviderImpl {
       responseTypesSupported.push('token');
     }
 
+    // Determine supported grant types
+    const grantTypesSupported = [GrantType.AUTHORIZATION_CODE, GrantType.REFRESH_TOKEN];
+    if (this.options.allowTokenExchangeGrant) {
+      grantTypesSupported.push(GrantType.TOKEN_EXCHANGE);
+    }
+
     const metadata = {
       issuer: new URL(tokenEndpoint).origin,
       authorization_endpoint: authorizeEndpoint,
@@ -1280,7 +1511,7 @@ class OAuthProviderImpl {
       scopes_supported: this.options.scopesSupported,
       response_types_supported: responseTypesSupported,
       response_modes_supported: ['query'],
-      grant_types_supported: ['authorization_code', 'refresh_token'],
+      grant_types_supported: grantTypesSupported,
       // Support "none" auth method for public clients
       token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post', 'none'],
       // not implemented: token_endpoint_auth_signing_alg_values_supported
@@ -1295,6 +1526,9 @@ class OAuthProviderImpl {
       // not implemented: introspection_endpoint_auth_methods_supported
       // not implemented: introspection_endpoint_auth_signing_alg_values_supported
       code_challenge_methods_supported: ['plain', 'S256'], // PKCE support
+      // MCP Client ID Metadata Document support (CIMD)
+      // Only enabled when global_fetch_strictly_public compat flag is set (for SSRF protection)
+      client_id_metadata_document_supported: this.hasGlobalFetchStrictlyPublic(),
     };
 
     return new Response(JSON.stringify(metadata), {
@@ -1314,10 +1548,12 @@ class OAuthProviderImpl {
     // Handle different grant types
     const grantType = body.grant_type;
 
-    if (grantType === 'authorization_code') {
+    if (grantType === GrantType.AUTHORIZATION_CODE) {
       return this.handleAuthorizationCodeGrant(body, clientInfo, env);
-    } else if (grantType === 'refresh_token') {
+    } else if (grantType === GrantType.REFRESH_TOKEN) {
       return this.handleRefreshTokenGrant(body, clientInfo, env);
+    } else if (grantType === GrantType.TOKEN_EXCHANGE && this.options.allowTokenExchangeGrant) {
+      return this.handleTokenExchangeGrant(body, clientInfo, env);
     } else {
       return this.createErrorResponse('unsupported_grant_type', 'Grant type not supported');
     }
@@ -1416,11 +1652,6 @@ class OAuthProviderImpl {
       }
     }
 
-    // Code is valid - generate access token
-    const accessTokenSecret = generateRandomString(TOKEN_LENGTH);
-    const accessToken = `${userId}:${grantId}:${accessTokenSecret}`;
-    const accessTokenId = await generateTokenId(accessToken);
-
     // Define the access token TTL, may be updated by callback if provided
     let accessTokenTTL = this.options.accessTokenTTL!;
     // Define the refresh token TTL, may be updated by callback if provided
@@ -1434,6 +1665,10 @@ class OAuthProviderImpl {
     let accessTokenEncryptionKey = encryptionKey;
     let encryptedAccessTokenProps = grantData.encryptedProps;
 
+    // Parse and validate scope parameter for downscoping (RFC 6749 Section 3.3)
+    // The token request can include a scope parameter to request a subset of the granted scopes
+    let tokenScopes: string[] = this.downscope(body.scope, grantData.scope);
+
     // Process token exchange callback if provided
     if (this.options.tokenExchangeCallback) {
       // Decrypt the existing props to provide them to the callback
@@ -1444,10 +1679,11 @@ class OAuthProviderImpl {
       let accessTokenProps = decryptedProps;
 
       const callbackOptions: TokenExchangeCallbackOptions = {
-        grantType: 'authorization_code',
+        grantType: GrantType.AUTHORIZATION_CODE,
         clientId: clientInfo.clientId,
         userId: userId,
         scope: grantData.scope,
+        requestedScope: tokenScopes,
         props: decryptedProps,
       };
 
@@ -1479,6 +1715,11 @@ class OAuthProviderImpl {
         if ('refreshTokenTTL' in callbackResult) {
           refreshTokenTTL = callbackResult.refreshTokenTTL;
         }
+
+        // If accessTokenScope was specified, use it for this token
+        if (callbackResult.accessTokenScope) {
+          tokenScopes = this.downscope(callbackResult.accessTokenScope, grantData.scope);
+        }
       }
 
       // Re-encrypt the potentially updated grant props
@@ -1500,13 +1741,9 @@ class OAuthProviderImpl {
 
     // Calculate the access token expiration time (after callback might have updated TTL)
     const now = Math.floor(Date.now() / 1000);
-    const accessTokenExpiresAt = now + accessTokenTTL;
 
     // Determine if we should issue a refresh token
     const useRefreshToken = refreshTokenTTL !== 0;
-
-    // Wrap the key for access token
-    const accessTokenWrappedKey = await wrapKeyWithToken(accessToken, accessTokenEncryptionKey);
 
     // Update the grant:
     // - Remove the auth code hash (it's single-use)
@@ -1567,25 +1804,17 @@ class OAuthProviderImpl {
       );
     }
 
-    // Store access token with denormalized grant information
-    const accessTokenData: Token = {
-      id: accessTokenId,
-      grantId: grantId,
-      userId: userId,
-      createdAt: now,
-      expiresAt: accessTokenExpiresAt,
-      audience: audience,
-      wrappedEncryptionKey: accessTokenWrappedKey,
-      grant: {
-        clientId: grantData.clientId,
-        scope: grantData.scope,
-        encryptedProps: encryptedAccessTokenProps,
-      },
-    };
-
-    // Save access token with TTL (using the potentially callback-provided TTL)
-    await env.OAUTH_KV.put(`token:${userId}:${grantId}:${accessTokenId}`, JSON.stringify(accessTokenData), {
-      expirationTtl: accessTokenTTL,
+    // Create and store access token with potentially narrowed scopes
+    const accessToken = await this.createAccessToken({
+      userId,
+      grantId,
+      clientId: grantData.clientId,
+      scope: tokenScopes,
+      encryptedProps: encryptedAccessTokenProps,
+      encryptionKey: accessTokenEncryptionKey,
+      expiresIn: accessTokenTTL,
+      audience,
+      env,
     });
 
     // Build the response
@@ -1593,7 +1822,7 @@ class OAuthProviderImpl {
       access_token: accessToken,
       token_type: 'bearer',
       expires_in: accessTokenTTL,
-      scope: grantData.scope.join(' '),
+      scope: tokenScopes.join(' '),
     };
 
     if (refreshToken) {
@@ -1690,6 +1919,10 @@ class OAuthProviderImpl {
     let accessTokenEncryptionKey = encryptionKey;
     let encryptedAccessTokenProps = grantData.encryptedProps;
 
+    // Parse and validate scope parameter for downscoping (RFC 6749 Section 3.3)
+    // The token request can include a scope parameter to request a subset of the granted scopes
+    let tokenScopes = this.downscope(body.scope, grantData.scope);
+
     // Track whether grant props changed
     let grantPropsChanged = false;
 
@@ -1703,10 +1936,11 @@ class OAuthProviderImpl {
       let accessTokenProps = decryptedProps;
 
       const callbackOptions: TokenExchangeCallbackOptions = {
-        grantType: 'refresh_token',
+        grantType: GrantType.REFRESH_TOKEN,
         clientId: clientInfo.clientId,
         userId: userId,
         scope: grantData.scope,
+        requestedScope: tokenScopes,
         props: decryptedProps,
       };
 
@@ -1741,6 +1975,11 @@ class OAuthProviderImpl {
             'invalid_request',
             'refreshTokenTTL cannot be changed during refresh token exchange'
           );
+        }
+
+        // If accessTokenScope was specified, use it for this token
+        if (callbackResult.accessTokenScope) {
+          tokenScopes = this.downscope(callbackResult.accessTokenScope, grantData.scope);
         }
       }
 
@@ -1849,6 +2088,7 @@ class OAuthProviderImpl {
       createdAt: now,
       expiresAt: accessTokenExpiresAt,
       audience: audience,
+      scope: tokenScopes,
       wrappedEncryptionKey: accessTokenWrappedKey,
       grant: {
         clientId: grantData.clientId,
@@ -1868,7 +2108,7 @@ class OAuthProviderImpl {
       token_type: 'bearer',
       expires_in: accessTokenTTL,
       refresh_token: newRefreshToken,
-      scope: grantData.scope.join(' '),
+      scope: tokenScopes.join(' '),
     };
 
     // RFC 8707 Section 2.2: SHOULD return resource parameter in response
@@ -1880,6 +2120,264 @@ class OAuthProviderImpl {
     return new Response(JSON.stringify(tokenResponse), {
       headers: { 'Content-Type': 'application/json' },
     });
+  }
+
+  /**
+   * Core token exchange logic (RFC 8693)
+   * Performs the actual token exchange operation
+   * This method is not private because `OAuthHelpers` needs to call it. Note that since
+   * `OAuthProviderImpl` is not exposed outside this module, this is still effectively
+   * module-private.
+   * @param subjectToken - The subject token to exchange
+   * @param requestedScopes - Optional narrowed scopes (must be subset of original)
+   * @param requestedResource - Optional resource/audience (must be subset of original if original had resource)
+   * @param expiresIn - Optional TTL override in seconds
+   * @param clientInfo - The client making the exchange request
+   * @param env - Cloudflare Worker environment variables
+   * @returns Promise resolving to token response
+   * @throws OAuthError with OAuth error code and description
+   */
+  async exchangeToken(
+    subjectToken: string,
+    requestedScopes: string[] | undefined,
+    requestedResource: string | string[] | undefined,
+    expiresIn: number | undefined,
+    clientInfo: ClientInfo,
+    env: any
+  ): Promise<TokenResponse & { issued_token_type?: string }> {
+    // Unwrap and validate the subject token
+    const tokenSummary = await this.unwrapToken(subjectToken, env);
+    if (!tokenSummary) {
+      throw new OAuthError('invalid_grant', 'Invalid or expired subject token');
+    }
+
+    // Get the grant to access resource information
+    const grantKey = `grant:${tokenSummary.userId}:${tokenSummary.grantId}`;
+    const grantData: Grant | null = await env.OAUTH_KV.get(grantKey, { type: 'json' });
+    if (!grantData) {
+      throw new OAuthError('invalid_grant', 'Grant not found');
+    }
+
+    // If scopes are requested, validate they are a subset of the original grant scopes
+    let tokenScopes: string[] = this.downscope(requestedScopes, grantData.scope);
+
+    // Parse and validate resource parameter (RFC 8707) if provided
+    let newAudience: string | string[] | undefined = tokenSummary.audience;
+    if (requestedResource) {
+      // Validate downscoping: requested resources must be subset of grant resources if grant had resources
+      if (grantData.resource) {
+        const requestedResources = Array.isArray(requestedResource) ? requestedResource : [requestedResource];
+        const grantedResources = Array.isArray(grantData.resource) ? grantData.resource : [grantData.resource];
+
+        // Check that all requested resources are in the granted resources
+        for (const requested of requestedResources) {
+          if (!grantedResources.includes(requested)) {
+            throw new OAuthError('invalid_target', 'Requested resource was not included in the authorization request');
+          }
+        }
+      }
+
+      // Parse and validate the resource parameter
+      const parsedResource = parseResourceParameter(requestedResource);
+      if (!parsedResource) {
+        throw new OAuthError(
+          'invalid_target',
+          'The resource parameter must be a valid absolute URI without a fragment'
+        );
+      }
+      newAudience = parsedResource;
+    }
+
+    // Determine TTL for new token
+    const now = Math.floor(Date.now() / 1000);
+    const subjectTokenRemainingLifetime = tokenSummary.expiresAt - now;
+    let accessTokenTTL = this.options.accessTokenTTL ?? DEFAULT_ACCESS_TOKEN_TTL;
+
+    // If expiresIn is provided, use it but clamp to subject token's remaining lifetime
+    if (expiresIn !== undefined) {
+      if (expiresIn <= 0) {
+        throw new OAuthError('invalid_request', 'Invalid expires_in parameter');
+      }
+      accessTokenTTL = Math.min(expiresIn, subjectTokenRemainingLifetime);
+    } else {
+      // Default to subject token's remaining lifetime or configured TTL, whichever is smaller
+      accessTokenTTL = Math.min(accessTokenTTL, subjectTokenRemainingLifetime);
+    }
+
+    // Get the subject token data to access encryption key
+    const subjectTokenData: Token | null = await env.OAUTH_KV.get(
+      `token:${tokenSummary.userId}:${tokenSummary.grantId}:${tokenSummary.id}`,
+      { type: 'json' }
+    );
+
+    if (!subjectTokenData) {
+      throw new OAuthError('invalid_grant', 'Subject token data not found');
+    }
+
+    // Unwrap the encryption key from the subject token
+    const encryptionKey = await unwrapKeyWithToken(subjectToken, subjectTokenData.wrappedEncryptionKey);
+
+    // Use the same props as the subject token
+    let accessTokenEncryptionKey = encryptionKey;
+    let encryptedAccessTokenProps = subjectTokenData.grant.encryptedProps;
+
+    // Process token exchange callback if provided
+    if (this.options.tokenExchangeCallback) {
+      const decryptedProps = await decryptProps(encryptionKey, subjectTokenData.grant.encryptedProps);
+
+      const callbackOptions: TokenExchangeCallbackOptions = {
+        grantType: GrantType.TOKEN_EXCHANGE,
+        clientId: clientInfo.clientId,
+        userId: tokenSummary.userId,
+        scope: tokenSummary.grant.scope,
+        requestedScope: tokenScopes,
+        props: decryptedProps,
+      };
+
+      const callbackResult = await Promise.resolve(this.options.tokenExchangeCallback(callbackOptions));
+
+      if (callbackResult) {
+        let accessTokenProps = decryptedProps;
+
+        if (callbackResult.newProps) {
+          // If accessTokenProps wasn't explicitly specified, use the updated newProps
+          if (!callbackResult.accessTokenProps) {
+            accessTokenProps = callbackResult.newProps;
+          }
+        }
+
+        if (callbackResult.accessTokenProps) {
+          accessTokenProps = callbackResult.accessTokenProps;
+        }
+
+        if (callbackResult.accessTokenTTL !== undefined) {
+          // Clamp to subject token's remaining lifetime
+          accessTokenTTL = Math.min(callbackResult.accessTokenTTL, subjectTokenRemainingLifetime);
+        }
+
+        // Re-encrypt the access token props if they changed
+        if (accessTokenProps !== decryptedProps) {
+          const tokenResult = await encryptProps(accessTokenProps);
+          encryptedAccessTokenProps = tokenResult.encryptedData;
+          accessTokenEncryptionKey = tokenResult.key;
+        }
+
+        // If accessTokenScope was specified, use it for this token
+        if (callbackResult.accessTokenScope) {
+          tokenScopes = this.downscope(callbackResult.accessTokenScope, grantData.scope);
+        }
+      }
+    }
+
+    // Create and store access token
+    const newAccessToken = await this.createAccessToken({
+      userId: tokenSummary.userId,
+      grantId: tokenSummary.grantId,
+      clientId: tokenSummary.grant.clientId,
+      scope: tokenScopes,
+      encryptedProps: encryptedAccessTokenProps,
+      encryptionKey: accessTokenEncryptionKey,
+      expiresIn: accessTokenTTL,
+      audience: newAudience,
+      env,
+    });
+
+    // Build the response per RFC 8693
+    const tokenResponse: TokenResponse & { issued_token_type?: string } = {
+      access_token: newAccessToken,
+      issued_token_type: 'urn:ietf:params:oauth:token-type:access_token',
+      token_type: 'bearer',
+      expires_in: accessTokenTTL,
+      scope: tokenScopes.join(' '),
+    };
+
+    // RFC 8707 Section 2.2: SHOULD return resource parameter in response
+    if (newAudience) {
+      tokenResponse.resource = newAudience;
+    }
+
+    return tokenResponse;
+  }
+
+  /**
+   * Handles OAuth 2.0 token exchange requests (RFC 8693)
+   * Exchanges an existing access token for a new one with modified characteristics
+   * @param body - The parsed request body
+   * @param clientInfo - The authenticated client information
+   * @param env - Cloudflare Worker environment variables
+   * @returns Response with new token data or error
+   */
+  private async handleTokenExchangeGrant(body: any, clientInfo: ClientInfo, env: any): Promise<Response> {
+    const subjectToken = body.subject_token;
+    const subjectTokenType = body.subject_token_type;
+    const requestedTokenType = body.requested_token_type || 'urn:ietf:params:oauth:token-type:access_token';
+    const requestedScope = body.scope;
+    const requestedResource = body.resource;
+
+    // Validate required parameters
+    if (!subjectToken) {
+      return this.createErrorResponse('invalid_request', 'subject_token is required');
+    }
+
+    if (!subjectTokenType) {
+      return this.createErrorResponse('invalid_request', 'subject_token_type is required');
+    }
+
+    // Only support access token as subject token type
+    if (subjectTokenType !== 'urn:ietf:params:oauth:token-type:access_token') {
+      return this.createErrorResponse('invalid_request', 'Only access_token subject_token_type is supported');
+    }
+
+    // Only support access token as requested token type
+    if (requestedTokenType !== 'urn:ietf:params:oauth:token-type:access_token') {
+      return this.createErrorResponse('invalid_request', 'Only access_token requested_token_type is supported');
+    }
+
+    // Parse requested scopes
+    let requestedScopes: string[] | undefined;
+    if (requestedScope) {
+      if (typeof requestedScope === 'string') {
+        requestedScopes = requestedScope.split(' ').filter(Boolean);
+      } else if (Array.isArray(requestedScope)) {
+        requestedScopes = requestedScope;
+      } else {
+        return this.createErrorResponse('invalid_request', 'Invalid scope parameter format');
+      }
+    }
+
+    // Parse expires_in
+    let expiresIn: number | undefined;
+    if (body.expires_in !== undefined) {
+      const requestedTTL = parseInt(body.expires_in, 10);
+      if (isNaN(requestedTTL) || requestedTTL <= 0) {
+        return this.createErrorResponse('invalid_request', 'Invalid expires_in parameter');
+      }
+      expiresIn = requestedTTL;
+    }
+
+    // Perform the token exchange
+    try {
+      const tokenResponse = await this.exchangeToken(
+        subjectToken,
+        requestedScopes,
+        requestedResource,
+        expiresIn,
+        clientInfo,
+        env
+      );
+
+      // Return the token
+      return new Response(JSON.stringify(tokenResponse), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    } catch (error) {
+      // Convert OAuthError to HTTP error response
+      if (error instanceof OAuthError) {
+        return this.createErrorResponse(error.code, error.message);
+      }
+      // Re-throw unexpected errors
+      throw error;
+    }
   }
 
   /**
@@ -2014,37 +2512,9 @@ class OAuthProviderImpl {
       return this.createErrorResponse('invalid_request', 'Invalid JSON payload', 400);
     }
 
-    // Basic type validation functions
-    const validateStringField = (field: any): string | undefined => {
-      if (field === undefined) {
-        return undefined;
-      }
-      if (typeof field !== 'string') {
-        throw new Error('Field must be a string');
-      }
-      return field;
-    };
-
-    const validateStringArray = (arr: any): string[] | undefined => {
-      if (arr === undefined) {
-        return undefined;
-      }
-      if (!Array.isArray(arr)) {
-        throw new Error('Field must be an array');
-      }
-
-      // Validate all elements are strings
-      for (const item of arr) {
-        if (typeof item !== 'string') {
-          throw new Error('All array elements must be strings');
-        }
-      }
-
-      return arr;
-    };
-
     // Get token endpoint auth method, default to client_secret_basic
-    const authMethod = validateStringField(clientMetadata.token_endpoint_auth_method) || 'client_secret_basic';
+    const authMethod =
+      OAuthProviderImpl.validateStringField(clientMetadata.token_endpoint_auth_method) || 'client_secret_basic';
     const isPublicClient = authMethod === 'none';
 
     // Check if public client registrations are disallowed
@@ -2067,7 +2537,7 @@ class OAuthProviderImpl {
     let clientInfo: ClientInfo;
     try {
       // Validate redirect URIs - must exist and have at least one entry
-      const redirectUris = validateStringArray(clientMetadata.redirect_uris);
+      const redirectUris = OAuthProviderImpl.validateStringArray(clientMetadata.redirect_uris);
       if (!redirectUris || redirectUris.length === 0) {
         throw new Error('At least one redirect URI is required');
       }
@@ -2080,15 +2550,19 @@ class OAuthProviderImpl {
       clientInfo = {
         clientId,
         redirectUris,
-        clientName: validateStringField(clientMetadata.client_name),
-        logoUri: validateStringField(clientMetadata.logo_uri),
-        clientUri: validateStringField(clientMetadata.client_uri),
-        policyUri: validateStringField(clientMetadata.policy_uri),
-        tosUri: validateStringField(clientMetadata.tos_uri),
-        jwksUri: validateStringField(clientMetadata.jwks_uri),
-        contacts: validateStringArray(clientMetadata.contacts),
-        grantTypes: validateStringArray(clientMetadata.grant_types) || ['authorization_code', 'refresh_token'],
-        responseTypes: validateStringArray(clientMetadata.response_types) || ['code'],
+        clientName: OAuthProviderImpl.validateStringField(clientMetadata.client_name),
+        logoUri: OAuthProviderImpl.validateStringField(clientMetadata.logo_uri),
+        clientUri: OAuthProviderImpl.validateStringField(clientMetadata.client_uri),
+        policyUri: OAuthProviderImpl.validateStringField(clientMetadata.policy_uri),
+        tosUri: OAuthProviderImpl.validateStringField(clientMetadata.tos_uri),
+        jwksUri: OAuthProviderImpl.validateStringField(clientMetadata.jwks_uri),
+        contacts: OAuthProviderImpl.validateStringArray(clientMetadata.contacts),
+        grantTypes: OAuthProviderImpl.validateStringArray(clientMetadata.grant_types) || [
+          GrantType.AUTHORIZATION_CODE,
+          GrantType.REFRESH_TOKEN,
+          ...(this.options.allowTokenExchangeGrant ? [GrantType.TOKEN_EXCHANGE] : []),
+        ],
+        responseTypes: OAuthProviderImpl.validateStringArray(clientMetadata.response_types) || ['code'],
         registrationDate: Math.floor(Date.now() / 1000),
         tokenEndpointAuthMethod: authMethod,
       };
@@ -2210,6 +2684,7 @@ class OAuthProviderImpl {
       const decryptedProps = await decryptProps(encryptionKey, tokenData.grant.encryptedProps);
 
       // Set the decrypted props on the context object
+      // @ts-expect-error - ctx.props is actually writable https://github.com/cloudflare/workers-oauth-provider/issues/124
       ctx.props = decryptedProps;
     } else if (this.options.resolveExternalToken) {
       // No token data was found, so we validate the provided token with the provided validator
@@ -2238,6 +2713,7 @@ class OAuthProviderImpl {
       }
 
       // Set the external props on the context object
+      // @ts-expect-error - ctx.props is actually writable https://github.com/cloudflare/workers-oauth-provider/issues/124
       ctx.props = ext.props;
     }
 
@@ -2272,7 +2748,7 @@ class OAuthProviderImpl {
    * @param env - Cloudflare Worker environment variables
    * @returns An instance of OAuthHelpers
    */
-  private createOAuthHelpers(env: any): OAuthHelpers {
+  public createOAuthHelpers(env: any): OAuthHelpers {
     return new OAuthHelpersImpl(env, this);
   }
 
@@ -2290,17 +2766,300 @@ class OAuthProviderImpl {
   }
 
   /**
-   * Fetches client information from KV storage
+   * Fetches client information from KV storage or via CIMD (Client ID Metadata Document)
    * This method is not private because `OAuthHelpers` needs to call it. Note that since
    * `OAuthProviderImpl` is not exposed outside this module, this is still effectively
    * module-private.
+   *
+   * Supports CIMD: If clientId is an HTTPS URL with a non-root path, the metadata
+   * document will be fetched from that URL instead of looking up in KV storage.
+   *
    * @param env - Cloudflare Worker environment variables
-   * @param clientId - The client ID to look up
+   * @param clientId - The client ID to look up (can be a regular ID or an HTTPS URL for CIMD)
    * @returns The client information, or null if not found
    */
-  getClient(env: any, clientId: string): Promise<ClientInfo | null> {
+  async getClient(env: any, clientId: string): Promise<ClientInfo | null> {
+    // Check if this is a CIMD (Client ID Metadata Document) URL
+    if (this.isClientMetadataUrl(clientId)) {
+      if (!this.hasGlobalFetchStrictlyPublic()) {
+        throw new Error(
+          `Client ID "${clientId}" appears to be a CIMD URL, but the 'global_fetch_strictly_public' ` +
+            `compatibility flag is not enabled. Add this flag to your wrangler.jsonc to enable CIMD support.`
+        );
+      }
+      return this.fetchClientMetadataDocument(clientId);
+    }
+
+    // Standard KV lookup
     const clientKey = `client:${clientId}`;
     return env.OAUTH_KV.get(clientKey, { type: 'json' });
+  }
+
+  /**
+   * Creates and stores an access token
+   * @param params - Options for creating the access token
+   * @returns The access token string
+   */
+  private async createAccessToken(params: CreateAccessTokenOptions): Promise<string> {
+    const { userId, grantId, clientId, scope, encryptedProps, encryptionKey, expiresIn, audience, env } = params;
+
+    // Generate access token
+    const accessTokenSecret = generateRandomString(TOKEN_LENGTH);
+    const accessToken = `${userId}:${grantId}:${accessTokenSecret}`;
+
+    const now = Math.floor(Date.now() / 1000);
+    const accessTokenId = await generateTokenId(accessToken);
+    const accessTokenExpiresAt = now + expiresIn;
+
+    // Wrap the key for the access token
+    const accessTokenWrappedKey = await wrapKeyWithToken(accessToken, encryptionKey);
+
+    // Store access token with denormalized grant information
+    const accessTokenData: Token = {
+      id: accessTokenId,
+      grantId: grantId,
+      userId: userId,
+      createdAt: now,
+      expiresAt: accessTokenExpiresAt,
+      audience: audience,
+      scope: scope,
+      wrappedEncryptionKey: accessTokenWrappedKey,
+      grant: {
+        clientId: clientId,
+        scope: scope,
+        encryptedProps: encryptedProps,
+      },
+    };
+
+    // Save access token with TTL
+    await env.OAUTH_KV.put(`token:${userId}:${grantId}:${accessTokenId}`, JSON.stringify(accessTokenData), {
+      expirationTtl: expiresIn,
+    });
+
+    return accessToken;
+  }
+
+  /**
+   * Downscopes requested scopes to only include those that are in the grant
+   * Filters out any requested scopes that are not in the granted scopes
+   * @param requestedScope - The scope parameter from the request (string or array)
+   * @param grantedScopes - The scopes that were granted in the authorization
+   * @returns The filtered scopes that are a subset of the granted scopes
+   */
+  private downscope(requestedScope: string | string[] | undefined, grantedScopes: string[]): string[] {
+    if (!requestedScope) return grantedScopes;
+
+    const requestedScopes: string[] =
+      typeof requestedScope === 'string' ? requestedScope.split(' ').filter(Boolean) : requestedScope;
+
+    // Filter out any requested scopes that are not in the grant
+    return requestedScopes.filter((scope: string) => grantedScopes.includes(scope));
+  }
+
+  /**
+   * Checks if the global_fetch_strictly_public compatibility flag is enabled.
+   * This flag is required for CIMD to prevent SSRF attacks.
+   * See: https://developers.cloudflare.com/workers/configuration/compatibility-flags/#global-fetch-strictly-public
+   */
+  private hasGlobalFetchStrictlyPublic(): boolean {
+    const compatFlags =
+      typeof Cloudflare !== 'undefined' && Cloudflare.compatibilityFlags ? Cloudflare.compatibilityFlags : null;
+    return !!compatFlags?.global_fetch_strictly_public;
+  }
+
+  /**
+   * Checks if a client_id is a CIMD URL (HTTPS with non-root path)
+   */
+  private isClientMetadataUrl(clientId: string): boolean {
+    try {
+      const url = new URL(clientId);
+      return url.protocol === 'https:' && url.pathname !== '/';
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Maximum size for CIMD metadata documents (5KB per IETF spec recommendation)
+   */
+  private static readonly CIMD_MAX_SIZE_BYTES = 5 * 1024;
+
+  /**
+   * Request timeout for CIMD metadata fetches (10 seconds)
+   * Prevents slow-loris style attacks
+   */
+  private static readonly CIMD_FETCH_TIMEOUT_MS = 10_000;
+
+  /**
+   * Allowed authentication methods for CIMD clients (per IETF spec)
+   * CIMD clients cannot use symmetric secrets since there's no pre-shared secret
+   */
+  private static readonly CIMD_ALLOWED_AUTH_METHODS = ['none', 'private_key_jwt'];
+
+  /**
+   * Validates that a field is a string or undefined
+   * @param field - The field value to validate
+   * @param fieldName - Name of the field for error messages
+   * @returns The validated string or undefined
+   * @throws Error if field is not a string or undefined
+   */
+  private static validateStringField(field: unknown, fieldName?: string): string | undefined {
+    if (field === undefined) return undefined;
+    if (typeof field !== 'string') {
+      throw new Error(
+        fieldName ? `Invalid ${fieldName}: expected string, got ${typeof field}` : 'Field must be a string'
+      );
+    }
+    return field;
+  }
+
+  /**
+   * Validates that a field is a string array or undefined
+   * @param arr - The array to validate
+   * @param fieldName - Name of the field for error messages
+   * @returns The validated string array or undefined
+   * @throws Error if field is not a string array or undefined
+   */
+  private static validateStringArray(arr: unknown, fieldName?: string): string[] | undefined {
+    if (arr === undefined) return undefined;
+    if (!Array.isArray(arr)) {
+      throw new Error(fieldName ? `Invalid ${fieldName}: expected array, got ${typeof arr}` : 'Field must be an array');
+    }
+    if (!arr.every((item) => typeof item === 'string')) {
+      throw new Error(
+        fieldName ? `Invalid ${fieldName}: array must contain only strings` : 'All array elements must be strings'
+      );
+    }
+    return arr;
+  }
+
+  /**
+   * Fetches and validates a Client ID Metadata Document from the given URL
+   * Per the MCP spec, the client_id in the document must match the URL exactly
+   *
+   * Uses Cloudflare HTTP cache for caching (via cacheEverything option).
+   * Response size is limited to 5KB per IETF spec.
+   *
+   * @param metadataUrl - The HTTPS URL to fetch metadata from
+   * @returns The client information
+   * @throws Error if fetch fails or validation fails
+   */
+  private async fetchClientMetadataDocument(metadataUrl: string): Promise<ClientInfo> {
+    const abortController = new AbortController();
+    const timeoutId = setTimeout(() => abortController.abort(), OAuthProviderImpl.CIMD_FETCH_TIMEOUT_MS);
+
+    try {
+      const response = await fetch(metadataUrl, {
+        headers: { Accept: 'application/json' },
+        signal: abortController.signal,
+        cf: { cacheEverything: true },
+      });
+
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        throw new Error(`Failed to fetch client metadata: HTTP ${response.status}`);
+      }
+
+      const contentLength = response.headers.get('content-length');
+      if (contentLength && parseInt(contentLength, 10) > OAuthProviderImpl.CIMD_MAX_SIZE_BYTES) {
+        throw new Error(
+          `Client metadata exceeds size limit: ${contentLength} bytes (max ${OAuthProviderImpl.CIMD_MAX_SIZE_BYTES})`
+        );
+      }
+
+      const rawMetadata = await this.readJsonWithSizeLimit(response, OAuthProviderImpl.CIMD_MAX_SIZE_BYTES);
+
+      const clientId = OAuthProviderImpl.validateStringField(rawMetadata.client_id, 'client_id');
+      const redirectUris = OAuthProviderImpl.validateStringArray(rawMetadata.redirect_uris, 'redirect_uris');
+      const tokenEndpointAuthMethod = OAuthProviderImpl.validateStringField(
+        rawMetadata.token_endpoint_auth_method,
+        'token_endpoint_auth_method'
+      );
+
+      // Validate that client_id matches the URL (required by spec)
+      if (clientId !== metadataUrl) {
+        throw new Error(`client_id "${clientId}" does not match metadata URL "${metadataUrl}"`);
+      }
+
+      if (!redirectUris || redirectUris.length === 0) {
+        throw new Error('redirect_uris is required and must not be empty');
+      }
+
+      if (tokenEndpointAuthMethod && !OAuthProviderImpl.CIMD_ALLOWED_AUTH_METHODS.includes(tokenEndpointAuthMethod)) {
+        throw new Error(
+          `token_endpoint_auth_method "${tokenEndpointAuthMethod}" is not allowed for CIMD clients. ` +
+            `Allowed methods: ${OAuthProviderImpl.CIMD_ALLOWED_AUTH_METHODS.join(', ')}`
+        );
+      }
+
+      return {
+        clientId,
+        redirectUris,
+        clientName: OAuthProviderImpl.validateStringField(rawMetadata.client_name, 'client_name'),
+        clientUri: OAuthProviderImpl.validateStringField(rawMetadata.client_uri, 'client_uri'),
+        logoUri: OAuthProviderImpl.validateStringField(rawMetadata.logo_uri, 'logo_uri'),
+        policyUri: OAuthProviderImpl.validateStringField(rawMetadata.policy_uri, 'policy_uri'),
+        tosUri: OAuthProviderImpl.validateStringField(rawMetadata.tos_uri, 'tos_uri'),
+        jwksUri: OAuthProviderImpl.validateStringField(rawMetadata.jwks_uri, 'jwks_uri'),
+        contacts: OAuthProviderImpl.validateStringArray(rawMetadata.contacts, 'contacts'),
+        grantTypes: OAuthProviderImpl.validateStringArray(rawMetadata.grant_types, 'grant_types') || [
+          'authorization_code',
+        ],
+        responseTypes: OAuthProviderImpl.validateStringArray(rawMetadata.response_types, 'response_types') || ['code'],
+        tokenEndpointAuthMethod: tokenEndpointAuthMethod || 'none',
+      };
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  /**
+   * Reads JSON from a response with a size limit to prevent DoS attacks.
+   * Streams the response body and aborts if it exceeds the limit.
+   *
+   * @param response - The fetch response
+   * @param maxBytes - Maximum allowed size in bytes
+   * @returns Parsed JSON object
+   * @throws Error if response body is null, size exceeded, or JSON parse failed
+   */
+  private async readJsonWithSizeLimit(response: Response, maxBytes: number): Promise<Record<string, unknown>> {
+    const reader = response.body?.getReader();
+    if (!reader) {
+      throw new Error('Response body is null');
+    }
+
+    const chunks: Uint8Array[] = [];
+    let totalSize = 0;
+
+    while (true) {
+      const { done, value } = await reader.read();
+
+      if (done) {
+        break;
+      }
+
+      if (value) {
+        totalSize += value.length;
+
+        if (totalSize > maxBytes) {
+          await reader.cancel();
+          throw new Error(`Response exceeded size limit of ${maxBytes} bytes`);
+        }
+
+        chunks.push(value);
+      }
+    }
+
+    const allChunks = new Uint8Array(totalSize);
+    let position = 0;
+    for (const chunk of chunks) {
+      allChunks.set(chunk, position);
+      position += chunk.length;
+    }
+
+    const text = new TextDecoder().decode(allChunks);
+    return JSON.parse(text);
   }
 
   /**
@@ -2337,6 +3096,20 @@ class OAuthProviderImpl {
 }
 
 // Constants
+/**
+ * Error class for OAuth operations
+ * Carries OAuth error code and description for proper error responses
+ */
+class OAuthError extends Error {
+  constructor(
+    public code: string,
+    message: string
+  ) {
+    super(message);
+    this.name = 'OAuthError';
+  }
+}
+
 /**
  * Default expiration time for access tokens (1 hour in seconds)
  */
@@ -2880,6 +3653,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
         createdAt: now,
         expiresAt: accessTokenExpiresAt,
         audience: audience,
+        scope: options.scope,
         wrappedEncryptionKey: accessTokenWrappedKey,
         grant: {
           clientId: options.request.clientId,
@@ -2981,7 +3755,11 @@ class OAuthHelpersImpl implements OAuthHelpers {
       tosUri: clientInfo.tosUri,
       jwksUri: clientInfo.jwksUri,
       contacts: clientInfo.contacts,
-      grantTypes: clientInfo.grantTypes || ['authorization_code', 'refresh_token'],
+      grantTypes: clientInfo.grantTypes || [
+        GrantType.AUTHORIZATION_CODE,
+        GrantType.REFRESH_TOKEN,
+        ...(this.provider.options.allowTokenExchangeGrant ? [GrantType.TOKEN_EXCHANGE] : []),
+      ],
       responseTypes: clientInfo.responseTypes || ['code'],
       registrationDate: Math.floor(Date.now() / 1000),
       tokenEndpointAuthMethod,
@@ -3220,6 +3998,45 @@ class OAuthHelpersImpl implements OAuthHelpers {
 
     // After all tokens are deleted, delete the grant itself
     await this.env.OAUTH_KV.delete(grantKey);
+  }
+
+  /**
+   * Decodes a token and returns token data with decrypted props
+   * @param token - The token
+   * @returns Promise resolving to token data with decrypted props, or null if token is invalid
+   */
+  async unwrapToken<T = any>(token: string): Promise<TokenSummary<T> | null> {
+    return await this.provider.unwrapToken(token, this.env);
+  }
+
+  /**
+   * Exchanges an existing access token for a new one with modified characteristics
+   * Implements OAuth 2.0 Token Exchange (RFC 8693)
+   * @param options - Options for token exchange including subject token and optional modifications
+   * @returns Promise resolving to token response with new access token
+   */
+  async exchangeToken(options: ExchangeTokenOptions): Promise<TokenResponse> {
+    // Validate subject token first to get client info
+    const tokenSummary = await this.unwrapToken(options.subjectToken);
+    if (!tokenSummary) {
+      throw new Error('Invalid or expired subject token');
+    }
+
+    const clientInfo = await this.lookupClient(tokenSummary.grant.clientId);
+    if (!clientInfo) {
+      throw new Error('Client not found');
+    }
+
+    // Perform the token exchange using the shared method
+    // Errors will be thrown directly from exchangeToken with appropriate messages
+    return await this.provider.exchangeToken(
+      options.subjectToken,
+      options.scope,
+      options.aud,
+      options.expiresIn,
+      clientInfo,
+      this.env
+    );
   }
 }
 
