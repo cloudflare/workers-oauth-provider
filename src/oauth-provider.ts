@@ -2384,39 +2384,35 @@ function validateResourceUri(uri: string): boolean {
 }
 
 /**
- * Checks if a resource server matches an audience claim
- * RFC 7519 Section 4.1.3: audience values are case-sensitive strings
+ * Checks if a resource server matches an audience claim.
+ * Uses origin comparison (case-insensitive hostname via URL normalization)
+ * and path-prefix matching on path boundaries for RFC 8707 resource indicators.
  * @param resourceServerUrl - The resource server URL (from request)
  * @param audienceValue - The audience value from token
  * @returns true if they match, false otherwise
  */
 function audienceMatches(resourceServerUrl: string, audienceValue: string): boolean {
-  // RFC 7519 Section 4.1.3: "aud" value is an array of case-sensitive strings
-
-  // Exact match (fast path)
-  if (resourceServerUrl === audienceValue) {
-    return true;
-  }
-
-  // Smart matching for backward compatibility with origin-only audiences
-  // while supporting RFC 8707 path-aware resource indicators
   try {
-    const audienceUrl = new URL(audienceValue);
-    const resourceUrl = new URL(resourceServerUrl);
+    const resource = new URL(resourceServerUrl);
+    const audience = new URL(audienceValue);
 
-    // If audience is origin-only (no path or just '/'), match by origin
-    // This maintains backward compatibility with existing code
-    if (audienceUrl.pathname === '/' || audienceUrl.pathname === '') {
-      return audienceUrl.origin === resourceUrl.origin;
+    // Origins must always match (case-insensitive via URL normalization)
+    if (resource.origin !== audience.origin) {
+      return false;
     }
 
-    // If audience has a path component, require exact match
-    // This supports RFC 8707 path-aware resource indicators
-  } catch {
-    // If URL parsing fails, no match
-  }
+    // Origin-only audience matches any path (backward compatibility)
+    if (audience.pathname === '/' || audience.pathname === '') {
+      return true;
+    }
 
-  return false;
+    // Path-aware audience: prefix match on path boundary (RFC 8707)
+    // e.g. audience "/api" matches request "/api", "/api/", "/api/users"
+    // but does NOT match "/api-v2" or "/apiary"
+    return resource.pathname === audience.pathname || resource.pathname.startsWith(audience.pathname + '/');
+  } catch {
+    return false;
+  }
 }
 
 /**

@@ -2580,10 +2580,8 @@ describe('OAuthProvider', () => {
     });
 
     it('should reject token with path-aware audience at different path (RFC 8707)', async () => {
-      // Request token with path-specific resource indicator
       const accessToken = await getAccessTokenWithResource('https://example.com/api/test');
 
-      // Request to different path should fail (strict path matching)
       const apiRequest = createMockRequest('https://example.com/api/other', 'GET', {
         Authorization: `Bearer ${accessToken}`,
       });
@@ -2596,13 +2594,118 @@ describe('OAuthProvider', () => {
       expect(error.error_description).toContain('audience');
     });
 
-    it('should accept token with path-aware audience for ChatGPT connector use case (RFC 8707)', async () => {
-      // Simulates ChatGPT custom connector flow (issue #108)
-      // ChatGPT sends resource=https://server/api/connector with path component
-      const accessToken = await getAccessTokenWithResource('https://example.com/api/connector');
+    it('should accept external token with path-aware audience at matching path (RFC 8707)', async () => {
+      const externalProvider = new OAuthProvider({
+        apiRoute: ['/api/', 'https://example.com/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        scopesSupported: ['read', 'write', 'profile'],
+        resolveExternalToken: async ({ token }) => {
+          if (token === 'external-token-path-audience') {
+            return {
+              props: { userId: 'external-user', source: 'external' },
+              audience: 'https://example.com/api/test',
+            };
+          }
+          return null;
+        },
+      });
 
-      // API request to exact matching path should succeed
-      const apiRequest = createMockRequest('https://example.com/api/connector', 'GET', {
+      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: 'Bearer external-token-path-audience',
+      });
+
+      const apiResponse = await externalProvider.fetch(apiRequest, mockEnv, mockCtx);
+
+      expect(apiResponse.status).toBe(200);
+      const data = await apiResponse.json<any>();
+      expect(data.success).toBe(true);
+    });
+
+    it('should reject external token with path-aware audience at different path (RFC 8707)', async () => {
+      const externalProvider = new OAuthProvider({
+        apiRoute: ['/api/', 'https://example.com/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        scopesSupported: ['read', 'write', 'profile'],
+        resolveExternalToken: async ({ token }) => {
+          if (token === 'external-token-path-mismatch') {
+            return {
+              props: { userId: 'external-user', source: 'external' },
+              audience: 'https://example.com/api/test',
+            };
+          }
+          return null;
+        },
+      });
+
+      const apiRequest = createMockRequest('https://example.com/api/other', 'GET', {
+        Authorization: 'Bearer external-token-path-mismatch',
+      });
+
+      const apiResponse = await externalProvider.fetch(apiRequest, mockEnv, mockCtx);
+
+      expect(apiResponse.status).toBe(401);
+      const error = await apiResponse.json<any>();
+      expect(error.error).toBe('invalid_token');
+      expect(error.error_description).toContain('audience');
+    });
+
+    it('should allow sub-path access with parent path audience (prefix matching on path boundary)', async () => {
+      const accessToken = await getAccessTokenWithResource('https://example.com/api');
+
+      const apiRequest = createMockRequest('https://example.com/api/admin', 'GET', {
+        Authorization: `Bearer ${accessToken}`,
+      });
+
+      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+
+      expect(apiResponse.status).toBe(200);
+      const data = await apiResponse.json<any>();
+      expect(data.success).toBe(true);
+    });
+
+    it('should reject access when audience path is a string prefix but not on a path boundary', async () => {
+      // audience is "/api/test" but request is "/api/testing" — the audience is a string prefix
+      // but NOT a path-boundary prefix, so it must be rejected
+      const accessToken = await getAccessTokenWithResource('https://example.com/api/test');
+
+      const apiRequest = createMockRequest('https://example.com/api/testing', 'GET', {
+        Authorization: `Bearer ${accessToken}`,
+      });
+
+      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+
+      expect(apiResponse.status).toBe(401);
+      const error = await apiResponse.json<any>();
+      expect(error.error).toBe('invalid_token');
+      expect(error.error_description).toContain('audience');
+    });
+
+    it('should match path-aware audience when request includes query string', async () => {
+      const accessToken = await getAccessTokenWithResource('https://example.com/api/test');
+
+      const apiRequest = createMockRequest('https://example.com/api/test?foo=bar&baz=qux', 'GET', {
+        Authorization: `Bearer ${accessToken}`,
+      });
+
+      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+
+      expect(apiResponse.status).toBe(200);
+      const data = await apiResponse.json<any>();
+      expect(data.success).toBe(true);
+    });
+
+    it('should accept trailing slash as sub-path of audience (prefix matching)', async () => {
+      const accessToken = await getAccessTokenWithResource('https://example.com/api/test');
+
+      const apiRequest = createMockRequest('https://example.com/api/test/', 'GET', {
         Authorization: `Bearer ${accessToken}`,
       });
 
