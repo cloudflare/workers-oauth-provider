@@ -454,6 +454,24 @@ describe('OAuthProvider', () => {
       expect(response.headers.get('Access-Control-Max-Age')).toBe('86400');
     });
 
+    it('should derive authorization_servers from tokenEndpoint origin for cross-origin auth', async () => {
+      const crossOriginProvider = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: 'https://auth.example.com/authorize',
+        tokenEndpoint: 'https://auth.example.com/oauth/token',
+        scopesSupported: ['read', 'write'],
+      });
+
+      const request = createMockRequest('https://resource.example.com/.well-known/oauth-protected-resource');
+      const response = await crossOriginProvider.fetch(request, mockEnv, mockCtx);
+
+      const metadata = await response.json<any>();
+      expect(metadata.resource).toBe('https://resource.example.com');
+      expect(metadata.authorization_servers).toEqual(['https://auth.example.com']);
+    });
+
     it('should handle OPTIONS preflight for protected resource metadata endpoint', async () => {
       const preflightRequest = createMockRequest(
         'https://example.com/.well-known/oauth-protected-resource',

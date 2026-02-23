@@ -313,7 +313,7 @@ export interface OAuthProviderOptions {
    * Controls the response served at /.well-known/oauth-protected-resource.
    *
    * If not provided, the endpoint will be automatically generated using the request origin
-   * as both the resource identifier and authorization server.
+   * as the resource identifier, and the token endpoint's origin as the authorization server.
    */
   resourceMetadata?: {
     /**
@@ -323,7 +323,8 @@ export interface OAuthProviderOptions {
     resource?: string;
     /**
      * List of authorization server issuer URLs that can issue tokens for this resource.
-     * If not set, defaults to [request URL's origin] (same-origin auth server).
+     * If not set, defaults to the token endpoint's origin (consistent with the issuer
+     * in authorization server metadata).
      */
     authorization_servers?: string[];
     /**
@@ -1584,12 +1585,15 @@ class OAuthProviderImpl {
    * @returns Response with protected resource metadata
    */
   private handleProtectedResourceMetadata(requestUrl: URL): Response {
-    const origin = requestUrl.origin;
     const rm = this.options.resourceMetadata;
 
+    // Derive authorization server from token endpoint, same as issuer in auth server metadata
+    const tokenEndpointUrl = this.getFullEndpointUrl(this.options.tokenEndpoint, requestUrl);
+    const authServerOrigin = new URL(tokenEndpointUrl).origin;
+
     const metadata: Record<string, unknown> = {
-      resource: rm?.resource ?? origin,
-      authorization_servers: rm?.authorization_servers ?? [origin],
+      resource: rm?.resource ?? requestUrl.origin,
+      authorization_servers: rm?.authorization_servers ?? [authServerOrigin],
       scopes_supported: rm?.scopes_supported ?? this.options.scopesSupported,
       bearer_methods_supported: rm?.bearer_methods_supported ?? ['header'],
     };
