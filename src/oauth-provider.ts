@@ -30,18 +30,21 @@ export enum GrantType {
   TOKEN_EXCHANGE = 'urn:ietf:params:oauth:grant-type:token-exchange',
 }
 
+/** ExecutionContext with writable props — ctx.props is read-only in types but writable at runtime */
+type MutableExecutionContext = Omit<ExecutionContext, 'props'> & { props: any };
+
 /**
  * Aliases for either type of Handler that makes .fetch required
  */
-type ExportedHandlerWithFetch<Env = unknown> = ExportedHandler<Env> & Pick<Required<ExportedHandler<Env>>, 'fetch'>;
-type WorkerEntrypointWithFetch<Env = unknown> = WorkerEntrypoint<Env> & {
+type ExportedHandlerWithFetch<Env = any> = ExportedHandler<Env> & Pick<Required<ExportedHandler<Env>>, 'fetch'>;
+type WorkerEntrypointWithFetch<Env = any> = WorkerEntrypoint<Env> & {
   fetch: NonNullable<WorkerEntrypoint['fetch']>;
 };
 
 /**
  * Discriminated union type for handlers
  */
-type TypedHandler<Env = unknown> =
+type TypedHandler<Env = any> =
   | {
       type: HandlerType.EXPORTED_HANDLER;
       handler: ExportedHandlerWithFetch<Env>;
@@ -171,7 +174,7 @@ export interface ResolveExternalTokenResult {
   audience?: string | string[];
 }
 
-export interface OAuthProviderOptions<Env = unknown> {
+export interface OAuthProviderOptions<Env = any> {
   /**
    * URL(s) for API routes. Requests with URLs starting with any of these prefixes
    * will be treated as API requests and require a valid access token.
@@ -961,7 +964,7 @@ interface CreateAccessTokenOptions {
  * Implements authorization code flow with support for refresh tokens
  * and dynamic client registration.
  */
-export class OAuthProvider<Env = unknown> {
+export class OAuthProvider<Env = any> {
   #impl: OAuthProviderImpl<Env>;
 
   /**
@@ -991,7 +994,7 @@ export class OAuthProvider<Env = unknown> {
  * @param env - Cloudflare Worker environment variables
  * @returns An instance of OAuthHelpers
  */
-export function getOAuthApi<Env = unknown>(options: OAuthProviderOptions<Env>, env: Env): OAuthHelpers {
+export function getOAuthApi<Env = any>(options: OAuthProviderOptions<Env>, env: Env): OAuthHelpers {
   const impl = new OAuthProviderImpl<Env>(options);
   return impl.createOAuthHelpers(env);
 }
@@ -1004,7 +1007,7 @@ export function getOAuthApi<Env = unknown>(options: OAuthProviderOptions<Env>, e
  * annotation, and does not actually prevent the method from being called from outside the class,
  * including over RPC.
  */
-class OAuthProviderImpl<Env = unknown> {
+class OAuthProviderImpl<Env = any> {
   /**
    * Configuration options for the provider
    */
@@ -2759,7 +2762,7 @@ class OAuthProviderImpl<Env = unknown> {
       const decryptedProps = await decryptProps(encryptionKey, tokenData.grant.encryptedProps);
 
       // Set the decrypted props on the context object
-      ctx.props = decryptedProps;
+      (ctx as MutableExecutionContext).props = decryptedProps;
     } else if (this.options.resolveExternalToken) {
       // No token data was found, so we validate the provided token with the provided validator
       const ext = await this.options.resolveExternalToken({ token: accessToken, request, env });
@@ -2787,7 +2790,7 @@ class OAuthProviderImpl<Env = unknown> {
       }
 
       // Set the external props on the context object
-      ctx.props = ext.props;
+      (ctx as MutableExecutionContext).props = ext.props;
     }
 
     // Inject OAuth helpers into env if not already present
