@@ -372,6 +372,108 @@ describe('OAuthProvider', () => {
     });
   });
 
+  describe('Protected Resource Metadata (RFC 9728)', () => {
+    it('should return default metadata at .well-known/oauth-protected-resource', async () => {
+      const request = createMockRequest('https://example.com/.well-known/oauth-protected-resource');
+      const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
+
+      expect(response.status).toBe(200);
+
+      const metadata = await response.json<any>();
+      expect(metadata.resource).toBe('https://example.com');
+      expect(metadata.authorization_servers).toEqual(['https://example.com']);
+      expect(metadata.scopes_supported).toEqual(['read', 'write', 'profile']);
+      expect(metadata.bearer_methods_supported).toEqual(['header']);
+      expect(metadata.resource_name).toBeUndefined();
+    });
+
+    it('should use custom resourceMetadata when provided', async () => {
+      const customProvider = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        scopesSupported: ['read', 'write'],
+        resourceMetadata: {
+          resource: 'https://api.example.com',
+          authorization_servers: ['https://auth.example.com'],
+          scopes_supported: ['custom:read', 'custom:write'],
+          bearer_methods_supported: ['header', 'body'],
+          resource_name: 'Example API',
+        },
+      });
+
+      const request = createMockRequest('https://example.com/.well-known/oauth-protected-resource');
+      const response = await customProvider.fetch(request, mockEnv, mockCtx);
+
+      expect(response.status).toBe(200);
+
+      const metadata = await response.json<any>();
+      expect(metadata.resource).toBe('https://api.example.com');
+      expect(metadata.authorization_servers).toEqual(['https://auth.example.com']);
+      expect(metadata.scopes_supported).toEqual(['custom:read', 'custom:write']);
+      expect(metadata.bearer_methods_supported).toEqual(['header', 'body']);
+      expect(metadata.resource_name).toBe('Example API');
+    });
+
+    it('should fall back to top-level scopesSupported when resourceMetadata.scopes_supported is not set', async () => {
+      const providerWithPartialMetadata = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        scopesSupported: ['read', 'write'],
+        resourceMetadata: {
+          resource: 'https://api.example.com',
+        },
+      });
+
+      const request = createMockRequest('https://example.com/.well-known/oauth-protected-resource');
+      const response = await providerWithPartialMetadata.fetch(request, mockEnv, mockCtx);
+
+      const metadata = await response.json<any>();
+      expect(metadata.resource).toBe('https://api.example.com');
+      expect(metadata.authorization_servers).toEqual(['https://example.com']);
+      expect(metadata.scopes_supported).toEqual(['read', 'write']);
+    });
+
+    it('should add CORS headers to protected resource metadata endpoint', async () => {
+      const request = createMockRequest('https://example.com/.well-known/oauth-protected-resource', 'GET', {
+        Origin: 'https://client.example.com',
+      });
+
+      const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get('Access-Control-Allow-Origin')).toBe('https://client.example.com');
+      expect(response.headers.get('Access-Control-Allow-Methods')).toBe('*');
+      expect(response.headers.get('Access-Control-Allow-Headers')).toBe('Authorization, *');
+      expect(response.headers.get('Access-Control-Max-Age')).toBe('86400');
+    });
+
+    it('should handle OPTIONS preflight for protected resource metadata endpoint', async () => {
+      const preflightRequest = createMockRequest(
+        'https://example.com/.well-known/oauth-protected-resource',
+        'OPTIONS',
+        {
+          Origin: 'https://spa.example.com',
+          'Access-Control-Request-Method': 'GET',
+        }
+      );
+
+      const response = await oauthProvider.fetch(preflightRequest, mockEnv, mockCtx);
+
+      expect(response.status).toBe(204);
+      expect(response.headers.get('Access-Control-Allow-Origin')).toBe('https://spa.example.com');
+      expect(response.headers.get('Access-Control-Allow-Methods')).toBe('*');
+      expect(response.headers.get('Access-Control-Allow-Headers')).toBe('Authorization, *');
+      expect(response.headers.get('Access-Control-Max-Age')).toBe('86400');
+      expect(response.headers.get('Content-Length')).toBe('0');
+    });
+  });
+
   describe('Client Registration', () => {
     it('should register a new client', async () => {
       const clientData = {
