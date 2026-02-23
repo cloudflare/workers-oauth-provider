@@ -371,6 +371,39 @@ describe('OAuthProvider', () => {
       expect(metadata.response_types_supported).toContain('code');
       expect(metadata.response_types_supported).not.toContain('token');
     });
+
+    it('should only include S256 PKCE method when allowPlainPKCE is false', async () => {
+      // Create a provider with plain PKCE disabled
+      const providerWithoutPlainPKCE = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        scopesSupported: ['read', 'write'],
+        allowPlainPKCE: false, // Enforce S256 only
+      });
+
+      const request = createMockRequest('https://example.com/.well-known/oauth-authorization-server');
+      const response = await providerWithoutPlainPKCE.fetch(request, mockEnv, mockCtx);
+
+      expect(response.status).toBe(200);
+
+      const metadata = await response.json<any>();
+      expect(metadata.code_challenge_methods_supported).toEqual(['S256']);
+      expect(metadata.code_challenge_methods_supported).not.toContain('plain');
+    });
+
+    it('should include both plain and S256 PKCE methods by default', async () => {
+      const request = createMockRequest('https://example.com/.well-known/oauth-authorization-server');
+      const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
+
+      expect(response.status).toBe(200);
+
+      const metadata = await response.json<any>();
+      expect(metadata.code_challenge_methods_supported).toContain('plain');
+      expect(metadata.code_challenge_methods_supported).toContain('S256');
+    });
   });
 
   describe('Protected Resource Metadata (RFC 9728)', () => {
@@ -821,6 +854,61 @@ describe('OAuthProvider', () => {
       await expect(providerWithoutImplicit.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
         'The implicit grant flow is not enabled for this provider'
       );
+    });
+
+    it('should reject plain PKCE when allowPlainPKCE is false', async () => {
+      // Create a provider with plain PKCE disabled
+      const providerWithoutPlainPKCE = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        scopesSupported: ['read', 'write'],
+        allowPlainPKCE: false, // Enforce S256 only
+      });
+
+      // Create an authorization request with plain PKCE
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123` +
+          `&code_challenge=test_challenge&code_challenge_method=plain`
+      );
+
+      // Expect an error response
+      await expect(providerWithoutPlainPKCE.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
+        'The plain PKCE method is not allowed. Use S256 instead.'
+      );
+    });
+
+    it('should accept S256 PKCE when allowPlainPKCE is false', async () => {
+      // Create a provider with plain PKCE disabled
+      const providerWithoutPlainPKCE = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        scopesSupported: ['read', 'write'],
+        allowPlainPKCE: false, // Enforce S256 only
+      });
+
+      // Create a valid S256 code challenge (SHA-256 of 'test_verifier' base64url encoded)
+      const codeChallenge = 'dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk';
+
+      // Create an authorization request with S256 PKCE
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123` +
+          `&code_challenge=${codeChallenge}&code_challenge_method=S256`
+      );
+
+      // This should NOT throw - S256 is allowed
+      const response = await providerWithoutPlainPKCE.fetch(authRequest, mockEnv, mockCtx);
+      // The request should be processed by the default handler
+      expect(response.status).toBe(302);
     });
 
     it('should use the access token to access API directly', async () => {
