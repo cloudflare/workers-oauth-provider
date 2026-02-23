@@ -1688,7 +1688,7 @@ class OAuthProviderImpl {
     }
 
     // Verify redirect URI if provided
-    if (redirectUri && !clientInfo.redirectUris.includes(redirectUri)) {
+    if (redirectUri && !isValidRedirectUri(redirectUri, clientInfo.redirectUris)) {
       return this.createErrorResponse('invalid_grant', 'Invalid redirect URI');
     }
 
@@ -3373,6 +3373,55 @@ function validateRedirectUriScheme(redirectUri: string): void {
 }
 
 /**
+ * Checks if a URI is a loopback redirect URI (127.0.0.0/8 or ::1)
+ * Per RFC 8252 Section 7.3, these get special port handling
+ */
+function isLoopbackUri(uri: string): boolean {
+  try {
+    const url = new URL(uri);
+    const host = url.hostname;
+    // Check for IPv4 loopback (127.0.0.0/8)
+    if (host.match(/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/)) {
+      return true;
+    }
+    // Check for IPv6 loopback (::1 or [::1])
+    if (host === '::1' || host === '[::1]') {
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Validates a redirect URI against registered URIs with RFC 8252 loopback support.
+ * For loopback URIs (127.x.x.x, ::1), any port is allowed as long as scheme, host, and path match.
+ * For non-loopback URIs, exact match is required.
+ */
+function isValidRedirectUri(requestUri: string, registeredUris: string[]): boolean {
+  return registeredUris.some((registered) => {
+    // For loopback URIs, allow any port (RFC 8252 Section 7.3)
+    if (isLoopbackUri(requestUri) && isLoopbackUri(registered)) {
+      try {
+        const reqUrl = new URL(requestUri);
+        const regUrl = new URL(registered);
+        // Must match scheme, hostname, and pathname (ignore port)
+        return (
+          reqUrl.protocol === regUrl.protocol &&
+          reqUrl.hostname === regUrl.hostname &&
+          reqUrl.pathname === regUrl.pathname
+        );
+      } catch {
+        return false;
+      }
+    }
+    // Non-loopback: exact match required
+    return requestUri === registered;
+  });
+}
+
+/**
  * Encodes a string as base64url (URL-safe base64)
  * @param str - The string to encode
  * @returns The base64url encoded string
@@ -3618,7 +3667,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
       }
       // If client exists, validate the redirect URI against registered URIs
       if (clientInfo && redirectUri) {
-        if (!clientInfo.redirectUris.includes(redirectUri)) {
+        if (!isValidRedirectUri(redirectUri, clientInfo.redirectUris)) {
           throw new Error(
             `Invalid redirect URI. The redirect URI provided does not match any registered URI for this client.`
           );
@@ -3663,7 +3712,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
 
     // Re-validate the redirectUri to prevent open redirect vulnerabilities
     const clientInfo = await this.lookupClient(clientId);
-    if (!clientInfo || !clientInfo.redirectUris.includes(redirectUri)) {
+    if (!clientInfo || !isValidRedirectUri(redirectUri, clientInfo.redirectUris)) {
       throw new Error(
         'Invalid redirect URI. The redirect URI provided does not match any registered URI for this client.'
       );
