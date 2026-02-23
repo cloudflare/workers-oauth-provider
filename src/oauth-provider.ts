@@ -307,6 +307,41 @@ export interface OAuthProviderOptions {
     status: number;
     headers: Record<string, string>;
   }) => Response | void;
+
+  /**
+   * Optional metadata for RFC 9728 OAuth 2.0 Protected Resource Metadata.
+   * Controls the response served at /.well-known/oauth-protected-resource.
+   *
+   * If not provided, the endpoint will be automatically generated using the request origin
+   * as the resource identifier, and the token endpoint's origin as the authorization server.
+   */
+  resourceMetadata?: {
+    /**
+     * The protected resource identifier URL (RFC 9728 `resource` field).
+     * If not set, defaults to the request URL's origin.
+     */
+    resource?: string;
+    /**
+     * List of authorization server issuer URLs that can issue tokens for this resource.
+     * If not set, defaults to the token endpoint's origin (consistent with the issuer
+     * in authorization server metadata).
+     */
+    authorization_servers?: string[];
+    /**
+     * Scopes supported by this protected resource.
+     * If not set, falls back to the top-level scopesSupported option.
+     */
+    scopes_supported?: string[];
+    /**
+     * Methods by which bearer tokens can be presented to this resource.
+     * Defaults to ["header"].
+     */
+    bearer_methods_supported?: string[];
+    /**
+     * Human-readable name for this resource.
+     */
+    resource_name?: string;
+  };
 }
 
 // Using ExportedHandler from Cloudflare Workers Types for both API and default handlers
@@ -1111,6 +1146,7 @@ class OAuthProviderImpl {
       if (
         this.isApiRequest(url) ||
         url.pathname === '/.well-known/oauth-authorization-server' ||
+        url.pathname === '/.well-known/oauth-protected-resource' ||
         this.isTokenEndpoint(url) ||
         (this.options.clientRegistrationEndpoint && this.isClientRegistrationEndpoint(url))
       ) {
@@ -1130,6 +1166,12 @@ class OAuthProviderImpl {
     // Handle .well-known/oauth-authorization-server
     if (url.pathname === '/.well-known/oauth-authorization-server') {
       const response = await this.handleMetadataDiscovery(url);
+      return this.addCorsHeaders(response, request);
+    }
+
+    // Handle .well-known/oauth-protected-resource (RFC 9728)
+    if (url.pathname === '/.well-known/oauth-protected-resource') {
+      const response = this.handleProtectedResourceMetadata(url);
       return this.addCorsHeaders(response, request);
     }
 
@@ -1530,6 +1572,35 @@ class OAuthProviderImpl {
       // Only enabled when global_fetch_strictly_public compat flag is set (for SSRF protection)
       client_id_metadata_document_supported: this.hasGlobalFetchStrictlyPublic(),
     };
+
+    return new Response(JSON.stringify(metadata), {
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  /**
+   * Handles the OAuth Protected Resource Metadata endpoint
+   * Implements RFC 9728 for OAuth Protected Resource Metadata
+   * @param requestUrl - The URL of the incoming request
+   * @returns Response with protected resource metadata
+   */
+  private handleProtectedResourceMetadata(requestUrl: URL): Response {
+    const rm = this.options.resourceMetadata;
+
+    // Derive authorization server from token endpoint, same as issuer in auth server metadata
+    const tokenEndpointUrl = this.getFullEndpointUrl(this.options.tokenEndpoint, requestUrl);
+    const authServerOrigin = new URL(tokenEndpointUrl).origin;
+
+    const metadata: Record<string, unknown> = {
+      resource: rm?.resource ?? requestUrl.origin,
+      authorization_servers: rm?.authorization_servers ?? [authServerOrigin],
+      scopes_supported: rm?.scopes_supported ?? this.options.scopesSupported,
+      bearer_methods_supported: rm?.bearer_methods_supported ?? ['header'],
+    };
+
+    if (rm?.resource_name) {
+      metadata.resource_name = rm.resource_name;
+    }
 
     return new Response(JSON.stringify(metadata), {
       headers: { 'Content-Type': 'application/json' },
