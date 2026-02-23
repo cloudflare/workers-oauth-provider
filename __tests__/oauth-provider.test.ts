@@ -2880,6 +2880,19 @@ describe('OAuthProvider', () => {
       expect(error.error).toBe('invalid_token');
     });
 
+    it('should include resource_metadata in WWW-Authenticate header on 401 (RFC 9728)', async () => {
+      const apiRequest = createMockRequest('https://example.com/api/test');
+
+      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+
+      expect(apiResponse.status).toBe(401);
+
+      const wwwAuth = apiResponse.headers.get('WWW-Authenticate');
+      expect(wwwAuth).toBe(
+        'Bearer realm="OAuth", resource_metadata="https://example.com/.well-known/oauth-protected-resource", error="invalid_token", error_description="Missing or invalid access token"'
+      );
+    });
+
     it('should reject API requests with an invalid token', async () => {
       const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
         Authorization: 'Bearer invalid-token',
@@ -3058,6 +3071,7 @@ describe('OAuthProvider', () => {
 
       const wwwAuth = apiResponse.headers.get('WWW-Authenticate');
       expect(wwwAuth).toContain('Bearer');
+      expect(wwwAuth).toContain('resource_metadata="https://example.com/.well-known/oauth-protected-resource"');
       expect(wwwAuth).toContain('error="invalid_token"');
       expect(wwwAuth).toContain('Invalid audience');
 
