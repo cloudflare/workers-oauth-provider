@@ -31,23 +31,25 @@ export enum GrantType {
 }
 
 /**
+ * Aliases for either type of Handler that makes .fetch required
+ */
+type ExportedHandlerWithFetch<Env = unknown> = ExportedHandler<Env> & Pick<Required<ExportedHandler<Env>>, 'fetch'>;
+type WorkerEntrypointWithFetch<Env = unknown> = WorkerEntrypoint<Env> & {
+  fetch: NonNullable<WorkerEntrypoint['fetch']>;
+};
+
+/**
  * Discriminated union type for handlers
  */
-type TypedHandler =
+type TypedHandler<Env = unknown> =
   | {
       type: HandlerType.EXPORTED_HANDLER;
-      handler: ExportedHandlerWithFetch;
+      handler: ExportedHandlerWithFetch<Env>;
     }
   | {
       type: HandlerType.WORKER_ENTRYPOINT;
-      handler: new (ctx: ExecutionContext, env: any) => WorkerEntrypointWithFetch;
+      handler: new (ctx: ExecutionContext, env: Env) => WorkerEntrypointWithFetch<Env>;
     };
-
-/**
- * Aliases for either type of Handler that makes .fetch required
- */
-type ExportedHandlerWithFetch = ExportedHandler & Pick<Required<ExportedHandler>, 'fetch'>;
-type WorkerEntrypointWithFetch = WorkerEntrypoint & Pick<Required<WorkerEntrypoint>, 'fetch'>;
 
 /**
  * Configuration options for the OAuth Provider
@@ -169,7 +171,7 @@ export interface ResolveExternalTokenResult {
   audience?: string | string[];
 }
 
-export interface OAuthProviderOptions {
+export interface OAuthProviderOptions<Env = unknown> {
   /**
    * URL(s) for API routes. Requests with URLs starting with any of these prefixes
    * will be treated as API requests and require a valid access token.
@@ -188,7 +190,9 @@ export interface OAuthProviderOptions {
    * Used with `apiRoute` for the single-handler configuration. This is incompatible with
    * the `apiHandlers` property. You must use either `apiRoute` + `apiHandler` OR `apiHandlers`, not both.
    */
-  apiHandler?: ExportedHandlerWithFetch | (new (ctx: ExecutionContext, env: any) => WorkerEntrypointWithFetch);
+  apiHandler?:
+    | ExportedHandlerWithFetch<Env>
+    | (new (ctx: ExecutionContext, env: Env) => WorkerEntrypointWithFetch<Env>);
 
   /**
    * Map of API routes to their corresponding handlers for the multi-handler configuration.
@@ -202,14 +206,14 @@ export interface OAuthProviderOptions {
    */
   apiHandlers?: Record<
     string,
-    ExportedHandlerWithFetch | (new (ctx: ExecutionContext, env: any) => WorkerEntrypointWithFetch)
+    ExportedHandlerWithFetch<Env> | (new (ctx: ExecutionContext, env: Env) => WorkerEntrypointWithFetch<Env>)
   >;
 
   /**
    * Handler for all non-API requests or API requests without a valid token.
    * Can be either an ExportedHandler object with a fetch method or a class extending WorkerEntrypoint.
    */
-  defaultHandler: ExportedHandler | (new (ctx: ExecutionContext, env: any) => WorkerEntrypointWithFetch);
+  defaultHandler: ExportedHandler<Env> | (new (ctx: ExecutionContext, env: Env) => WorkerEntrypointWithFetch<Env>);
 
   /**
    * URL of the OAuth authorization endpoint where users can grant permissions.
@@ -957,15 +961,15 @@ interface CreateAccessTokenOptions {
  * Implements authorization code flow with support for refresh tokens
  * and dynamic client registration.
  */
-export class OAuthProvider {
-  #impl: OAuthProviderImpl;
+export class OAuthProvider<Env = unknown> {
+  #impl: OAuthProviderImpl<Env>;
 
   /**
    * Creates a new OAuth provider instance
    * @param options - Configuration options for the provider
    */
-  constructor(options: OAuthProviderOptions) {
-    this.#impl = new OAuthProviderImpl(options);
+  constructor(options: OAuthProviderOptions<Env>) {
+    this.#impl = new OAuthProviderImpl<Env>(options);
   }
 
   /**
@@ -976,7 +980,7 @@ export class OAuthProvider {
    * @param ctx - Cloudflare Worker execution context
    * @returns A Promise resolving to an HTTP Response
    */
-  fetch(request: Request, env: any, ctx: ExecutionContext): Promise<Response> {
+  fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     return this.#impl.fetch(request, env, ctx);
   }
 }
@@ -987,8 +991,8 @@ export class OAuthProvider {
  * @param env - Cloudflare Worker environment variables
  * @returns An instance of OAuthHelpers
  */
-export function getOAuthApi(options: OAuthProviderOptions, env: any): OAuthHelpers {
-  const impl = new OAuthProviderImpl(options);
+export function getOAuthApi<Env = unknown>(options: OAuthProviderOptions<Env>, env: Env): OAuthHelpers {
+  const impl = new OAuthProviderImpl<Env>(options);
   return impl.createOAuthHelpers(env);
 }
 
@@ -1000,29 +1004,29 @@ export function getOAuthApi(options: OAuthProviderOptions, env: any): OAuthHelpe
  * annotation, and does not actually prevent the method from being called from outside the class,
  * including over RPC.
  */
-class OAuthProviderImpl {
+class OAuthProviderImpl<Env = unknown> {
   /**
    * Configuration options for the provider
    */
-  options: OAuthProviderOptions;
+  options: OAuthProviderOptions<Env>;
 
   /**
    * Represents the validated type of a handler (ExportedHandler or WorkerEntrypoint)
    */
-  private typedDefaultHandler: TypedHandler;
+  private typedDefaultHandler: TypedHandler<Env>;
 
   /**
    * Array of tuples of API routes and their validated handlers
    * In the simple case, this will be a single entry with the route and handler from options.apiRoute/apiHandler
    * In the advanced case, this will contain entries from options.apiHandlers
    */
-  private typedApiHandlers: Array<[string, TypedHandler]>;
+  private typedApiHandlers: Array<[string, TypedHandler<Env>]>;
 
   /**
    * Creates a new OAuth provider instance
    * @param options - Configuration options for the provider
    */
-  constructor(options: OAuthProviderOptions) {
+  constructor(options: OAuthProviderOptions<Env>) {
     // Initialize typedApiHandlers as an array
     this.typedApiHandlers = [];
 
@@ -1113,7 +1117,7 @@ class OAuthProviderImpl {
    * @returns The type of the handler (EXPORTED_HANDLER or WORKER_ENTRYPOINT)
    * @throws TypeError if the handler is invalid
    */
-  private validateHandler(handler: any, name: string): TypedHandler {
+  private validateHandler(handler: any, name: string): TypedHandler<Env> {
     if (typeof handler === 'object' && handler !== null && typeof handler.fetch === 'function') {
       // It's an ExportedHandler object
       return { type: HandlerType.EXPORTED_HANDLER, handler };
@@ -1137,7 +1141,7 @@ class OAuthProviderImpl {
    * @param ctx - Cloudflare Worker execution context
    * @returns A Promise resolving to an HTTP Response
    */
-  async fetch(request: Request, env: any, ctx: ExecutionContext): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
     // Special handling for OPTIONS requests (CORS preflight)
@@ -1207,8 +1211,8 @@ class OAuthProviderImpl {
     }
 
     // Inject OAuth helpers into env if not already present
-    if (!env.OAUTH_PROVIDER) {
-      env.OAUTH_PROVIDER = this.createOAuthHelpers(env);
+    if (!(env as Record<string, unknown>).OAUTH_PROVIDER) {
+      (env as Record<string, unknown>).OAUTH_PROVIDER = this.createOAuthHelpers(env);
     }
 
     // Call the default handler based on its type
@@ -1216,7 +1220,7 @@ class OAuthProviderImpl {
     if (this.typedDefaultHandler.type === HandlerType.EXPORTED_HANDLER) {
       // It's an object with a fetch method
       return this.typedDefaultHandler.handler.fetch(
-        request as Parameters<ExportedHandlerWithFetch['fetch']>[0],
+        request as Parameters<ExportedHandlerWithFetch<Env>['fetch']>[0],
         env,
         ctx
       );
@@ -1458,7 +1462,7 @@ class OAuthProviderImpl {
    * @param url - The URL to find a handler for
    * @returns The TypedHandler for the URL, or undefined if no handler matches
    */
-  private findApiHandlerForUrl(url: URL): TypedHandler | undefined {
+  private findApiHandlerForUrl(url: URL): TypedHandler<Env> | undefined {
     // Check each route in our array of validated API handlers
     for (const [route, handler] of this.typedApiHandlers) {
       if (this.matchApiRoute(url, route)) {
@@ -2755,7 +2759,6 @@ class OAuthProviderImpl {
       const decryptedProps = await decryptProps(encryptionKey, tokenData.grant.encryptedProps);
 
       // Set the decrypted props on the context object
-      // @ts-expect-error - ctx.props is actually writable https://github.com/cloudflare/workers-oauth-provider/issues/124
       ctx.props = decryptedProps;
     } else if (this.options.resolveExternalToken) {
       // No token data was found, so we validate the provided token with the provided validator
@@ -2784,13 +2787,12 @@ class OAuthProviderImpl {
       }
 
       // Set the external props on the context object
-      // @ts-expect-error - ctx.props is actually writable https://github.com/cloudflare/workers-oauth-provider/issues/124
       ctx.props = ext.props;
     }
 
     // Inject OAuth helpers into env if not already present
-    if (!env.OAUTH_PROVIDER) {
-      env.OAUTH_PROVIDER = this.createOAuthHelpers(env);
+    if (!(env as Record<string, unknown>).OAUTH_PROVIDER) {
+      (env as Record<string, unknown>).OAUTH_PROVIDER = this.createOAuthHelpers(env);
     }
 
     // Find the appropriate API handler for this URL
@@ -3563,14 +3565,14 @@ async function unwrapKeyWithToken(tokenStr: string, wrappedKeyBase64: string): P
  */
 class OAuthHelpersImpl implements OAuthHelpers {
   private env: any;
-  private provider: OAuthProviderImpl;
+  private provider: OAuthProviderImpl<any>;
 
   /**
    * Creates a new OAuthHelpers instance
    * @param env - Cloudflare Worker environment variables
    * @param provider - Reference to the parent provider instance
    */
-  constructor(env: any, provider: OAuthProviderImpl) {
+  constructor(env: any, provider: OAuthProviderImpl<any>) {
     this.env = env;
     this.provider = provider;
   }
