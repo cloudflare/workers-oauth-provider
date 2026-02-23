@@ -2104,18 +2104,30 @@ class OAuthProviderImpl {
     const newRefreshTokenWrappedKey = await wrapKeyWithToken(newRefreshToken, grantEncryptionKey);
 
     // Update the grant with the token rotation information
-    // The token which the client used this time becomes the "previous" token, so that the client
-    // can always use the same token again next time. This might technically violate OAuth 2.1's
-    // requirement that refresh tokens be single-use. However, this requirement violates the laws
-    // of distributed systems. It's important that the client can always retry when a transient
-    // failure occurs. Under the strict requirement, if the failure occurred after the server
-    // rotated the token but before the client managed to store the updated token, then the client
-    // no longer has any valid refresh token and has effectively lost its grant. That's bad! So
-    // instead, we don't invalidate the old token until the client successfully uses a newer token.
-    // This provides most of the security benefits (tokens still rotate naturally) but without
-    // being inherently unreliable.
-    grantData.previousRefreshTokenId = providedTokenHash;
-    grantData.previousRefreshTokenWrappedKey = wrappedKeyToUse;
+    // For confidential clients: The token which the client used this time becomes the "previous"
+    // token, so that the client can always use the same token again next time. This might
+    // technically violate OAuth 2.1's requirement that refresh tokens be single-use. However,
+    // this requirement violates the laws of distributed systems. It's important that the client
+    // can always retry when a transient failure occurs. Under the strict requirement, if the
+    // failure occurred after the server rotated the token but before the client managed to store
+    // the updated token, then the client no longer has any valid refresh token and has
+    // effectively lost its grant. That's bad! So instead, we don't invalidate the old token
+    // until the client successfully uses a newer token. This provides most of the security
+    // benefits (tokens still rotate naturally) but without being inherently unreliable.
+    //
+    // For public clients: OAuth 2.1 Section 4.3.1 requires strict single-use refresh tokens.
+    // Public clients are more vulnerable to token theft, so we enforce immediate invalidation
+    // of the old token with no grace period.
+    const isPublicClient = clientInfo.tokenEndpointAuthMethod === 'none';
+    if (isPublicClient) {
+      // Public clients: strict single-use tokens per OAuth 2.1 Section 4.3.1
+      grantData.previousRefreshTokenId = undefined;
+      grantData.previousRefreshTokenWrappedKey = undefined;
+    } else {
+      // Confidential clients: allow grace period for network resilience
+      grantData.previousRefreshTokenId = providedTokenHash;
+      grantData.previousRefreshTokenWrappedKey = wrappedKeyToUse;
+    }
 
     // The newly-generated token becomes the new "current" token.
     grantData.refreshTokenId = newRefreshTokenId;
