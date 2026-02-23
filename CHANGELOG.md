@@ -1,5 +1,75 @@
 # @cloudflare/workers-oauth-provider
 
+## 0.2.3
+
+### Patch Changes
+
+- [#117](https://github.com/cloudflare/workers-oauth-provider/pull/117) [`b2c5877`](https://github.com/cloudflare/workers-oauth-provider/commit/b2c5877617809107ea4759b22c4994f0711affe4) Thanks [@DeanMauro](https://github.com/DeanMauro)! - Add `getOAuthApi` helper function to access OAuthHelpers outside of the `fetch` method. This enables OAuth functionality in worker RPC methods and other entry points.
+
+- [#109](https://github.com/cloudflare/workers-oauth-provider/pull/109) [`9f118f3`](https://github.com/cloudflare/workers-oauth-provider/commit/9f118f36c4f0aba8a56c9179844ca47d5b37387a) Thanks [@bokhi](https://github.com/bokhi)! - fix: path-aware audience validation for RFC 8707 resource indicators. Include request pathname in `resourceServer` computation for both internal and external token validation. Replace strict equality in `audienceMatches()` with origin + path-prefix matching on path boundaries. Origin-only audiences (e.g. `https://example.com`) still match any path (backward compatible). Path-aware audiences (e.g. `https://example.com/api`) match the exact path and sub-paths (`/api/users`) but not partial matches (`/api-v2`).
+
+- [#120](https://github.com/cloudflare/workers-oauth-provider/pull/120) [`155c410`](https://github.com/cloudflare/workers-oauth-provider/commit/155c4108c781ab767d048b75eae9e9afdb0eb4d9) Thanks [@DeanMauro](https://github.com/DeanMauro)! - Add OAuth 2.0 Token Exchange (RFC 8693) support. Clients can exchange an existing access token for a new one with narrowed scopes, a different audience, or a shorter TTL — without requiring the user to re-authorize. Gated behind the `allowTokenExchangeGrant` option (default `false`). Also adds scope downscoping (RFC 6749 Section 3.3) to authorization code and refresh token flows.
+
+## 0.2.2
+
+### Patch Changes
+
+- [#129](https://github.com/cloudflare/workers-oauth-provider/pull/129) [`1e14e05`](https://github.com/cloudflare/workers-oauth-provider/commit/1e14e05e1d2521914dc829d4f33f7887dfa732ce) Thanks [@threepointone](https://github.com/threepointone)! - feat: add Client ID Metadata Document (CIMD) support
+
+  (by @mattzcarey in https://github.com/cloudflare/workers-oauth-provider/issues/112)
+
+  CIMD support allows clients to use HTTPS URLs as client_id values that
+  point to metadata documents.
+
+  When a client_id is an HTTPS URL with a non-root path, the provider
+  fetches and validates the metadata document instead of looking up in KV
+  storage. Added validation to ensure client_id in the document matches
+  the URL and redirect_uris are present.
+
+  matches the new authorization spec for MCP
+
+  https://modelcontextprotocol.io/specification/draft/basic/authorization
+
+## 0.2.1
+
+### Patch Changes
+
+- [#127](https://github.com/cloudflare/workers-oauth-provider/pull/127) [`11fd839`](https://github.com/cloudflare/workers-oauth-provider/commit/11fd839e269c888d1a1fb2753b9bf415d4d7038b) Thanks [@threepointone](https://github.com/threepointone)! - feat: add Client ID Metadata Document (CIMD) support
+
+  (by @mattzcarey in https://github.com/cloudflare/workers-oauth-provider/issues/112)
+
+  CIMD support allows clients to use HTTPS URLs as client_id values that
+  point to metadata documents.
+
+  When a client_id is an HTTPS URL with a non-root path, the provider
+  fetches and validates the metadata document instead of looking up in KV
+  storage. Added validation to ensure client_id in the document matches
+  the URL and redirect_uris are present.
+
+  matches the new authorization spec for MCP
+
+  https://modelcontextprotocol.io/specification/draft/basic/authorization
+
+## 0.1.1
+
+### Patch Changes
+
+- [#114](https://github.com/cloudflare/workers-oauth-provider/pull/114) [`768cd6c`](https://github.com/cloudflare/workers-oauth-provider/commit/768cd6c9d34488f653a678b08f33070b31c071e5) Thanks [@DeanMauro](https://github.com/DeanMauro)! - adds a method `decodeToken` that retrieves a granted access token from the KV and returns the user-defined props attached to it. This permits token decoding outside of a fetch call, e.g. an RPC call from another worker.
+
+## 0.1.0
+
+### Minor Changes
+
+- [#103](https://github.com/cloudflare/workers-oauth-provider/pull/103) [`818a557`](https://github.com/cloudflare/workers-oauth-provider/commit/818a557a0042b99282397cbaf12bff84487a737a) Thanks [@mattzcarey](https://github.com/mattzcarey)! - feat: add audience validation for OAuth tokens per RFC 7519
+
+## 0.0.13
+
+### Patch Changes
+
+- [#98](https://github.com/cloudflare/workers-oauth-provider/pull/98) [`0982a1c`](https://github.com/cloudflare/workers-oauth-provider/commit/0982a1c61e2aab25cddd929738d1f3d94be08e7a) Thanks [@threepointone](https://github.com/threepointone)! - Enhance redirect URI scheme validation for security
+
+  Added a robust helper to validate redirect URI schemes, preventing dangerous pseudo-schemes (e.g., javascript:, data:, vbscript:) with normalization and case-insensitive checks. Expanded test coverage to include bypass attempts using mixed case, whitespace, control characters, and edge cases to ensure comprehensive protection against XSS and related attacks.
+
 ## 0.0.12
 
 ### Patch Changes

@@ -1,6 +1,6 @@
 {
   "name": "@cloudflare/workers-oauth-provider",
-  "version": "0.0.12",
+  "version": "0.2.3",
   "description": "OAuth provider for Cloudflare Workers",
   "main": "dist/oauth-provider.js",
   "types": "dist/oauth-provider.d.ts",
@@ -15,8 +15,8 @@
     "access": "public"
   },
   "scripts": {
-    "build": "tsup",
-    "build:watch": "tsup --watch",
+    "build": "tsdown",
+    "build:watch": "tsdown --watch",
     "check": "npm run typecheck && npm run test",
     "typecheck": "tsc",
     "test": "vitest run",
@@ -25,14 +25,13 @@
     "prettier": "prettier -w ."
   },
   "devDependencies": {
-    "@changesets/changelog-github": "^0.5.1",
-    "@changesets/cli": "^2.29.7",
-    "@cloudflare/workers-types": "^4.20250807.0",
-    "pkg-pr-new": "^0.0.59",
-    "prettier": "^3.6.2",
-    "tsup": "^8.5.0",
-    "tsx": "^4.20.5",
-    "typescript": "^5.9.2",
+    "@changesets/changelog-github": "^0.5.2",
+    "@changesets/cli": "^2.29.8",
+    "@cloudflare/workers-types": "^4.20251218.0",
+    "pkg-pr-new": "^0.0.62",
+    "prettier": "^3.7.4",
+    "tsdown": "^0.18.1",
+    "typescript": "^5.9.3",
     "vitest": "^3.2.4"
   },
   "repository": {

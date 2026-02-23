@@ -12,11 +12,11 @@ The system implements end-to-end encryption for sensitive application-specific p
 
 All keys in the KV namespace follow a consistent pattern to make them easily identifiable:
 
-| Prefix | Purpose | Example |
-|--------|---------|---------|
-| `client:` | Client registration data | `client:abc123` |
-| `grant:{userId}:` | Authorization grant data | `grant:user123:xyz789` |
-| `token:` | Access and refresh tokens | `token:ghi789` |
+| Prefix            | Purpose                   | Example                |
+| ----------------- | ------------------------- | ---------------------- |
+| `client:`         | Client registration data  | `client:abc123`        |
+| `grant:{userId}:` | Authorization grant data  | `grant:user123:xyz789` |
+| `token:`          | Access and refresh tokens | `token:ghi789`         |
 
 ## Data Structures
 
@@ -27,6 +27,7 @@ Client records store OAuth client application information.
 **Key format:** `client:{clientId}`
 
 **Content Example:**
+
 ```json
 {
   "clientId": "abc123",
@@ -56,6 +57,7 @@ Grant records store information about permissions a user has granted to an appli
 **Key format:** `grant:{userId}:{grantId}`
 
 **Content Example (during authorization):**
+
 ```json
 {
   "id": "xyz789",
@@ -76,6 +78,7 @@ Grant records store information about permissions a user has granted to an appli
 ```
 
 **Content Example (after code exchange):**
+
 ```json
 {
   "id": "xyz789",
@@ -94,6 +97,7 @@ Grant records store information about permissions a user has granted to an appli
 ```
 
 **Content Example (after refresh token rotation):**
+
 ```json
 {
   "id": "xyz789",
@@ -114,6 +118,7 @@ Grant records store information about permissions a user has granted to an appli
 ```
 
 **TTL:**
+
 - Initially 10 minutes (during authorization process)
 - No expiration after the authorization code is exchanged for tokens
 
@@ -126,6 +131,7 @@ Token records store metadata about issued access tokens, including denormalized 
 **Key format:** `token:{userId}:{grantId}:{tokenId}`
 
 **Content Example:**
+
 ```json
 {
   "id": "ghi789",
@@ -214,7 +220,7 @@ Token records store metadata about issued access tokens, including denormalized 
    - A refresh token is generated and its hash is stored in the grant's `refreshTokenId` field
    - The wrapped key for the refresh token is stored in `refreshTokenWrappedKey`
    - The grant's TTL is removed, making it permanent
-   - A new access token is generated and stored as `token:{userId}:{grantId}:{accessTokenId}` 
+   - A new access token is generated and stored as `token:{userId}:{grantId}:{accessTokenId}`
    - The access token record includes the encrypted props, IV, and wrapped key
    - Both tokens are returned to the client
 
