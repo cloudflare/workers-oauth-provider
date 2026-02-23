@@ -632,6 +632,13 @@ export interface CompleteAuthorizationOptions {
    * authorized by this grant
    */
   props: any;
+
+  /**
+   * If true, revokes all existing grants for this user+client combination
+   * before creating the new grant. Useful for re-authorization flows where
+   * the client should use the new tokens with updated props.
+   */
+  revokeExistingGrants?: boolean;
 }
 
 /**
@@ -3764,6 +3771,17 @@ class OAuthHelpersImpl implements OAuthHelpers {
       throw new Error(
         'Invalid redirect URI. The redirect URI provided does not match any registered URI for this client.'
       );
+    }
+
+    // If requested, revoke existing grants for this user+client combination
+    // This ensures clients use the new tokens with updated props after re-authorization
+    if (options.revokeExistingGrants) {
+      const existingGrants = await this.listUserGrants(options.userId);
+      for (const grant of existingGrants.items) {
+        if (grant.clientId === clientId) {
+          await this.revokeGrant(grant.id, options.userId);
+        }
+      }
     }
 
     // Generate a unique grant ID
