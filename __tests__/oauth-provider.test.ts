@@ -170,7 +170,8 @@ function createMockEnv() {
 }
 
 describe('OAuthProvider', () => {
-  let oauthProvider: OAuthProvider;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let oauthProvider: OAuthProvider<any>;
   let mockEnv: ReturnType<typeof createMockEnv>;
   let mockCtx: MockExecutionContext;
 
@@ -4052,7 +4053,8 @@ describe('OAuthProvider', () => {
 
   describe('Token Exchange Callback', () => {
     // Test with provider that has token exchange callback
-    let oauthProviderWithCallback: OAuthProvider;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let oauthProviderWithCallback: OAuthProvider<any>;
     let callbackInvocations: any[] = [];
     let mockEnv: ReturnType<typeof createMockEnv>;
     let mockCtx: MockExecutionContext;
