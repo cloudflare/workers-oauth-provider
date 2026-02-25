@@ -634,9 +634,10 @@ export interface CompleteAuthorizationOptions {
   props: any;
 
   /**
-   * If true, revokes all existing grants for this user+client combination
-   * before creating the new grant. Useful for re-authorization flows where
-   * the client should use the new tokens with updated props.
+   * Revokes all existing grants for this user+client combination
+   * after storing the new grant. Defaults to true. This prevents stale
+   * tokens from causing infinite re-auth loops when props change.
+   * Set to false to allow multiple concurrent grants per user+client.
    */
   revokeExistingGrants?: boolean;
 }
@@ -3773,15 +3774,20 @@ class OAuthHelpersImpl implements OAuthHelpers {
       );
     }
 
-    // If requested, revoke existing grants for this user+client combination
-    // This ensures clients use the new tokens with updated props after re-authorization
-    if (options.revokeExistingGrants) {
-      const existingGrants = await this.listUserGrants(options.userId);
-      for (const grant of existingGrants.items) {
-        if (grant.clientId === clientId) {
-          await this.revokeGrant(grant.id, options.userId);
+    // If requested, collect existing grants for this user+client to revoke AFTER the new grant is created.
+    // This avoids a data-loss window where the user has no grants if creation fails.
+    let grantsToRevoke: string[] = [];
+    if (options.revokeExistingGrants !== false) {
+      let cursor: string | undefined;
+      do {
+        const page = await this.listUserGrants(options.userId, { cursor });
+        for (const grant of page.items) {
+          if (grant.clientId === clientId) {
+            grantsToRevoke.push(grant.id);
+          }
         }
-      }
+        cursor = page.cursor;
+      } while (cursor);
     }
 
     // Generate a unique grant ID
@@ -3870,6 +3876,11 @@ class OAuthHelpersImpl implements OAuthHelpers {
       // Set the fragment (hash) part of the URL
       redirectUrl.hash = fragment.toString();
 
+      // Revoke old grants AFTER the new grant is successfully stored
+      for (const oldGrantId of grantsToRevoke) {
+        await this.revokeGrant(oldGrantId, options.userId);
+      }
+
       return { redirectTo: redirectUrl.toString() };
     } else {
       // Standard authorization code flow
@@ -3912,6 +3923,11 @@ class OAuthHelpersImpl implements OAuthHelpers {
       redirectUrl.searchParams.set('code', authCode);
       if (options.request.state) {
         redirectUrl.searchParams.set('state', options.request.state);
+      }
+
+      // Revoke old grants AFTER the new grant is successfully stored
+      for (const oldGrantId of grantsToRevoke) {
+        await this.revokeGrant(oldGrantId, options.userId);
       }
 
       return { redirectTo: redirectUrl.toString() };
