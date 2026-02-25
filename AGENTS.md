@@ -4,7 +4,25 @@
 
 `@cloudflare/workers-oauth-provider` is a production-grade OAuth 2.1 provider library for Cloudflare Workers. It implements authorization code flow with PKCE, dynamic client registration, token exchange, and end-to-end encryption of sensitive data stored in KV.
 
+**Primary use case:** This library powers authentication for **MCP (Model Context Protocol) servers**. MCP servers are OAuth Resource Servers, and this library provides the authorization server functionality needed to secure them.
+
 This library was largely written with Claude AI assistance, with all code thoroughly reviewed by Cloudflare security engineers.
+
+## MCP specification compliance
+
+When modifying OAuth functionality, **always check the latest published MCP specification** (not drafts):
+
+- **Specification:** https://modelcontextprotocol.io/specification/2025-11-25
+- **Authorization section:** https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization
+
+This library must be feature-complete with the latest published MCP spec version. Key MCP auth requirements:
+
+- MCP servers are OAuth Resource Servers with protected resource metadata (RFC 9728)
+- MCP clients must support Resource Indicators (RFC 8707) for audience-scoped tokens
+- Client registration supports: out-of-band, CIMD (Client ID Metadata Documents), and DCR (Dynamic Client Registration)
+- Streamable HTTP transport uses OAuth 2.1 for authentication
+
+When in doubt about OAuth behavior, the MCP specification takes precedence for MCP-related use cases.
 
 ## Repository structure
 
