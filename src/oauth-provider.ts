@@ -3396,7 +3396,7 @@ function isLoopbackUri(uri: string): boolean {
 
 /**
  * Validates a redirect URI against registered URIs with RFC 8252 loopback support.
- * For loopback URIs (127.x.x.x, ::1), any port is allowed as long as scheme, host, and path match.
+ * For loopback URIs (127.x.x.x, ::1), any port is allowed as long as scheme, host, path, and query match.
  * For non-loopback URIs, exact match is required.
  */
 function isValidRedirectUri(requestUri: string, registeredUris: string[]): boolean {
@@ -3406,11 +3406,12 @@ function isValidRedirectUri(requestUri: string, registeredUris: string[]): boole
       try {
         const reqUrl = new URL(requestUri);
         const regUrl = new URL(registered);
-        // Must match scheme, hostname, and pathname (ignore port)
+        // Must match scheme, hostname, pathname, and query (ignore port only)
         return (
           reqUrl.protocol === regUrl.protocol &&
           reqUrl.hostname === regUrl.hostname &&
-          reqUrl.pathname === regUrl.pathname
+          reqUrl.pathname === regUrl.pathname &&
+          reqUrl.search === regUrl.search
         );
       } catch {
         return false;
