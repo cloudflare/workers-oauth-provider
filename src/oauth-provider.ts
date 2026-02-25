@@ -36,15 +36,15 @@ type MutableExecutionContext = Omit<ExecutionContext, 'props'> & { props: any };
 /**
  * Aliases for either type of Handler that makes .fetch required
  */
-type ExportedHandlerWithFetch<Env = any> = ExportedHandler<Env> & Pick<Required<ExportedHandler<Env>>, 'fetch'>;
-type WorkerEntrypointWithFetch<Env = any> = WorkerEntrypoint<Env> & {
+type ExportedHandlerWithFetch<Env = Cloudflare.Env> = ExportedHandler<Env> & Pick<Required<ExportedHandler<Env>>, 'fetch'>;
+type WorkerEntrypointWithFetch<Env = Cloudflare.Env> = WorkerEntrypoint<Env> & {
   fetch: NonNullable<WorkerEntrypoint['fetch']>;
 };
 
 /**
  * Discriminated union type for handlers
  */
-type TypedHandler<Env = any> =
+type TypedHandler<Env = Cloudflare.Env> =
   | {
       type: HandlerType.EXPORTED_HANDLER;
       handler: ExportedHandlerWithFetch<Env>;
@@ -174,7 +174,7 @@ export interface ResolveExternalTokenResult {
   audience?: string | string[];
 }
 
-export interface OAuthProviderOptions<Env = any> {
+export interface OAuthProviderOptions<Env = Cloudflare.Env> {
   /**
    * URL(s) for API routes. Requests with URLs starting with any of these prefixes
    * will be treated as API requests and require a valid access token.
@@ -964,7 +964,7 @@ interface CreateAccessTokenOptions {
  * Implements authorization code flow with support for refresh tokens
  * and dynamic client registration.
  */
-export class OAuthProvider<Env = any> {
+export class OAuthProvider<Env = Cloudflare.Env> {
   #impl: OAuthProviderImpl<Env>;
 
   /**
@@ -994,7 +994,7 @@ export class OAuthProvider<Env = any> {
  * @param env - Cloudflare Worker environment variables
  * @returns An instance of OAuthHelpers
  */
-export function getOAuthApi<Env = any>(options: OAuthProviderOptions<Env>, env: Env): OAuthHelpers {
+export function getOAuthApi<Env = Cloudflare.Env>(options: OAuthProviderOptions<Env>, env: Env): OAuthHelpers {
   const impl = new OAuthProviderImpl<Env>(options);
   return impl.createOAuthHelpers(env);
 }
@@ -1007,7 +1007,7 @@ export function getOAuthApi<Env = any>(options: OAuthProviderOptions<Env>, env: 
  * annotation, and does not actually prevent the method from being called from outside the class,
  * including over RPC.
  */
-class OAuthProviderImpl<Env = any> {
+class OAuthProviderImpl<Env = Cloudflare.Env> {
   /**
    * Configuration options for the provider
    */
