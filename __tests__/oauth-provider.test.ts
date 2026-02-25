@@ -91,8 +91,14 @@ class MockExecutionContext implements ExecutionContext {
   }
 }
 
+// Test environment type
+type TestEnv = {
+  OAUTH_KV: MockKV;
+  OAUTH_PROVIDER: OAuthHelpers | null;
+};
+
 // Simple API handler for testing
-class TestApiHandler extends WorkerEntrypoint {
+class TestApiHandler extends WorkerEntrypoint<TestEnv> {
   fetch(request: Request) {
     const url = new URL(request.url);
 
@@ -115,16 +121,16 @@ class TestApiHandler extends WorkerEntrypoint {
 
 // Simple default handler for testing
 const testDefaultHandler = {
-  async fetch(request: Request, env: any, ctx: ExecutionContext) {
+  async fetch(request: Request, env: TestEnv, ctx: ExecutionContext) {
     const url = new URL(request.url);
 
     if (url.pathname === '/authorize') {
       // Mock authorize endpoint
-      const oauthReqInfo = await env.OAUTH_PROVIDER.parseAuthRequest(request);
-      const clientInfo = await env.OAUTH_PROVIDER.lookupClient(oauthReqInfo.clientId);
+      const oauthReqInfo = await env.OAUTH_PROVIDER!.parseAuthRequest(request);
+      const clientInfo = await env.OAUTH_PROVIDER!.lookupClient(oauthReqInfo.clientId);
 
       // Mock user consent flow - automatically grant consent
-      const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
+      const { redirectTo } = await env.OAUTH_PROVIDER!.completeAuthorization({
         request: oauthReqInfo,
         userId: 'test-user-123',
         metadata: { testConsent: true },
@@ -159,20 +165,16 @@ function createMockRequest(
 }
 
 // Create a configured mock environment
-function createMockEnv() {
+function createMockEnv(): TestEnv {
   return {
     OAUTH_KV: new MockKV(),
     OAUTH_PROVIDER: null, // Will be populated by the OAuthProvider
-  } as {
-    OAUTH_KV: MockKV;
-    OAUTH_PROVIDER: OAuthHelpers | null;
   };
 }
 
 describe('OAuthProvider', () => {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let oauthProvider: OAuthProvider<any>;
-  let mockEnv: ReturnType<typeof createMockEnv>;
+  let oauthProvider: OAuthProvider<TestEnv>;
+  let mockEnv: TestEnv;
   let mockCtx: MockExecutionContext;
 
   beforeEach(() => {
@@ -206,13 +208,13 @@ describe('OAuthProvider', () => {
   describe('API Route Configuration', () => {
     it('should support multi-handler configuration with apiHandlers', async () => {
       // Create handler classes for different API routes
-      class UsersApiHandler extends WorkerEntrypoint {
+      class UsersApiHandler extends WorkerEntrypoint<TestEnv> {
         fetch(request: Request) {
           return new Response('Users API response', { status: 200 });
         }
       }
 
-      class DocumentsApiHandler extends WorkerEntrypoint {
+      class DocumentsApiHandler extends WorkerEntrypoint<TestEnv> {
         fetch(request: Request) {
           return new Response('Documents API response', { status: 200 });
         }
@@ -4053,10 +4055,9 @@ describe('OAuthProvider', () => {
 
   describe('Token Exchange Callback', () => {
     // Test with provider that has token exchange callback
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let oauthProviderWithCallback: OAuthProvider<any>;
+    let oauthProviderWithCallback: OAuthProvider<TestEnv>;
     let callbackInvocations: any[] = [];
-    let mockEnv: ReturnType<typeof createMockEnv>;
+    let mockEnv: TestEnv;
     let mockCtx: MockExecutionContext;
 
     // Helper function to create a test OAuth provider with a token exchange callback
