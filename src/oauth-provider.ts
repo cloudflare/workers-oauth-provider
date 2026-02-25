@@ -1430,6 +1430,10 @@ class OAuthProviderImpl {
   private matchApiRoute(url: URL, route: string): boolean {
     if (this.isPath(route)) {
       // It's a path - match only the pathname
+      // Special case: '/' should match exactly, not all paths (which would break OAuth routes)
+      if (route === '/') {
+        return url.pathname === '/';
+      }
       return url.pathname.startsWith(route);
     } else {
       // It's a full URL - match the entire URL including hostname
@@ -2689,13 +2693,19 @@ class OAuthProviderImpl {
    * @returns Response from the API handler or error
    */
   private async handleApiRequest(request: Request, env: any, ctx: ExecutionContext): Promise<Response> {
+    const url = new URL(request.url);
+    const resourceMetadataUrl = `${url.origin}/.well-known/oauth-protected-resource`;
+
     // Get access token from Authorization header
     const authHeader = request.headers.get('Authorization');
 
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
       return this.createErrorResponse('invalid_token', 'Missing or invalid access token', 401, {
-        'WWW-Authenticate':
-          'Bearer realm="OAuth", error="invalid_token", error_description="Missing or invalid access token"',
+        'WWW-Authenticate': this.buildWwwAuthenticateHeader(
+          resourceMetadataUrl,
+          'invalid_token',
+          'Missing or invalid access token'
+        ),
       });
     }
 
@@ -2717,7 +2727,7 @@ class OAuthProviderImpl {
     // No internal token found in KV and no external token validator provided
     if (!tokenData && !this.options.resolveExternalToken) {
       return this.createErrorResponse('invalid_token', 'Invalid access token', 401, {
-        'WWW-Authenticate': 'Bearer realm="OAuth", error="invalid_token"',
+        'WWW-Authenticate': this.buildWwwAuthenticateHeader(resourceMetadataUrl, 'invalid_token'),
       });
     }
 
@@ -2727,7 +2737,7 @@ class OAuthProviderImpl {
       const now = Math.floor(Date.now() / 1000);
       if (tokenData.expiresAt < now) {
         return this.createErrorResponse('invalid_token', 'Access token expired', 401, {
-          'WWW-Authenticate': 'Bearer realm="OAuth", error="invalid_token"',
+          'WWW-Authenticate': this.buildWwwAuthenticateHeader(resourceMetadataUrl, 'invalid_token'),
         });
       }
 
@@ -2743,7 +2753,11 @@ class OAuthProviderImpl {
         const matches = audiences.some((aud) => audienceMatches(resourceServer, aud));
         if (!matches) {
           return this.createErrorResponse('invalid_token', 'Token audience does not match resource server', 401, {
-            'WWW-Authenticate': 'Bearer realm="OAuth", error="invalid_token", error_description="Invalid audience"',
+            'WWW-Authenticate': this.buildWwwAuthenticateHeader(
+              resourceMetadataUrl,
+              'invalid_token',
+              'Invalid audience'
+            ),
           });
         }
       }
@@ -2764,7 +2778,7 @@ class OAuthProviderImpl {
       // Failed external validation
       if (!ext) {
         return this.createErrorResponse('invalid_token', 'Invalid access token', 401, {
-          'WWW-Authenticate': 'Bearer realm="OAuth", error="invalid_token"',
+          'WWW-Authenticate': this.buildWwwAuthenticateHeader(resourceMetadataUrl, 'invalid_token'),
         });
       }
 
@@ -2778,7 +2792,11 @@ class OAuthProviderImpl {
         const matches = audiences.some((aud) => audienceMatches(resourceServer, aud));
         if (!matches) {
           return this.createErrorResponse('invalid_token', 'Token audience does not match resource server', 401, {
-            'WWW-Authenticate': 'Bearer realm="OAuth", error="invalid_token", error_description="Invalid audience"',
+            'WWW-Authenticate': this.buildWwwAuthenticateHeader(
+              resourceMetadataUrl,
+              'invalid_token',
+              'Invalid audience'
+            ),
           });
         }
       }
@@ -2794,7 +2812,6 @@ class OAuthProviderImpl {
     }
 
     // Find the appropriate API handler for this URL
-    const url = new URL(request.url);
     const apiHandler = this.findApiHandlerForUrl(url);
 
     if (!apiHandler) {
@@ -3131,6 +3148,17 @@ class OAuthProviderImpl {
 
     const text = new TextDecoder().decode(allChunks);
     return JSON.parse(text);
+  }
+
+  /**
+   * Builds a WWW-Authenticate header value with resource_metadata per RFC 9728 §5.1
+   */
+  private buildWwwAuthenticateHeader(resourceMetadataUrl: string, error: string, errorDescription?: string): string {
+    let header = `Bearer realm="OAuth", resource_metadata="${resourceMetadataUrl}", error="${error}"`;
+    if (errorDescription) {
+      header += `, error_description="${errorDescription}"`;
+    }
+    return header;
   }
 
   /**
