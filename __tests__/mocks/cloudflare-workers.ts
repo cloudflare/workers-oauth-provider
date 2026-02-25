@@ -3,11 +3,11 @@
  * Provides a minimal implementation of WorkerEntrypoint for testing
  */
 
-export class WorkerEntrypoint {
+export class WorkerEntrypoint<Env = any> {
   ctx: any;
-  env: any;
+  env: Env;
 
-  constructor(ctx: any, env: any) {
+  constructor(ctx: any, env: Env) {
     this.ctx = ctx;
     this.env = env;
   }
