@@ -36,7 +36,8 @@ type MutableExecutionContext = Omit<ExecutionContext, 'props'> & { props: any };
 /**
  * Aliases for either type of Handler that makes .fetch required
  */
-type ExportedHandlerWithFetch<Env = Cloudflare.Env> = ExportedHandler<Env> & Pick<Required<ExportedHandler<Env>>, 'fetch'>;
+type ExportedHandlerWithFetch<Env = Cloudflare.Env> = ExportedHandler<Env> &
+  Pick<Required<ExportedHandler<Env>>, 'fetch'>;
 type WorkerEntrypointWithFetch<Env = Cloudflare.Env> = WorkerEntrypoint<Env> & {
   fetch: NonNullable<WorkerEntrypoint['fetch']>;
 };
