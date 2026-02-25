@@ -1438,6 +1438,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   private matchApiRoute(url: URL, route: string): boolean {
     if (this.isPath(route)) {
       // It's a path - match only the pathname
+      // Special case: '/' should match exactly, not all paths (which would break OAuth routes)
+      if (route === '/') {
+        return url.pathname === '/';
+      }
       return url.pathname.startsWith(route);
     } else {
       // It's a full URL - match the entire URL including hostname
