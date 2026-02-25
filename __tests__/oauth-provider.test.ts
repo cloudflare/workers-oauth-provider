@@ -6754,10 +6754,7 @@ describe('OAuthProvider', () => {
       });
 
       it('should still reject when no registered URI matches loopback criteria', async () => {
-        await registerClient([
-          'https://example.com/callback',
-          'http://127.0.0.1:8080/other-path',
-        ]);
+        await registerClient(['https://example.com/callback', 'http://127.0.0.1:8080/other-path']);
 
         // Different path, should not match any registered URI
         await expect(makeAuthRequest('http://127.0.0.1:55555/callback')).rejects.toThrow('Invalid redirect URI');
