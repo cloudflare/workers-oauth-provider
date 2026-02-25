@@ -8,7 +8,7 @@ on:
 
 jobs:
   bonk:
-    if: github.event.sender.type != 'Bot'
+    if: github.event.sender.type != 'Bot' && (contains(github.event.comment.body, '/bonk') || contains(github.event.comment.body, '@ask-bonk'))
     runs-on: ubuntu-latest
     timeout-minutes: 20
     concurrency:
