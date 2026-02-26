@@ -1,5 +1,21 @@
 # @cloudflare/workers-oauth-provider
 
+## 0.2.4
+
+### Patch Changes
+
+- [#136](https://github.com/cloudflare/workers-oauth-provider/pull/136) [`a8c5936`](https://github.com/cloudflare/workers-oauth-provider/commit/a8c593674b1d3dac497803758a00e880b2215f32) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Add `/.well-known/oauth-protected-resource` endpoint (RFC 9728) for OAuth 2.0 Protected Resource Metadata discovery, as required by the MCP authorization specification. The endpoint is always served with sensible defaults (request origin as resource and authorization server), and can be customized via the new `resourceMetadata` option.
+
+- [#151](https://github.com/cloudflare/workers-oauth-provider/pull/151) [`dbb150e`](https://github.com/cloudflare/workers-oauth-provider/commit/dbb150edb8655f779b0af9e0d2cce1f36bfadf37) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Add `allowPlainPKCE` option to enforce S256-only PKCE as recommended by OAuth 2.1. When set to false, the plain PKCE method is rejected and only S256 is accepted. Defaults to true for backward compatibility.
+
+- [#140](https://github.com/cloudflare/workers-oauth-provider/pull/140) [`65d5cfa`](https://github.com/cloudflare/workers-oauth-provider/commit/65d5cfa9d4e1fc52a03fcba6fc0c4539a73c296d) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Fix apiHandler route matching when set to '/' to use exact match instead of prefix match, preventing it from matching all routes and breaking OAuth endpoints
+
+- [#150](https://github.com/cloudflare/workers-oauth-provider/pull/150) [`734738c`](https://github.com/cloudflare/workers-oauth-provider/commit/734738cb519a74474435b5b911ad3c83b1f2bb73) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Fix TypeScript types by making OAuthProviderOptions generic over Env, eliminating the need for @ts-expect-error workarounds when using typed environments
+
+- [#145](https://github.com/cloudflare/workers-oauth-provider/pull/145) [`6ce5c10`](https://github.com/cloudflare/workers-oauth-provider/commit/6ce5c10826d8746bb339cf80b15f95c33fb45e99) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Add RFC 8252 Section 7.3 compliance: allow any port for loopback redirect URIs (127.x.x.x, ::1) to support native apps that use ephemeral ports
+
+- [#143](https://github.com/cloudflare/workers-oauth-provider/pull/143) [`8909060`](https://github.com/cloudflare/workers-oauth-provider/commit/890906003b8a8a249cddea731af3ee0997fbfe73) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Include `resource_metadata` URL in `WWW-Authenticate` headers on 401 responses per RFC 9728 §5.1, enabling clients to discover the protected resource metadata endpoint directly from authentication challenges.
+
 ## 0.2.3
 
 ### Patch Changes
