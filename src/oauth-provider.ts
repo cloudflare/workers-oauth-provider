@@ -1,13 +1,14 @@
-import { WorkerEntrypoint } from 'cloudflare:workers';
+import { WorkerEntrypoint } from "cloudflare:workers";
 
 // Log CIMD status on module load
 const hasStrictlyPublicFetch =
-  typeof Cloudflare !== 'undefined' && Cloudflare.compatibilityFlags?.global_fetch_strictly_public === true;
+  typeof Cloudflare !== "undefined" &&
+  Cloudflare.compatibilityFlags?.global_fetch_strictly_public === true;
 
 if (!hasStrictlyPublicFetch) {
   console.warn(
     `CIMD (Client ID Metadata Document) is disabled: add '"compatibility_flags": ["global_fetch_strictly_public"]' to your wrangler.jsonc to enable. ` +
-      `See: https://developers.cloudflare.com/workers/configuration/compatibility-flags/#global-fetch-strictly-public`
+      `See: https://developers.cloudflare.com/workers/configuration/compatibility-flags/#global-fetch-strictly-public`,
   );
 }
 
@@ -25,21 +26,21 @@ enum HandlerType {
  * Enum representing OAuth grant types
  */
 export enum GrantType {
-  AUTHORIZATION_CODE = 'authorization_code',
-  REFRESH_TOKEN = 'refresh_token',
-  TOKEN_EXCHANGE = 'urn:ietf:params:oauth:grant-type:token-exchange',
+  AUTHORIZATION_CODE = "authorization_code",
+  REFRESH_TOKEN = "refresh_token",
+  TOKEN_EXCHANGE = "urn:ietf:params:oauth:grant-type:token-exchange",
 }
 
 /** ExecutionContext with writable props — ctx.props is read-only in types but writable at runtime */
-type MutableExecutionContext = Omit<ExecutionContext, 'props'> & { props: any };
+type MutableExecutionContext = Omit<ExecutionContext, "props"> & { props: any };
 
 /**
  * Aliases for either type of Handler that makes .fetch required
  */
 type ExportedHandlerWithFetch<Env = Cloudflare.Env> = ExportedHandler<Env> &
-  Pick<Required<ExportedHandler<Env>>, 'fetch'>;
+  Pick<Required<ExportedHandler<Env>>, "fetch">;
 type WorkerEntrypointWithFetch<Env = Cloudflare.Env> = WorkerEntrypoint<Env> & {
-  fetch: NonNullable<WorkerEntrypoint['fetch']>;
+  fetch: NonNullable<WorkerEntrypoint["fetch"]>;
 };
 
 /**
@@ -210,14 +211,17 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
    */
   apiHandlers?: Record<
     string,
-    ExportedHandlerWithFetch<Env> | (new (ctx: ExecutionContext, env: Env) => WorkerEntrypointWithFetch<Env>)
+    | ExportedHandlerWithFetch<Env>
+    | (new (ctx: ExecutionContext, env: Env) => WorkerEntrypointWithFetch<Env>)
   >;
 
   /**
    * Handler for all non-API requests or API requests without a valid token.
    * Can be either an ExportedHandler object with a fetch method or a class extending WorkerEntrypoint.
    */
-  defaultHandler: ExportedHandler<Env> | (new (ctx: ExecutionContext, env: Env) => WorkerEntrypointWithFetch<Env>);
+  defaultHandler:
+    | ExportedHandler<Env>
+    | (new (ctx: ExecutionContext, env: Env) => WorkerEntrypointWithFetch<Env>);
 
   /**
    * URL of the OAuth authorization endpoint where users can grant permissions.
@@ -297,7 +301,7 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
    * If the callback returns nothing or undefined for a props field, the original props will be used.
    */
   tokenExchangeCallback?: (
-    options: TokenExchangeCallbackOptions
+    options: TokenExchangeCallbackOptions,
   ) => Promise<TokenExchangeCallbackResult | void> | TokenExchangeCallbackResult | void;
 
   /**
@@ -309,7 +313,9 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
    * The callback can optionally return props values that will passed-through to the apiHandlers.
    * The callback can return `null` to signal resolution failure.
    */
-  resolveExternalToken?: (input: ResolveExternalTokenInput) => Promise<ResolveExternalTokenResult | null>;
+  resolveExternalToken?: (
+    input: ResolveExternalTokenInput,
+  ) => Promise<ResolveExternalTokenResult | null>;
 
   /**
    * Optional callback function that is called whenever the OAuthProvider returns an error response
@@ -736,7 +742,7 @@ export interface Grant {
  */
 interface TokenResponse {
   access_token: string;
-  token_type: 'bearer';
+  token_type: "bearer";
   expires_in: number;
   refresh_token?: string;
   scope: string;
@@ -1003,7 +1009,10 @@ export class OAuthProvider<Env = Cloudflare.Env> {
  * @param env - Cloudflare Worker environment variables
  * @returns An instance of OAuthHelpers
  */
-export function getOAuthApi<Env = Cloudflare.Env>(options: OAuthProviderOptions<Env>, env: Env): OAuthHelpers {
+export function getOAuthApi<Env = Cloudflare.Env>(
+  options: OAuthProviderOptions<Env>,
+  env: Env,
+): OAuthHelpers {
   const impl = new OAuthProviderImpl<Env>(options);
   return impl.createOAuthHelpers(env);
 }
@@ -1048,24 +1057,25 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     if (hasSingleHandlerConfig && hasMultiHandlerConfig) {
       throw new TypeError(
-        'Cannot use both apiRoute/apiHandler and apiHandlers. ' +
-          'Use either apiRoute + apiHandler OR apiHandlers, not both.'
+        "Cannot use both apiRoute/apiHandler and apiHandlers. " +
+          "Use either apiRoute + apiHandler OR apiHandlers, not both.",
       );
     }
 
     if (!hasSingleHandlerConfig && !hasMultiHandlerConfig) {
       throw new TypeError(
-        'Must provide either apiRoute + apiHandler OR apiHandlers. ' + 'No API route configuration provided.'
+        "Must provide either apiRoute + apiHandler OR apiHandlers. " +
+          "No API route configuration provided.",
       );
     }
 
     // Validate default handler
-    this.typedDefaultHandler = this.validateHandler(options.defaultHandler, 'defaultHandler');
+    this.typedDefaultHandler = this.validateHandler(options.defaultHandler, "defaultHandler");
 
     // Process and validate the API handlers
     if (hasSingleHandlerConfig) {
       // Single handler mode with apiRoute + apiHandler
-      const apiHandler = this.validateHandler(options.apiHandler!, 'apiHandler');
+      const apiHandler = this.validateHandler(options.apiHandler!, "apiHandler");
 
       // For single handler mode, process the apiRoute(s) and map them all to the single apiHandler
       if (Array.isArray(options.apiRoute)) {
@@ -1074,7 +1084,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
           this.typedApiHandlers.push([route, apiHandler]);
         });
       } else {
-        this.validateEndpoint(options.apiRoute!, 'apiRoute');
+        this.validateEndpoint(options.apiRoute!, "apiRoute");
         this.typedApiHandlers.push([options.apiRoute!, apiHandler]);
       }
     } else {
@@ -1086,10 +1096,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     // Validate that the oauth endpoints are either absolute paths or full URLs
-    this.validateEndpoint(options.authorizeEndpoint, 'authorizeEndpoint');
-    this.validateEndpoint(options.tokenEndpoint, 'tokenEndpoint');
+    this.validateEndpoint(options.authorizeEndpoint, "authorizeEndpoint");
+    this.validateEndpoint(options.tokenEndpoint, "tokenEndpoint");
     if (options.clientRegistrationEndpoint) {
-      this.validateEndpoint(options.clientRegistrationEndpoint, 'clientRegistrationEndpoint');
+      this.validateEndpoint(options.clientRegistrationEndpoint, "clientRegistrationEndpoint");
     }
 
     this.options = {
@@ -1109,7 +1119,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   private validateEndpoint(endpoint: string, name: string): void {
     if (this.isPath(endpoint)) {
       // It should be an absolute path starting with /
-      if (!endpoint.startsWith('/')) {
+      if (!endpoint.startsWith("/")) {
         throw new TypeError(`${name} path must be an absolute path starting with /`);
       }
     } else {
@@ -1117,7 +1127,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       try {
         new URL(endpoint);
       } catch (e) {
-        throw new TypeError(`${name} must be either an absolute path starting with / or a valid URL`);
+        throw new TypeError(
+          `${name} must be either an absolute path starting with / or a valid URL`,
+        );
       }
     }
   }
@@ -1130,18 +1142,18 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @throws TypeError if the handler is invalid
    */
   private validateHandler(handler: any, name: string): TypedHandler<Env> {
-    if (typeof handler === 'object' && handler !== null && typeof handler.fetch === 'function') {
+    if (typeof handler === "object" && handler !== null && typeof handler.fetch === "function") {
       // It's an ExportedHandler object
       return { type: HandlerType.EXPORTED_HANDLER, handler };
     }
 
     // Check if it's a class constructor extending WorkerEntrypoint
-    if (typeof handler === 'function' && handler.prototype instanceof WorkerEntrypoint) {
+    if (typeof handler === "function" && handler.prototype instanceof WorkerEntrypoint) {
       return { type: HandlerType.WORKER_ENTRYPOINT, handler };
     }
 
     throw new TypeError(
-      `${name} must be either an ExportedHandler object with a fetch method or a class extending WorkerEntrypoint`
+      `${name} must be either an ExportedHandler object with a fetch method or a class extending WorkerEntrypoint`,
     );
   }
 
@@ -1157,12 +1169,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const url = new URL(request.url);
 
     // Special handling for OPTIONS requests (CORS preflight)
-    if (request.method === 'OPTIONS') {
+    if (request.method === "OPTIONS") {
       // For API routes and OAuth endpoints, respond with CORS headers
       if (
         this.isApiRequest(url) ||
-        url.pathname === '/.well-known/oauth-authorization-server' ||
-        url.pathname === '/.well-known/oauth-protected-resource' ||
+        url.pathname === "/.well-known/oauth-authorization-server" ||
+        url.pathname === "/.well-known/oauth-protected-resource" ||
         this.isTokenEndpoint(url) ||
         (this.options.clientRegistrationEndpoint && this.isClientRegistrationEndpoint(url))
       ) {
@@ -1170,9 +1182,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         return this.addCorsHeaders(
           new Response(null, {
             status: 204,
-            headers: { 'Content-Length': '0' },
+            headers: { "Content-Length": "0" },
           }),
-          request
+          request,
         );
       }
 
@@ -1180,13 +1192,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     // Handle .well-known/oauth-authorization-server
-    if (url.pathname === '/.well-known/oauth-authorization-server') {
+    if (url.pathname === "/.well-known/oauth-authorization-server") {
       const response = await this.handleMetadataDiscovery(url);
       return this.addCorsHeaders(response, request);
     }
 
     // Handle .well-known/oauth-protected-resource (RFC 9728)
-    if (url.pathname === '/.well-known/oauth-protected-resource') {
+    if (url.pathname === "/.well-known/oauth-protected-resource") {
       const response = this.handleProtectedResourceMetadata(url);
       return this.addCorsHeaders(response, request);
     }
@@ -1232,9 +1244,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     if (this.typedDefaultHandler.type === HandlerType.EXPORTED_HANDLER) {
       // It's an object with a fetch method
       return this.typedDefaultHandler.handler.fetch(
-        request as Parameters<ExportedHandlerWithFetch<Env>['fetch']>[0],
+        request as Parameters<ExportedHandlerWithFetch<Env>["fetch"]>[0],
         env,
-        ctx
+        ctx,
       );
     } else {
       // It's a WorkerEntrypoint class - instantiate it with ctx and env in that order
@@ -1250,7 +1262,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @returns Promise resolving to token data with decrypted props, or null if token is invalid
    */
   async unwrapToken<T = any>(token: string, env: any): Promise<TokenSummary<T> | null> {
-    const parts = token.split(':');
+    const parts = token.split(":");
     const isPossiblyInternalFormat = parts.length === 3;
 
     if (!isPossiblyInternalFormat) {
@@ -1260,7 +1272,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Retrieve the token from KV
     const [userId, grantId] = parts;
     const id = await generateTokenId(token);
-    const tokenData: Token | null = await env.OAUTH_KV.get(`token:${userId}:${grantId}:${id}`, { type: 'json' });
+    const tokenData: Token | null = await env.OAUTH_KV.get(`token:${userId}:${grantId}:${id}`, {
+      type: "json",
+    });
 
     // Return null if missing or expired
     if (!tokenData) {
@@ -1299,7 +1313,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @returns True if the endpoint is a path (starts with /), false if it's a full URL
    */
   private isPath(endpoint: string): boolean {
-    return endpoint.startsWith('/');
+    return endpoint.startsWith("/");
   }
 
   /**
@@ -1345,7 +1359,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    */
   private async parseTokenEndpointRequest(
     request: Request,
-    env: any
+    env: any,
   ): Promise<
     | {
         body: any;
@@ -1355,16 +1369,20 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     | Response
   > {
     // Only accept POST requests
-    if (request.method !== 'POST') {
-      return this.createErrorResponse('invalid_request', 'Method not allowed', 405);
+    if (request.method !== "POST") {
+      return this.createErrorResponse("invalid_request", "Method not allowed", 405);
     }
 
-    let contentType = request.headers.get('Content-Type') || '';
+    let contentType = request.headers.get("Content-Type") || "";
     let body: any = {};
 
     // According to OAuth 2.0 RFC 6749/7009, requests MUST use application/x-www-form-urlencoded
-    if (!contentType.includes('application/x-www-form-urlencoded')) {
-      return this.createErrorResponse('invalid_request', 'Content-Type must be application/x-www-form-urlencoded', 400);
+    if (!contentType.includes("application/x-www-form-urlencoded")) {
+      return this.createErrorResponse(
+        "invalid_request",
+        "Content-Type must be application/x-www-form-urlencoded",
+        400,
+      );
     }
 
     // Process application/x-www-form-urlencoded
@@ -1376,53 +1394,61 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     // Get client ID from request
-    const authHeader = request.headers.get('Authorization');
-    let clientId = '';
-    let clientSecret = '';
+    const authHeader = request.headers.get("Authorization");
+    let clientId = "";
+    let clientSecret = "";
 
-    if (authHeader && authHeader.startsWith('Basic ')) {
+    if (authHeader && authHeader.startsWith("Basic ")) {
       // Basic auth
       const credentials = atob(authHeader.substring(6));
-      const [id, secret] = credentials.split(':', 2);
+      const [id, secret] = credentials.split(":", 2);
       clientId = decodeURIComponent(id);
-      clientSecret = decodeURIComponent(secret || '');
+      clientSecret = decodeURIComponent(secret || "");
     } else {
       // Form parameters
       clientId = body.client_id;
-      clientSecret = body.client_secret || '';
+      clientSecret = body.client_secret || "";
     }
 
     if (!clientId) {
-      return this.createErrorResponse('invalid_client', 'Client ID is required', 401);
+      return this.createErrorResponse("invalid_client", "Client ID is required", 401);
     }
 
     // Verify client exists
     const clientInfo = await this.getClient(env, clientId);
     if (!clientInfo) {
-      return this.createErrorResponse('invalid_client', 'Client not found', 401);
+      return this.createErrorResponse("invalid_client", "Client not found", 401);
     }
 
     // Determine authentication requirements based on token endpoint auth method
-    const isPublicClient = clientInfo.tokenEndpointAuthMethod === 'none';
+    const isPublicClient = clientInfo.tokenEndpointAuthMethod === "none";
 
     // For confidential clients, validate the secret
     if (!isPublicClient) {
       if (!clientSecret) {
-        return this.createErrorResponse('invalid_client', 'Client authentication failed: missing client_secret', 401);
+        return this.createErrorResponse(
+          "invalid_client",
+          "Client authentication failed: missing client_secret",
+          401,
+        );
       }
 
       // Verify the client secret matches
       if (!clientInfo.clientSecret) {
         return this.createErrorResponse(
-          'invalid_client',
-          'Client authentication failed: client has no registered secret',
-          401
+          "invalid_client",
+          "Client authentication failed: client has no registered secret",
+          401,
         );
       }
 
       const providedSecretHash = await hashSecret(clientSecret);
       if (providedSecretHash !== clientInfo.clientSecret) {
-        return this.createErrorResponse('invalid_client', 'Client authentication failed: invalid client_secret', 401);
+        return this.createErrorResponse(
+          "invalid_client",
+          "Client authentication failed: invalid client_secret",
+          401,
+        );
       }
     }
 
@@ -1447,8 +1473,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     if (this.isPath(route)) {
       // It's a path - match only the pathname
       // Special case: '/' should match exactly, not all paths (which would break OAuth routes)
-      if (route === '/') {
-        return url.pathname === '/';
+      if (route === "/") {
+        return url.pathname === "/";
       }
       return url.pathname.startsWith(route);
     } else {
@@ -1513,7 +1539,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    */
   private addCorsHeaders(response: Response, request: Request): Response {
     // Get the Origin header from the request
-    const origin = request.headers.get('Origin');
+    const origin = request.headers.get("Origin");
 
     // If there's no Origin header, return the original response
     if (!origin) {
@@ -1525,11 +1551,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const newResponse = new Response(response.body, response);
 
     // Add CORS headers
-    newResponse.headers.set('Access-Control-Allow-Origin', origin);
-    newResponse.headers.set('Access-Control-Allow-Methods', '*');
+    newResponse.headers.set("Access-Control-Allow-Origin", origin);
+    newResponse.headers.set("Access-Control-Allow-Methods", "*");
     // Include Authorization explicitly since it's not included in * for security reasons
-    newResponse.headers.set('Access-Control-Allow-Headers', 'Authorization, *');
-    newResponse.headers.set('Access-Control-Max-Age', '86400'); // 24 hours
+    newResponse.headers.set("Access-Control-Allow-Headers", "Authorization, *");
+    newResponse.headers.set("Access-Control-Max-Age", "86400"); // 24 hours
 
     return newResponse;
   }
@@ -1547,15 +1573,18 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     let registrationEndpoint: string | undefined = undefined;
     if (this.options.clientRegistrationEndpoint) {
-      registrationEndpoint = this.getFullEndpointUrl(this.options.clientRegistrationEndpoint, requestUrl);
+      registrationEndpoint = this.getFullEndpointUrl(
+        this.options.clientRegistrationEndpoint,
+        requestUrl,
+      );
     }
 
     // Determine supported response types
-    const responseTypesSupported = ['code'];
+    const responseTypesSupported = ["code"];
 
     // Add token response type if implicit flow is allowed
     if (this.options.allowImplicitFlow) {
-      responseTypesSupported.push('token');
+      responseTypesSupported.push("token");
     }
 
     // Determine supported grant types
@@ -1572,10 +1601,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       registration_endpoint: registrationEndpoint,
       scopes_supported: this.options.scopesSupported,
       response_types_supported: responseTypesSupported,
-      response_modes_supported: ['query'],
+      response_modes_supported: ["query"],
       grant_types_supported: grantTypesSupported,
       // Support "none" auth method for public clients
-      token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post', 'none'],
+      token_endpoint_auth_methods_supported: ["client_secret_basic", "client_secret_post", "none"],
       // not implemented: token_endpoint_auth_signing_alg_values_supported
       // not implemented: service_documentation
       // not implemented: ui_locales_supported
@@ -1587,14 +1616,15 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       // not implemented: introspection_endpoint
       // not implemented: introspection_endpoint_auth_methods_supported
       // not implemented: introspection_endpoint_auth_signing_alg_values_supported
-      code_challenge_methods_supported: this.options.allowPlainPKCE !== false ? ['plain', 'S256'] : ['S256'], // PKCE support
+      code_challenge_methods_supported:
+        this.options.allowPlainPKCE !== false ? ["plain", "S256"] : ["S256"], // PKCE support
       // MCP Client ID Metadata Document support (CIMD)
       // Only enabled when global_fetch_strictly_public compat flag is set (for SSRF protection)
       client_id_metadata_document_supported: this.hasGlobalFetchStrictlyPublic(),
     };
 
     return new Response(JSON.stringify(metadata), {
-      headers: { 'Content-Type': 'application/json' },
+      headers: { "Content-Type": "application/json" },
     });
   }
 
@@ -1615,7 +1645,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       resource: rm?.resource ?? requestUrl.origin,
       authorization_servers: rm?.authorization_servers ?? [authServerOrigin],
       scopes_supported: rm?.scopes_supported ?? this.options.scopesSupported,
-      bearer_methods_supported: rm?.bearer_methods_supported ?? ['header'],
+      bearer_methods_supported: rm?.bearer_methods_supported ?? ["header"],
     };
 
     if (rm?.resource_name) {
@@ -1623,7 +1653,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     return new Response(JSON.stringify(metadata), {
-      headers: { 'Content-Type': 'application/json' },
+      headers: { "Content-Type": "application/json" },
     });
   }
 
@@ -1646,7 +1676,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     } else if (grantType === GrantType.TOKEN_EXCHANGE && this.options.allowTokenExchangeGrant) {
       return this.handleTokenExchangeGrant(body, clientInfo, env);
     } else {
-      return this.createErrorResponse('unsupported_grant_type', 'Grant type not supported');
+      return this.createErrorResponse("unsupported_grant_type", "Grant type not supported");
     }
   }
 
@@ -1658,45 +1688,52 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @param env - Cloudflare Worker environment variables
    * @returns Response with token data or error
    */
-  private async handleAuthorizationCodeGrant(body: any, clientInfo: ClientInfo, env: any): Promise<Response> {
+  private async handleAuthorizationCodeGrant(
+    body: any,
+    clientInfo: ClientInfo,
+    env: any,
+  ): Promise<Response> {
     const code = body.code;
     const redirectUri = body.redirect_uri;
     const codeVerifier = body.code_verifier;
 
     if (!code) {
-      return this.createErrorResponse('invalid_request', 'Authorization code is required');
+      return this.createErrorResponse("invalid_request", "Authorization code is required");
     }
 
     // Parse the authorization code to extract user ID and grant ID
-    const codeParts = code.split(':');
+    const codeParts = code.split(":");
     if (codeParts.length !== 3) {
-      return this.createErrorResponse('invalid_grant', 'Invalid authorization code format');
+      return this.createErrorResponse("invalid_grant", "Invalid authorization code format");
     }
 
     const [userId, grantId, _] = codeParts;
 
     // Get the grant
     const grantKey = `grant:${userId}:${grantId}`;
-    const grantData: Grant | null = await env.OAUTH_KV.get(grantKey, { type: 'json' });
+    const grantData: Grant | null = await env.OAUTH_KV.get(grantKey, { type: "json" });
 
     if (!grantData) {
-      return this.createErrorResponse('invalid_grant', 'Grant not found or authorization code expired');
+      return this.createErrorResponse(
+        "invalid_grant",
+        "Grant not found or authorization code expired",
+      );
     }
 
     // Verify that the grant contains an auth code hash
     if (!grantData.authCodeId) {
-      return this.createErrorResponse('invalid_grant', 'Authorization code already used');
+      return this.createErrorResponse("invalid_grant", "Authorization code already used");
     }
 
     // Verify the authorization code by comparing its hash to the one in the grant
     const codeHash = await hashSecret(code);
     if (codeHash !== grantData.authCodeId) {
-      return this.createErrorResponse('invalid_grant', 'Invalid authorization code');
+      return this.createErrorResponse("invalid_grant", "Invalid authorization code");
     }
 
     // Verify client ID matches
     if (grantData.clientId !== clientInfo.clientId) {
-      return this.createErrorResponse('invalid_grant', 'Client ID mismatch');
+      return this.createErrorResponse("invalid_grant", "Client ID mismatch");
     }
 
     // Check if PKCE is being used
@@ -1704,33 +1741,39 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // OAuth 2.1 requires redirect_uri parameter unless PKCE is used
     if (!redirectUri && !isPkceEnabled) {
-      return this.createErrorResponse('invalid_request', 'redirect_uri is required when not using PKCE');
+      return this.createErrorResponse(
+        "invalid_request",
+        "redirect_uri is required when not using PKCE",
+      );
     }
 
     // Verify redirect URI if provided
     if (redirectUri && !isValidRedirectUri(redirectUri, clientInfo.redirectUris)) {
-      return this.createErrorResponse('invalid_grant', 'Invalid redirect URI');
+      return this.createErrorResponse("invalid_grant", "Invalid redirect URI");
     }
 
     // Reject if code_verifier is provided but PKCE wasn't used in authorization
     if (!isPkceEnabled && codeVerifier) {
-      return this.createErrorResponse('invalid_request', 'code_verifier provided for a flow that did not use PKCE');
+      return this.createErrorResponse(
+        "invalid_request",
+        "code_verifier provided for a flow that did not use PKCE",
+      );
     }
 
     // Verify PKCE code_verifier if code_challenge was provided during authorization
     if (isPkceEnabled) {
       if (!codeVerifier) {
-        return this.createErrorResponse('invalid_request', 'code_verifier is required for PKCE');
+        return this.createErrorResponse("invalid_request", "code_verifier is required for PKCE");
       }
 
       // Verify the code verifier against the stored code challenge
       let calculatedChallenge: string;
 
-      if (grantData.codeChallengeMethod === 'S256') {
+      if (grantData.codeChallengeMethod === "S256") {
         // SHA-256 transformation for S256 method
         const encoder = new TextEncoder();
         const data = encoder.encode(codeVerifier);
-        const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+        const hashBuffer = await crypto.subtle.digest("SHA-256", data);
         const hashArray = Array.from(new Uint8Array(hashBuffer));
         calculatedChallenge = base64UrlEncode(String.fromCharCode(...hashArray));
       } else {
@@ -1739,7 +1782,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       }
 
       if (calculatedChallenge !== grantData.codeChallenge) {
-        return this.createErrorResponse('invalid_grant', 'Invalid PKCE code_verifier');
+        return this.createErrorResponse("invalid_grant", "Invalid PKCE code_verifier");
       }
     }
 
@@ -1778,7 +1821,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         props: decryptedProps,
       };
 
-      const callbackResult = await Promise.resolve(this.options.tokenExchangeCallback(callbackOptions));
+      const callbackResult = await Promise.resolve(
+        this.options.tokenExchangeCallback(callbackOptions),
+      );
 
       if (callbackResult) {
         // Use the returned props if provided, otherwise keep the original props
@@ -1803,7 +1848,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         }
 
         // If refreshTokenTTL was specified, use that for this grant
-        if ('refreshTokenTTL' in callbackResult) {
+        if ("refreshTokenTTL" in callbackResult) {
           refreshTokenTTL = callbackResult.refreshTokenTTL;
         }
 
@@ -1872,14 +1917,16 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Validate downscoping: token request resources must be subset of grant resources
     if (body.resource && grantData.resource) {
       const requestedResources = Array.isArray(body.resource) ? body.resource : [body.resource];
-      const grantedResources = Array.isArray(grantData.resource) ? grantData.resource : [grantData.resource];
+      const grantedResources = Array.isArray(grantData.resource)
+        ? grantData.resource
+        : [grantData.resource];
 
       // Check that all requested resources are in the granted resources
       for (const requested of requestedResources) {
         if (!grantedResources.includes(requested)) {
           return this.createErrorResponse(
-            'invalid_target',
-            'Requested resource was not included in the authorization request'
+            "invalid_target",
+            "Requested resource was not included in the authorization request",
           );
         }
       }
@@ -1890,8 +1937,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     if ((body.resource || grantData.resource) && !audience) {
       // RFC 8707 Section 2.1: invalid or unacceptable resource
       return this.createErrorResponse(
-        'invalid_target',
-        'The resource parameter must be a valid absolute URI without a fragment'
+        "invalid_target",
+        "The resource parameter must be a valid absolute URI without a fragment",
       );
     }
 
@@ -1911,9 +1958,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Build the response
     const tokenResponse: TokenResponse = {
       access_token: accessToken,
-      token_type: 'bearer',
+      token_type: "bearer",
       expires_in: accessTokenTTL,
-      scope: tokenScopes.join(' '),
+      scope: tokenScopes.join(" "),
     };
 
     if (refreshToken) {
@@ -1927,7 +1974,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Return the tokens
     return new Response(JSON.stringify(tokenResponse), {
-      headers: { 'Content-Type': 'application/json' },
+      headers: { "Content-Type": "application/json" },
     });
   }
 
@@ -1939,17 +1986,21 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @param env - Cloudflare Worker environment variables
    * @returns Response with token data or error
    */
-  private async handleRefreshTokenGrant(body: any, clientInfo: ClientInfo, env: any): Promise<Response> {
+  private async handleRefreshTokenGrant(
+    body: any,
+    clientInfo: ClientInfo,
+    env: any,
+  ): Promise<Response> {
     const refreshToken = body.refresh_token;
 
     if (!refreshToken) {
-      return this.createErrorResponse('invalid_request', 'Refresh token is required');
+      return this.createErrorResponse("invalid_request", "Refresh token is required");
     }
 
     // Parse the token to extract user ID and grant ID
-    const tokenParts = refreshToken.split(':');
+    const tokenParts = refreshToken.split(":");
     if (tokenParts.length !== 3) {
-      return this.createErrorResponse('invalid_grant', 'Invalid token format');
+      return this.createErrorResponse("invalid_grant", "Invalid token format");
     }
 
     const [userId, grantId, _] = tokenParts;
@@ -1959,10 +2010,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Get the associated grant using userId in the key
     const grantKey = `grant:${userId}:${grantId}`;
-    const grantData: Grant | null = await env.OAUTH_KV.get(grantKey, { type: 'json' });
+    const grantData: Grant | null = await env.OAUTH_KV.get(grantKey, { type: "json" });
 
     if (!grantData) {
-      return this.createErrorResponse('invalid_grant', 'Grant not found');
+      return this.createErrorResponse("invalid_grant", "Grant not found");
     }
 
     // Check if the provided token matches either the current or previous refresh token
@@ -1970,19 +2021,19 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const isPreviousToken = grantData.previousRefreshTokenId === providedTokenHash;
 
     if (!isCurrentToken && !isPreviousToken) {
-      return this.createErrorResponse('invalid_grant', 'Invalid refresh token');
+      return this.createErrorResponse("invalid_grant", "Invalid refresh token");
     }
 
     // Verify client ID matches
     if (grantData.clientId !== clientInfo.clientId) {
-      return this.createErrorResponse('invalid_grant', 'Client ID mismatch');
+      return this.createErrorResponse("invalid_grant", "Client ID mismatch");
     }
 
     // Check if the refresh token has expired
     if (grantData.expiresAt !== undefined) {
       const now = Math.floor(Date.now() / 1000);
       if (now >= grantData.expiresAt) {
-        return this.createErrorResponse('invalid_grant', 'Refresh token has expired');
+        return this.createErrorResponse("invalid_grant", "Refresh token has expired");
       }
     }
 
@@ -2035,7 +2086,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         props: decryptedProps,
       };
 
-      const callbackResult = await Promise.resolve(this.options.tokenExchangeCallback(callbackOptions));
+      const callbackResult = await Promise.resolve(
+        this.options.tokenExchangeCallback(callbackOptions),
+      );
 
       if (callbackResult) {
         // Use the returned props if provided, otherwise keep the original props
@@ -2061,10 +2114,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         }
 
         // refreshTokenTTL changes are not supported during refresh token exchange
-        if ('refreshTokenTTL' in callbackResult) {
+        if ("refreshTokenTTL" in callbackResult) {
           return this.createErrorResponse(
-            'invalid_request',
-            'refreshTokenTTL cannot be changed during refresh token exchange'
+            "invalid_request",
+            "refreshTokenTTL cannot be changed during refresh token exchange",
           );
         }
 
@@ -2148,14 +2201,16 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Validate downscoping: token request resources must be subset of grant resources
     if (body.resource && grantData.resource) {
       const requestedResources = Array.isArray(body.resource) ? body.resource : [body.resource];
-      const grantedResources = Array.isArray(grantData.resource) ? grantData.resource : [grantData.resource];
+      const grantedResources = Array.isArray(grantData.resource)
+        ? grantData.resource
+        : [grantData.resource];
 
       // Check that all requested resources are in the granted resources
       for (const requested of requestedResources) {
         if (!grantedResources.includes(requested)) {
           return this.createErrorResponse(
-            'invalid_target',
-            'Requested resource was not included in the authorization request'
+            "invalid_target",
+            "Requested resource was not included in the authorization request",
           );
         }
       }
@@ -2166,8 +2221,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     if ((body.resource || grantData.resource) && !audience) {
       // RFC 8707 Section 2.1: invalid or unacceptable resource
       return this.createErrorResponse(
-        'invalid_target',
-        'The resource parameter must be a valid absolute URI without a fragment'
+        "invalid_target",
+        "The resource parameter must be a valid absolute URI without a fragment",
       );
     }
 
@@ -2189,17 +2244,21 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     };
 
     // Save access token with TTL (using the potentially callback-provided TTL)
-    await env.OAUTH_KV.put(`token:${userId}:${grantId}:${accessTokenId}`, JSON.stringify(accessTokenData), {
-      expirationTtl: accessTokenTTL,
-    });
+    await env.OAUTH_KV.put(
+      `token:${userId}:${grantId}:${accessTokenId}`,
+      JSON.stringify(accessTokenData),
+      {
+        expirationTtl: accessTokenTTL,
+      },
+    );
 
     // Build the response
     const tokenResponse: TokenResponse = {
       access_token: newAccessToken,
-      token_type: 'bearer',
+      token_type: "bearer",
       expires_in: accessTokenTTL,
       refresh_token: newRefreshToken,
-      scope: tokenScopes.join(' '),
+      scope: tokenScopes.join(" "),
     };
 
     // RFC 8707 Section 2.2: SHOULD return resource parameter in response
@@ -2209,7 +2268,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Return the tokens
     return new Response(JSON.stringify(tokenResponse), {
-      headers: { 'Content-Type': 'application/json' },
+      headers: { "Content-Type": "application/json" },
     });
   }
 
@@ -2234,19 +2293,19 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     requestedResource: string | string[] | undefined,
     expiresIn: number | undefined,
     clientInfo: ClientInfo,
-    env: any
+    env: any,
   ): Promise<TokenResponse & { issued_token_type?: string }> {
     // Unwrap and validate the subject token
     const tokenSummary = await this.unwrapToken(subjectToken, env);
     if (!tokenSummary) {
-      throw new OAuthError('invalid_grant', 'Invalid or expired subject token');
+      throw new OAuthError("invalid_grant", "Invalid or expired subject token");
     }
 
     // Get the grant to access resource information
     const grantKey = `grant:${tokenSummary.userId}:${tokenSummary.grantId}`;
-    const grantData: Grant | null = await env.OAUTH_KV.get(grantKey, { type: 'json' });
+    const grantData: Grant | null = await env.OAUTH_KV.get(grantKey, { type: "json" });
     if (!grantData) {
-      throw new OAuthError('invalid_grant', 'Grant not found');
+      throw new OAuthError("invalid_grant", "Grant not found");
     }
 
     // If scopes are requested, validate they are a subset of the original grant scopes
@@ -2257,13 +2316,20 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     if (requestedResource) {
       // Validate downscoping: requested resources must be subset of grant resources if grant had resources
       if (grantData.resource) {
-        const requestedResources = Array.isArray(requestedResource) ? requestedResource : [requestedResource];
-        const grantedResources = Array.isArray(grantData.resource) ? grantData.resource : [grantData.resource];
+        const requestedResources = Array.isArray(requestedResource)
+          ? requestedResource
+          : [requestedResource];
+        const grantedResources = Array.isArray(grantData.resource)
+          ? grantData.resource
+          : [grantData.resource];
 
         // Check that all requested resources are in the granted resources
         for (const requested of requestedResources) {
           if (!grantedResources.includes(requested)) {
-            throw new OAuthError('invalid_target', 'Requested resource was not included in the authorization request');
+            throw new OAuthError(
+              "invalid_target",
+              "Requested resource was not included in the authorization request",
+            );
           }
         }
       }
@@ -2272,8 +2338,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       const parsedResource = parseResourceParameter(requestedResource);
       if (!parsedResource) {
         throw new OAuthError(
-          'invalid_target',
-          'The resource parameter must be a valid absolute URI without a fragment'
+          "invalid_target",
+          "The resource parameter must be a valid absolute URI without a fragment",
         );
       }
       newAudience = parsedResource;
@@ -2287,7 +2353,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // If expiresIn is provided, use it but clamp to subject token's remaining lifetime
     if (expiresIn !== undefined) {
       if (expiresIn <= 0) {
-        throw new OAuthError('invalid_request', 'Invalid expires_in parameter');
+        throw new OAuthError("invalid_request", "Invalid expires_in parameter");
       }
       accessTokenTTL = Math.min(expiresIn, subjectTokenRemainingLifetime);
     } else {
@@ -2298,15 +2364,18 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Get the subject token data to access encryption key
     const subjectTokenData: Token | null = await env.OAUTH_KV.get(
       `token:${tokenSummary.userId}:${tokenSummary.grantId}:${tokenSummary.id}`,
-      { type: 'json' }
+      { type: "json" },
     );
 
     if (!subjectTokenData) {
-      throw new OAuthError('invalid_grant', 'Subject token data not found');
+      throw new OAuthError("invalid_grant", "Subject token data not found");
     }
 
     // Unwrap the encryption key from the subject token
-    const encryptionKey = await unwrapKeyWithToken(subjectToken, subjectTokenData.wrappedEncryptionKey);
+    const encryptionKey = await unwrapKeyWithToken(
+      subjectToken,
+      subjectTokenData.wrappedEncryptionKey,
+    );
 
     // Use the same props as the subject token
     let accessTokenEncryptionKey = encryptionKey;
@@ -2314,7 +2383,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Process token exchange callback if provided
     if (this.options.tokenExchangeCallback) {
-      const decryptedProps = await decryptProps(encryptionKey, subjectTokenData.grant.encryptedProps);
+      const decryptedProps = await decryptProps(
+        encryptionKey,
+        subjectTokenData.grant.encryptedProps,
+      );
 
       const callbackOptions: TokenExchangeCallbackOptions = {
         grantType: GrantType.TOKEN_EXCHANGE,
@@ -2325,7 +2397,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         props: decryptedProps,
       };
 
-      const callbackResult = await Promise.resolve(this.options.tokenExchangeCallback(callbackOptions));
+      const callbackResult = await Promise.resolve(
+        this.options.tokenExchangeCallback(callbackOptions),
+      );
 
       if (callbackResult) {
         let accessTokenProps = decryptedProps;
@@ -2376,10 +2450,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Build the response per RFC 8693
     const tokenResponse: TokenResponse & { issued_token_type?: string } = {
       access_token: newAccessToken,
-      issued_token_type: 'urn:ietf:params:oauth:token-type:access_token',
-      token_type: 'bearer',
+      issued_token_type: "urn:ietf:params:oauth:token-type:access_token",
+      token_type: "bearer",
       expires_in: accessTokenTTL,
-      scope: tokenScopes.join(' '),
+      scope: tokenScopes.join(" "),
     };
 
     // RFC 8707 Section 2.2: SHOULD return resource parameter in response
@@ -2398,41 +2472,52 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @param env - Cloudflare Worker environment variables
    * @returns Response with new token data or error
    */
-  private async handleTokenExchangeGrant(body: any, clientInfo: ClientInfo, env: any): Promise<Response> {
+  private async handleTokenExchangeGrant(
+    body: any,
+    clientInfo: ClientInfo,
+    env: any,
+  ): Promise<Response> {
     const subjectToken = body.subject_token;
     const subjectTokenType = body.subject_token_type;
-    const requestedTokenType = body.requested_token_type || 'urn:ietf:params:oauth:token-type:access_token';
+    const requestedTokenType =
+      body.requested_token_type || "urn:ietf:params:oauth:token-type:access_token";
     const requestedScope = body.scope;
     const requestedResource = body.resource;
 
     // Validate required parameters
     if (!subjectToken) {
-      return this.createErrorResponse('invalid_request', 'subject_token is required');
+      return this.createErrorResponse("invalid_request", "subject_token is required");
     }
 
     if (!subjectTokenType) {
-      return this.createErrorResponse('invalid_request', 'subject_token_type is required');
+      return this.createErrorResponse("invalid_request", "subject_token_type is required");
     }
 
     // Only support access token as subject token type
-    if (subjectTokenType !== 'urn:ietf:params:oauth:token-type:access_token') {
-      return this.createErrorResponse('invalid_request', 'Only access_token subject_token_type is supported');
+    if (subjectTokenType !== "urn:ietf:params:oauth:token-type:access_token") {
+      return this.createErrorResponse(
+        "invalid_request",
+        "Only access_token subject_token_type is supported",
+      );
     }
 
     // Only support access token as requested token type
-    if (requestedTokenType !== 'urn:ietf:params:oauth:token-type:access_token') {
-      return this.createErrorResponse('invalid_request', 'Only access_token requested_token_type is supported');
+    if (requestedTokenType !== "urn:ietf:params:oauth:token-type:access_token") {
+      return this.createErrorResponse(
+        "invalid_request",
+        "Only access_token requested_token_type is supported",
+      );
     }
 
     // Parse requested scopes
     let requestedScopes: string[] | undefined;
     if (requestedScope) {
-      if (typeof requestedScope === 'string') {
-        requestedScopes = requestedScope.split(' ').filter(Boolean);
+      if (typeof requestedScope === "string") {
+        requestedScopes = requestedScope.split(" ").filter(Boolean);
       } else if (Array.isArray(requestedScope)) {
         requestedScopes = requestedScope;
       } else {
-        return this.createErrorResponse('invalid_request', 'Invalid scope parameter format');
+        return this.createErrorResponse("invalid_request", "Invalid scope parameter format");
       }
     }
 
@@ -2441,7 +2526,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     if (body.expires_in !== undefined) {
       const requestedTTL = parseInt(body.expires_in, 10);
       if (isNaN(requestedTTL) || requestedTTL <= 0) {
-        return this.createErrorResponse('invalid_request', 'Invalid expires_in parameter');
+        return this.createErrorResponse("invalid_request", "Invalid expires_in parameter");
       }
       expiresIn = requestedTTL;
     }
@@ -2454,12 +2539,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         requestedResource,
         expiresIn,
         clientInfo,
-        env
+        env,
       );
 
       // Return the token
       return new Response(JSON.stringify(tokenResponse), {
-        headers: { 'Content-Type': 'application/json' },
+        headers: { "Content-Type": "application/json" },
       });
     } catch (error) {
       // Convert OAuthError to HTTP error response
@@ -2493,11 +2578,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const token = body.token;
 
     if (!token) {
-      return this.createErrorResponse('invalid_request', 'Token parameter is required');
+      return this.createErrorResponse("invalid_request", "Token parameter is required");
     }
-    const tokenParts = token.split(':');
+    const tokenParts = token.split(":");
     if (tokenParts.length !== 3) {
-      return new Response('', { status: 200 });
+      return new Response("", { status: 200 });
     }
 
     const [userId, grantId, _] = tokenParts;
@@ -2511,7 +2596,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     } else if (isRefreshToken) {
       await this.createOAuthHelpers(env).revokeGrant(grantId, userId);
     }
-    return new Response('', { status: 200 });
+    return new Response("", { status: 200 });
   }
 
   /**
@@ -2521,7 +2606,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @param grantId - The grant ID extracted from the token
    * @param env - Cloudflare Worker environment variables
    */
-  private async revokeSpecificAccessToken(tokenId: string, userId: string, grantId: string, env: any): Promise<void> {
+  private async revokeSpecificAccessToken(
+    tokenId: string,
+    userId: string,
+    grantId: string,
+    env: any,
+  ): Promise<void> {
     const tokenKey = `token:${userId}:${grantId}:${tokenId}`;
     await env.OAUTH_KV.delete(tokenKey);
   }
@@ -2534,9 +2624,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @param env - Cloudflare Worker environment variables
    * @returns Promise<boolean> indicating if the token is valid
    */
-  private async validateAccessToken(tokenId: string, userId: string, grantId: string, env: any): Promise<boolean> {
+  private async validateAccessToken(
+    tokenId: string,
+    userId: string,
+    grantId: string,
+    env: any,
+  ): Promise<boolean> {
     const tokenKey = `token:${userId}:${grantId}:${tokenId}`;
-    const tokenData = await env.OAUTH_KV.get(tokenKey, { type: 'json' });
+    const tokenData = await env.OAUTH_KV.get(tokenKey, { type: "json" });
 
     if (!tokenData) {
       return false;
@@ -2555,9 +2650,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @param env - Cloudflare Worker environment variables
    * @returns Promise<boolean> indicating if the token is valid
    */
-  private async validateRefreshToken(tokenId: string, userId: string, grantId: string, env: any): Promise<boolean> {
+  private async validateRefreshToken(
+    tokenId: string,
+    userId: string,
+    grantId: string,
+    env: any,
+  ): Promise<boolean> {
     const grantKey = `grant:${userId}:${grantId}`;
-    const grantData = await env.OAUTH_KV.get(grantKey, { type: 'json' });
+    const grantData = await env.OAUTH_KV.get(grantKey, { type: "json" });
 
     if (!grantData) {
       return false;
@@ -2575,19 +2675,23 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    */
   private async handleClientRegistration(request: Request, env: any): Promise<Response> {
     if (!this.options.clientRegistrationEndpoint) {
-      return this.createErrorResponse('not_implemented', 'Client registration is not enabled', 501);
+      return this.createErrorResponse("not_implemented", "Client registration is not enabled", 501);
     }
 
     // Check method
-    if (request.method !== 'POST') {
-      return this.createErrorResponse('invalid_request', 'Method not allowed', 405);
+    if (request.method !== "POST") {
+      return this.createErrorResponse("invalid_request", "Method not allowed", 405);
     }
 
     // Check content length to ensure it's not too large (1 MiB limit)
-    const contentLength = parseInt(request.headers.get('Content-Length') || '0', 10);
+    const contentLength = parseInt(request.headers.get("Content-Length") || "0", 10);
     if (contentLength > 1048576) {
       // 1 MiB = 1048576 bytes
-      return this.createErrorResponse('invalid_request', 'Request payload too large, must be under 1 MiB', 413);
+      return this.createErrorResponse(
+        "invalid_request",
+        "Request payload too large, must be under 1 MiB",
+        413,
+      );
     }
 
     // Parse client metadata with a size limitation
@@ -2596,21 +2700,29 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       const text = await request.text();
       if (text.length > 1048576) {
         // Double-check text length
-        return this.createErrorResponse('invalid_request', 'Request payload too large, must be under 1 MiB', 413);
+        return this.createErrorResponse(
+          "invalid_request",
+          "Request payload too large, must be under 1 MiB",
+          413,
+        );
       }
       clientMetadata = JSON.parse(text);
     } catch (error) {
-      return this.createErrorResponse('invalid_request', 'Invalid JSON payload', 400);
+      return this.createErrorResponse("invalid_request", "Invalid JSON payload", 400);
     }
 
     // Get token endpoint auth method, default to client_secret_basic
     const authMethod =
-      OAuthProviderImpl.validateStringField(clientMetadata.token_endpoint_auth_method) || 'client_secret_basic';
-    const isPublicClient = authMethod === 'none';
+      OAuthProviderImpl.validateStringField(clientMetadata.token_endpoint_auth_method) ||
+      "client_secret_basic";
+    const isPublicClient = authMethod === "none";
 
     // Check if public client registrations are disallowed
     if (isPublicClient && this.options.disallowPublicClientRegistration) {
-      return this.createErrorResponse('invalid_client_metadata', 'Public client registration is not allowed');
+      return this.createErrorResponse(
+        "invalid_client_metadata",
+        "Public client registration is not allowed",
+      );
     }
 
     // Create client ID
@@ -2630,7 +2742,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       // Validate redirect URIs - must exist and have at least one entry
       const redirectUris = OAuthProviderImpl.validateStringArray(clientMetadata.redirect_uris);
       if (!redirectUris || redirectUris.length === 0) {
-        throw new Error('At least one redirect URI is required');
+        throw new Error("At least one redirect URI is required");
       }
 
       // Validate each redirect URI scheme
@@ -2653,7 +2765,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
           GrantType.REFRESH_TOKEN,
           ...(this.options.allowTokenExchangeGrant ? [GrantType.TOKEN_EXCHANGE] : []),
         ],
-        responseTypes: OAuthProviderImpl.validateStringArray(clientMetadata.response_types) || ['code'],
+        responseTypes: OAuthProviderImpl.validateStringArray(clientMetadata.response_types) || [
+          "code",
+        ],
         registrationDate: Math.floor(Date.now() / 1000),
         tokenEndpointAuthMethod: authMethod,
       };
@@ -2664,8 +2778,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       }
     } catch (error) {
       return this.createErrorResponse(
-        'invalid_client_metadata',
-        error instanceof Error ? error.message : 'Invalid client metadata'
+        "invalid_client_metadata",
+        error instanceof Error ? error.message : "Invalid client metadata",
       );
     }
 
@@ -2697,7 +2811,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     return new Response(JSON.stringify(response), {
       status: 201,
-      headers: { 'Content-Type': 'application/json' },
+      headers: { "Content-Type": "application/json" },
     });
   }
 
@@ -2708,42 +2822,46 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @param ctx - Cloudflare Worker execution context
    * @returns Response from the API handler or error
    */
-  private async handleApiRequest(request: Request, env: any, ctx: ExecutionContext): Promise<Response> {
+  private async handleApiRequest(
+    request: Request,
+    env: any,
+    ctx: ExecutionContext,
+  ): Promise<Response> {
     const url = new URL(request.url);
     const resourceMetadataUrl = `${url.origin}/.well-known/oauth-protected-resource`;
 
     // Get access token from Authorization header
-    const authHeader = request.headers.get('Authorization');
+    const authHeader = request.headers.get("Authorization");
 
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return this.createErrorResponse('invalid_token', 'Missing or invalid access token', 401, {
-        'WWW-Authenticate': this.buildWwwAuthenticateHeader(
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return this.createErrorResponse("invalid_token", "Missing or invalid access token", 401, {
+        "WWW-Authenticate": this.buildWwwAuthenticateHeader(
           resourceMetadataUrl,
-          'invalid_token',
-          'Missing or invalid access token'
+          "invalid_token",
+          "Missing or invalid access token",
         ),
       });
     }
 
     const accessToken = authHeader.substring(7);
-    const parts = accessToken.split(':');
+    const parts = accessToken.split(":");
     const isPossiblyInternalFormat = parts.length === 3;
 
     let tokenData: Token | null = null;
-    let userId = '';
-    let grantId = '';
+    let userId = "";
+    let grantId = "";
 
     // It's a token generated by workers-oauth-provider
     if (isPossiblyInternalFormat) {
       [userId, grantId] = parts;
       const id = await generateTokenId(accessToken);
-      tokenData = await env.OAUTH_KV.get(`token:${userId}:${grantId}:${id}`, { type: 'json' });
+      tokenData = await env.OAUTH_KV.get(`token:${userId}:${grantId}:${id}`, { type: "json" });
     }
 
     // No internal token found in KV and no external token validator provided
     if (!tokenData && !this.options.resolveExternalToken) {
-      return this.createErrorResponse('invalid_token', 'Invalid access token', 401, {
-        'WWW-Authenticate': this.buildWwwAuthenticateHeader(resourceMetadataUrl, 'invalid_token'),
+      return this.createErrorResponse("invalid_token", "Invalid access token", 401, {
+        "WWW-Authenticate": this.buildWwwAuthenticateHeader(resourceMetadataUrl, "invalid_token"),
       });
     }
 
@@ -2752,8 +2870,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       // Check if token is expired (should be auto-deleted by KV TTL, but double-check)
       const now = Math.floor(Date.now() / 1000);
       if (tokenData.expiresAt < now) {
-        return this.createErrorResponse('invalid_token', 'Access token expired', 401, {
-          'WWW-Authenticate': this.buildWwwAuthenticateHeader(resourceMetadataUrl, 'invalid_token'),
+        return this.createErrorResponse("invalid_token", "Access token expired", 401, {
+          "WWW-Authenticate": this.buildWwwAuthenticateHeader(resourceMetadataUrl, "invalid_token"),
         });
       }
 
@@ -2763,18 +2881,25 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       if (tokenData.audience) {
         const requestUrl = new URL(request.url);
         const resourceServer = `${requestUrl.protocol}//${requestUrl.host}${requestUrl.pathname}`;
-        const audiences = Array.isArray(tokenData.audience) ? tokenData.audience : [tokenData.audience];
+        const audiences = Array.isArray(tokenData.audience)
+          ? tokenData.audience
+          : [tokenData.audience];
 
         // Check if any audience matches (RFC 3986: case-insensitive hostname comparison)
         const matches = audiences.some((aud) => audienceMatches(resourceServer, aud));
         if (!matches) {
-          return this.createErrorResponse('invalid_token', 'Token audience does not match resource server', 401, {
-            'WWW-Authenticate': this.buildWwwAuthenticateHeader(
-              resourceMetadataUrl,
-              'invalid_token',
-              'Invalid audience'
-            ),
-          });
+          return this.createErrorResponse(
+            "invalid_token",
+            "Token audience does not match resource server",
+            401,
+            {
+              "WWW-Authenticate": this.buildWwwAuthenticateHeader(
+                resourceMetadataUrl,
+                "invalid_token",
+                "Invalid audience",
+              ),
+            },
+          );
         }
       }
 
@@ -2792,8 +2917,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
       // Failed external validation
       if (!ext) {
-        return this.createErrorResponse('invalid_token', 'Invalid access token', 401, {
-          'WWW-Authenticate': this.buildWwwAuthenticateHeader(resourceMetadataUrl, 'invalid_token'),
+        return this.createErrorResponse("invalid_token", "Invalid access token", 401, {
+          "WWW-Authenticate": this.buildWwwAuthenticateHeader(resourceMetadataUrl, "invalid_token"),
         });
       }
 
@@ -2806,13 +2931,18 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         // Check if any audience matches (RFC 3986: case-insensitive hostname comparison)
         const matches = audiences.some((aud) => audienceMatches(resourceServer, aud));
         if (!matches) {
-          return this.createErrorResponse('invalid_token', 'Token audience does not match resource server', 401, {
-            'WWW-Authenticate': this.buildWwwAuthenticateHeader(
-              resourceMetadataUrl,
-              'invalid_token',
-              'Invalid audience'
-            ),
-          });
+          return this.createErrorResponse(
+            "invalid_token",
+            "Token audience does not match resource server",
+            401,
+            {
+              "WWW-Authenticate": this.buildWwwAuthenticateHeader(
+                resourceMetadataUrl,
+                "invalid_token",
+                "Invalid audience",
+              ),
+            },
+          );
         }
       }
 
@@ -2831,13 +2961,17 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     if (!apiHandler) {
       // This shouldn't happen since we already checked with isApiRequest,
       // but handle it gracefully just in case
-      return this.createErrorResponse('invalid_request', 'No handler found for API route', 404);
+      return this.createErrorResponse("invalid_request", "No handler found for API route", 404);
     }
 
     // Call the API handler based on its type
     if (apiHandler.type === HandlerType.EXPORTED_HANDLER) {
       // It's an object with a fetch method
-      return apiHandler.handler.fetch(request as Parameters<ExportedHandlerWithFetch['fetch']>[0], env, ctx);
+      return apiHandler.handler.fetch(
+        request as Parameters<ExportedHandlerWithFetch["fetch"]>[0],
+        env,
+        ctx,
+      );
     } else {
       // It's a WorkerEntrypoint class - instantiate it with ctx and env in that order
       const handler = new apiHandler.handler(ctx, env);
@@ -2861,7 +2995,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @param grantData - The grant data to save
    * @param now - Current timestamp in seconds
    */
-  private async saveGrantWithTTL(env: any, grantKey: string, grantData: Grant, now: number): Promise<void> {
+  private async saveGrantWithTTL(
+    env: any,
+    grantKey: string,
+    grantData: Grant,
+    now: number,
+  ): Promise<void> {
     // Use absolute expiration timestamp if grant has an expiration
     const kvOptions = grantData.expiresAt !== undefined ? { expiration: grantData.expiresAt } : {};
     await env.OAUTH_KV.put(grantKey, JSON.stringify(grantData), kvOptions);
@@ -2886,7 +3025,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       if (!this.hasGlobalFetchStrictlyPublic()) {
         throw new Error(
           `Client ID "${clientId}" appears to be a CIMD URL, but the 'global_fetch_strictly_public' ` +
-            `compatibility flag is not enabled. Add this flag to your wrangler.jsonc to enable CIMD support.`
+            `compatibility flag is not enabled. Add this flag to your wrangler.jsonc to enable CIMD support.`,
         );
       }
       return this.fetchClientMetadataDocument(clientId);
@@ -2894,7 +3033,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Standard KV lookup
     const clientKey = `client:${clientId}`;
-    return env.OAUTH_KV.get(clientKey, { type: 'json' });
+    return env.OAUTH_KV.get(clientKey, { type: "json" });
   }
 
   /**
@@ -2903,7 +3042,17 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @returns The access token string
    */
   private async createAccessToken(params: CreateAccessTokenOptions): Promise<string> {
-    const { userId, grantId, clientId, scope, encryptedProps, encryptionKey, expiresIn, audience, env } = params;
+    const {
+      userId,
+      grantId,
+      clientId,
+      scope,
+      encryptedProps,
+      encryptionKey,
+      expiresIn,
+      audience,
+      env,
+    } = params;
 
     // Generate access token
     const accessTokenSecret = generateRandomString(TOKEN_LENGTH);
@@ -2934,9 +3083,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     };
 
     // Save access token with TTL
-    await env.OAUTH_KV.put(`token:${userId}:${grantId}:${accessTokenId}`, JSON.stringify(accessTokenData), {
-      expirationTtl: expiresIn,
-    });
+    await env.OAUTH_KV.put(
+      `token:${userId}:${grantId}:${accessTokenId}`,
+      JSON.stringify(accessTokenData),
+      {
+        expirationTtl: expiresIn,
+      },
+    );
 
     return accessToken;
   }
@@ -2948,11 +3101,16 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @param grantedScopes - The scopes that were granted in the authorization
    * @returns The filtered scopes that are a subset of the granted scopes
    */
-  private downscope(requestedScope: string | string[] | undefined, grantedScopes: string[]): string[] {
+  private downscope(
+    requestedScope: string | string[] | undefined,
+    grantedScopes: string[],
+  ): string[] {
     if (!requestedScope) return grantedScopes;
 
     const requestedScopes: string[] =
-      typeof requestedScope === 'string' ? requestedScope.split(' ').filter(Boolean) : requestedScope;
+      typeof requestedScope === "string"
+        ? requestedScope.split(" ").filter(Boolean)
+        : requestedScope;
 
     // Filter out any requested scopes that are not in the grant
     return requestedScopes.filter((scope: string) => grantedScopes.includes(scope));
@@ -2965,7 +3123,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    */
   private hasGlobalFetchStrictlyPublic(): boolean {
     const compatFlags =
-      typeof Cloudflare !== 'undefined' && Cloudflare.compatibilityFlags ? Cloudflare.compatibilityFlags : null;
+      typeof Cloudflare !== "undefined" && Cloudflare.compatibilityFlags
+        ? Cloudflare.compatibilityFlags
+        : null;
     return !!compatFlags?.global_fetch_strictly_public;
   }
 
@@ -2975,7 +3135,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   private isClientMetadataUrl(clientId: string): boolean {
     try {
       const url = new URL(clientId);
-      return url.protocol === 'https:' && url.pathname !== '/';
+      return url.protocol === "https:" && url.pathname !== "/";
     } catch {
       return false;
     }
@@ -2996,7 +3156,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * Allowed authentication methods for CIMD clients (per IETF spec)
    * CIMD clients cannot use symmetric secrets since there's no pre-shared secret
    */
-  private static readonly CIMD_ALLOWED_AUTH_METHODS = ['none', 'private_key_jwt'];
+  private static readonly CIMD_ALLOWED_AUTH_METHODS = ["none", "private_key_jwt"];
 
   /**
    * Validates that a field is a string or undefined
@@ -3007,9 +3167,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    */
   private static validateStringField(field: unknown, fieldName?: string): string | undefined {
     if (field === undefined) return undefined;
-    if (typeof field !== 'string') {
+    if (typeof field !== "string") {
       throw new Error(
-        fieldName ? `Invalid ${fieldName}: expected string, got ${typeof field}` : 'Field must be a string'
+        fieldName
+          ? `Invalid ${fieldName}: expected string, got ${typeof field}`
+          : "Field must be a string",
       );
     }
     return field;
@@ -3025,11 +3187,17 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   private static validateStringArray(arr: unknown, fieldName?: string): string[] | undefined {
     if (arr === undefined) return undefined;
     if (!Array.isArray(arr)) {
-      throw new Error(fieldName ? `Invalid ${fieldName}: expected array, got ${typeof arr}` : 'Field must be an array');
-    }
-    if (!arr.every((item) => typeof item === 'string')) {
       throw new Error(
-        fieldName ? `Invalid ${fieldName}: array must contain only strings` : 'All array elements must be strings'
+        fieldName
+          ? `Invalid ${fieldName}: expected array, got ${typeof arr}`
+          : "Field must be an array",
+      );
+    }
+    if (!arr.every((item) => typeof item === "string")) {
+      throw new Error(
+        fieldName
+          ? `Invalid ${fieldName}: array must contain only strings`
+          : "All array elements must be strings",
       );
     }
     return arr;
@@ -3048,11 +3216,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    */
   private async fetchClientMetadataDocument(metadataUrl: string): Promise<ClientInfo> {
     const abortController = new AbortController();
-    const timeoutId = setTimeout(() => abortController.abort(), OAuthProviderImpl.CIMD_FETCH_TIMEOUT_MS);
+    const timeoutId = setTimeout(
+      () => abortController.abort(),
+      OAuthProviderImpl.CIMD_FETCH_TIMEOUT_MS,
+    );
 
     try {
       const response = await fetch(metadataUrl, {
-        headers: { Accept: 'application/json' },
+        headers: { Accept: "application/json" },
         signal: abortController.signal,
         cf: { cacheEverything: true },
       });
@@ -3063,20 +3234,26 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         throw new Error(`Failed to fetch client metadata: HTTP ${response.status}`);
       }
 
-      const contentLength = response.headers.get('content-length');
+      const contentLength = response.headers.get("content-length");
       if (contentLength && parseInt(contentLength, 10) > OAuthProviderImpl.CIMD_MAX_SIZE_BYTES) {
         throw new Error(
-          `Client metadata exceeds size limit: ${contentLength} bytes (max ${OAuthProviderImpl.CIMD_MAX_SIZE_BYTES})`
+          `Client metadata exceeds size limit: ${contentLength} bytes (max ${OAuthProviderImpl.CIMD_MAX_SIZE_BYTES})`,
         );
       }
 
-      const rawMetadata = await this.readJsonWithSizeLimit(response, OAuthProviderImpl.CIMD_MAX_SIZE_BYTES);
+      const rawMetadata = await this.readJsonWithSizeLimit(
+        response,
+        OAuthProviderImpl.CIMD_MAX_SIZE_BYTES,
+      );
 
-      const clientId = OAuthProviderImpl.validateStringField(rawMetadata.client_id, 'client_id');
-      const redirectUris = OAuthProviderImpl.validateStringArray(rawMetadata.redirect_uris, 'redirect_uris');
+      const clientId = OAuthProviderImpl.validateStringField(rawMetadata.client_id, "client_id");
+      const redirectUris = OAuthProviderImpl.validateStringArray(
+        rawMetadata.redirect_uris,
+        "redirect_uris",
+      );
       const tokenEndpointAuthMethod = OAuthProviderImpl.validateStringField(
         rawMetadata.token_endpoint_auth_method,
-        'token_endpoint_auth_method'
+        "token_endpoint_auth_method",
       );
 
       // Validate that client_id matches the URL (required by spec)
@@ -3085,31 +3262,38 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       }
 
       if (!redirectUris || redirectUris.length === 0) {
-        throw new Error('redirect_uris is required and must not be empty');
+        throw new Error("redirect_uris is required and must not be empty");
       }
 
-      if (tokenEndpointAuthMethod && !OAuthProviderImpl.CIMD_ALLOWED_AUTH_METHODS.includes(tokenEndpointAuthMethod)) {
+      if (
+        tokenEndpointAuthMethod &&
+        !OAuthProviderImpl.CIMD_ALLOWED_AUTH_METHODS.includes(tokenEndpointAuthMethod)
+      ) {
         throw new Error(
           `token_endpoint_auth_method "${tokenEndpointAuthMethod}" is not allowed for CIMD clients. ` +
-            `Allowed methods: ${OAuthProviderImpl.CIMD_ALLOWED_AUTH_METHODS.join(', ')}`
+            `Allowed methods: ${OAuthProviderImpl.CIMD_ALLOWED_AUTH_METHODS.join(", ")}`,
         );
       }
 
       return {
         clientId,
         redirectUris,
-        clientName: OAuthProviderImpl.validateStringField(rawMetadata.client_name, 'client_name'),
-        clientUri: OAuthProviderImpl.validateStringField(rawMetadata.client_uri, 'client_uri'),
-        logoUri: OAuthProviderImpl.validateStringField(rawMetadata.logo_uri, 'logo_uri'),
-        policyUri: OAuthProviderImpl.validateStringField(rawMetadata.policy_uri, 'policy_uri'),
-        tosUri: OAuthProviderImpl.validateStringField(rawMetadata.tos_uri, 'tos_uri'),
-        jwksUri: OAuthProviderImpl.validateStringField(rawMetadata.jwks_uri, 'jwks_uri'),
-        contacts: OAuthProviderImpl.validateStringArray(rawMetadata.contacts, 'contacts'),
-        grantTypes: OAuthProviderImpl.validateStringArray(rawMetadata.grant_types, 'grant_types') || [
-          'authorization_code',
-        ],
-        responseTypes: OAuthProviderImpl.validateStringArray(rawMetadata.response_types, 'response_types') || ['code'],
-        tokenEndpointAuthMethod: tokenEndpointAuthMethod || 'none',
+        clientName: OAuthProviderImpl.validateStringField(rawMetadata.client_name, "client_name"),
+        clientUri: OAuthProviderImpl.validateStringField(rawMetadata.client_uri, "client_uri"),
+        logoUri: OAuthProviderImpl.validateStringField(rawMetadata.logo_uri, "logo_uri"),
+        policyUri: OAuthProviderImpl.validateStringField(rawMetadata.policy_uri, "policy_uri"),
+        tosUri: OAuthProviderImpl.validateStringField(rawMetadata.tos_uri, "tos_uri"),
+        jwksUri: OAuthProviderImpl.validateStringField(rawMetadata.jwks_uri, "jwks_uri"),
+        contacts: OAuthProviderImpl.validateStringArray(rawMetadata.contacts, "contacts"),
+        grantTypes: OAuthProviderImpl.validateStringArray(
+          rawMetadata.grant_types,
+          "grant_types",
+        ) || ["authorization_code"],
+        responseTypes: OAuthProviderImpl.validateStringArray(
+          rawMetadata.response_types,
+          "response_types",
+        ) || ["code"],
+        tokenEndpointAuthMethod: tokenEndpointAuthMethod || "none",
       };
     } finally {
       clearTimeout(timeoutId);
@@ -3125,10 +3309,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @returns Parsed JSON object
    * @throws Error if response body is null, size exceeded, or JSON parse failed
    */
-  private async readJsonWithSizeLimit(response: Response, maxBytes: number): Promise<Record<string, unknown>> {
+  private async readJsonWithSizeLimit(
+    response: Response,
+    maxBytes: number,
+  ): Promise<Record<string, unknown>> {
     const reader = response.body?.getReader();
     if (!reader) {
-      throw new Error('Response body is null');
+      throw new Error("Response body is null");
     }
 
     const chunks: Uint8Array[] = [];
@@ -3167,7 +3354,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   /**
    * Builds a WWW-Authenticate header value with resource_metadata per RFC 9728 §5.1
    */
-  private buildWwwAuthenticateHeader(resourceMetadataUrl: string, error: string, errorDescription?: string): string {
+  private buildWwwAuthenticateHeader(
+    resourceMetadataUrl: string,
+    error: string,
+    errorDescription?: string,
+  ): string {
     let header = `Bearer realm="OAuth", resource_metadata="${resourceMetadataUrl}", error="${error}"`;
     if (errorDescription) {
       header += `, error_description="${errorDescription}"`;
@@ -3187,7 +3378,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     code: string,
     description: string,
     status: number = 400,
-    headers: Record<string, string> = {}
+    headers: Record<string, string> = {},
   ): Response {
     // Notify the user of the error and allow them to override the response
     const customErrorResponse = this.options.onError?.({ code, description, status, headers });
@@ -3201,7 +3392,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     return new Response(body, {
       status,
       headers: {
-        'Content-Type': 'application/json',
+        "Content-Type": "application/json",
         ...headers,
       },
     });
@@ -3216,10 +3407,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 class OAuthError extends Error {
   constructor(
     public code: string,
-    message: string
+    message: string,
   ) {
     super(message);
-    this.name = 'OAuthError';
+    this.name = "OAuthError";
   }
 }
 
@@ -3240,7 +3431,7 @@ const TOKEN_LENGTH = 32;
  * @returns true if valid, false otherwise
  */
 function validateResourceUri(uri: string): boolean {
-  if (!uri || typeof uri !== 'string') {
+  if (!uri || typeof uri !== "string") {
     return false;
   }
 
@@ -3258,7 +3449,7 @@ function validateResourceUri(uri: string): boolean {
     }
 
     // Must be http or https for security
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
       return false;
     }
 
@@ -3288,14 +3479,17 @@ function audienceMatches(resourceServerUrl: string, audienceValue: string): bool
     }
 
     // Origin-only audience matches any path (backward compatibility)
-    if (audience.pathname === '/' || audience.pathname === '') {
+    if (audience.pathname === "/" || audience.pathname === "") {
       return true;
     }
 
     // Path-aware audience: prefix match on path boundary (RFC 8707)
     // e.g. audience "/api" matches request "/api", "/api/", "/api/users"
     // but does NOT match "/api-v2" or "/apiary"
-    return resource.pathname === audience.pathname || resource.pathname.startsWith(audience.pathname + '/');
+    return (
+      resource.pathname === audience.pathname ||
+      resource.pathname.startsWith(audience.pathname + "/")
+    );
   } catch {
     return false;
   }
@@ -3307,7 +3501,9 @@ function audienceMatches(resourceServerUrl: string, audienceValue: string): bool
  * @param value - The resource parameter value from the request body
  * @returns The validated value as string, string array, or undefined if validation fails
  */
-function parseResourceParameter(value: string | string[] | undefined): string | string[] | undefined {
+function parseResourceParameter(
+  value: string | string[] | undefined,
+): string | string[] | undefined {
   if (!value) {
     return undefined;
   }
@@ -3315,7 +3511,7 @@ function parseResourceParameter(value: string | string[] | undefined): string | 
   // Validate all URIs (RFC 8707 Section 2)
   const uris = Array.isArray(value) ? value : [value];
   for (const uri of uris) {
-    if (typeof uri !== 'string' || !validateResourceUri(uri)) {
+    if (typeof uri !== "string" || !validateResourceUri(uri)) {
       // Invalid resource URI - return undefined to trigger error
       return undefined;
     }
@@ -3340,8 +3536,8 @@ async function hashSecret(secret: string): Promise<string> {
  * @returns A random string of the specified length
  */
 function generateRandomString(length: number): string {
-  const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
-  let result = '';
+  const characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  let result = "";
   const values = new Uint8Array(length);
   crypto.getRandomValues(values);
   for (let i = 0; i < length; i++) {
@@ -3361,11 +3557,11 @@ async function generateTokenId(token: string): Promise<string> {
   const data = encoder.encode(token);
 
   // Use the WebCrypto API to create a SHA-256 hash
-  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
 
   // Convert the hash to a hex string
   const hashArray = Array.from(new Uint8Array(hashBuffer));
-  const hashHex = hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
+  const hashHex = hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
 
   return hashHex;
 }
@@ -3381,7 +3577,7 @@ async function generateTokenId(token: string): Promise<string> {
  */
 function validateRedirectUriScheme(redirectUri: string): void {
   // List of dangerous pseudo-schemes that should not be allowed
-  const dangerousSchemes = ['javascript:', 'data:', 'vbscript:', 'file:', 'mailto:', 'blob:'];
+  const dangerousSchemes = ["javascript:", "data:", "vbscript:", "file:", "mailto:", "blob:"];
 
   // 1. Trim leading and trailing whitespace (allowed per RFC 3986 preprocessing)
   const normalized = redirectUri.trim();
@@ -3392,15 +3588,15 @@ function validateRedirectUriScheme(redirectUri: string): void {
   for (let i = 0; i < normalized.length; i++) {
     const code = normalized.charCodeAt(i);
     if ((code >= 0x00 && code <= 0x1f) || (code >= 0x7f && code <= 0x9f)) {
-      throw new Error('Invalid redirect URI');
+      throw new Error("Invalid redirect URI");
     }
   }
 
   // 3. Extract the scheme by finding everything before the first ':'
-  const colonIndex = normalized.indexOf(':');
+  const colonIndex = normalized.indexOf(":");
   if (colonIndex === -1) {
     // No scheme present - reject relative URIs
-    throw new Error('Invalid redirect URI');
+    throw new Error("Invalid redirect URI");
   }
 
   // Get the scheme and convert to lowercase for case-insensitive comparison
@@ -3409,7 +3605,7 @@ function validateRedirectUriScheme(redirectUri: string): void {
   // Check against blacklist
   for (const dangerousScheme of dangerousSchemes) {
     if (scheme === dangerousScheme) {
-      throw new Error('Invalid redirect URI');
+      throw new Error("Invalid redirect URI");
     }
   }
 }
@@ -3427,7 +3623,7 @@ function isLoopbackUri(uri: string): boolean {
       return true;
     }
     // Check for IPv6 loopback (::1 or [::1])
-    if (host === '::1' || host === '[::1]') {
+    if (host === "::1" || host === "[::1]") {
       return true;
     }
     return false;
@@ -3470,7 +3666,7 @@ function isValidRedirectUri(requestUri: string, registeredUris: string[]): boole
  * @returns The base64url encoded string
  */
 function base64UrlEncode(str: string): string {
-  return btoa(str).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+  return btoa(str).replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
 }
 
 /**
@@ -3506,11 +3702,11 @@ async function encryptProps(data: any): Promise<{ encryptedData: string; key: Cr
   // @ts-ignore
   const key: CryptoKey = await crypto.subtle.generateKey(
     {
-      name: 'AES-GCM',
+      name: "AES-GCM",
       length: 256,
     },
     true, // extractable
-    ['encrypt', 'decrypt']
+    ["encrypt", "decrypt"],
   );
 
   // Use a constant IV (all zeros) since each key is used only once
@@ -3524,11 +3720,11 @@ async function encryptProps(data: any): Promise<{ encryptedData: string; key: Cr
   // Encrypt the data
   const encryptedBuffer = await crypto.subtle.encrypt(
     {
-      name: 'AES-GCM',
+      name: "AES-GCM",
       iv,
     },
     key,
-    encodedData
+    encodedData,
   );
 
   // Convert to base64 for storage
@@ -3554,11 +3750,11 @@ async function decryptProps(key: CryptoKey, encryptedData: string): Promise<any>
   // Decrypt the data
   const decryptedBuffer = await crypto.subtle.decrypt(
     {
-      name: 'AES-GCM',
+      name: "AES-GCM",
       iv,
     },
     key,
-    encryptedBuffer
+    encryptedBuffer,
   );
 
   // Convert the decrypted buffer to a string, then parse as JSON
@@ -3571,8 +3767,8 @@ async function decryptProps(key: CryptoKey, encryptedData: string): Promise<any>
 // This ensures that even if someone has the token ID, they can't derive the wrapping key
 // We use a fixed array of 32 bytes for optimal performance
 const WRAPPING_KEY_HMAC_KEY = new Uint8Array([
-  0x22, 0x7e, 0x26, 0x86, 0x8d, 0xf1, 0xe1, 0x6d, 0x80, 0x70, 0xea, 0x17, 0x97, 0x5b, 0x47, 0xa6, 0x82, 0x18, 0xfa,
-  0x87, 0x28, 0xae, 0xde, 0x85, 0xb5, 0x1d, 0x4a, 0xd9, 0x96, 0xca, 0xca, 0x43,
+  0x22, 0x7e, 0x26, 0x86, 0x8d, 0xf1, 0xe1, 0x6d, 0x80, 0x70, 0xea, 0x17, 0x97, 0x5b, 0x47, 0xa6,
+  0x82, 0x18, 0xfa, 0x87, 0x28, 0xae, 0xde, 0x85, 0xb5, 0x1d, 0x4a, 0xd9, 0x96, 0xca, 0xca, 0x43,
 ]);
 
 /**
@@ -3587,23 +3783,23 @@ async function deriveKeyFromToken(tokenStr: string): Promise<CryptoKey> {
 
   // Import the pre-defined HMAC key (already 32 bytes)
   const hmacKey = await crypto.subtle.importKey(
-    'raw',
+    "raw",
     WRAPPING_KEY_HMAC_KEY,
-    { name: 'HMAC', hash: 'SHA-256' },
+    { name: "HMAC", hash: "SHA-256" },
     false,
-    ['sign']
+    ["sign"],
   );
 
   // Use HMAC-SHA256 to derive the wrapping key material
-  const hmacResult = await crypto.subtle.sign('HMAC', hmacKey, encoder.encode(tokenStr));
+  const hmacResult = await crypto.subtle.sign("HMAC", hmacKey, encoder.encode(tokenStr));
 
   // Import the HMAC result as the wrapping key
   return await crypto.subtle.importKey(
-    'raw',
+    "raw",
     hmacResult,
-    { name: 'AES-KW' },
+    { name: "AES-KW" },
     false, // not extractable
-    ['wrapKey', 'unwrapKey']
+    ["wrapKey", "unwrapKey"],
   );
 }
 
@@ -3618,7 +3814,9 @@ async function wrapKeyWithToken(tokenStr: string, keyToWrap: CryptoKey): Promise
   const wrappingKey = await deriveKeyFromToken(tokenStr);
 
   // Wrap the encryption key
-  const wrappedKeyBuffer = await crypto.subtle.wrapKey('raw', keyToWrap, wrappingKey, { name: 'AES-KW' });
+  const wrappedKeyBuffer = await crypto.subtle.wrapKey("raw", keyToWrap, wrappingKey, {
+    name: "AES-KW",
+  });
 
   // Convert to base64 for storage
   return arrayBufferToBase64(wrappedKeyBuffer);
@@ -3639,13 +3837,13 @@ async function unwrapKeyWithToken(tokenStr: string, wrappedKeyBase64: string): P
 
   // Unwrap the key
   return await crypto.subtle.unwrapKey(
-    'raw',
+    "raw",
     wrappedKeyBuffer,
     wrappingKey,
-    { name: 'AES-KW' },
-    { name: 'AES-GCM' },
+    { name: "AES-KW" },
+    { name: "AES-GCM" },
     true, // extractable
-    ['encrypt', 'decrypt']
+    ["encrypt", "decrypt"],
   );
 }
 
@@ -3674,17 +3872,21 @@ class OAuthHelpersImpl implements OAuthHelpers {
    */
   async parseAuthRequest(request: Request): Promise<AuthRequest> {
     const url = new URL(request.url);
-    const responseType = url.searchParams.get('response_type') || '';
-    const clientId = url.searchParams.get('client_id') || '';
-    const redirectUri = url.searchParams.get('redirect_uri') || '';
-    const scope = (url.searchParams.get('scope') || '').split(' ').filter(Boolean);
-    const state = url.searchParams.get('state') || '';
-    const codeChallenge = url.searchParams.get('code_challenge') || undefined;
-    const codeChallengeMethod = url.searchParams.get('code_challenge_method') || 'plain';
+    const responseType = url.searchParams.get("response_type") || "";
+    const clientId = url.searchParams.get("client_id") || "";
+    const redirectUri = url.searchParams.get("redirect_uri") || "";
+    const scope = (url.searchParams.get("scope") || "").split(" ").filter(Boolean);
+    const state = url.searchParams.get("state") || "";
+    const codeChallenge = url.searchParams.get("code_challenge") || undefined;
+    const codeChallengeMethod = url.searchParams.get("code_challenge_method") || "plain";
     // RFC 8707 Section 2.1: Multiple resource parameters MAY be used
-    const resourceParams = url.searchParams.getAll('resource');
+    const resourceParams = url.searchParams.getAll("resource");
     const resourceParam =
-      resourceParams.length > 0 ? (resourceParams.length === 1 ? resourceParams[0] : resourceParams) : undefined;
+      resourceParams.length > 0
+        ? resourceParams.length === 1
+          ? resourceParams[0]
+          : resourceParams
+        : undefined;
 
     // Validate redirect URI to prevent javascript: URIs / XSS attacks
     // Using helper function that normalizes and checks in a case-insensitive manner
@@ -3693,17 +3895,17 @@ class OAuthHelpersImpl implements OAuthHelpers {
     // Parse and validate resource parameter (RFC 8707)
     const resource = parseResourceParameter(resourceParam);
     if (resourceParam && !resource) {
-      throw new Error('The resource parameter must be a valid absolute URI without a fragment');
+      throw new Error("The resource parameter must be a valid absolute URI without a fragment");
     }
 
     // Check if implicit flow is requested but not allowed
-    if (responseType === 'token' && !this.provider.options.allowImplicitFlow) {
-      throw new Error('The implicit grant flow is not enabled for this provider');
+    if (responseType === "token" && !this.provider.options.allowImplicitFlow) {
+      throw new Error("The implicit grant flow is not enabled for this provider");
     }
 
     // Check if plain PKCE method is used but not allowed (OAuth 2.1 recommends S256 only)
-    if (codeChallengeMethod === 'plain' && this.provider.options.allowPlainPKCE === false) {
-      throw new Error('The plain PKCE method is not allowed. Use S256 instead.');
+    if (codeChallengeMethod === "plain" && this.provider.options.allowPlainPKCE === false) {
+      throw new Error("The plain PKCE method is not allowed. Use S256 instead.");
     }
 
     // Validate the client ID and redirect URI
@@ -3717,7 +3919,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
       if (clientInfo && redirectUri) {
         if (!isValidRedirectUri(redirectUri, clientInfo.redirectUris)) {
           throw new Error(
-            `Invalid redirect URI. The redirect URI provided does not match any registered URI for this client.`
+            `Invalid redirect URI. The redirect URI provided does not match any registered URI for this client.`,
           );
         }
       }
@@ -3751,18 +3953,20 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * @param options - Options specifying the grant details
    * @returns A Promise resolving to an object containing the redirect URL
    */
-  async completeAuthorization(options: CompleteAuthorizationOptions): Promise<{ redirectTo: string }> {
+  async completeAuthorization(
+    options: CompleteAuthorizationOptions,
+  ): Promise<{ redirectTo: string }> {
     const { clientId, redirectUri } = options.request;
 
     if (!clientId || !redirectUri) {
-      throw new Error('Client ID and Redirect URI are required in the authorization request.');
+      throw new Error("Client ID and Redirect URI are required in the authorization request.");
     }
 
     // Re-validate the redirectUri to prevent open redirect vulnerabilities
     const clientInfo = await this.lookupClient(clientId);
     if (!clientInfo || !isValidRedirectUri(redirectUri, clientInfo.redirectUris)) {
       throw new Error(
-        'Invalid redirect URI. The redirect URI provided does not match any registered URI for this client.'
+        "Invalid redirect URI. The redirect URI provided does not match any registered URI for this client.",
       );
     }
 
@@ -3776,7 +3980,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
     const now = Math.floor(Date.now() / 1000);
 
     // Check if this is an implicit flow request (response_type=token)
-    if (options.request.responseType === 'token') {
+    if (options.request.responseType === "token") {
       // For implicit flow, we skip the authorization code and directly issue an access token
       const accessTokenSecret = generateRandomString(TOKEN_LENGTH);
       const accessToken = `${options.userId}:${grantId}:${accessTokenSecret}`;
@@ -3794,7 +3998,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
       // Parse and validate resource parameter (RFC 8707) for implicit flow
       const audience = parseResourceParameter(options.request.resource);
       if (options.request.resource && !audience) {
-        throw new Error('The resource parameter must be a valid absolute URI without a fragment');
+        throw new Error("The resource parameter must be a valid absolute URI without a fragment");
       }
 
       // Store the grant without an auth code (will be referenced by the access token)
@@ -3834,19 +4038,19 @@ class OAuthHelpersImpl implements OAuthHelpers {
       await this.env.OAUTH_KV.put(
         `token:${options.userId}:${grantId}:${accessTokenId}`,
         JSON.stringify(accessTokenData),
-        { expirationTtl: accessTokenTTL }
+        { expirationTtl: accessTokenTTL },
       );
 
       // Build the redirect URL for implicit flow (token in fragment, not query params)
       const redirectUrl = new URL(options.request.redirectUri);
       const fragment = new URLSearchParams();
-      fragment.set('access_token', accessToken);
-      fragment.set('token_type', 'bearer');
-      fragment.set('expires_in', accessTokenTTL.toString());
-      fragment.set('scope', options.scope.join(' '));
+      fragment.set("access_token", accessToken);
+      fragment.set("token_type", "bearer");
+      fragment.set("expires_in", accessTokenTTL.toString());
+      fragment.set("scope", options.scope.join(" "));
 
       if (options.request.state) {
-        fragment.set('state', options.request.state);
+        fragment.set("state", options.request.state);
       }
 
       // Set the fragment (hash) part of the URL
@@ -3887,13 +4091,15 @@ class OAuthHelpersImpl implements OAuthHelpers {
 
       // Set 10-minute TTL for the grant (will be extended when code is exchanged)
       const codeExpiresIn = 600; // 10 minutes
-      await this.env.OAUTH_KV.put(grantKey, JSON.stringify(grant), { expirationTtl: codeExpiresIn });
+      await this.env.OAUTH_KV.put(grantKey, JSON.stringify(grant), {
+        expirationTtl: codeExpiresIn,
+      });
 
       // Build the redirect URL for authorization code flow
       const redirectUrl = new URL(options.request.redirectUri);
-      redirectUrl.searchParams.set('code', authCode);
+      redirectUrl.searchParams.set("code", authCode);
       if (options.request.state) {
-        redirectUrl.searchParams.set('state', options.request.state);
+        redirectUrl.searchParams.set("state", options.request.state);
       }
 
       return { redirectTo: redirectUrl.toString() };
@@ -3909,8 +4115,8 @@ class OAuthHelpersImpl implements OAuthHelpers {
     const clientId = generateRandomString(16);
 
     // Determine token endpoint auth method
-    const tokenEndpointAuthMethod = clientInfo.tokenEndpointAuthMethod || 'client_secret_basic';
-    const isPublicClient = tokenEndpointAuthMethod === 'none';
+    const tokenEndpointAuthMethod = clientInfo.tokenEndpointAuthMethod || "client_secret_basic";
+    const isPublicClient = tokenEndpointAuthMethod === "none";
 
     // Create a new client object
     const newClient: ClientInfo = {
@@ -3928,7 +4134,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
         GrantType.REFRESH_TOKEN,
         ...(this.provider.options.allowTokenExchangeGrant ? [GrantType.TOKEN_EXCHANGE] : []),
       ],
-      responseTypes: clientInfo.responseTypes || ['code'],
+      responseTypes: clientInfo.responseTypes || ["code"],
       registrationDate: Math.floor(Date.now() / 1000),
       tokenEndpointAuthMethod,
     };
@@ -3967,7 +4173,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
   async listClients(options?: ListOptions): Promise<ListResult<ClientInfo>> {
     // Prepare list options for KV
     const listOptions: { limit?: number; cursor?: string; prefix: string } = {
-      prefix: 'client:',
+      prefix: "client:",
     };
 
     if (options?.limit !== undefined) {
@@ -3984,7 +4190,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
     // Fetch all clients in parallel
     const clients: ClientInfo[] = [];
     const promises = response.keys.map(async (key: { name: string }) => {
-      const clientId = key.name.substring('client:'.length);
+      const clientId = key.name.substring("client:".length);
       const client = await this.provider.getClient(this.env, clientId);
       if (client) {
         clients.push(client);
@@ -4013,8 +4219,9 @@ class OAuthHelpersImpl implements OAuthHelpers {
     }
 
     // Determine token endpoint auth method
-    let authMethod = updates.tokenEndpointAuthMethod || client.tokenEndpointAuthMethod || 'client_secret_basic';
-    const isPublicClient = authMethod === 'none';
+    let authMethod =
+      updates.tokenEndpointAuthMethod || client.tokenEndpointAuthMethod || "client_secret_basic";
+    const isPublicClient = authMethod === "none";
 
     // Handle changes in auth method
     let secretToStore = client.clientSecret;
@@ -4093,7 +4300,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
     // Fetch all grants in parallel and convert to grant summaries
     const grantSummaries: GrantSummary[] = [];
     const promises = response.keys.map(async (key: { name: string }) => {
-      const grantData: Grant | null = await this.env.OAUTH_KV.get(key.name, { type: 'json' });
+      const grantData: Grant | null = await this.env.OAUTH_KV.get(key.name, { type: "json" });
       if (grantData) {
         // Create a summary with only the public fields
         const summary: GrantSummary = {
@@ -4152,7 +4359,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
         await Promise.all(
           result.keys.map((key: { name: string }) => {
             return this.env.OAUTH_KV.delete(key.name);
-          })
+          }),
         );
       }
 
@@ -4187,12 +4394,12 @@ class OAuthHelpersImpl implements OAuthHelpers {
     // Validate subject token first to get client info
     const tokenSummary = await this.unwrapToken(options.subjectToken);
     if (!tokenSummary) {
-      throw new Error('Invalid or expired subject token');
+      throw new Error("Invalid or expired subject token");
     }
 
     const clientInfo = await this.lookupClient(tokenSummary.grant.clientId);
     if (!clientInfo) {
-      throw new Error('Client not found');
+      throw new Error("Client not found");
     }
 
     // Perform the token exchange using the shared method
@@ -4203,7 +4410,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
       options.aud,
       options.expiresIn,
       clientInfo,
-      this.env
+      this.env,
     );
   }
 }

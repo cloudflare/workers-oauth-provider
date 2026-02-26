@@ -16,8 +16,8 @@ This is a TypeScript library that implements the provider side of the OAuth 2.1 
 A Worker that uses the library might look like this:
 
 ```ts
-import { OAuthProvider } from '@cloudflare/workers-oauth-provider';
-import { WorkerEntrypoint } from 'cloudflare:workers';
+import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
+import { WorkerEntrypoint } from "cloudflare:workers";
 
 // We export the OAuthProvider instance as the entrypoint to our Worker. This means it
 // implements the `fetch()` handler, receiving all HTTP requests.
@@ -29,8 +29,8 @@ export default new OAuthProvider({
   // - A single route (string) or multiple routes (array)
   // - Full URLs (which will match the hostname) or just paths (which will match any hostname)
   apiRoute: [
-    '/api/', // Path only - will match any hostname
-    'https://api.example.com/', // Full URL - will check hostname
+    "/api/", // Path only - will match any hostname
+    "https://api.example.com/", // Full URL - will check hostname
   ],
 
   // When the OAuth system receives an API request with a valid access token, it passes the request
@@ -58,23 +58,23 @@ export default new OAuthProvider({
   // this URL is given to the OAuthProvider is so that it can implement the RFC-8414 metadata
   // discovery endpoint, i.e. `.well-known/oauth-authorization-server`.
   // Can also be specified as just a path (e.g., "/authorize").
-  authorizeEndpoint: 'https://example.com/authorize',
+  authorizeEndpoint: "https://example.com/authorize",
 
   // This specifies the OAuth 2 token exchange endpoint. The OAuthProvider will implement this
   // endpoint (by directly responding to requests with a matching URL).
   // Can also be specified as just a path (e.g., "/oauth/token").
-  tokenEndpoint: 'https://example.com/oauth/token',
+  tokenEndpoint: "https://example.com/oauth/token",
 
   // This specifies the RFC-7591 dynamic client registration endpoint. This setting is optional,
   // but if provided, the OAuthProvider will implement this endpoint to allow dynamic client
   // registration.
   // Can also be specified as just a path (e.g., "/oauth/register").
-  clientRegistrationEndpoint: 'https://example.com/oauth/register',
+  clientRegistrationEndpoint: "https://example.com/oauth/register",
 
   // Optional list of scopes supported by this OAuth provider.
   // If provided, this will be included in the RFC 8414 metadata as 'scopes_supported'.
   // If not provided, the 'scopes_supported' field will be omitted from the metadata.
-  scopesSupported: ['document.read', 'document.write', 'profile'],
+  scopesSupported: ["document.read", "document.write", "profile"],
 
   // Optional: Controls whether the OAuth implicit flow is allowed.
   // The implicit flow is discouraged in OAuth 2.1 but may be needed for some clients.
@@ -116,7 +116,7 @@ const defaultHandler = {
   async fetch(request: Request, env, ctx) {
     let url = new URL(request.url);
 
-    if (url.pathname == '/authorize') {
+    if (url.pathname == "/authorize") {
       // This is a request for our OAuth authorization flow UI. It is up to the application to
       // implement this. However, the OAuthProvider library provides some helpers to assist.
 
@@ -143,23 +143,23 @@ const defaultHandler = {
         // The application must specify the user's ID, which is some sort of string. This is needed
         // so that the application can later query the OAuthProvider to enumerate all grants
         // belonging to a particular user, e.g. to implement an audit and revocation UI.
-        userId: '1234',
+        userId: "1234",
 
         // The application can specify some arbitary metadata which describes this grant. The
         // metadata can contain any JSON-serializable content. This metadata is not used by the
         // OAuthProvider, but the application can read back the metadata attached to specific
         // grants when enumerating them later, again e.g. to implement an udit and revocation UI.
-        metadata: { label: 'foo' },
+        metadata: { label: "foo" },
 
         // The application specifies the list of OAuth scope identifiers that were granted. This
         // may or may not be the same as was requested in `oauthReqInfo.scope`.
-        scope: ['document.read', 'document.write'],
+        scope: ["document.read", "document.write"],
 
         // `props` is an arbitrary JSON-serializable object which will be passed back to the API
         // handler for every request authorized by this grant.
         props: {
           userId: 1234,
-          username: 'Bob',
+          username: "Bob",
         },
       });
 
@@ -172,7 +172,7 @@ const defaultHandler = {
 
     // ... the application can implement other non-API HTTP endpoints here ...
 
-    return new Response('Not found', { status: 404 });
+    return new Response("Not found", { status: 404 });
   },
 };
 
@@ -192,13 +192,13 @@ class ApiHandler extends WorkerEntrypoint {
     // endpoint, `/api/whoami`, which returns the user's authenticated identity.
 
     let url = new URL(request.url);
-    if (url.pathname == '/api/whoami') {
+    if (url.pathname == "/api/whoami") {
       // Since the username is embedded in `ctx.props`, which came from the access token that the
       // OAuthProivder already verified, we don't need to do any other authentication steps.
       return new Response(`You are authenticated as: ${this.ctx.props.username}`);
     }
 
-    return new Response('Not found', { status: 404 });
+    return new Response("Not found", { status: 404 });
   }
 }
 ```
@@ -229,7 +229,7 @@ new OAuthProvider({
     // options.props contains the current props
     // options.clientId, options.userId, and options.scope are also available
 
-    if (options.grantType === 'authorization_code') {
+    if (options.grantType === "authorization_code") {
       // For authorization code exchange, might want to obtain upstream tokens
       const upstreamTokens = await exchangeUpstreamToken(options.props.someCode);
 
@@ -247,7 +247,7 @@ new OAuthProvider({
       };
     }
 
-    if (options.grantType === 'refresh_token') {
+    if (options.grantType === "refresh_token") {
       // For refresh token exchanges, might want to refresh upstream tokens too
       const upstreamTokens = await refreshUpstreamToken(options.props.upstreamRefreshToken);
 
@@ -300,8 +300,8 @@ By returning a `Response` you can also override what the OAuthProvider returns t
 new OAuthProvider({
   // ... other options ...
   onError({ code, description, status, headers }) {
-    if (code === 'unsupported_grant_type') {
-      return new Response('...', { status, headers });
+    if (code === "unsupported_grant_type") {
+      return new Response("...", { status, headers });
     }
     // returning undefined (i.e. void) uses the default Response generation
   },
