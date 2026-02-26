@@ -6549,4 +6549,321 @@ describe('OAuthProvider', () => {
       });
     });
   });
+
+  describe('RFC 8252 Loopback Redirect URI Port Flexibility', () => {
+    let clientId: string;
+    let clientSecret: string;
+
+    // Helper to register a client with given redirect URIs
+    async function registerClient(redirectUris: string[], authMethod = 'client_secret_basic') {
+      const clientData = {
+        redirect_uris: redirectUris,
+        client_name: 'Loopback Test Client',
+        token_endpoint_auth_method: authMethod,
+      };
+
+      const request = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify(clientData)
+      );
+
+      const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
+      const client = await response.json<any>();
+      clientId = client.client_id;
+      clientSecret = client.client_secret;
+    }
+
+    // Helper to make an authorization request
+    async function makeAuthRequest(redirectUri: string) {
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read&state=xyz123`
+      );
+      return oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+    }
+
+    // Helper to extract auth code from redirect response
+    function extractCode(response: Response): string {
+      const location = response.headers.get('Location')!;
+      const url = new URL(location);
+      return url.searchParams.get('code')!;
+    }
+
+    // Helper to exchange auth code for tokens
+    async function exchangeCode(code: string, redirectUri: string) {
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      );
+
+      return oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+    }
+
+    describe('should allow different ports for loopback redirect URIs', () => {
+      it('should accept 127.0.0.1 with different port than registered', async () => {
+        await registerClient(['http://127.0.0.1:8080/callback']);
+        const response = await makeAuthRequest('http://127.0.0.1:52431/callback');
+        expect(response.status).toBe(302);
+        expect(response.headers.get('Location')).toContain('code=');
+      });
+
+      it('should accept 127.0.0.1 with no port when registered has port', async () => {
+        await registerClient(['http://127.0.0.1:8080/callback']);
+        const response = await makeAuthRequest('http://127.0.0.1/callback');
+        expect(response.status).toBe(302);
+        expect(response.headers.get('Location')).toContain('code=');
+      });
+
+      it('should accept 127.0.0.1 with port when registered has no port', async () => {
+        await registerClient(['http://127.0.0.1/callback']);
+        const response = await makeAuthRequest('http://127.0.0.1:9999/callback');
+        expect(response.status).toBe(302);
+        expect(response.headers.get('Location')).toContain('code=');
+      });
+
+      it('should accept IPv6 loopback [::1] with different port', async () => {
+        await registerClient(['http://[::1]:8080/callback']);
+        const response = await makeAuthRequest('http://[::1]:43210/callback');
+        expect(response.status).toBe(302);
+        expect(response.headers.get('Location')).toContain('code=');
+      });
+
+      it('should accept 127.0.0.1 with same port (exact match still works)', async () => {
+        await registerClient(['http://127.0.0.1:8080/callback']);
+        const response = await makeAuthRequest('http://127.0.0.1:8080/callback');
+        expect(response.status).toBe(302);
+        expect(response.headers.get('Location')).toContain('code=');
+      });
+
+      it('should accept loopback in the full 127.x.x.x range', async () => {
+        await registerClient(['http://127.255.255.255:8080/callback']);
+        const response = await makeAuthRequest('http://127.255.255.255:9999/callback');
+        expect(response.status).toBe(302);
+        expect(response.headers.get('Location')).toContain('code=');
+      });
+    });
+
+    describe('should reject loopback URIs when non-port components differ', () => {
+      it('should reject loopback with different path', async () => {
+        await registerClient(['http://127.0.0.1:8080/callback']);
+        await expect(makeAuthRequest('http://127.0.0.1:8080/evil')).rejects.toThrow('Invalid redirect URI');
+      });
+
+      it('should reject loopback with different scheme (http vs https)', async () => {
+        await registerClient(['http://127.0.0.1:8080/callback']);
+        await expect(makeAuthRequest('https://127.0.0.1:8080/callback')).rejects.toThrow('Invalid redirect URI');
+      });
+
+      it('should reject loopback with different hostname (127.0.0.1 vs 127.0.0.2)', async () => {
+        await registerClient(['http://127.0.0.1:8080/callback']);
+        await expect(makeAuthRequest('http://127.0.0.2:8080/callback')).rejects.toThrow('Invalid redirect URI');
+      });
+
+      it('should reject loopback IPv4 vs IPv6 mismatch', async () => {
+        await registerClient(['http://127.0.0.1:8080/callback']);
+        await expect(makeAuthRequest('http://[::1]:8080/callback')).rejects.toThrow('Invalid redirect URI');
+      });
+    });
+
+    describe('should NOT treat localhost as loopback (RFC 8252 Section 7.3)', () => {
+      it('should reject localhost with different port (exact match required)', async () => {
+        await registerClient(['http://localhost:8080/callback']);
+        await expect(makeAuthRequest('http://localhost:9999/callback')).rejects.toThrow('Invalid redirect URI');
+      });
+
+      it('should accept localhost with exact same URI', async () => {
+        await registerClient(['http://localhost:8080/callback']);
+        const response = await makeAuthRequest('http://localhost:8080/callback');
+        expect(response.status).toBe(302);
+        expect(response.headers.get('Location')).toContain('code=');
+      });
+    });
+
+    describe('should preserve exact match for non-loopback URIs', () => {
+      it('should reject non-loopback with different port', async () => {
+        await registerClient(['https://example.com:8080/callback']);
+        await expect(makeAuthRequest('https://example.com:9090/callback')).rejects.toThrow('Invalid redirect URI');
+      });
+
+      it('should accept non-loopback with exact match', async () => {
+        await registerClient(['https://example.com/callback']);
+        const response = await makeAuthRequest('https://example.com/callback');
+        expect(response.status).toBe(302);
+        expect(response.headers.get('Location')).toContain('code=');
+      });
+    });
+
+    describe('should validate loopback redirect URI in token exchange', () => {
+      it('should accept token exchange with different loopback port', async () => {
+        await registerClient(['http://127.0.0.1:8080/callback']);
+
+        // Authorize with one port
+        const authResponse = await makeAuthRequest('http://127.0.0.1:52431/callback');
+        expect(authResponse.status).toBe(302);
+        const code = extractCode(authResponse);
+
+        // Exchange with yet another port
+        const tokenResponse = await exchangeCode(code, 'http://127.0.0.1:33333/callback');
+        expect(tokenResponse.status).toBe(200);
+        const tokens = await tokenResponse.json<any>();
+        expect(tokens.access_token).toBeDefined();
+        expect(tokens.refresh_token).toBeDefined();
+      });
+
+      it('should reject token exchange with non-matching loopback path', async () => {
+        await registerClient(['http://127.0.0.1:8080/callback']);
+
+        // Authorize with valid loopback
+        const authResponse = await makeAuthRequest('http://127.0.0.1:52431/callback');
+        expect(authResponse.status).toBe(302);
+        const code = extractCode(authResponse);
+
+        // Exchange with different path
+        const tokenResponse = await exchangeCode(code, 'http://127.0.0.1:52431/evil');
+        expect(tokenResponse.status).toBe(400);
+        const error = await tokenResponse.json<any>();
+        expect(error.error).toBe('invalid_grant');
+      });
+    });
+
+    describe('should validate loopback redirect URI in completeAuthorization', () => {
+      it('should reject completeAuthorization with tampered non-loopback redirect URI', async () => {
+        await registerClient(['http://127.0.0.1:8080/callback']);
+
+        // Get helpers
+        await oauthProvider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
+        const helpers = mockEnv.OAUTH_PROVIDER!;
+
+        // Parse a valid auth request
+        const authRequest = createMockRequest(
+          `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+            `&redirect_uri=${encodeURIComponent('http://127.0.0.1:52431/callback')}` +
+            `&scope=read&state=xyz123`
+        );
+        const oauthReqInfo = await helpers.parseAuthRequest(authRequest);
+
+        // Tamper with redirect URI to a non-loopback address
+        const tamperedRequest = { ...oauthReqInfo, redirectUri: 'https://attacker.com/callback' };
+
+        await expect(
+          helpers.completeAuthorization({
+            request: tamperedRequest,
+            userId: 'test-user-123',
+            metadata: {},
+            scope: tamperedRequest.scope,
+            props: {},
+          })
+        ).rejects.toThrow('Invalid redirect URI');
+      });
+
+      it('should accept completeAuthorization with valid loopback different port', async () => {
+        await registerClient(['http://127.0.0.1:8080/callback']);
+
+        // Get helpers
+        await oauthProvider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
+        const helpers = mockEnv.OAUTH_PROVIDER!;
+
+        // Parse auth request with different port
+        const authRequest = createMockRequest(
+          `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+            `&redirect_uri=${encodeURIComponent('http://127.0.0.1:52431/callback')}` +
+            `&scope=read&state=xyz123`
+        );
+        const oauthReqInfo = await helpers.parseAuthRequest(authRequest);
+
+        // Should succeed - loopback with different port
+        const result = await helpers.completeAuthorization({
+          request: oauthReqInfo,
+          userId: 'test-user-123',
+          metadata: {},
+          scope: oauthReqInfo.scope,
+          props: {},
+        });
+
+        expect(result.redirectTo).toContain('http://127.0.0.1:52431/callback');
+        expect(result.redirectTo).toContain('code=');
+      });
+    });
+
+    describe('full end-to-end flow with loopback ephemeral ports', () => {
+      it('should complete full auth code flow with different loopback ports at each stage', async () => {
+        // Register with one port
+        await registerClient(['http://127.0.0.1:8080/callback']);
+
+        // Authorize with an ephemeral port (simulating native app)
+        const authResponse = await makeAuthRequest('http://127.0.0.1:52431/callback');
+        expect(authResponse.status).toBe(302);
+
+        const location = authResponse.headers.get('Location')!;
+        // Verify the redirect goes to the ephemeral port, not the registered one
+        expect(location).toContain('http://127.0.0.1:52431/callback');
+        const code = extractCode(authResponse);
+
+        // Exchange code with the same ephemeral port used during authorization
+        const tokenResponse = await exchangeCode(code, 'http://127.0.0.1:52431/callback');
+        expect(tokenResponse.status).toBe(200);
+
+        const tokens = await tokenResponse.json<any>();
+        expect(tokens.access_token).toBeDefined();
+        expect(tokens.refresh_token).toBeDefined();
+        expect(tokens.token_type).toBe('bearer');
+
+        // Use the access token to access a protected API
+        const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
+          Authorization: `Bearer ${tokens.access_token}`,
+        });
+        const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+        expect(apiResponse.status).toBe(200);
+      });
+
+      it('should complete full flow with IPv6 loopback', async () => {
+        await registerClient(['http://[::1]:3000/callback']);
+
+        // Authorize with different port
+        const authResponse = await makeAuthRequest('http://[::1]:48721/callback');
+        expect(authResponse.status).toBe(302);
+        const code = extractCode(authResponse);
+
+        // Exchange with the port used during auth
+        const tokenResponse = await exchangeCode(code, 'http://[::1]:48721/callback');
+        expect(tokenResponse.status).toBe(200);
+        const tokens = await tokenResponse.json<any>();
+        expect(tokens.access_token).toBeDefined();
+      });
+    });
+
+    describe('multiple registered redirect URIs with loopback', () => {
+      it('should match correct loopback URI from multiple registered URIs', async () => {
+        await registerClient([
+          'https://example.com/callback',
+          'http://127.0.0.1:8080/callback',
+          'http://127.0.0.1:8080/other-callback',
+        ]);
+
+        // Should match the second registered URI (loopback with port flexibility)
+        const response = await makeAuthRequest('http://127.0.0.1:55555/callback');
+        expect(response.status).toBe(302);
+        expect(response.headers.get('Location')).toContain('code=');
+      });
+
+      it('should still reject when no registered URI matches loopback criteria', async () => {
+        await registerClient(['https://example.com/callback', 'http://127.0.0.1:8080/other-path']);
+
+        // Different path, should not match any registered URI
+        await expect(makeAuthRequest('http://127.0.0.1:55555/callback')).rejects.toThrow('Invalid redirect URI');
+      });
+    });
+  });
 });
