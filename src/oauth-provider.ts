@@ -264,6 +264,14 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
   allowImplicitFlow?: boolean;
 
   /**
+   * Controls whether the plain PKCE method is allowed.
+   * OAuth 2.1 recommends using S256 exclusively as plain offers no cryptographic protection.
+   * When set to false, only the S256 code_challenge_method will be accepted.
+   * Defaults to true for backward compatibility.
+   */
+  allowPlainPKCE?: boolean;
+
+  /**
    * Controls whether OAuth 2.0 Token Exchange (RFC 8693) is allowed.
    * When false, the token exchange grant type will not be advertised in metadata
    * and token exchange requests will be rejected.
@@ -1579,7 +1587,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       // not implemented: introspection_endpoint
       // not implemented: introspection_endpoint_auth_methods_supported
       // not implemented: introspection_endpoint_auth_signing_alg_values_supported
-      code_challenge_methods_supported: ['plain', 'S256'], // PKCE support
+      code_challenge_methods_supported: this.options.allowPlainPKCE !== false ? ['plain', 'S256'] : ['S256'], // PKCE support
       // MCP Client ID Metadata Document support (CIMD)
       // Only enabled when global_fetch_strictly_public compat flag is set (for SSRF protection)
       client_id_metadata_document_supported: this.hasGlobalFetchStrictlyPublic(),
@@ -3691,6 +3699,11 @@ class OAuthHelpersImpl implements OAuthHelpers {
     // Check if implicit flow is requested but not allowed
     if (responseType === 'token' && !this.provider.options.allowImplicitFlow) {
       throw new Error('The implicit grant flow is not enabled for this provider');
+    }
+
+    // Check if plain PKCE method is used but not allowed (OAuth 2.1 recommends S256 only)
+    if (codeChallengeMethod === 'plain' && this.provider.options.allowPlainPKCE === false) {
+      throw new Error('The plain PKCE method is not allowed. Use S256 instead.');
     }
 
     // Validate the client ID and redirect URI

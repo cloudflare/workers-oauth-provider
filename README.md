@@ -81,6 +81,12 @@ export default new OAuthProvider({
   // Defaults to false.
   allowImplicitFlow: false,
 
+  // Optional: Controls whether the plain PKCE code_challenge_method is allowed.
+  // OAuth 2.1 recommends using S256 exclusively as plain offers no cryptographic protection.
+  // When false, only S256 is accepted and advertised in the metadata endpoint.
+  // Defaults to true for backward compatibility.
+  allowPlainPKCE: true,
+
   // Optional: Controls whether public clients (clients without a secret, like SPAs)
   // can register via the dynamic client registration endpoint.
   // When true, only confidential clients can register.

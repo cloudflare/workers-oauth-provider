@@ -91,8 +91,14 @@ class MockExecutionContext implements ExecutionContext {
   }
 }
 
+// Test environment type
+type TestEnv = {
+  OAUTH_KV: MockKV;
+  OAUTH_PROVIDER: OAuthHelpers | null;
+};
+
 // Simple API handler for testing
-class TestApiHandler extends WorkerEntrypoint {
+class TestApiHandler extends WorkerEntrypoint<TestEnv> {
   fetch(request: Request) {
     const url = new URL(request.url);
 
@@ -115,16 +121,16 @@ class TestApiHandler extends WorkerEntrypoint {
 
 // Simple default handler for testing
 const testDefaultHandler = {
-  async fetch(request: Request, env: any, ctx: ExecutionContext) {
+  async fetch(request: Request, env: TestEnv, ctx: ExecutionContext) {
     const url = new URL(request.url);
 
     if (url.pathname === '/authorize') {
       // Mock authorize endpoint
-      const oauthReqInfo = await env.OAUTH_PROVIDER.parseAuthRequest(request);
-      const clientInfo = await env.OAUTH_PROVIDER.lookupClient(oauthReqInfo.clientId);
+      const oauthReqInfo = await env.OAUTH_PROVIDER!.parseAuthRequest(request);
+      const clientInfo = await env.OAUTH_PROVIDER!.lookupClient(oauthReqInfo.clientId);
 
       // Mock user consent flow - automatically grant consent
-      const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
+      const { redirectTo } = await env.OAUTH_PROVIDER!.completeAuthorization({
         request: oauthReqInfo,
         userId: 'test-user-123',
         metadata: { testConsent: true },
@@ -159,19 +165,16 @@ function createMockRequest(
 }
 
 // Create a configured mock environment
-function createMockEnv() {
+function createMockEnv(): TestEnv {
   return {
     OAUTH_KV: new MockKV(),
     OAUTH_PROVIDER: null, // Will be populated by the OAuthProvider
-  } as {
-    OAUTH_KV: MockKV;
-    OAUTH_PROVIDER: OAuthHelpers | null;
   };
 }
 
 describe('OAuthProvider', () => {
-  let oauthProvider: OAuthProvider;
-  let mockEnv: ReturnType<typeof createMockEnv>;
+  let oauthProvider: OAuthProvider<TestEnv>;
+  let mockEnv: TestEnv;
   let mockCtx: MockExecutionContext;
 
   beforeEach(() => {
@@ -205,13 +208,13 @@ describe('OAuthProvider', () => {
   describe('API Route Configuration', () => {
     it('should support multi-handler configuration with apiHandlers', async () => {
       // Create handler classes for different API routes
-      class UsersApiHandler extends WorkerEntrypoint {
+      class UsersApiHandler extends WorkerEntrypoint<TestEnv> {
         fetch(request: Request) {
           return new Response('Users API response', { status: 200 });
         }
       }
 
-      class DocumentsApiHandler extends WorkerEntrypoint {
+      class DocumentsApiHandler extends WorkerEntrypoint<TestEnv> {
         fetch(request: Request) {
           return new Response('Documents API response', { status: 200 });
         }
@@ -370,6 +373,39 @@ describe('OAuthProvider', () => {
       const metadata = await response.json<any>();
       expect(metadata.response_types_supported).toContain('code');
       expect(metadata.response_types_supported).not.toContain('token');
+    });
+
+    it('should only include S256 PKCE method when allowPlainPKCE is false', async () => {
+      // Create a provider with plain PKCE disabled
+      const providerWithoutPlainPKCE = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        scopesSupported: ['read', 'write'],
+        allowPlainPKCE: false, // Enforce S256 only
+      });
+
+      const request = createMockRequest('https://example.com/.well-known/oauth-authorization-server');
+      const response = await providerWithoutPlainPKCE.fetch(request, mockEnv, mockCtx);
+
+      expect(response.status).toBe(200);
+
+      const metadata = await response.json<any>();
+      expect(metadata.code_challenge_methods_supported).toEqual(['S256']);
+      expect(metadata.code_challenge_methods_supported).not.toContain('plain');
+    });
+
+    it('should include both plain and S256 PKCE methods by default', async () => {
+      const request = createMockRequest('https://example.com/.well-known/oauth-authorization-server');
+      const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
+
+      expect(response.status).toBe(200);
+
+      const metadata = await response.json<any>();
+      expect(metadata.code_challenge_methods_supported).toContain('plain');
+      expect(metadata.code_challenge_methods_supported).toContain('S256');
     });
   });
 
@@ -821,6 +857,61 @@ describe('OAuthProvider', () => {
       await expect(providerWithoutImplicit.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
         'The implicit grant flow is not enabled for this provider'
       );
+    });
+
+    it('should reject plain PKCE when allowPlainPKCE is false', async () => {
+      // Create a provider with plain PKCE disabled
+      const providerWithoutPlainPKCE = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        scopesSupported: ['read', 'write'],
+        allowPlainPKCE: false, // Enforce S256 only
+      });
+
+      // Create an authorization request with plain PKCE
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123` +
+          `&code_challenge=test_challenge&code_challenge_method=plain`
+      );
+
+      // Expect an error response
+      await expect(providerWithoutPlainPKCE.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
+        'The plain PKCE method is not allowed. Use S256 instead.'
+      );
+    });
+
+    it('should accept S256 PKCE when allowPlainPKCE is false', async () => {
+      // Create a provider with plain PKCE disabled
+      const providerWithoutPlainPKCE = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        scopesSupported: ['read', 'write'],
+        allowPlainPKCE: false, // Enforce S256 only
+      });
+
+      // Create a valid S256 code challenge (SHA-256 of 'test_verifier' base64url encoded)
+      const codeChallenge = 'dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk';
+
+      // Create an authorization request with S256 PKCE
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123` +
+          `&code_challenge=${codeChallenge}&code_challenge_method=S256`
+      );
+
+      // This should NOT throw - S256 is allowed
+      const response = await providerWithoutPlainPKCE.fetch(authRequest, mockEnv, mockCtx);
+      // The request should be processed by the default handler
+      expect(response.status).toBe(302);
     });
 
     it('should use the access token to access API directly', async () => {
@@ -3964,9 +4055,9 @@ describe('OAuthProvider', () => {
 
   describe('Token Exchange Callback', () => {
     // Test with provider that has token exchange callback
-    let oauthProviderWithCallback: OAuthProvider;
+    let oauthProviderWithCallback: OAuthProvider<TestEnv>;
     let callbackInvocations: any[] = [];
-    let mockEnv: ReturnType<typeof createMockEnv>;
+    let mockEnv: TestEnv;
     let mockCtx: MockExecutionContext;
 
     // Helper function to create a test OAuth provider with a token exchange callback
