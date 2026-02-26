@@ -108,17 +108,20 @@ Prettier with 120 character line width. Run `npm run prettier` before committing
 This is a security-critical OAuth library. All changes must consider:
 
 **Token storage:**
+
 - Secrets (tokens, authorization codes) are stored as SHA-256 hashes only
 - Props are encrypted with AES-GCM, key wrapped with the token itself
 - Only token holders can decrypt their associated props
 
 **Validation:**
+
 - Redirect URIs validated against XSS payloads
 - Client IDs validated (including CIMD URL validation)
 - PKCE enforced for public clients (S256 method)
 - Scope downscoping validated per RFC 6749 Section 3.3
 
 **Refresh token rotation:**
+
 - Dual refresh tokens: current + previous both valid
 - Handles network failure cases gracefully
 - Previous token invalidated only after new token first used
@@ -135,11 +138,13 @@ npm run test:watch    # Watch mode
 **Test file:** `__tests__/oauth-provider.test.ts`
 
 **Mock implementations:**
+
 - `MockKV` — In-memory KV with TTL simulation
 - `MockExecutionContext` — ctx.props support
 - `createMockRequest()` — HTTP request builder
 
 **Coverage areas:**
+
 - OAuth metadata discovery endpoints
 - Authorization code flow with PKCE
 - Token exchange and refresh flows
@@ -150,6 +155,7 @@ npm run test:watch    # Watch mode
 - Resource-aware audience validation
 
 **Test pattern:**
+
 ```typescript
 beforeEach(() => {
   mockEnv = createMockEnv();
@@ -175,6 +181,7 @@ npx changeset    # Interactive: select semver bump, write description
 ### Pull request process
 
 CI runs on every PR:
+
 1. `npm ci` — Clean install
 2. `npm run build` — Build with tsdown
 3. `npm run check` — Typecheck + tests
@@ -207,6 +214,7 @@ This library implements multiple OAuth/security RFCs. When making changes, maint
 ## Boundaries
 
 **Always:**
+
 - Run `npm run check` before considering work done
 - Add tests for new functionality
 - Document public APIs with JSDoc
@@ -214,12 +222,14 @@ This library implements multiple OAuth/security RFCs. When making changes, maint
 - Maintain backwards compatibility for handler patterns
 
 **Ask first:**
+
 - Adding new dependencies (this ships to users with zero runtime deps)
 - Changing KV storage schema (requires migration planning)
 - Modifying OAuth endpoints or flows
 - Adding new feature flags
 
 **Never:**
+
 - Hardcode secrets or API keys
 - Bypass constructor validation
 - Store unhashed tokens or secrets in KV
@@ -230,6 +240,7 @@ This library implements multiple OAuth/security RFCs. When making changes, maint
 ## Keeping AGENTS.md updated
 
 Update this file when:
+
 - Adding new modules or significant features
 - Changing project structure
 - Modifying build/test tooling
