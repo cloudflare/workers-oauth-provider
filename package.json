@@ -2,44 +2,48 @@
   "name": "@cloudflare/workers-oauth-provider",
   "version": "0.2.3",
   "description": "OAuth provider for Cloudflare Workers",
-  "main": "dist/oauth-provider.js",
-  "types": "dist/oauth-provider.d.ts",
-  "author": "Kenton Varda <kenton@cloudflare.com>",
+  "homepage": "https://github.com/cloudflare/workers-oauth-provider#readme",
+  "bugs": {
+    "url": "https://github.com/cloudflare/workers-oauth-provider/issues"
+  },
   "license": "MIT",
-  "sideEffects": false,
+  "author": "Kenton Varda <kenton@cloudflare.com>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cloudflare/workers-oauth-provider"
+  },
   "files": [
     "dist"
   ],
   "type": "module",
+  "sideEffects": false,
+  "main": "dist/oauth-provider.js",
+  "types": "dist/oauth-provider.d.ts",
   "publishConfig": {
     "access": "public"
   },
   "scripts": {
     "build": "tsdown",
     "build:watch": "tsdown --watch",
-    "check": "npm run typecheck && npm run test",
+    "check": "oxlint && tsc && npm run test",
     "typecheck": "tsc",
     "test": "vitest run",
     "test:watch": "vitest",
-    "prepublishOnly": "npm run build",
-    "prettier": "prettier -w ."
+    "lint": "oxlint",
+    "lint:fix": "oxlint --fix",
+    "format": "oxfmt --write .",
+    "format:check": "oxfmt --check .",
+    "prepublishOnly": "npm run build"
   },
   "devDependencies": {
     "@changesets/changelog-github": "^0.5.2",
     "@changesets/cli": "^2.29.8",
     "@cloudflare/workers-types": "^4.20251218.0",
+    "oxfmt": "^0.31.0",
+    "oxlint": "^1.46.0",
     "pkg-pr-new": "^0.0.62",
-    "prettier": "^3.7.4",
     "tsdown": "^0.18.1",
     "typescript": "^5.9.3",
     "vitest": "^3.2.4"
-  },
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/cloudflare/workers-oauth-provider"
-  },
-  "bugs": {
-    "url": "https://github.com/cloudflare/workers-oauth-provider/issues"
-  },
-  "homepage": "https://github.com/cloudflare/workers-oauth-provider#readme"
+  }
 }

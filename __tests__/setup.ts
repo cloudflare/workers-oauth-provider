@@ -1,8 +1,8 @@
-import { vi } from 'vitest';
-import { WorkerEntrypoint } from './mocks/cloudflare-workers';
+import { vi } from "vitest";
+import { WorkerEntrypoint } from "./mocks/cloudflare-workers";
 
 // Mock the 'cloudflare:workers' module
-vi.mock('cloudflare:workers', () => {
+vi.mock("cloudflare:workers", () => {
   return {
     WorkerEntrypoint,
   };

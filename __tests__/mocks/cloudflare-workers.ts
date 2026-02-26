@@ -13,6 +13,6 @@ export class WorkerEntrypoint<Env = any> {
   }
 
   fetch(request: Request): Response | Promise<Response> {
-    throw new Error('Method not implemented. This should be overridden by subclasses.');
+    throw new Error("Method not implemented. This should be overridden by subclasses.");
   }
 }
