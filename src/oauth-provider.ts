@@ -632,6 +632,14 @@ export interface CompleteAuthorizationOptions {
    * authorized by this grant
    */
   props: any;
+
+  /**
+   * Revokes all existing grants for this user+client combination
+   * after storing the new grant. Defaults to true. This prevents stale
+   * tokens from causing infinite re-auth loops when props change.
+   * Set to false to allow multiple concurrent grants per user+client.
+   */
+  revokeExistingGrants?: boolean;
 }
 
 /**
@@ -1684,7 +1692,15 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     // Verify that the grant contains an auth code hash
+    // If absent, the authorization code has been previously exchanged.
+    // Per RFC 6749 Section 10.5, revoke all tokens issued from the first
+    // exchange as a precaution against authorization code replay attacks.
     if (!grantData.authCodeId) {
+      try {
+        await this.createOAuthHelpers(env).revokeGrant(grantId, userId);
+      } catch {
+        // Best-effort revocation — always return invalid_grant per RFC 6749 §10.5
+      }
       return this.createErrorResponse('invalid_grant', 'Authorization code already used');
     }
 
@@ -3766,6 +3782,22 @@ class OAuthHelpersImpl implements OAuthHelpers {
       );
     }
 
+    // If requested, collect existing grants for this user+client to revoke AFTER the new grant is created.
+    // This avoids a data-loss window where the user has no grants if creation fails.
+    let grantsToRevoke: string[] = [];
+    if (options.revokeExistingGrants !== false) {
+      let cursor: string | undefined;
+      do {
+        const page = await this.listUserGrants(options.userId, { cursor });
+        for (const grant of page.items) {
+          if (grant.clientId === clientId) {
+            grantsToRevoke.push(grant.id);
+          }
+        }
+        cursor = page.cursor;
+      } while (cursor);
+    }
+
     // Generate a unique grant ID
     const grantId = generateRandomString(16);
 
@@ -3852,6 +3884,13 @@ class OAuthHelpersImpl implements OAuthHelpers {
       // Set the fragment (hash) part of the URL
       redirectUrl.hash = fragment.toString();
 
+      // Revoke old grants AFTER the new grant is successfully stored
+      try {
+        await Promise.all(grantsToRevoke.map((oldGrantId) => this.revokeGrant(oldGrantId, options.userId)));
+      } catch {
+        // Best-effort revocation — new grant is already stored, don't fail the authorization
+      }
+
       return { redirectTo: redirectUrl.toString() };
     } else {
       // Standard authorization code flow
@@ -3894,6 +3933,13 @@ class OAuthHelpersImpl implements OAuthHelpers {
       redirectUrl.searchParams.set('code', authCode);
       if (options.request.state) {
         redirectUrl.searchParams.set('state', options.request.state);
+      }
+
+      // Revoke old grants AFTER the new grant is successfully stored
+      try {
+        await Promise.all(grantsToRevoke.map((oldGrantId) => this.revokeGrant(oldGrantId, options.userId)));
+      } catch {
+        // Best-effort revocation — new grant is already stored, don't fail the authorization
       }
 
       return { redirectTo: redirectUrl.toString() };
