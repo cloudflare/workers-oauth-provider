@@ -1323,6 +1323,75 @@ describe('OAuthProvider', () => {
       expect(grant.refreshTokenId).toBeDefined(); // Refresh token should be added
     });
 
+    it('should revoke tokens when authorization code is reused', async () => {
+      // First get an auth code
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123`
+      );
+
+      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const location = authResponse.headers.get('Location')!;
+      const url = new URL(location);
+      const code = url.searchParams.get('code')!;
+
+      // First exchange: should succeed and issue tokens
+      const params1 = new URLSearchParams();
+      params1.append('grant_type', 'authorization_code');
+      params1.append('code', code);
+      params1.append('redirect_uri', redirectUri);
+      params1.append('client_id', clientId);
+      params1.append('client_secret', clientSecret);
+
+      const tokenRequest1 = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params1.toString()
+      );
+
+      const tokenResponse1 = await oauthProvider.fetch(tokenRequest1, mockEnv, mockCtx);
+      expect(tokenResponse1.status).toBe(200);
+
+      const tokens = await tokenResponse1.json<any>();
+      expect(tokens.access_token).toBeDefined();
+
+      // Verify tokens are in KV
+      const tokensBefore = await mockEnv.OAUTH_KV.list({ prefix: 'token:' });
+      expect(tokensBefore.keys.length).toBe(1);
+
+      // reuse code: should fail with invalid_grant
+      const params2 = new URLSearchParams();
+      params2.append('grant_type', 'authorization_code');
+      params2.append('code', code);
+      params2.append('redirect_uri', redirectUri);
+      params2.append('client_id', clientId);
+      params2.append('client_secret', clientSecret);
+
+      const tokenRequest2 = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params2.toString()
+      );
+
+      const tokenResponse2 = await oauthProvider.fetch(tokenRequest2, mockEnv, mockCtx);
+      expect(tokenResponse2.status).toBe(400);
+
+      const error = await tokenResponse2.json<any>();
+      expect(error.error).toBe('invalid_grant');
+      expect(error.error_description).toBe('Authorization code already used');
+
+      // Verify tokens from the first exchange were revoked
+      const tokensAfter = await mockEnv.OAUTH_KV.list({ prefix: 'token:' });
+      expect(tokensAfter.keys.length).toBe(0);
+
+      // Verify the grant itself was also revoked
+      const grantsAfter = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      expect(grantsAfter.keys.length).toBe(0);
+    });
+
     it('should reject token exchange without redirect_uri when not using PKCE', async () => {
       // First get an auth code
       const authRequest = createMockRequest(
