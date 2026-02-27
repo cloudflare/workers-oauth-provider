@@ -6935,4 +6935,815 @@ describe('OAuthProvider', () => {
       });
     });
   });
+
+  /**
+   * Issue #34: Re-authorization stale props / infinite loop
+   *
+   * When a user re-authorizes, the old grant persists with stale props.
+   * If the MCP client still holds the old refresh token, it continues to use
+   * the old grant with outdated props, creating an infinite re-auth loop.
+   */
+  describe('Re-authorization Grant Revocation (Issue #34)', () => {
+    let reAuthEnv: { OAUTH_KV: MockKV; OAUTH_PROVIDER: OAuthHelpers | null };
+    let reAuthCtx: MockExecutionContext;
+    let propsFromAuthorize: Record<string, any>;
+
+    // --- Helpers for the OAuth dance ---
+
+    async function registerClient(
+      provider: OAuthProvider,
+      env: any,
+      ctx: MockExecutionContext
+    ): Promise<{ clientId: string; clientSecret: string }> {
+      const response = await provider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify({
+            redirect_uris: ['https://client.example.com/callback'],
+            client_name: 'MCP Test Client',
+            token_endpoint_auth_method: 'client_secret_basic',
+          })
+        ),
+        env,
+        ctx
+      );
+      const client = await response.json<any>();
+      return { clientId: client.client_id, clientSecret: client.client_secret };
+    }
+
+    async function authorizeAndGetCode(
+      provider: OAuthProvider,
+      env: any,
+      ctx: MockExecutionContext,
+      clientId: string
+    ): Promise<string> {
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}` +
+          `&scope=${encodeURIComponent('read write')}&state=test-state`
+      );
+      const response = await provider.fetch(authRequest, env, ctx);
+      const location = response.headers.get('Location')!;
+      return new URL(location).searchParams.get('code')!;
+    }
+
+    async function exchangeCodeForTokens(
+      provider: OAuthProvider,
+      env: any,
+      ctx: MockExecutionContext,
+      code: string,
+      clientId: string,
+      clientSecret: string
+    ): Promise<{ access_token: string; refresh_token: string }> {
+      const response = await provider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+          },
+          `grant_type=authorization_code&code=${code}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}`
+        ),
+        env,
+        ctx
+      );
+      return response.json<any>();
+    }
+
+    async function refreshTokens(
+      provider: OAuthProvider,
+      env: any,
+      ctx: MockExecutionContext,
+      refreshToken: string,
+      clientId: string,
+      clientSecret: string
+    ): Promise<{ status: number; body: any; error?: string }> {
+      try {
+        const response = await provider.fetch(
+          createMockRequest(
+            'https://example.com/oauth/token',
+            'POST',
+            {
+              'Content-Type': 'application/x-www-form-urlencoded',
+              Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+            },
+            `grant_type=refresh_token&refresh_token=${refreshToken}`
+          ),
+          env,
+          ctx
+        );
+        return { status: response.status, body: await response.json<any>() };
+      } catch (err: any) {
+        return { status: 400, body: null, error: err.message };
+      }
+    }
+
+    async function callApi(
+      provider: OAuthProvider,
+      env: any,
+      ctx: MockExecutionContext,
+      accessToken: string
+    ): Promise<{ status: number; body: any }> {
+      const response = await provider.fetch(
+        createMockRequest('https://example.com/api/test', 'GET', {
+          Authorization: `Bearer ${accessToken}`,
+        }),
+        env,
+        ctx
+      );
+      return { status: response.status, body: await response.json<any>() };
+    }
+
+    function createDefaultHandlerNoRevoke(getProps: () => Record<string, any>) {
+      return {
+        async fetch(request: Request, env: any, _ctx: ExecutionContext) {
+          const url = new URL(request.url);
+          if (url.pathname === '/authorize') {
+            const oauthReqInfo = await env.OAUTH_PROVIDER.parseAuthRequest(request);
+            const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
+              request: oauthReqInfo,
+              userId: 'user-1',
+              metadata: {},
+              scope: oauthReqInfo.scope,
+              props: getProps(),
+              revokeExistingGrants: false,
+            });
+            return Response.redirect(redirectTo, 302);
+          }
+          return new Response('OK', { status: 200 });
+        },
+      };
+    }
+
+    function createDefaultHandlerWithRevoke(getProps: () => Record<string, any>) {
+      return {
+        async fetch(request: Request, env: any, _ctx: ExecutionContext) {
+          const url = new URL(request.url);
+          if (url.pathname === '/authorize') {
+            const oauthReqInfo = await env.OAUTH_PROVIDER.parseAuthRequest(request);
+            const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
+              request: oauthReqInfo,
+              userId: 'user-1',
+              metadata: {},
+              scope: oauthReqInfo.scope,
+              props: getProps(),
+            });
+            return Response.redirect(redirectTo, 302);
+          }
+          return new Response('OK', { status: 200 });
+        },
+      };
+    }
+
+    beforeEach(() => {
+      vi.resetAllMocks();
+      reAuthEnv = { OAUTH_KV: new MockKV(), OAUTH_PROVIDER: null };
+      reAuthCtx = new MockExecutionContext();
+      propsFromAuthorize = { upstreamToken: 'token-v1', version: 1 };
+    });
+
+    afterEach(() => {
+      reAuthEnv.OAUTH_KV.clear();
+    });
+
+    describe('WITHOUT revokeExistingGrants (opt-out / the bug)', () => {
+      it('should demonstrate that re-authorization creates a second grant while old grant persists', async () => {
+        const provider = new OAuthProvider({
+          apiRoute: ['/api/'],
+          apiHandler: TestApiHandler,
+          defaultHandler: createDefaultHandlerNoRevoke(() => propsFromAuthorize),
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: '/oauth/token',
+          clientRegistrationEndpoint: '/oauth/register',
+          scopesSupported: ['read', 'write'],
+        });
+
+        const { clientId, clientSecret } = await registerClient(provider, reAuthEnv, reAuthCtx);
+
+        // --- First authorization: props v1 ---
+        const code1 = await authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, clientId);
+        const tokens1 = await exchangeCodeForTokens(provider, reAuthEnv, reAuthCtx, code1, clientId, clientSecret);
+
+        // Verify props v1 are served
+        const api1 = await callApi(provider, reAuthEnv, reAuthCtx, tokens1.access_token);
+        expect(api1.status).toBe(200);
+        expect(api1.body.user.upstreamToken).toBe('token-v1');
+
+        // --- Simulate upstream token change ---
+        propsFromAuthorize = { upstreamToken: 'token-v2', version: 2 };
+
+        // --- Second authorization (re-auth): props v2 ---
+        const code2 = await authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, clientId);
+        const tokens2 = await exchangeCodeForTokens(provider, reAuthEnv, reAuthCtx, code2, clientId, clientSecret);
+
+        // New tokens have correct props v2
+        const api2 = await callApi(provider, reAuthEnv, reAuthCtx, tokens2.access_token);
+        expect(api2.status).toBe(200);
+        expect(api2.body.user.upstreamToken).toBe('token-v2');
+
+        // BUG: Old tokens STILL WORK with stale props v1!
+        const apiOld = await callApi(provider, reAuthEnv, reAuthCtx, tokens1.access_token);
+        expect(apiOld.status).toBe(200);
+        expect(apiOld.body.user.upstreamToken).toBe('token-v1'); // stale!
+
+        // BUG: Old refresh token STILL WORKS - client can keep getting stale v1 tokens
+        const refreshOld = await refreshTokens(
+          provider,
+          reAuthEnv,
+          reAuthCtx,
+          tokens1.refresh_token,
+          clientId,
+          clientSecret
+        );
+        expect(refreshOld.status).toBe(200); // This is the root cause of infinite loops
+
+        // Verify there are now TWO grants for the same user+client
+        const grants = await reAuthEnv.OAUTH_PROVIDER!.listUserGrants('user-1');
+        expect(grants.items.length).toBe(2);
+        expect(grants.items.every((g: any) => g.clientId === clientId)).toBe(true);
+      });
+
+      it('should demonstrate the infinite re-auth loop scenario', async () => {
+        const provider = new OAuthProvider({
+          apiRoute: ['/api/'],
+          apiHandler: TestApiHandler,
+          defaultHandler: createDefaultHandlerNoRevoke(() => propsFromAuthorize),
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: '/oauth/token',
+          clientRegistrationEndpoint: '/oauth/register',
+          scopesSupported: ['read', 'write'],
+          tokenExchangeCallback: async (options) => {
+            if (options.grantType === 'refresh_token') {
+              if (options.props.upstreamToken === 'token-v1-expired') {
+                throw new Error(
+                  JSON.stringify({
+                    error: 'invalid_grant',
+                    error_description: 'upstream token expired',
+                  })
+                );
+              }
+            }
+            return undefined;
+          },
+        });
+
+        const { clientId, clientSecret } = await registerClient(provider, reAuthEnv, reAuthCtx);
+
+        // First auth with a token that will expire
+        propsFromAuthorize = { upstreamToken: 'token-v1-expired', version: 1 };
+        const code1 = await authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, clientId);
+        const tokens1 = await exchangeCodeForTokens(provider, reAuthEnv, reAuthCtx, code1, clientId, clientSecret);
+
+        // Simulate upstream token expiry - refresh should fail with invalid_grant
+        const refresh1 = await refreshTokens(
+          provider,
+          reAuthEnv,
+          reAuthCtx,
+          tokens1.refresh_token,
+          clientId,
+          clientSecret
+        );
+        expect(refresh1.status).toBe(400);
+        expect(refresh1.error).toContain('invalid_grant');
+
+        // Client goes through re-auth with fresh props
+        propsFromAuthorize = { upstreamToken: 'token-v2-fresh', version: 2 };
+        const code2 = await authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, clientId);
+        await exchangeCodeForTokens(provider, reAuthEnv, reAuthCtx, code2, clientId, clientSecret);
+
+        // THE BUG: Old grant still exists — two grants for the same user+client
+        const grants = await reAuthEnv.OAUTH_PROVIDER!.listUserGrants('user-1');
+        expect(grants.items.length).toBe(2);
+      });
+    });
+
+    describe('WITH revokeExistingGrants (the fix)', () => {
+      it('should revoke old grants on re-authorization so stale tokens are invalidated', async () => {
+        const provider = new OAuthProvider({
+          apiRoute: ['/api/'],
+          apiHandler: TestApiHandler,
+          defaultHandler: createDefaultHandlerWithRevoke(() => propsFromAuthorize),
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: '/oauth/token',
+          clientRegistrationEndpoint: '/oauth/register',
+          scopesSupported: ['read', 'write'],
+        });
+
+        const { clientId, clientSecret } = await registerClient(provider, reAuthEnv, reAuthCtx);
+
+        // --- First authorization: props v1 ---
+        const code1 = await authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, clientId);
+        const tokens1 = await exchangeCodeForTokens(provider, reAuthEnv, reAuthCtx, code1, clientId, clientSecret);
+
+        // Verify first auth works
+        const api1 = await callApi(provider, reAuthEnv, reAuthCtx, tokens1.access_token);
+        expect(api1.status).toBe(200);
+        expect(api1.body.user.upstreamToken).toBe('token-v1');
+
+        // --- Simulate upstream token change ---
+        propsFromAuthorize = { upstreamToken: 'token-v2', version: 2 };
+
+        // --- Re-authorize with revokeExistingGrants: true ---
+        const code2 = await authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, clientId);
+        const tokens2 = await exchangeCodeForTokens(provider, reAuthEnv, reAuthCtx, code2, clientId, clientSecret);
+
+        // New tokens have correct props v2
+        const api2 = await callApi(provider, reAuthEnv, reAuthCtx, tokens2.access_token);
+        expect(api2.status).toBe(200);
+        expect(api2.body.user.upstreamToken).toBe('token-v2');
+
+        // FIX: Old access token should now be INVALID (grant was revoked)
+        const apiOld = await callApi(provider, reAuthEnv, reAuthCtx, tokens1.access_token);
+        expect(apiOld.status).toBe(401);
+
+        // FIX: Old refresh token should also be INVALID
+        const refreshOld = await refreshTokens(
+          provider,
+          reAuthEnv,
+          reAuthCtx,
+          tokens1.refresh_token,
+          clientId,
+          clientSecret
+        );
+        expect(refreshOld.status).toBe(400);
+
+        // FIX: Only ONE grant should exist for this user+client
+        const grants = await reAuthEnv.OAUTH_PROVIDER!.listUserGrants('user-1');
+        expect(grants.items.length).toBe(1);
+        expect(grants.items[0].clientId).toBe(clientId);
+      });
+
+      it('should break the infinite re-auth loop', async () => {
+        const provider = new OAuthProvider({
+          apiRoute: ['/api/'],
+          apiHandler: TestApiHandler,
+          defaultHandler: createDefaultHandlerWithRevoke(() => propsFromAuthorize),
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: '/oauth/token',
+          clientRegistrationEndpoint: '/oauth/register',
+          scopesSupported: ['read', 'write'],
+          tokenExchangeCallback: async (options) => {
+            if (options.grantType === 'refresh_token') {
+              if (options.props.upstreamToken === 'token-v1-expired') {
+                throw new Error(
+                  JSON.stringify({
+                    error: 'invalid_grant',
+                    error_description: 'upstream token expired',
+                  })
+                );
+              }
+            }
+            return undefined;
+          },
+        });
+
+        const { clientId, clientSecret } = await registerClient(provider, reAuthEnv, reAuthCtx);
+
+        // First auth with token that will expire
+        propsFromAuthorize = { upstreamToken: 'token-v1-expired', version: 1 };
+        const code1 = await authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, clientId);
+        const tokens1 = await exchangeCodeForTokens(provider, reAuthEnv, reAuthCtx, code1, clientId, clientSecret);
+
+        // Refresh fails because upstream token is expired
+        const refresh1 = await refreshTokens(
+          provider,
+          reAuthEnv,
+          reAuthCtx,
+          tokens1.refresh_token,
+          clientId,
+          clientSecret
+        );
+        expect(refresh1.status).toBe(400);
+        expect(refresh1.error).toContain('invalid_grant');
+
+        // Re-authorize with fresh props + revokeExistingGrants
+        propsFromAuthorize = { upstreamToken: 'token-v2-fresh', version: 2 };
+        const code2 = await authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, clientId);
+        const tokens2 = await exchangeCodeForTokens(provider, reAuthEnv, reAuthCtx, code2, clientId, clientSecret);
+
+        // FIX: Old refresh token FAILS immediately (grant was revoked)
+        const refreshOld = await refreshTokens(
+          provider,
+          reAuthEnv,
+          reAuthCtx,
+          tokens1.refresh_token,
+          clientId,
+          clientSecret
+        );
+        expect(refreshOld.status).toBe(400);
+
+        // New refresh token works correctly with fresh props
+        const refreshNew = await refreshTokens(
+          provider,
+          reAuthEnv,
+          reAuthCtx,
+          tokens2.refresh_token,
+          clientId,
+          clientSecret
+        );
+        expect(refreshNew.status).toBe(200);
+
+        // Only one grant should exist
+        const grants = await reAuthEnv.OAUTH_PROVIDER!.listUserGrants('user-1');
+        expect(grants.items.length).toBe(1);
+      });
+
+      it('should not affect grants from other clients', async () => {
+        const provider = new OAuthProvider({
+          apiRoute: ['/api/'],
+          apiHandler: TestApiHandler,
+          defaultHandler: createDefaultHandlerWithRevoke(() => propsFromAuthorize),
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: '/oauth/token',
+          clientRegistrationEndpoint: '/oauth/register',
+          scopesSupported: ['read', 'write'],
+        });
+
+        // Register two different clients
+        const client1 = await registerClient(provider, reAuthEnv, reAuthCtx);
+
+        const response2 = await provider.fetch(
+          createMockRequest(
+            'https://example.com/oauth/register',
+            'POST',
+            { 'Content-Type': 'application/json' },
+            JSON.stringify({
+              redirect_uris: ['https://other-client.example.com/callback'],
+              client_name: 'Other MCP Client',
+              token_endpoint_auth_method: 'client_secret_basic',
+            })
+          ),
+          reAuthEnv,
+          reAuthCtx
+        );
+        const c2 = await response2.json<any>();
+        const client2 = { clientId: c2.client_id, clientSecret: c2.client_secret };
+
+        // Authorize both clients
+        const code1 = await authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, client1.clientId);
+        await exchangeCodeForTokens(provider, reAuthEnv, reAuthCtx, code1, client1.clientId, client1.clientSecret);
+
+        // For client2, we need to use its redirect_uri
+        const authRequest2 = createMockRequest(
+          `https://example.com/authorize?response_type=code&client_id=${client2.clientId}` +
+            `&redirect_uri=${encodeURIComponent('https://other-client.example.com/callback')}` +
+            `&scope=read%20write&state=test-state`
+        );
+        const authResponse2 = await provider.fetch(authRequest2, reAuthEnv, reAuthCtx);
+        const code2 = new URL(authResponse2.headers.get('Location')!).searchParams.get('code')!;
+
+        const tokenResponse2 = await provider.fetch(
+          createMockRequest(
+            'https://example.com/oauth/token',
+            'POST',
+            {
+              'Content-Type': 'application/x-www-form-urlencoded',
+              Authorization: `Basic ${btoa(`${client2.clientId}:${client2.clientSecret}`)}`,
+            },
+            `grant_type=authorization_code&code=${code2}&redirect_uri=${encodeURIComponent('https://other-client.example.com/callback')}`
+          ),
+          reAuthEnv,
+          reAuthCtx
+        );
+        const tokens2 = await tokenResponse2.json<any>();
+
+        // Should have 2 grants (one per client)
+        let grants = await reAuthEnv.OAUTH_PROVIDER!.listUserGrants('user-1');
+        expect(grants.items.length).toBe(2);
+
+        // Re-authorize client1 with revokeExistingGrants
+        propsFromAuthorize = { upstreamToken: 'token-v2', version: 2 };
+        const code1b = await authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, client1.clientId);
+        await exchangeCodeForTokens(provider, reAuthEnv, reAuthCtx, code1b, client1.clientId, client1.clientSecret);
+
+        // Should still have 2 grants: new client1 grant + untouched client2 grant
+        grants = await reAuthEnv.OAUTH_PROVIDER!.listUserGrants('user-1');
+        expect(grants.items.length).toBe(2);
+
+        // Client2's tokens should still work
+        const api2 = await callApi(provider, reAuthEnv, reAuthCtx, tokens2.access_token);
+        expect(api2.status).toBe(200);
+      });
+    });
+  });
+
+  describe('RFC 8252 Loopback Redirect URI Port Flexibility', () => {
+    let clientId: string;
+    let clientSecret: string;
+
+    // Helper to register a client with given redirect URIs
+    async function registerClient(redirectUris: string[], authMethod = 'client_secret_basic') {
+      const clientData = {
+        redirect_uris: redirectUris,
+        client_name: 'Loopback Test Client',
+        token_endpoint_auth_method: authMethod,
+      };
+
+      const request = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify(clientData)
+      );
+
+      const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
+      const client = await response.json<any>();
+      clientId = client.client_id;
+      clientSecret = client.client_secret;
+    }
+
+    // Helper to make an authorization request
+    async function makeAuthRequest(redirectUri: string) {
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read&state=xyz123`
+      );
+      return oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+    }
+
+    // Helper to extract auth code from redirect response
+    function extractCode(response: Response): string {
+      const location = response.headers.get('Location')!;
+      const url = new URL(location);
+      return url.searchParams.get('code')!;
+    }
+
+    // Helper to exchange auth code for tokens
+    async function exchangeCode(code: string, redirectUri: string) {
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      );
+
+      return oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+    }
+
+    describe('should allow different ports for loopback redirect URIs', () => {
+      it('should accept 127.0.0.1 with different port than registered', async () => {
+        await registerClient(['http://127.0.0.1:8080/callback']);
+        const response = await makeAuthRequest('http://127.0.0.1:52431/callback');
+        expect(response.status).toBe(302);
+        expect(response.headers.get('Location')).toContain('code=');
+      });
+
+      it('should accept 127.0.0.1 with no port when registered has port', async () => {
+        await registerClient(['http://127.0.0.1:8080/callback']);
+        const response = await makeAuthRequest('http://127.0.0.1/callback');
+        expect(response.status).toBe(302);
+        expect(response.headers.get('Location')).toContain('code=');
+      });
+
+      it('should accept 127.0.0.1 with port when registered has no port', async () => {
+        await registerClient(['http://127.0.0.1/callback']);
+        const response = await makeAuthRequest('http://127.0.0.1:9999/callback');
+        expect(response.status).toBe(302);
+        expect(response.headers.get('Location')).toContain('code=');
+      });
+
+      it('should accept IPv6 loopback [::1] with different port', async () => {
+        await registerClient(['http://[::1]:8080/callback']);
+        const response = await makeAuthRequest('http://[::1]:43210/callback');
+        expect(response.status).toBe(302);
+        expect(response.headers.get('Location')).toContain('code=');
+      });
+
+      it('should accept 127.0.0.1 with same port (exact match still works)', async () => {
+        await registerClient(['http://127.0.0.1:8080/callback']);
+        const response = await makeAuthRequest('http://127.0.0.1:8080/callback');
+        expect(response.status).toBe(302);
+        expect(response.headers.get('Location')).toContain('code=');
+      });
+
+      it('should accept loopback in the full 127.x.x.x range', async () => {
+        await registerClient(['http://127.255.255.255:8080/callback']);
+        const response = await makeAuthRequest('http://127.255.255.255:9999/callback');
+        expect(response.status).toBe(302);
+        expect(response.headers.get('Location')).toContain('code=');
+      });
+    });
+
+    describe('should reject loopback URIs when non-port components differ', () => {
+      it('should reject loopback with different path', async () => {
+        await registerClient(['http://127.0.0.1:8080/callback']);
+        await expect(makeAuthRequest('http://127.0.0.1:8080/evil')).rejects.toThrow('Invalid redirect URI');
+      });
+
+      it('should reject loopback with different scheme (http vs https)', async () => {
+        await registerClient(['http://127.0.0.1:8080/callback']);
+        await expect(makeAuthRequest('https://127.0.0.1:8080/callback')).rejects.toThrow('Invalid redirect URI');
+      });
+
+      it('should reject loopback with different hostname (127.0.0.1 vs 127.0.0.2)', async () => {
+        await registerClient(['http://127.0.0.1:8080/callback']);
+        await expect(makeAuthRequest('http://127.0.0.2:8080/callback')).rejects.toThrow('Invalid redirect URI');
+      });
+
+      it('should reject loopback IPv4 vs IPv6 mismatch', async () => {
+        await registerClient(['http://127.0.0.1:8080/callback']);
+        await expect(makeAuthRequest('http://[::1]:8080/callback')).rejects.toThrow('Invalid redirect URI');
+      });
+    });
+
+    describe('should NOT treat localhost as loopback (RFC 8252 Section 7.3)', () => {
+      it('should reject localhost with different port (exact match required)', async () => {
+        await registerClient(['http://localhost:8080/callback']);
+        await expect(makeAuthRequest('http://localhost:9999/callback')).rejects.toThrow('Invalid redirect URI');
+      });
+
+      it('should accept localhost with exact same URI', async () => {
+        await registerClient(['http://localhost:8080/callback']);
+        const response = await makeAuthRequest('http://localhost:8080/callback');
+        expect(response.status).toBe(302);
+        expect(response.headers.get('Location')).toContain('code=');
+      });
+    });
+
+    describe('should preserve exact match for non-loopback URIs', () => {
+      it('should reject non-loopback with different port', async () => {
+        await registerClient(['https://example.com:8080/callback']);
+        await expect(makeAuthRequest('https://example.com:9090/callback')).rejects.toThrow('Invalid redirect URI');
+      });
+
+      it('should accept non-loopback with exact match', async () => {
+        await registerClient(['https://example.com/callback']);
+        const response = await makeAuthRequest('https://example.com/callback');
+        expect(response.status).toBe(302);
+        expect(response.headers.get('Location')).toContain('code=');
+      });
+    });
+
+    describe('should validate loopback redirect URI in token exchange', () => {
+      it('should accept token exchange with different loopback port', async () => {
+        await registerClient(['http://127.0.0.1:8080/callback']);
+
+        // Authorize with one port
+        const authResponse = await makeAuthRequest('http://127.0.0.1:52431/callback');
+        expect(authResponse.status).toBe(302);
+        const code = extractCode(authResponse);
+
+        // Exchange with yet another port
+        const tokenResponse = await exchangeCode(code, 'http://127.0.0.1:33333/callback');
+        expect(tokenResponse.status).toBe(200);
+        const tokens = await tokenResponse.json<any>();
+        expect(tokens.access_token).toBeDefined();
+        expect(tokens.refresh_token).toBeDefined();
+      });
+
+      it('should reject token exchange with non-matching loopback path', async () => {
+        await registerClient(['http://127.0.0.1:8080/callback']);
+
+        // Authorize with valid loopback
+        const authResponse = await makeAuthRequest('http://127.0.0.1:52431/callback');
+        expect(authResponse.status).toBe(302);
+        const code = extractCode(authResponse);
+
+        // Exchange with different path
+        const tokenResponse = await exchangeCode(code, 'http://127.0.0.1:52431/evil');
+        expect(tokenResponse.status).toBe(400);
+        const error = await tokenResponse.json<any>();
+        expect(error.error).toBe('invalid_grant');
+      });
+    });
+
+    describe('should validate loopback redirect URI in completeAuthorization', () => {
+      it('should reject completeAuthorization with tampered non-loopback redirect URI', async () => {
+        await registerClient(['http://127.0.0.1:8080/callback']);
+
+        // Get helpers
+        await oauthProvider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
+        const helpers = mockEnv.OAUTH_PROVIDER!;
+
+        // Parse a valid auth request
+        const authRequest = createMockRequest(
+          `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+            `&redirect_uri=${encodeURIComponent('http://127.0.0.1:52431/callback')}` +
+            `&scope=read&state=xyz123`
+        );
+        const oauthReqInfo = await helpers.parseAuthRequest(authRequest);
+
+        // Tamper with redirect URI to a non-loopback address
+        const tamperedRequest = { ...oauthReqInfo, redirectUri: 'https://attacker.com/callback' };
+
+        await expect(
+          helpers.completeAuthorization({
+            request: tamperedRequest,
+            userId: 'test-user-123',
+            metadata: {},
+            scope: tamperedRequest.scope,
+            props: {},
+          })
+        ).rejects.toThrow('Invalid redirect URI');
+      });
+
+      it('should accept completeAuthorization with valid loopback different port', async () => {
+        await registerClient(['http://127.0.0.1:8080/callback']);
+
+        // Get helpers
+        await oauthProvider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
+        const helpers = mockEnv.OAUTH_PROVIDER!;
+
+        // Parse auth request with different port
+        const authRequest = createMockRequest(
+          `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+            `&redirect_uri=${encodeURIComponent('http://127.0.0.1:52431/callback')}` +
+            `&scope=read&state=xyz123`
+        );
+        const oauthReqInfo = await helpers.parseAuthRequest(authRequest);
+
+        // Should succeed - loopback with different port
+        const result = await helpers.completeAuthorization({
+          request: oauthReqInfo,
+          userId: 'test-user-123',
+          metadata: {},
+          scope: oauthReqInfo.scope,
+          props: {},
+        });
+
+        expect(result.redirectTo).toContain('http://127.0.0.1:52431/callback');
+        expect(result.redirectTo).toContain('code=');
+      });
+    });
+
+    describe('full end-to-end flow with loopback ephemeral ports', () => {
+      it('should complete full auth code flow with different loopback ports at each stage', async () => {
+        // Register with one port
+        await registerClient(['http://127.0.0.1:8080/callback']);
+
+        // Authorize with an ephemeral port (simulating native app)
+        const authResponse = await makeAuthRequest('http://127.0.0.1:52431/callback');
+        expect(authResponse.status).toBe(302);
+
+        const location = authResponse.headers.get('Location')!;
+        // Verify the redirect goes to the ephemeral port, not the registered one
+        expect(location).toContain('http://127.0.0.1:52431/callback');
+        const code = extractCode(authResponse);
+
+        // Exchange code with the same ephemeral port used during authorization
+        const tokenResponse = await exchangeCode(code, 'http://127.0.0.1:52431/callback');
+        expect(tokenResponse.status).toBe(200);
+
+        const tokens = await tokenResponse.json<any>();
+        expect(tokens.access_token).toBeDefined();
+        expect(tokens.refresh_token).toBeDefined();
+        expect(tokens.token_type).toBe('bearer');
+
+        // Use the access token to access a protected API
+        const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
+          Authorization: `Bearer ${tokens.access_token}`,
+        });
+        const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+        expect(apiResponse.status).toBe(200);
+      });
+
+      it('should complete full flow with IPv6 loopback', async () => {
+        await registerClient(['http://[::1]:3000/callback']);
+
+        // Authorize with different port
+        const authResponse = await makeAuthRequest('http://[::1]:48721/callback');
+        expect(authResponse.status).toBe(302);
+        const code = extractCode(authResponse);
+
+        // Exchange with the port used during auth
+        const tokenResponse = await exchangeCode(code, 'http://[::1]:48721/callback');
+        expect(tokenResponse.status).toBe(200);
+        const tokens = await tokenResponse.json<any>();
+        expect(tokens.access_token).toBeDefined();
+      });
+    });
+
+    describe('multiple registered redirect URIs with loopback', () => {
+      it('should match correct loopback URI from multiple registered URIs', async () => {
+        await registerClient([
+          'https://example.com/callback',
+          'http://127.0.0.1:8080/callback',
+          'http://127.0.0.1:8080/other-callback',
+        ]);
+
+        // Should match the second registered URI (loopback with port flexibility)
+        const response = await makeAuthRequest('http://127.0.0.1:55555/callback');
+        expect(response.status).toBe(302);
+        expect(response.headers.get('Location')).toContain('code=');
+      });
+
+      it('should still reject when no registered URI matches loopback criteria', async () => {
+        await registerClient(['https://example.com/callback', 'http://127.0.0.1:8080/other-path']);
+
+        // Different path, should not match any registered URI
+        await expect(makeAuthRequest('http://127.0.0.1:55555/callback')).rejects.toThrow('Invalid redirect URI');
+      });
+    });
+  });
 });
