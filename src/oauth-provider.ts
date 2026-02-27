@@ -3877,7 +3877,11 @@ class OAuthHelpersImpl implements OAuthHelpers {
       redirectUrl.hash = fragment.toString();
 
       // Revoke old grants AFTER the new grant is successfully stored
-      await Promise.all(grantsToRevoke.map((oldGrantId) => this.revokeGrant(oldGrantId, options.userId)));
+      try {
+        await Promise.all(grantsToRevoke.map((oldGrantId) => this.revokeGrant(oldGrantId, options.userId)));
+      } catch {
+        // Best-effort revocation — new grant is already stored, don't fail the authorization
+      }
 
       return { redirectTo: redirectUrl.toString() };
     } else {
@@ -3924,7 +3928,11 @@ class OAuthHelpersImpl implements OAuthHelpers {
       }
 
       // Revoke old grants AFTER the new grant is successfully stored
-      await Promise.all(grantsToRevoke.map((oldGrantId) => this.revokeGrant(oldGrantId, options.userId)));
+      try {
+        await Promise.all(grantsToRevoke.map((oldGrantId) => this.revokeGrant(oldGrantId, options.userId)));
+      } catch {
+        // Best-effort revocation — new grant is already stored, don't fail the authorization
+      }
 
       return { redirectTo: redirectUrl.toString() };
     }
