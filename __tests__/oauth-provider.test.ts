@@ -6951,7 +6951,7 @@ describe('OAuthProvider', () => {
     // --- Helpers for the OAuth dance ---
 
     async function registerClient(
-      provider: OAuthProvider,
+      provider: OAuthProvider<any>,
       env: any,
       ctx: MockExecutionContext
     ): Promise<{ clientId: string; clientSecret: string }> {
@@ -6974,7 +6974,7 @@ describe('OAuthProvider', () => {
     }
 
     async function authorizeAndGetCode(
-      provider: OAuthProvider,
+      provider: OAuthProvider<any>,
       env: any,
       ctx: MockExecutionContext,
       clientId: string
@@ -6990,7 +6990,7 @@ describe('OAuthProvider', () => {
     }
 
     async function exchangeCodeForTokens(
-      provider: OAuthProvider,
+      provider: OAuthProvider<any>,
       env: any,
       ctx: MockExecutionContext,
       code: string,
@@ -7014,7 +7014,7 @@ describe('OAuthProvider', () => {
     }
 
     async function refreshTokens(
-      provider: OAuthProvider,
+      provider: OAuthProvider<any>,
       env: any,
       ctx: MockExecutionContext,
       refreshToken: string,
@@ -7042,7 +7042,7 @@ describe('OAuthProvider', () => {
     }
 
     async function callApi(
-      provider: OAuthProvider,
+      provider: OAuthProvider<any>,
       env: any,
       ctx: MockExecutionContext,
       accessToken: string
