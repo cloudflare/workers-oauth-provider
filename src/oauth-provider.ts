@@ -1598,7 +1598,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       code_challenge_methods_supported: this.options.allowPlainPKCE !== false ? ['plain', 'S256'] : ['S256'], // PKCE support
       // MCP Client ID Metadata Document support (CIMD)
       // Only enabled when global_fetch_strictly_public compat flag is set (for SSRF protection)
-      client_id_metadata_document_supported: !!this.options.clientIdMetadataDocumentEnabled && this.hasGlobalFetchStrictlyPublic(),
+      client_id_metadata_document_supported:
+        !!this.options.clientIdMetadataDocumentEnabled && this.hasGlobalFetchStrictlyPublic(),
     };
 
     return new Response(JSON.stringify(metadata), {
@@ -2897,9 +2898,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         return env.OAUTH_KV.get(clientKey, { type: 'json' });
       }
       if (!this.hasGlobalFetchStrictlyPublic()) {
-        throw new Error(
-          `CIMD is enabled but 'global_fetch_strictly_public' compatibility flag is not set.`
-        );
+        throw new Error(`CIMD is enabled but 'global_fetch_strictly_public' compatibility flag is not set.`);
       }
       return this.fetchClientMetadataDocument(clientId);
     }
