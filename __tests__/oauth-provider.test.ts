@@ -5974,6 +5974,20 @@ describe('OAuthProvider', () => {
           global_fetch_strictly_public: true,
         },
       };
+      // Enable CIMD for the CIMD test suite
+      oauthProvider = new OAuthProvider({
+        apiRoute: ['/api/', 'https://api.example.com/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        scopesSupported: ['read', 'write', 'profile'],
+        accessTokenTTL: 3600,
+        allowImplicitFlow: true,
+        allowTokenExchangeGrant: true,
+        clientIdMetadataDocumentEnabled: true,
+      });
     });
 
     afterEach(() => {
@@ -6539,7 +6553,7 @@ describe('OAuthProvider', () => {
         );
 
         await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
-          "global_fetch_strictly_public' compatibility flag is not enabled"
+          "global_fetch_strictly_public' compatibility flag is not set"
         );
         expect(fetchSpy).not.toHaveBeenCalled();
       });
@@ -6559,7 +6573,7 @@ describe('OAuthProvider', () => {
         );
 
         await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
-          "global_fetch_strictly_public' compatibility flag is not enabled"
+          "global_fetch_strictly_public' compatibility flag is not set"
         );
         expect(fetchSpy).not.toHaveBeenCalled();
       });
@@ -6579,13 +6593,13 @@ describe('OAuthProvider', () => {
         );
 
         await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
-          "global_fetch_strictly_public' compatibility flag is not enabled"
+          "global_fetch_strictly_public' compatibility flag is not set"
         );
         expect(fetchSpy).not.toHaveBeenCalled();
       });
 
-      it('should report client_id_metadata_document_supported as true when flag is enabled', async () => {
-        // Flag is enabled in beforeEach
+      it('should report client_id_metadata_document_supported as true when option and flag are enabled', async () => {
+        // Both clientIdMetadataDocumentEnabled and compat flag are enabled in beforeEach
         const metadataRequest = createMockRequest('https://example.com/.well-known/oauth-authorization-server', 'GET');
         const response = await oauthProvider.fetch(metadataRequest, mockEnv, mockCtx);
         const metadata = (await response.json()) as { client_id_metadata_document_supported: boolean };
@@ -6593,7 +6607,7 @@ describe('OAuthProvider', () => {
         expect(metadata.client_id_metadata_document_supported).toBe(true);
       });
 
-      it('should report client_id_metadata_document_supported as false when flag is not enabled', async () => {
+      it('should report client_id_metadata_document_supported as false when compat flag is not enabled', async () => {
         (globalThis as any).Cloudflare = {
           compatibilityFlags: {
             global_fetch_strictly_public: false,
@@ -6615,6 +6629,101 @@ describe('OAuthProvider', () => {
         const metadata = (await response.json()) as { client_id_metadata_document_supported: boolean };
 
         expect(metadata.client_id_metadata_document_supported).toBe(false);
+      });
+    });
+
+    describe('Explicit Opt-In', () => {
+      it('should fall through to KV lookup for URL client_id when CIMD is not enabled', async () => {
+        // Create provider WITHOUT clientIdMetadataDocumentEnabled
+        const providerWithoutCimd = new OAuthProvider({
+          apiRoute: ['/api/', 'https://api.example.com/'],
+          apiHandler: TestApiHandler,
+          defaultHandler: testDefaultHandler,
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: '/oauth/token',
+          clientRegistrationEndpoint: '/oauth/register',
+          scopesSupported: ['read', 'write', 'profile'],
+          accessTokenTTL: 3600,
+          allowImplicitFlow: true,
+          allowTokenExchangeGrant: true,
+        });
+
+        const cimdUrl = 'https://client.example.com/oauth/metadata.json';
+        const fetchSpy = vi.fn();
+        globalThis.fetch = fetchSpy;
+
+        const authRequest = createMockRequest(
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          'GET'
+        );
+
+        // Should NOT call fetch — falls through to KV lookup (which returns null → "Invalid client")
+        await expect(providerWithoutCimd.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        expect(fetchSpy).not.toHaveBeenCalled();
+      });
+
+      it('should report client_id_metadata_document_supported as false when option is not set', async () => {
+        const providerWithoutCimd = new OAuthProvider({
+          apiRoute: ['/api/', 'https://api.example.com/'],
+          apiHandler: TestApiHandler,
+          defaultHandler: testDefaultHandler,
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: '/oauth/token',
+          clientRegistrationEndpoint: '/oauth/register',
+          scopesSupported: ['read', 'write', 'profile'],
+          accessTokenTTL: 3600,
+          allowImplicitFlow: true,
+          allowTokenExchangeGrant: true,
+        });
+
+        const metadataRequest = createMockRequest('https://example.com/.well-known/oauth-authorization-server', 'GET');
+        const response = await providerWithoutCimd.fetch(metadataRequest, mockEnv, mockCtx);
+        const metadata = (await response.json()) as { client_id_metadata_document_supported: boolean };
+
+        expect(metadata.client_id_metadata_document_supported).toBe(false);
+      });
+
+      it('should fetch CIMD when option is enabled and compat flag is set', async () => {
+        // oauthProvider already has clientIdMetadataDocumentEnabled: true from beforeEach
+        // and Cloudflare global_fetch_strictly_public: true
+        const cimdUrl = 'https://client.example.com/oauth/metadata.json';
+        const validMetadata = {
+          client_id: cimdUrl,
+          client_name: 'CIMD Opt-In Client',
+          redirect_uris: ['https://client.example.com/callback'],
+          token_endpoint_auth_method: 'none',
+        };
+
+        globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(createMockFetchResponse(validMetadata)));
+
+        const authRequest = createMockRequest(
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          'GET'
+        );
+
+        const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+        expect(authResponse.status).toBe(302);
+        expect(globalThis.fetch).toHaveBeenCalledWith(cimdUrl, expect.anything());
+      });
+
+      it('should throw when option is enabled but compat flag is missing', async () => {
+        // oauthProvider has clientIdMetadataDocumentEnabled: true from beforeEach
+        // but remove the compat flag
+        delete (globalThis as any).Cloudflare;
+
+        const cimdUrl = 'https://client.example.com/oauth/metadata.json';
+        const fetchSpy = vi.fn();
+        globalThis.fetch = fetchSpy;
+
+        const authRequest = createMockRequest(
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          'GET'
+        );
+
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
+          "CIMD is enabled but 'global_fetch_strictly_public' compatibility flag is not set."
+        );
+        expect(fetchSpy).not.toHaveBeenCalled();
       });
     });
   });

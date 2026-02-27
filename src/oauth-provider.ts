@@ -325,6 +325,14 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
   }) => Response | void;
 
   /**
+   * Explicitly enable Client ID Metadata Document (CIMD) support.
+   * When true, URL-formatted client_ids will be fetched as metadata documents.
+   * Requires the 'global_fetch_strictly_public' compatibility flag.
+   * Defaults to false.
+   */
+  clientIdMetadataDocumentEnabled?: boolean;
+
+  /**
    * Optional metadata for RFC 9728 OAuth 2.0 Protected Resource Metadata.
    * Controls the response served at /.well-known/oauth-protected-resource.
    *
@@ -1598,7 +1606,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       code_challenge_methods_supported: this.options.allowPlainPKCE !== false ? ['plain', 'S256'] : ['S256'], // PKCE support
       // MCP Client ID Metadata Document support (CIMD)
       // Only enabled when global_fetch_strictly_public compat flag is set (for SSRF protection)
-      client_id_metadata_document_supported: this.hasGlobalFetchStrictlyPublic(),
+      client_id_metadata_document_supported:
+        !!this.options.clientIdMetadataDocumentEnabled && this.hasGlobalFetchStrictlyPublic(),
     };
 
     return new Response(JSON.stringify(metadata), {
@@ -2899,11 +2908,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   async getClient(env: any, clientId: string): Promise<ClientInfo | null> {
     // Check if this is a CIMD (Client ID Metadata Document) URL
     if (this.isClientMetadataUrl(clientId)) {
+      if (!this.options.clientIdMetadataDocumentEnabled) {
+        // CIMD not enabled — treat as standard KV lookup
+        const clientKey = `client:${clientId}`;
+        return env.OAUTH_KV.get(clientKey, { type: 'json' });
+      }
       if (!this.hasGlobalFetchStrictlyPublic()) {
-        throw new Error(
-          `Client ID "${clientId}" appears to be a CIMD URL, but the 'global_fetch_strictly_public' ` +
-            `compatibility flag is not enabled. Add this flag to your wrangler.jsonc to enable CIMD support.`
-        );
+        throw new Error(`CIMD is enabled but 'global_fetch_strictly_public' compatibility flag is not set.`);
       }
       return this.fetchClientMetadataDocument(clientId);
     }
