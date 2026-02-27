@@ -6046,7 +6046,7 @@ describe('OAuthProvider', () => {
     });
 
     describe('Response Size Limit (DoS Prevention)', () => {
-      it('should reject responses exceeding 5KB via Content-Length header', async () => {
+      it('should treat oversized Content-Length response as invalid client', async () => {
         const cimdUrl = 'https://malicious.example.com/oauth/metadata.json';
         const validMetadata = {
           client_id: cimdUrl,
@@ -6064,12 +6064,10 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
-          'Client metadata exceeds size limit'
-        );
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
       });
 
-      it('should reject responses exceeding 5KB via streaming', async () => {
+      it('should treat streaming response exceeding 5KB as invalid client', async () => {
         const cimdUrl = 'https://malicious.example.com/oauth/metadata.json';
         const largeBody = JSON.stringify({
           client_id: cimdUrl,
@@ -6089,9 +6087,7 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
-          'Response exceeded size limit'
-        );
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
       });
     });
 
@@ -6167,9 +6163,7 @@ describe('OAuthProvider', () => {
           `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
           'GET'
         );
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
-          'Failed to fetch client metadata: HTTP 404'
-        );
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
 
         // No KV caching anymore - Cloudflare HTTP cache handles caching
         const cacheKey = `cimd:${cimdUrl}`;
@@ -6190,9 +6184,7 @@ describe('OAuthProvider', () => {
           `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
           'GET'
         );
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
-          'client_id "https://different.example.com/metadata.json" does not match metadata URL'
-        );
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
 
         // No KV caching anymore - Cloudflare HTTP cache handles caching
         const cacheKey = `cimd:${cimdUrl}`;
@@ -6202,7 +6194,7 @@ describe('OAuthProvider', () => {
     });
 
     describe('Symmetric Auth Method Rejection', () => {
-      it('should reject client_secret_post auth method', async () => {
+      it('should treat client_secret_post auth method as invalid client', async () => {
         const cimdUrl = 'https://client.example.com/oauth/metadata.json';
         globalThis.fetch = vi.fn().mockResolvedValue(
           createMockFetchResponse({
@@ -6217,12 +6209,10 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
-          'is not allowed for CIMD clients. Allowed methods: none, private_key_jwt'
-        );
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
       });
 
-      it('should reject client_secret_basic auth method', async () => {
+      it('should treat client_secret_basic auth method as invalid client', async () => {
         const cimdUrl = 'https://client.example.com/oauth/metadata.json';
         globalThis.fetch = vi.fn().mockResolvedValue(
           createMockFetchResponse({
@@ -6237,12 +6227,10 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
-          'is not allowed for CIMD clients. Allowed methods: none, private_key_jwt'
-        );
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
       });
 
-      it('should reject client_secret_jwt auth method', async () => {
+      it('should treat client_secret_jwt auth method as invalid client', async () => {
         const cimdUrl = 'https://client.example.com/oauth/metadata.json';
         globalThis.fetch = vi.fn().mockResolvedValue(
           createMockFetchResponse({
@@ -6257,9 +6245,7 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
-          'is not allowed for CIMD clients. Allowed methods: none, private_key_jwt'
-        );
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
       });
 
       it('should accept none auth method', async () => {
@@ -6309,7 +6295,7 @@ describe('OAuthProvider', () => {
     });
 
     describe('Metadata Validation', () => {
-      it('should reject when client_id does not match URL', async () => {
+      it('should treat mismatched client_id as invalid client', async () => {
         const cimdUrl = 'https://client.example.com/oauth/metadata.json';
         const invalidMetadata = {
           client_id: 'https://different.example.com/metadata.json',
@@ -6323,12 +6309,10 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
-          'client_id "https://different.example.com/metadata.json" does not match metadata URL'
-        );
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
       });
 
-      it('should reject when redirect_uris is missing', async () => {
+      it('should treat missing redirect_uris as invalid client', async () => {
         const cimdUrl = 'https://client.example.com/oauth/metadata.json';
         const invalidMetadata = {
           client_id: cimdUrl,
@@ -6342,12 +6326,10 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
-          'redirect_uris is required and must not be empty'
-        );
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
       });
 
-      it('should reject when redirect_uris is empty', async () => {
+      it('should treat empty redirect_uris as invalid client', async () => {
         const cimdUrl = 'https://client.example.com/oauth/metadata.json';
         const invalidMetadata = {
           client_id: cimdUrl,
@@ -6362,12 +6344,10 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
-          'redirect_uris is required and must not be empty'
-        );
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
       });
 
-      it('should reject invalid JSON response', async () => {
+      it('should treat invalid JSON response as invalid client', async () => {
         const cimdUrl = 'https://client.example.com/oauth/metadata.json';
 
         globalThis.fetch = vi.fn().mockResolvedValue(
@@ -6382,7 +6362,7 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('is not valid JSON');
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
       });
     });
 
@@ -6441,7 +6421,7 @@ describe('OAuthProvider', () => {
     });
 
     describe('Request Timeout', () => {
-      it('should handle fetch abort gracefully', async () => {
+      it('should treat fetch abort as invalid client', async () => {
         const cimdUrl = 'https://abort.example.com/oauth/metadata.json';
         globalThis.fetch = vi.fn().mockRejectedValue(new DOMException('Aborted', 'AbortError'));
 
@@ -6450,7 +6430,7 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Aborted');
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
       });
 
       it('should pass AbortSignal to fetch', async () => {
@@ -6480,7 +6460,7 @@ describe('OAuthProvider', () => {
     });
 
     describe('HTTP Error Handling', () => {
-      it('should reject 404 responses', async () => {
+      it('should treat 404 responses as invalid client', async () => {
         const cimdUrl = 'https://client.example.com/oauth/metadata.json';
         globalThis.fetch = vi.fn().mockResolvedValue(new Response('Not Found', { status: 404 }));
 
@@ -6489,12 +6469,10 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
-          'Failed to fetch client metadata: HTTP 404'
-        );
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
       });
 
-      it('should reject 500 responses', async () => {
+      it('should treat 500 responses as invalid client', async () => {
         const cimdUrl = 'https://client.example.com/oauth/metadata.json';
         globalThis.fetch = vi.fn().mockResolvedValue(new Response('Internal Server Error', { status: 500 }));
 
@@ -6503,12 +6481,10 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
-          'Failed to fetch client metadata: HTTP 500'
-        );
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
       });
 
-      it('should handle network errors gracefully', async () => {
+      it('should treat network errors as invalid client', async () => {
         const cimdUrl = 'https://unreachable.example.com/oauth/metadata.json';
         globalThis.fetch = vi.fn().mockRejectedValue(new Error('Network error'));
 
@@ -6517,7 +6493,7 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Network error');
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
       });
     });
 

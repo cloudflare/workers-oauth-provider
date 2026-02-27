@@ -2916,7 +2916,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       if (!this.hasGlobalFetchStrictlyPublic()) {
         throw new Error(`CIMD is enabled but 'global_fetch_strictly_public' compatibility flag is not set.`);
       }
-      return this.fetchClientMetadataDocument(clientId);
+      try {
+        return await this.fetchClientMetadataDocument(clientId);
+      } catch {
+        // CIMD fetch failed (size limit, timeout, HTTP error, invalid metadata, etc.)
+        // Return null so callers treat this as "client not found" instead of a 500
+        return null;
+      }
     }
 
     // Standard KV lookup
