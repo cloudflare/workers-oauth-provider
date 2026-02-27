@@ -1,5 +1,15 @@
 # @cloudflare/workers-oauth-provider
 
+## 0.3.0
+
+### Minor Changes
+
+- [#144](https://github.com/cloudflare/workers-oauth-provider/pull/144) [`49a1d24`](https://github.com/cloudflare/workers-oauth-provider/commit/49a1d24b298984b623eec6d780eb6c9bf2fd01bb) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Add `revokeExistingGrants` option to `completeAuthorization()` that revokes existing grants for the same user+client after creating a new one. Defaults to `true`, fixing infinite re-auth loops when props change between authorizations (issue #34). Set to `false` to allow multiple concurrent grants per user+client.
+
+  Revoke tokens and grant when an authorization code is reused, per RFC 6749 §10.5. This prevents authorization code replay attacks by invalidating all tokens issued from the first exchange.
+
+  **Breaking behavior change:** Previously, re-authorizing the same user+client created an additional grant, leaving old tokens valid. Now, old grants are revoked by default. If your application relies on multiple concurrent grants per user+client, set `revokeExistingGrants: false` to preserve the old behavior.
+
 ## 0.2.4
 
 ### Patch Changes
