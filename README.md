@@ -125,7 +125,7 @@ const defaultHandler = {
       // state. It returns an object containing all these (using idiomatic camelCase naming).
       let oauthReqInfo = await env.OAUTH_PROVIDER.parseAuthRequest(request);
 
-      // `env.OAUTH_PROVIDER.lookupClient()` looks up metadata about the client, as definetd by RFC-7591. This
+      // `env.OAUTH_PROVIDER.lookupClient()` looks up metadata about the client, as defined by RFC-7591. This
       // includes things like redirect_uris, client_name, logo_uri, etc.
       let clientInfo = await env.OAUTH_PROVIDER.lookupClient(oauthReqInfo.clientId);
 
@@ -145,10 +145,10 @@ const defaultHandler = {
         // belonging to a particular user, e.g. to implement an audit and revocation UI.
         userId: '1234',
 
-        // The application can specify some arbitary metadata which describes this grant. The
+        // The application can specify some arbitrary metadata which describes this grant. The
         // metadata can contain any JSON-serializable content. This metadata is not used by the
         // OAuthProvider, but the application can read back the metadata attached to specific
-        // grants when enumerating them later, again e.g. to implement an udit and revocation UI.
+        // grants when enumerating them later, again e.g. to implement an audit and revocation UI.
         metadata: { label: 'foo' },
 
         // The application specifies the list of OAuth scope identifiers that were granted. This
@@ -176,7 +176,7 @@ const defaultHandler = {
   },
 };
 
-// The API handler object - the OAuthProivder will pass authorized API requests to this object's fetch method
+// The API handler object - the OAuthProvider will pass authorized API requests to this object's fetch method
 // (because we provided it as the `apiHandler` setting, above). This is ONLY called for API requests
 // that had a valid access token.
 class ApiHandler extends WorkerEntrypoint {
@@ -194,7 +194,7 @@ class ApiHandler extends WorkerEntrypoint {
     let url = new URL(request.url);
     if (url.pathname == '/api/whoami') {
       // Since the username is embedded in `ctx.props`, which came from the access token that the
-      // OAuthProivder already verified, we don't need to do any other authentication steps.
+      // OAuthProvider already verified, we don't need to do any other authentication steps.
       return new Response(`You are authenticated as: ${this.ctx.props.username}`);
     }
 
