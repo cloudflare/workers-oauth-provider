@@ -551,6 +551,7 @@ describe('OAuthProvider', () => {
       const registeredClient = await response.json<any>();
       expect(registeredClient.client_id).toBeDefined();
       expect(registeredClient.client_secret).toBeDefined();
+      expect(registeredClient.client_secret_expires_at).toBe(0);
       expect(registeredClient.redirect_uris).toEqual(['https://client.example.com/callback']);
       expect(registeredClient.client_name).toBe('Test Client');
 

@@ -2709,6 +2709,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Only include client_secret for confidential clients
     if (clientSecret) {
       response.client_secret = clientSecret; // Return the original unhashed secret
+      response.client_secret_expires_at = 0; // Indicate that the secret does not expire
     }
 
     return new Response(JSON.stringify(response), {
