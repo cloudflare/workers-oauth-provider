@@ -552,6 +552,7 @@ describe('OAuthProvider', () => {
       expect(registeredClient.client_id).toBeDefined();
       expect(registeredClient.client_secret).toBeDefined();
       expect(registeredClient.client_secret_expires_at).toBe(0);
+      expect(registeredClient.client_secret_issued_at).toEqual(expect.any(Number));
       expect(registeredClient.redirect_uris).toEqual(['https://client.example.com/callback']);
       expect(registeredClient.client_name).toBe('Test Client');
 
@@ -584,6 +585,8 @@ describe('OAuthProvider', () => {
       const registeredClient = await response.json<any>();
       expect(registeredClient.client_id).toBeDefined();
       expect(registeredClient.client_secret).toBeUndefined(); // Public client should not have a secret
+      expect(registeredClient.client_secret_expires_at).toBeUndefined();
+      expect(registeredClient.client_secret_issued_at).toBeUndefined();
       expect(registeredClient.token_endpoint_auth_method).toBe('none');
 
       // Verify the client was saved to KV
