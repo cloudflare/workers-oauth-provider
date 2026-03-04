@@ -100,6 +100,22 @@ export default new OAuthProvider({
   // Set to 0 to disable refresh tokens (only access tokens will be issued).
   // For example: 3600 = 1 hour, 86400 = 1 day, 2592000 = 30 days
   refreshTokenTTL: 2592000, // 30 days
+
+  // Optional: Time-to-live for access tokens in seconds.
+  // Defaults to 1 hour (3600 seconds) if not specified.
+  accessTokenTTL: 3600,
+
+  // Optional: Controls whether OAuth 2.0 Token Exchange (RFC 8693) is allowed.
+  // When false, the token exchange grant type will not be advertised in metadata
+  // and token exchange requests will be rejected.
+  // Defaults to false.
+  allowTokenExchangeGrant: false,
+
+  // Optional: Explicitly enable Client ID Metadata Document (CIMD) support.
+  // When true, URL-formatted client_ids will be fetched as metadata documents.
+  // Requires the 'global_fetch_strictly_public' compatibility flag.
+  // See the CIMD section below for details. Defaults to false.
+  clientIdMetadataDocumentEnabled: false,
 });
 
 // The default handler object - the OAuthProvider will pass through HTTP requests to this object's fetch method
@@ -310,6 +326,23 @@ new OAuthProvider({
 
 By default, the `onError` callback is set to ``({ status, code, description }) => console.warn(`OAuth error response: ${status} ${code} - ${description}`)``.
 
+## Protected Resource Metadata (RFC 9728)
+
+The library automatically serves a `/.well-known/oauth-protected-resource` endpoint. By default, it uses the request origin as the resource identifier and the token endpoint's origin as the authorization server. You can customize this with the `resourceMetadata` option:
+
+```ts
+new OAuthProvider({
+  // ... other options ...
+  resourceMetadata: {
+    resource: 'https://api.example.com',
+    authorization_servers: ['https://auth.example.com'],
+    scopes_supported: ['read', 'write'],
+    bearer_methods_supported: ['header'],
+    resource_name: 'My API',
+  },
+});
+```
+
 ## Standards Compliance
 
 This library implements the following OAuth and MCP specifications:
@@ -343,11 +376,22 @@ This library implements a compromise: At any particular time, a grant may have t
 
 ## Client ID Metadata Document (CIMD) Support
 
-This library supports [Client ID Metadata Documents](https://www.ietf.org/archive/id/draft-parecki-oauth-client-id-metadata-document-03.html), which allow clients to use HTTPS URLs as their `client_id`. When a client presents an HTTPS URL with a non-root path as its `client_id`, the library will fetch and validate the metadata document from that URL.
+This library supports [Client ID Metadata Documents](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-client-id-metadata-document), which allow clients to use HTTPS URLs as their `client_id`. When a client presents an HTTPS URL with a non-root path as its `client_id`, the library will fetch and validate the metadata document from that URL.
 
 ### Enabling CIMD
 
-To enable CIMD support, you must add the `global_fetch_strictly_public` compatibility flag to your `wrangler.jsonc`:
+CIMD support is opt-in and requires two things:
+
+1. Set `clientIdMetadataDocumentEnabled: true` in your OAuthProvider options:
+
+```ts
+new OAuthProvider({
+  // ... other options ...
+  clientIdMetadataDocumentEnabled: true,
+});
+```
+
+2. Add the `global_fetch_strictly_public` compatibility flag to your `wrangler.jsonc`:
 
 ```jsonc
 {
@@ -355,9 +399,11 @@ To enable CIMD support, you must add the `global_fetch_strictly_public` compatib
 }
 ```
 
-This flag is required for SSRF (Server-Side Request Forgery) protection. Due to a legacy quirk, `fetch()` requests to URLs within your zone's domain are sent directly to the origin server, bypassing Cloudflare. The `global_fetch_strictly_public` flag disables this behavior. See [Cloudflare's blog post](https://blog.cloudflare.com/workers-environment-live-object-bindings/) and [documentation](https://developers.cloudflare.com/workers/configuration/compatibility-flags/#global-fetch-strictly-public) for more details.
+The compatibility flag is required for SSRF (Server-Side Request Forgery) protection. Due to a legacy quirk, `fetch()` requests to URLs within your zone's domain are sent directly to the origin server, bypassing Cloudflare. The `global_fetch_strictly_public` flag disables this behavior. See [Cloudflare's documentation](https://developers.cloudflare.com/workers/configuration/compatibility-flags/#global-fetch-strictly-public) for more details.
 
-When this flag is not enabled, the OAuth metadata endpoint will report `client_id_metadata_document_supported: false` and MCP Clients should use DCR instead.
+When CIMD is not enabled (the default), URL-formatted `client_id` values fall through to standard KV lookup. When enabled, if fetching the metadata document fails, the library logs a warning and returns an `invalid_client` error, allowing MCP clients to recover by falling back to Dynamic Client Registration.
+
+The OAuth metadata endpoint reports `client_id_metadata_document_supported: true` only when both the option is enabled and the compatibility flag is present.
 
 ## Written using Claude
 
