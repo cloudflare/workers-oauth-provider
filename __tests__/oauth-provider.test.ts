@@ -5964,6 +5964,7 @@ describe('OAuthProvider', () => {
   describe('Client ID Metadata Document (CIMD)', () => {
     let originalFetch: typeof globalThis.fetch;
     let originalCloudflare: Cloudflare | undefined;
+    let warnSpy: ReturnType<typeof vi.spyOn>;
 
     beforeEach(() => {
       originalFetch = globalThis.fetch;
@@ -5988,11 +5989,13 @@ describe('OAuthProvider', () => {
         allowTokenExchangeGrant: true,
         clientIdMetadataDocumentEnabled: true,
       });
+      warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     });
 
     afterEach(() => {
       globalThis.fetch = originalFetch;
       (globalThis as any).Cloudflare = originalCloudflare;
+      warnSpy.mockRestore();
     });
 
     function createMockFetchResponse(
@@ -6700,6 +6703,122 @@ describe('OAuthProvider', () => {
           "CIMD is enabled but 'global_fetch_strictly_public' compatibility flag is not set."
         );
         expect(fetchSpy).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('CIMD Error Logging', () => {
+      const cimdUrl = 'https://client.example.com/oauth/metadata.json';
+
+      function makeAuthRequest(url: string = cimdUrl) {
+        return createMockRequest(
+          `https://example.com/authorize?client_id=${encodeURIComponent(url)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          'GET'
+        );
+      }
+
+      it('should log [timeout] on fetch abort', async () => {
+        globalThis.fetch = vi.fn().mockRejectedValue(new DOMException('Aborted', 'AbortError'));
+
+        await expect(oauthProvider.fetch(makeAuthRequest(), mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('[timeout]'));
+      });
+
+      it('should log [network] on network error', async () => {
+        globalThis.fetch = vi.fn().mockRejectedValue(new TypeError('fetch failed'));
+
+        await expect(oauthProvider.fetch(makeAuthRequest(), mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('[network]'));
+      });
+
+      it('should log [http_4xx] on HTTP 404', async () => {
+        globalThis.fetch = vi.fn().mockResolvedValue(new Response('Not Found', { status: 404 }));
+
+        await expect(oauthProvider.fetch(makeAuthRequest(), mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('[http_4xx]'));
+      });
+
+      it('should log [http_5xx] on HTTP 500', async () => {
+        globalThis.fetch = vi.fn().mockResolvedValue(new Response('Error', { status: 500 }));
+
+        await expect(oauthProvider.fetch(makeAuthRequest(), mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('[http_5xx]'));
+      });
+
+      it('should log [size_limit] on oversized Content-Length', async () => {
+        globalThis.fetch = vi
+          .fn()
+          .mockResolvedValue(
+            createMockFetchResponse(
+              { client_id: cimdUrl, redirect_uris: ['https://client.example.com/callback'] },
+              { headers: { 'Content-Length': '10000' } }
+            )
+          );
+
+        await expect(oauthProvider.fetch(makeAuthRequest(), mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('[size_limit]'));
+      });
+
+      it('should log [json_parse] on invalid JSON', async () => {
+        globalThis.fetch = vi
+          .fn()
+          .mockResolvedValue(
+            new Response('not valid json {{{', { status: 200, headers: { 'Content-Type': 'application/json' } })
+          );
+
+        await expect(oauthProvider.fetch(makeAuthRequest(), mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('[json_parse]'));
+      });
+
+      it('should log [metadata_validation] on client_id mismatch', async () => {
+        globalThis.fetch = vi.fn().mockResolvedValue(
+          createMockFetchResponse({
+            client_id: 'https://different.example.com/metadata.json',
+            redirect_uris: ['https://client.example.com/callback'],
+          })
+        );
+
+        await expect(oauthProvider.fetch(makeAuthRequest(), mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('[metadata_validation]'));
+      });
+
+      it('should log [metadata_validation] on non-array redirect_uris', async () => {
+        globalThis.fetch = vi.fn().mockResolvedValue(
+          createMockFetchResponse({
+            client_id: cimdUrl,
+            redirect_uris: 'not-an-array',
+          })
+        );
+
+        await expect(oauthProvider.fetch(makeAuthRequest(), mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('[metadata_validation]'));
+      });
+
+      it('should log host but not full URL path', async () => {
+        globalThis.fetch = vi.fn().mockResolvedValue(new Response('Not Found', { status: 404 }));
+
+        await expect(oauthProvider.fetch(makeAuthRequest(), mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        const logMessage = warnSpy.mock.calls[0]?.[0] as string;
+        expect(logMessage).toContain('client.example.com');
+        expect(logMessage).not.toContain('/oauth/metadata.json');
+      });
+    });
+
+    describe('Token Endpoint CIMD Failure', () => {
+      it('should return invalid_client OAuth error when CIMD fetch fails at token endpoint', async () => {
+        globalThis.fetch = vi.fn().mockResolvedValue(new Response('Not Found', { status: 404 }));
+
+        const cimdUrl = 'https://client.example.com/oauth/metadata.json';
+        const tokenRequest = createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          `grant_type=authorization_code&code=test-code&client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}`
+        );
+
+        const response = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+        expect(response.status).toBe(401);
+        const body = await response.json<any>();
+        expect(body.error).toBe('invalid_client');
       });
     });
   });
