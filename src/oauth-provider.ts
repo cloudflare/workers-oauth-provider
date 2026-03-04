@@ -3887,7 +3887,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
 
       // Revoke old grants AFTER the new grant is successfully stored
       try {
-        await Promise.all(grantsToRevoke.map((oldGrantId) => this.revokeGrant(oldGrantId, options.userId)));
+        await Promise.allSettled(grantsToRevoke.map((oldGrantId) => this.revokeGrant(oldGrantId, options.userId)));
       } catch {
         // Best-effort revocation — new grant is already stored, don't fail the authorization
       }
@@ -3938,7 +3938,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
 
       // Revoke old grants AFTER the new grant is successfully stored
       try {
-        await Promise.all(grantsToRevoke.map((oldGrantId) => this.revokeGrant(oldGrantId, options.userId)));
+        await Promise.allSettled(grantsToRevoke.map((oldGrantId) => this.revokeGrant(oldGrantId, options.userId)));
       } catch {
         // Best-effort revocation — new grant is already stored, don't fail the authorization
       }
