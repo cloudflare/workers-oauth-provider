@@ -2706,9 +2706,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       client_id_issued_at: clientInfo.registrationDate,
     };
 
-    // Only include client_secret for confidential clients
+    // Only include client_secret for confidential clients (RFC 7591 §3.2.1)
     if (clientSecret) {
       response.client_secret = clientSecret; // Return the original unhashed secret
+      response.client_secret_expires_at = 0; // Secret does not expire
+      response.client_secret_issued_at = clientInfo.registrationDate;
     }
 
     return new Response(JSON.stringify(response), {
