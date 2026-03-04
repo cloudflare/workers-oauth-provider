@@ -5968,6 +5968,7 @@ describe('OAuthProvider', () => {
   describe('Client ID Metadata Document (CIMD)', () => {
     let originalFetch: typeof globalThis.fetch;
     let originalCloudflare: Cloudflare | undefined;
+    let warnSpy: ReturnType<typeof vi.spyOn>;
 
     beforeEach(() => {
       originalFetch = globalThis.fetch;
@@ -5978,11 +5979,27 @@ describe('OAuthProvider', () => {
           global_fetch_strictly_public: true,
         },
       };
+      // Enable CIMD for the CIMD test suite
+      oauthProvider = new OAuthProvider({
+        apiRoute: ['/api/', 'https://api.example.com/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        scopesSupported: ['read', 'write', 'profile'],
+        accessTokenTTL: 3600,
+        allowImplicitFlow: true,
+        allowTokenExchangeGrant: true,
+        clientIdMetadataDocumentEnabled: true,
+      });
+      warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     });
 
     afterEach(() => {
       globalThis.fetch = originalFetch;
       (globalThis as any).Cloudflare = originalCloudflare;
+      warnSpy.mockRestore();
     });
 
     function createMockFetchResponse(
@@ -6036,7 +6053,7 @@ describe('OAuthProvider', () => {
     });
 
     describe('Response Size Limit (DoS Prevention)', () => {
-      it('should reject responses exceeding 5KB via Content-Length header', async () => {
+      it('should treat oversized Content-Length response as invalid client', async () => {
         const cimdUrl = 'https://malicious.example.com/oauth/metadata.json';
         const validMetadata = {
           client_id: cimdUrl,
@@ -6054,12 +6071,10 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
-          'Client metadata exceeds size limit'
-        );
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
       });
 
-      it('should reject responses exceeding 5KB via streaming', async () => {
+      it('should treat streaming response exceeding 5KB as invalid client', async () => {
         const cimdUrl = 'https://malicious.example.com/oauth/metadata.json';
         const largeBody = JSON.stringify({
           client_id: cimdUrl,
@@ -6079,9 +6094,7 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
-          'Response exceeded size limit'
-        );
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
       });
     });
 
@@ -6157,9 +6170,7 @@ describe('OAuthProvider', () => {
           `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
           'GET'
         );
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
-          'Failed to fetch client metadata: HTTP 404'
-        );
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
 
         // No KV caching anymore - Cloudflare HTTP cache handles caching
         const cacheKey = `cimd:${cimdUrl}`;
@@ -6180,9 +6191,7 @@ describe('OAuthProvider', () => {
           `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
           'GET'
         );
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
-          'client_id "https://different.example.com/metadata.json" does not match metadata URL'
-        );
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
 
         // No KV caching anymore - Cloudflare HTTP cache handles caching
         const cacheKey = `cimd:${cimdUrl}`;
@@ -6192,7 +6201,7 @@ describe('OAuthProvider', () => {
     });
 
     describe('Symmetric Auth Method Rejection', () => {
-      it('should reject client_secret_post auth method', async () => {
+      it('should treat client_secret_post auth method as invalid client', async () => {
         const cimdUrl = 'https://client.example.com/oauth/metadata.json';
         globalThis.fetch = vi.fn().mockResolvedValue(
           createMockFetchResponse({
@@ -6207,12 +6216,10 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
-          'is not allowed for CIMD clients. Allowed methods: none, private_key_jwt'
-        );
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
       });
 
-      it('should reject client_secret_basic auth method', async () => {
+      it('should treat client_secret_basic auth method as invalid client', async () => {
         const cimdUrl = 'https://client.example.com/oauth/metadata.json';
         globalThis.fetch = vi.fn().mockResolvedValue(
           createMockFetchResponse({
@@ -6227,12 +6234,10 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
-          'is not allowed for CIMD clients. Allowed methods: none, private_key_jwt'
-        );
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
       });
 
-      it('should reject client_secret_jwt auth method', async () => {
+      it('should treat client_secret_jwt auth method as invalid client', async () => {
         const cimdUrl = 'https://client.example.com/oauth/metadata.json';
         globalThis.fetch = vi.fn().mockResolvedValue(
           createMockFetchResponse({
@@ -6247,9 +6252,7 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
-          'is not allowed for CIMD clients. Allowed methods: none, private_key_jwt'
-        );
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
       });
 
       it('should accept none auth method', async () => {
@@ -6299,7 +6302,7 @@ describe('OAuthProvider', () => {
     });
 
     describe('Metadata Validation', () => {
-      it('should reject when client_id does not match URL', async () => {
+      it('should treat mismatched client_id as invalid client', async () => {
         const cimdUrl = 'https://client.example.com/oauth/metadata.json';
         const invalidMetadata = {
           client_id: 'https://different.example.com/metadata.json',
@@ -6313,12 +6316,10 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
-          'client_id "https://different.example.com/metadata.json" does not match metadata URL'
-        );
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
       });
 
-      it('should reject when redirect_uris is missing', async () => {
+      it('should treat missing redirect_uris as invalid client', async () => {
         const cimdUrl = 'https://client.example.com/oauth/metadata.json';
         const invalidMetadata = {
           client_id: cimdUrl,
@@ -6332,12 +6333,10 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
-          'redirect_uris is required and must not be empty'
-        );
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
       });
 
-      it('should reject when redirect_uris is empty', async () => {
+      it('should treat empty redirect_uris as invalid client', async () => {
         const cimdUrl = 'https://client.example.com/oauth/metadata.json';
         const invalidMetadata = {
           client_id: cimdUrl,
@@ -6352,12 +6351,10 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
-          'redirect_uris is required and must not be empty'
-        );
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
       });
 
-      it('should reject invalid JSON response', async () => {
+      it('should treat invalid JSON response as invalid client', async () => {
         const cimdUrl = 'https://client.example.com/oauth/metadata.json';
 
         globalThis.fetch = vi.fn().mockResolvedValue(
@@ -6372,7 +6369,7 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('is not valid JSON');
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
       });
     });
 
@@ -6431,7 +6428,7 @@ describe('OAuthProvider', () => {
     });
 
     describe('Request Timeout', () => {
-      it('should handle fetch abort gracefully', async () => {
+      it('should treat fetch abort as invalid client', async () => {
         const cimdUrl = 'https://abort.example.com/oauth/metadata.json';
         globalThis.fetch = vi.fn().mockRejectedValue(new DOMException('Aborted', 'AbortError'));
 
@@ -6440,7 +6437,7 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Aborted');
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
       });
 
       it('should pass AbortSignal to fetch', async () => {
@@ -6470,7 +6467,7 @@ describe('OAuthProvider', () => {
     });
 
     describe('HTTP Error Handling', () => {
-      it('should reject 404 responses', async () => {
+      it('should treat 404 responses as invalid client', async () => {
         const cimdUrl = 'https://client.example.com/oauth/metadata.json';
         globalThis.fetch = vi.fn().mockResolvedValue(new Response('Not Found', { status: 404 }));
 
@@ -6479,12 +6476,10 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
-          'Failed to fetch client metadata: HTTP 404'
-        );
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
       });
 
-      it('should reject 500 responses', async () => {
+      it('should treat 500 responses as invalid client', async () => {
         const cimdUrl = 'https://client.example.com/oauth/metadata.json';
         globalThis.fetch = vi.fn().mockResolvedValue(new Response('Internal Server Error', { status: 500 }));
 
@@ -6493,12 +6488,10 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
-          'Failed to fetch client metadata: HTTP 500'
-        );
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
       });
 
-      it('should handle network errors gracefully', async () => {
+      it('should treat network errors as invalid client', async () => {
         const cimdUrl = 'https://unreachable.example.com/oauth/metadata.json';
         globalThis.fetch = vi.fn().mockRejectedValue(new Error('Network error'));
 
@@ -6507,7 +6500,7 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Network error');
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
       });
     });
 
@@ -6543,7 +6536,7 @@ describe('OAuthProvider', () => {
         );
 
         await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
-          "global_fetch_strictly_public' compatibility flag is not enabled"
+          "global_fetch_strictly_public' compatibility flag is not set"
         );
         expect(fetchSpy).not.toHaveBeenCalled();
       });
@@ -6563,7 +6556,7 @@ describe('OAuthProvider', () => {
         );
 
         await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
-          "global_fetch_strictly_public' compatibility flag is not enabled"
+          "global_fetch_strictly_public' compatibility flag is not set"
         );
         expect(fetchSpy).not.toHaveBeenCalled();
       });
@@ -6583,13 +6576,13 @@ describe('OAuthProvider', () => {
         );
 
         await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
-          "global_fetch_strictly_public' compatibility flag is not enabled"
+          "global_fetch_strictly_public' compatibility flag is not set"
         );
         expect(fetchSpy).not.toHaveBeenCalled();
       });
 
-      it('should report client_id_metadata_document_supported as true when flag is enabled', async () => {
-        // Flag is enabled in beforeEach
+      it('should report client_id_metadata_document_supported as true when option and flag are enabled', async () => {
+        // Both clientIdMetadataDocumentEnabled and compat flag are enabled in beforeEach
         const metadataRequest = createMockRequest('https://example.com/.well-known/oauth-authorization-server', 'GET');
         const response = await oauthProvider.fetch(metadataRequest, mockEnv, mockCtx);
         const metadata = (await response.json()) as { client_id_metadata_document_supported: boolean };
@@ -6597,7 +6590,7 @@ describe('OAuthProvider', () => {
         expect(metadata.client_id_metadata_document_supported).toBe(true);
       });
 
-      it('should report client_id_metadata_document_supported as false when flag is not enabled', async () => {
+      it('should report client_id_metadata_document_supported as false when compat flag is not enabled', async () => {
         (globalThis as any).Cloudflare = {
           compatibilityFlags: {
             global_fetch_strictly_public: false,
@@ -6619,6 +6612,171 @@ describe('OAuthProvider', () => {
         const metadata = (await response.json()) as { client_id_metadata_document_supported: boolean };
 
         expect(metadata.client_id_metadata_document_supported).toBe(false);
+      });
+    });
+
+    describe('Explicit Opt-In', () => {
+      it('should fall through to KV lookup for URL client_id when CIMD is not enabled', async () => {
+        // Create provider WITHOUT clientIdMetadataDocumentEnabled
+        const providerWithoutCimd = new OAuthProvider({
+          apiRoute: ['/api/', 'https://api.example.com/'],
+          apiHandler: TestApiHandler,
+          defaultHandler: testDefaultHandler,
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: '/oauth/token',
+          clientRegistrationEndpoint: '/oauth/register',
+          scopesSupported: ['read', 'write', 'profile'],
+          accessTokenTTL: 3600,
+          allowImplicitFlow: true,
+          allowTokenExchangeGrant: true,
+        });
+
+        const cimdUrl = 'https://client.example.com/oauth/metadata.json';
+        const fetchSpy = vi.fn();
+        globalThis.fetch = fetchSpy;
+
+        const authRequest = createMockRequest(
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          'GET'
+        );
+
+        // Should NOT call fetch — falls through to KV lookup (which returns null → "Invalid client")
+        await expect(providerWithoutCimd.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        expect(fetchSpy).not.toHaveBeenCalled();
+      });
+
+      it('should report client_id_metadata_document_supported as false when option is not set', async () => {
+        const providerWithoutCimd = new OAuthProvider({
+          apiRoute: ['/api/', 'https://api.example.com/'],
+          apiHandler: TestApiHandler,
+          defaultHandler: testDefaultHandler,
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: '/oauth/token',
+          clientRegistrationEndpoint: '/oauth/register',
+          scopesSupported: ['read', 'write', 'profile'],
+          accessTokenTTL: 3600,
+          allowImplicitFlow: true,
+          allowTokenExchangeGrant: true,
+        });
+
+        const metadataRequest = createMockRequest('https://example.com/.well-known/oauth-authorization-server', 'GET');
+        const response = await providerWithoutCimd.fetch(metadataRequest, mockEnv, mockCtx);
+        const metadata = (await response.json()) as { client_id_metadata_document_supported: boolean };
+
+        expect(metadata.client_id_metadata_document_supported).toBe(false);
+      });
+
+      it('should fetch CIMD when option is enabled and compat flag is set', async () => {
+        // oauthProvider already has clientIdMetadataDocumentEnabled: true from beforeEach
+        // and Cloudflare global_fetch_strictly_public: true
+        const cimdUrl = 'https://client.example.com/oauth/metadata.json';
+        const validMetadata = {
+          client_id: cimdUrl,
+          client_name: 'CIMD Opt-In Client',
+          redirect_uris: ['https://client.example.com/callback'],
+          token_endpoint_auth_method: 'none',
+        };
+
+        globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(createMockFetchResponse(validMetadata)));
+
+        const authRequest = createMockRequest(
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          'GET'
+        );
+
+        const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+        expect(authResponse.status).toBe(302);
+        expect(globalThis.fetch).toHaveBeenCalledWith(cimdUrl, expect.anything());
+      });
+
+      it('should throw when option is enabled but compat flag is missing', async () => {
+        // oauthProvider has clientIdMetadataDocumentEnabled: true from beforeEach
+        // but remove the compat flag
+        delete (globalThis as any).Cloudflare;
+
+        const cimdUrl = 'https://client.example.com/oauth/metadata.json';
+        const fetchSpy = vi.fn();
+        globalThis.fetch = fetchSpy;
+
+        const authRequest = createMockRequest(
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          'GET'
+        );
+
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
+          "CIMD is enabled but 'global_fetch_strictly_public' compatibility flag is not set."
+        );
+        expect(fetchSpy).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('CIMD Error Logging', () => {
+      const cimdUrl = 'https://client.example.com/oauth/metadata.json';
+
+      function makeAuthRequest(url: string = cimdUrl) {
+        return createMockRequest(
+          `https://example.com/authorize?client_id=${encodeURIComponent(url)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          'GET'
+        );
+      }
+
+      it('should log warning with client URL and error message on HTTP failure', async () => {
+        globalThis.fetch = vi.fn().mockResolvedValue(new Response('Not Found', { status: 404 }));
+
+        await expect(oauthProvider.fetch(makeAuthRequest(), mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining(cimdUrl), expect.stringContaining('HTTP 404'));
+      });
+
+      it('should log warning on timeout', async () => {
+        globalThis.fetch = vi.fn().mockRejectedValue(new DOMException('Aborted', 'AbortError'));
+
+        await expect(oauthProvider.fetch(makeAuthRequest(), mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining(cimdUrl), expect.anything());
+      });
+
+      it('should log warning on size limit exceeded', async () => {
+        globalThis.fetch = vi
+          .fn()
+          .mockResolvedValue(
+            createMockFetchResponse(
+              { client_id: cimdUrl, redirect_uris: ['https://client.example.com/callback'] },
+              { headers: { 'Content-Length': '10000' } }
+            )
+          );
+
+        await expect(oauthProvider.fetch(makeAuthRequest(), mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        expect(warnSpy).toHaveBeenCalledWith(expect.anything(), expect.stringContaining('size limit'));
+      });
+
+      it('should log warning on metadata validation failure', async () => {
+        globalThis.fetch = vi.fn().mockResolvedValue(
+          createMockFetchResponse({
+            client_id: 'https://different.example.com/metadata.json',
+            redirect_uris: ['https://client.example.com/callback'],
+          })
+        );
+
+        await expect(oauthProvider.fetch(makeAuthRequest(), mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        expect(warnSpy).toHaveBeenCalledWith(expect.anything(), expect.stringContaining('does not match'));
+      });
+    });
+
+    describe('Token Endpoint CIMD Failure', () => {
+      it('should return invalid_client OAuth error when CIMD fetch fails at token endpoint', async () => {
+        globalThis.fetch = vi.fn().mockResolvedValue(new Response('Not Found', { status: 404 }));
+
+        const cimdUrl = 'https://client.example.com/oauth/metadata.json';
+        const tokenRequest = createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          `grant_type=authorization_code&code=test-code&client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}`
+        );
+
+        const response = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+        expect(response.status).toBe(401);
+        const body = await response.json<any>();
+        expect(body.error).toBe('invalid_client');
       });
     });
   });
