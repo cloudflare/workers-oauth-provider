@@ -1,5 +1,23 @@
 # @cloudflare/workers-oauth-provider
 
+## 0.3.0
+
+### Minor Changes
+
+- [#158](https://github.com/cloudflare/workers-oauth-provider/pull/158) [`b26f7ff`](https://github.com/cloudflare/workers-oauth-provider/commit/b26f7ff7320a2f60f6b033b6990ceb14e72b0262) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Add `clientIdMetadataDocumentEnabled` option to make CIMD (Client ID Metadata Document) support explicitly opt-in. Previously, CIMD auto-enabled when the `global_fetch_strictly_public` compatibility flag was present, which could cause crashes for servers where URL-shaped client_ids hit bot-protected endpoints. When not enabled (the default), URL-formatted client_ids now fall through to standard KV lookup instead of throwing.
+
+- [#144](https://github.com/cloudflare/workers-oauth-provider/pull/144) [`49a1d24`](https://github.com/cloudflare/workers-oauth-provider/commit/49a1d24b298984b623eec6d780eb6c9bf2fd01bb) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Add `revokeExistingGrants` option to `completeAuthorization()` that revokes existing grants for the same user+client after creating a new one. Defaults to `true`, fixing infinite re-auth loops when props change between authorizations (issue #34). Set to `false` to allow multiple concurrent grants per user+client.
+
+  Revoke tokens and grant when an authorization code is reused, per RFC 6749 §10.5. This prevents authorization code replay attacks by invalidating all tokens issued from the first exchange.
+
+  **Breaking behavior change:** Previously, re-authorizing the same user+client created an additional grant, leaving old tokens valid. Now, old grants are revoked by default. If your application relies on multiple concurrent grants per user+client, set `revokeExistingGrants: false` to preserve the old behavior.
+
+### Patch Changes
+
+- [#164](https://github.com/cloudflare/workers-oauth-provider/pull/164) [`4b640a3`](https://github.com/cloudflare/workers-oauth-provider/commit/4b640a31c7af021d03f430363499d0f2e6a241df) Thanks [@pnguyen-atlassian](https://github.com/pnguyen-atlassian)! - Include `client_secret_expires_at` and `client_secret_issued_at` in dynamic client registration responses when a `client_secret` is issued, per RFC 7591 §3.2.1.
+
+- [#165](https://github.com/cloudflare/workers-oauth-provider/pull/165) [`9cce070`](https://github.com/cloudflare/workers-oauth-provider/commit/9cce0707653e465e4066b97fd3d14ec9d889b504) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Use `Promise.allSettled` instead of `Promise.all` for best-effort grant revocation in `completeAuthorization()`, ensuring all grants are attempted even if one fails.
+
 ## 0.2.4
 
 ### Patch Changes
