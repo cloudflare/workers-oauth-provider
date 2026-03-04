@@ -6716,35 +6716,21 @@ describe('OAuthProvider', () => {
         );
       }
 
-      it('should log [timeout] on fetch abort', async () => {
-        globalThis.fetch = vi.fn().mockRejectedValue(new DOMException('Aborted', 'AbortError'));
-
-        await expect(oauthProvider.fetch(makeAuthRequest(), mockEnv, mockCtx)).rejects.toThrow('Invalid client');
-        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('[timeout]'));
-      });
-
-      it('should log [network] on network error', async () => {
-        globalThis.fetch = vi.fn().mockRejectedValue(new TypeError('fetch failed'));
-
-        await expect(oauthProvider.fetch(makeAuthRequest(), mockEnv, mockCtx)).rejects.toThrow('Invalid client');
-        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('[network]'));
-      });
-
-      it('should log [http_4xx] on HTTP 404', async () => {
+      it('should log warning with client URL and error message on HTTP failure', async () => {
         globalThis.fetch = vi.fn().mockResolvedValue(new Response('Not Found', { status: 404 }));
 
         await expect(oauthProvider.fetch(makeAuthRequest(), mockEnv, mockCtx)).rejects.toThrow('Invalid client');
-        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('[http_4xx]'));
+        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining(cimdUrl), expect.stringContaining('HTTP 404'));
       });
 
-      it('should log [http_5xx] on HTTP 500', async () => {
-        globalThis.fetch = vi.fn().mockResolvedValue(new Response('Error', { status: 500 }));
+      it('should log warning on timeout', async () => {
+        globalThis.fetch = vi.fn().mockRejectedValue(new DOMException('Aborted', 'AbortError'));
 
         await expect(oauthProvider.fetch(makeAuthRequest(), mockEnv, mockCtx)).rejects.toThrow('Invalid client');
-        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('[http_5xx]'));
+        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining(cimdUrl), expect.anything());
       });
 
-      it('should log [size_limit] on oversized Content-Length', async () => {
+      it('should log warning on size limit exceeded', async () => {
         globalThis.fetch = vi
           .fn()
           .mockResolvedValue(
@@ -6755,21 +6741,10 @@ describe('OAuthProvider', () => {
           );
 
         await expect(oauthProvider.fetch(makeAuthRequest(), mockEnv, mockCtx)).rejects.toThrow('Invalid client');
-        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('[size_limit]'));
+        expect(warnSpy).toHaveBeenCalledWith(expect.anything(), expect.stringContaining('size limit'));
       });
 
-      it('should log [json_parse] on invalid JSON', async () => {
-        globalThis.fetch = vi
-          .fn()
-          .mockResolvedValue(
-            new Response('not valid json {{{', { status: 200, headers: { 'Content-Type': 'application/json' } })
-          );
-
-        await expect(oauthProvider.fetch(makeAuthRequest(), mockEnv, mockCtx)).rejects.toThrow('Invalid client');
-        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('[json_parse]'));
-      });
-
-      it('should log [metadata_validation] on client_id mismatch', async () => {
+      it('should log warning on metadata validation failure', async () => {
         globalThis.fetch = vi.fn().mockResolvedValue(
           createMockFetchResponse({
             client_id: 'https://different.example.com/metadata.json',
@@ -6778,28 +6753,7 @@ describe('OAuthProvider', () => {
         );
 
         await expect(oauthProvider.fetch(makeAuthRequest(), mockEnv, mockCtx)).rejects.toThrow('Invalid client');
-        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('[metadata_validation]'));
-      });
-
-      it('should log [metadata_validation] on non-array redirect_uris', async () => {
-        globalThis.fetch = vi.fn().mockResolvedValue(
-          createMockFetchResponse({
-            client_id: cimdUrl,
-            redirect_uris: 'not-an-array',
-          })
-        );
-
-        await expect(oauthProvider.fetch(makeAuthRequest(), mockEnv, mockCtx)).rejects.toThrow('Invalid client');
-        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('[metadata_validation]'));
-      });
-
-      it('should log host but not full URL path', async () => {
-        globalThis.fetch = vi.fn().mockResolvedValue(new Response('Not Found', { status: 404 }));
-
-        await expect(oauthProvider.fetch(makeAuthRequest(), mockEnv, mockCtx)).rejects.toThrow('Invalid client');
-        const logMessage = warnSpy.mock.calls[0]?.[0] as string;
-        expect(logMessage).toContain('client.example.com');
-        expect(logMessage).not.toContain('/oauth/metadata.json');
+        expect(warnSpy).toHaveBeenCalledWith(expect.anything(), expect.stringContaining('does not match'));
       });
     });
 

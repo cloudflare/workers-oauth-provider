@@ -2920,16 +2920,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         return await this.fetchClientMetadataDocument(clientId);
       } catch (error) {
         // CIMD fetch failed (size limit, timeout, HTTP error, invalid metadata, etc.)
-        // Log structured warning for operators, then return null so callers
-        // treat this as "client not found" instead of a 500
-        const category = OAuthProviderImpl.categorizeCimdError(error);
-        let host: string;
-        try {
-          host = new URL(clientId).host;
-        } catch {
-          host = '<invalid-url>';
-        }
-        console.warn(`CIMD fetch failed for ${host}: [${category}]`);
+        // Return null so callers treat this as "client not found" instead of a 500
+        console.warn(`CIMD fetch failed for ${clientId}:`, error instanceof Error ? error.message : error);
         return null;
       }
     }
@@ -2998,32 +2990,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Filter out any requested scopes that are not in the grant
     return requestedScopes.filter((scope: string) => grantedScopes.includes(scope));
-  }
-
-  /**
-   * Categorizes a CIMD fetch error for structured logging.
-   * Returns a short category string — no sensitive data included.
-   */
-  private static categorizeCimdError(error: unknown): string {
-    if (error instanceof DOMException && error.name === 'AbortError') return 'timeout';
-    if (error instanceof TypeError) return 'network';
-    if (error instanceof SyntaxError) return 'json_parse';
-    if (error instanceof Error) {
-      const msg = error.message;
-      if (msg.includes('size limit') || msg.includes('exceeds size')) return 'size_limit';
-      if (msg.includes('HTTP 5') || msg.includes('HTTP 429')) return 'http_5xx';
-      if (msg.includes('HTTP ')) return 'http_4xx';
-      if (
-        msg.includes('does not match') ||
-        msg.includes('is required') ||
-        msg.includes('not allowed') ||
-        msg.includes('expected string') ||
-        msg.includes('expected array') ||
-        msg.includes('must contain only strings')
-      )
-        return 'metadata_validation';
-    }
-    return 'unknown';
   }
 
   /**
