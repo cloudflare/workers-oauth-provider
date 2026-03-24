@@ -3451,8 +3451,9 @@ function validateRedirectUriScheme(redirectUri: string): void {
 }
 
 /**
- * Checks if a URI is a loopback redirect URI (127.0.0.0/8 or ::1)
- * Per RFC 8252 Section 7.3, these get special port handling
+ * Checks if a URI is a loopback redirect URI (127.0.0.0/8, ::1, or localhost).
+ * Per RFC 8252 Section 7.3, loopback IPs get special port handling. This library
+ * applies the same port flexibility to localhost for native apps (e.g., Claude Code).
  */
 function isLoopbackUri(uri: string): boolean {
   try {
@@ -3466,6 +3467,9 @@ function isLoopbackUri(uri: string): boolean {
     if (host === '::1' || host === '[::1]') {
       return true;
     }
+    if (host.toLowerCase() === 'localhost') {
+      return true;
+    }
     return false;
   } catch {
     return false;
@@ -3474,7 +3478,7 @@ function isLoopbackUri(uri: string): boolean {
 
 /**
  * Validates a redirect URI against registered URIs with RFC 8252 loopback support.
- * For loopback URIs (127.x.x.x, ::1), any port is allowed as long as scheme, host, path, and query match.
+ * For loopback URIs (127.x.x.x, ::1, localhost), any port is allowed as long as scheme, host, path, and query match.
  * For non-loopback URIs, exact match is required.
  */
 function isValidRedirectUri(requestUri: string, registeredUris: string[]): boolean {

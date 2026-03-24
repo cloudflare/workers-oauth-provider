@@ -6884,6 +6884,27 @@ describe('OAuthProvider', () => {
         expect(response.status).toBe(302);
         expect(response.headers.get('Location')).toContain('code=');
       });
+
+      it('should accept localhost with different port than registered', async () => {
+        await registerClient(['http://localhost:8080/callback']);
+        const response = await makeAuthRequest('http://localhost:52431/callback');
+        expect(response.status).toBe(302);
+        expect(response.headers.get('Location')).toContain('code=');
+      });
+
+      it('should accept localhost with no port when registered has port', async () => {
+        await registerClient(['http://localhost:8080/callback']);
+        const response = await makeAuthRequest('http://localhost/callback');
+        expect(response.status).toBe(302);
+        expect(response.headers.get('Location')).toContain('code=');
+      });
+
+      it('should accept localhost with port when registered has no port', async () => {
+        await registerClient(['http://localhost/callback']);
+        const response = await makeAuthRequest('http://localhost:9999/callback');
+        expect(response.status).toBe(302);
+        expect(response.headers.get('Location')).toContain('code=');
+      });
     });
 
     describe('should reject loopback URIs when non-port components differ', () => {
@@ -6906,19 +6927,20 @@ describe('OAuthProvider', () => {
         await registerClient(['http://127.0.0.1:8080/callback']);
         await expect(makeAuthRequest('http://[::1]:8080/callback')).rejects.toThrow('Invalid redirect URI');
       });
-    });
 
-    describe('should NOT treat localhost as loopback (RFC 8252 Section 7.3)', () => {
-      it('should reject localhost with different port (exact match required)', async () => {
-        await registerClient(['http://localhost:8080/callback']);
-        await expect(makeAuthRequest('http://localhost:9999/callback')).rejects.toThrow('Invalid redirect URI');
+      it('should reject localhost vs IPv4 loopback hostname mismatch', async () => {
+        await registerClient(['http://127.0.0.1:8080/callback']);
+        await expect(makeAuthRequest('http://localhost:8080/callback')).rejects.toThrow('Invalid redirect URI');
       });
 
-      it('should accept localhost with exact same URI', async () => {
+      it('should reject IPv4 loopback when only localhost is registered', async () => {
         await registerClient(['http://localhost:8080/callback']);
-        const response = await makeAuthRequest('http://localhost:8080/callback');
-        expect(response.status).toBe(302);
-        expect(response.headers.get('Location')).toContain('code=');
+        await expect(makeAuthRequest('http://127.0.0.1:8080/callback')).rejects.toThrow('Invalid redirect URI');
+      });
+
+      it('should reject localhost with different path', async () => {
+        await registerClient(['http://localhost:8080/callback']);
+        await expect(makeAuthRequest('http://localhost:9999/evil')).rejects.toThrow('Invalid redirect URI');
       });
     });
 
@@ -6947,6 +6969,20 @@ describe('OAuthProvider', () => {
 
         // Exchange with yet another port
         const tokenResponse = await exchangeCode(code, 'http://127.0.0.1:33333/callback');
+        expect(tokenResponse.status).toBe(200);
+        const tokens = await tokenResponse.json<any>();
+        expect(tokens.access_token).toBeDefined();
+        expect(tokens.refresh_token).toBeDefined();
+      });
+
+      it('should accept token exchange with different localhost port', async () => {
+        await registerClient(['http://localhost:8080/callback']);
+
+        const authResponse = await makeAuthRequest('http://localhost:52431/callback');
+        expect(authResponse.status).toBe(302);
+        const code = extractCode(authResponse);
+
+        const tokenResponse = await exchangeCode(code, 'http://localhost:33333/callback');
         expect(tokenResponse.status).toBe(200);
         const tokens = await tokenResponse.json<any>();
         expect(tokens.access_token).toBeDefined();
@@ -7026,6 +7062,31 @@ describe('OAuthProvider', () => {
         expect(result.redirectTo).toContain('http://127.0.0.1:52431/callback');
         expect(result.redirectTo).toContain('code=');
       });
+
+      it('should accept completeAuthorization with valid localhost different port', async () => {
+        await registerClient(['http://localhost:8080/callback']);
+
+        await oauthProvider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
+        const helpers = mockEnv.OAUTH_PROVIDER!;
+
+        const authRequest = createMockRequest(
+          `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+            `&redirect_uri=${encodeURIComponent('http://localhost:52431/callback')}` +
+            `&scope=read&state=xyz123`
+        );
+        const oauthReqInfo = await helpers.parseAuthRequest(authRequest);
+
+        const result = await helpers.completeAuthorization({
+          request: oauthReqInfo,
+          userId: 'test-user-123',
+          metadata: {},
+          scope: oauthReqInfo.scope,
+          props: {},
+        });
+
+        expect(result.redirectTo).toContain('http://localhost:52431/callback');
+        expect(result.redirectTo).toContain('code=');
+      });
     });
 
     describe('full end-to-end flow with loopback ephemeral ports', () => {
@@ -7069,6 +7130,21 @@ describe('OAuthProvider', () => {
 
         // Exchange with the port used during auth
         const tokenResponse = await exchangeCode(code, 'http://[::1]:48721/callback');
+        expect(tokenResponse.status).toBe(200);
+        const tokens = await tokenResponse.json<any>();
+        expect(tokens.access_token).toBeDefined();
+      });
+
+      it('should complete full flow with localhost', async () => {
+        await registerClient(['http://localhost:3000/callback']);
+
+        const authResponse = await makeAuthRequest('http://localhost:48721/callback');
+        expect(authResponse.status).toBe(302);
+        const location = authResponse.headers.get('Location')!;
+        expect(location).toContain('http://localhost:48721/callback');
+        const code = extractCode(authResponse);
+
+        const tokenResponse = await exchangeCode(code, 'http://localhost:48721/callback');
         expect(tokenResponse.status).toBe(200);
         const tokens = await tokenResponse.json<any>();
         expect(tokens.access_token).toBeDefined();
@@ -7695,6 +7771,27 @@ describe('OAuthProvider', () => {
         expect(response.status).toBe(302);
         expect(response.headers.get('Location')).toContain('code=');
       });
+
+      it('should accept localhost with different port than registered', async () => {
+        await registerClient(['http://localhost:8080/callback']);
+        const response = await makeAuthRequest('http://localhost:52431/callback');
+        expect(response.status).toBe(302);
+        expect(response.headers.get('Location')).toContain('code=');
+      });
+
+      it('should accept localhost with no port when registered has port', async () => {
+        await registerClient(['http://localhost:8080/callback']);
+        const response = await makeAuthRequest('http://localhost/callback');
+        expect(response.status).toBe(302);
+        expect(response.headers.get('Location')).toContain('code=');
+      });
+
+      it('should accept localhost with port when registered has no port', async () => {
+        await registerClient(['http://localhost/callback']);
+        const response = await makeAuthRequest('http://localhost:9999/callback');
+        expect(response.status).toBe(302);
+        expect(response.headers.get('Location')).toContain('code=');
+      });
     });
 
     describe('should reject loopback URIs when non-port components differ', () => {
@@ -7717,19 +7814,20 @@ describe('OAuthProvider', () => {
         await registerClient(['http://127.0.0.1:8080/callback']);
         await expect(makeAuthRequest('http://[::1]:8080/callback')).rejects.toThrow('Invalid redirect URI');
       });
-    });
 
-    describe('should NOT treat localhost as loopback (RFC 8252 Section 7.3)', () => {
-      it('should reject localhost with different port (exact match required)', async () => {
-        await registerClient(['http://localhost:8080/callback']);
-        await expect(makeAuthRequest('http://localhost:9999/callback')).rejects.toThrow('Invalid redirect URI');
+      it('should reject localhost vs IPv4 loopback hostname mismatch', async () => {
+        await registerClient(['http://127.0.0.1:8080/callback']);
+        await expect(makeAuthRequest('http://localhost:8080/callback')).rejects.toThrow('Invalid redirect URI');
       });
 
-      it('should accept localhost with exact same URI', async () => {
+      it('should reject IPv4 loopback when only localhost is registered', async () => {
         await registerClient(['http://localhost:8080/callback']);
-        const response = await makeAuthRequest('http://localhost:8080/callback');
-        expect(response.status).toBe(302);
-        expect(response.headers.get('Location')).toContain('code=');
+        await expect(makeAuthRequest('http://127.0.0.1:8080/callback')).rejects.toThrow('Invalid redirect URI');
+      });
+
+      it('should reject localhost with different path', async () => {
+        await registerClient(['http://localhost:8080/callback']);
+        await expect(makeAuthRequest('http://localhost:9999/evil')).rejects.toThrow('Invalid redirect URI');
       });
     });
 
@@ -7758,6 +7856,20 @@ describe('OAuthProvider', () => {
 
         // Exchange with yet another port
         const tokenResponse = await exchangeCode(code, 'http://127.0.0.1:33333/callback');
+        expect(tokenResponse.status).toBe(200);
+        const tokens = await tokenResponse.json<any>();
+        expect(tokens.access_token).toBeDefined();
+        expect(tokens.refresh_token).toBeDefined();
+      });
+
+      it('should accept token exchange with different localhost port', async () => {
+        await registerClient(['http://localhost:8080/callback']);
+
+        const authResponse = await makeAuthRequest('http://localhost:52431/callback');
+        expect(authResponse.status).toBe(302);
+        const code = extractCode(authResponse);
+
+        const tokenResponse = await exchangeCode(code, 'http://localhost:33333/callback');
         expect(tokenResponse.status).toBe(200);
         const tokens = await tokenResponse.json<any>();
         expect(tokens.access_token).toBeDefined();
@@ -7837,6 +7949,31 @@ describe('OAuthProvider', () => {
         expect(result.redirectTo).toContain('http://127.0.0.1:52431/callback');
         expect(result.redirectTo).toContain('code=');
       });
+
+      it('should accept completeAuthorization with valid localhost different port', async () => {
+        await registerClient(['http://localhost:8080/callback']);
+
+        await oauthProvider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
+        const helpers = mockEnv.OAUTH_PROVIDER!;
+
+        const authRequest = createMockRequest(
+          `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+            `&redirect_uri=${encodeURIComponent('http://localhost:52431/callback')}` +
+            `&scope=read&state=xyz123`
+        );
+        const oauthReqInfo = await helpers.parseAuthRequest(authRequest);
+
+        const result = await helpers.completeAuthorization({
+          request: oauthReqInfo,
+          userId: 'test-user-123',
+          metadata: {},
+          scope: oauthReqInfo.scope,
+          props: {},
+        });
+
+        expect(result.redirectTo).toContain('http://localhost:52431/callback');
+        expect(result.redirectTo).toContain('code=');
+      });
     });
 
     describe('full end-to-end flow with loopback ephemeral ports', () => {
@@ -7880,6 +8017,21 @@ describe('OAuthProvider', () => {
 
         // Exchange with the port used during auth
         const tokenResponse = await exchangeCode(code, 'http://[::1]:48721/callback');
+        expect(tokenResponse.status).toBe(200);
+        const tokens = await tokenResponse.json<any>();
+        expect(tokens.access_token).toBeDefined();
+      });
+
+      it('should complete full flow with localhost', async () => {
+        await registerClient(['http://localhost:3000/callback']);
+
+        const authResponse = await makeAuthRequest('http://localhost:48721/callback');
+        expect(authResponse.status).toBe(302);
+        const location = authResponse.headers.get('Location')!;
+        expect(location).toContain('http://localhost:48721/callback');
+        const code = extractCode(authResponse);
+
+        const tokenResponse = await exchangeCode(code, 'http://localhost:48721/callback');
         expect(tokenResponse.status).toBe(200);
         const tokens = await tokenResponse.json<any>();
         expect(tokens.access_token).toBeDefined();
