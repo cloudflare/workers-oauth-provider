@@ -1,5 +1,11 @@
 # @cloudflare/workers-oauth-provider
 
+## 0.3.1
+
+### Patch Changes
+
+- [#169](https://github.com/cloudflare/workers-oauth-provider/pull/169) [`46629cc`](https://github.com/cloudflare/workers-oauth-provider/commit/46629cc7d7c1e47a7b2c3dc6d9f6ac7f8963a81e) Thanks [@rlucioni](https://github.com/rlucioni)! - Allow any port for localhost redirect URIs to support native apps that use localhost with ephemeral ports like Claude Code
+
 ## 0.3.0
 
 ### Minor Changes
