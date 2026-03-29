@@ -3117,6 +3117,56 @@ describe('OAuthProvider', () => {
       );
     });
 
+    it('should include correct resource_metadata for root API path', async () => {
+      const rootApiProvider = new OAuthProvider({
+        apiRoute: ['/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        scopesSupported: ['read'],
+      });
+
+      const apiRequest = createMockRequest('https://example.com/');
+      const apiResponse = await rootApiProvider.fetch(apiRequest, mockEnv, mockCtx);
+
+      expect(apiResponse.status).toBe(401);
+      const wwwAuth = apiResponse.headers.get('WWW-Authenticate');
+      expect(wwwAuth).toContain('resource_metadata="https://example.com/.well-known/oauth-protected-resource/"');
+    });
+
+    it('should include correct resource_metadata for nested API path', async () => {
+      const apiRequest = createMockRequest('https://example.com/api/v1/deeply/nested/resource');
+      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+
+      expect(apiResponse.status).toBe(401);
+      const wwwAuth = apiResponse.headers.get('WWW-Authenticate');
+      expect(wwwAuth).toContain(
+        'resource_metadata="https://example.com/.well-known/oauth-protected-resource/api/v1/deeply/nested/resource"'
+      );
+    });
+
+    it('should include correct resource_metadata for cross-origin API route', async () => {
+      // The default oauthProvider has apiRoute: ['/api/', 'https://api.example.com/']
+      const apiRequest = createMockRequest('https://api.example.com/data');
+      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+
+      expect(apiResponse.status).toBe(401);
+      const wwwAuth = apiResponse.headers.get('WWW-Authenticate');
+      expect(wwwAuth).toContain(
+        'resource_metadata="https://api.example.com/.well-known/oauth-protected-resource/data"'
+      );
+    });
+
+    it('should include correct resource_metadata with trailing slash path', async () => {
+      const apiRequest = createMockRequest('https://example.com/api/');
+      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+
+      expect(apiResponse.status).toBe(401);
+      const wwwAuth = apiResponse.headers.get('WWW-Authenticate');
+      expect(wwwAuth).toContain('resource_metadata="https://example.com/.well-known/oauth-protected-resource/api/"');
+    });
+
     it('should reject API requests with an invalid token', async () => {
       const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
         Authorization: 'Bearer invalid-token',
