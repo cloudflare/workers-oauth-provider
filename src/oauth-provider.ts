@@ -1,5 +1,7 @@
 import { WorkerEntrypoint } from 'cloudflare:workers';
 
+const PROTECTED_RESOURCE_WELL_KNOWN_PREFIX = '/.well-known/oauth-protected-resource';
+
 // Log CIMD status on module load
 const hasStrictlyPublicFetch =
   typeof Cloudflare !== 'undefined' && Cloudflare.compatibilityFlags?.global_fetch_strictly_public === true;
@@ -1178,7 +1180,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       if (
         this.isApiRequest(url) ||
         url.pathname === '/.well-known/oauth-authorization-server' ||
-        url.pathname === '/.well-known/oauth-protected-resource' ||
+        this.isProtectedResourceMetadataRequest(url) ||
         this.isTokenEndpoint(url) ||
         (this.options.clientRegistrationEndpoint && this.isClientRegistrationEndpoint(url))
       ) {
@@ -1202,7 +1204,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     // Handle .well-known/oauth-protected-resource (RFC 9728)
-    if (url.pathname === '/.well-known/oauth-protected-resource') {
+    // Supports both root resource (no path suffix) and path-based resources per RFC 9728 §3.1
+    if (this.isProtectedResourceMetadataRequest(url)) {
       const response = this.handleProtectedResourceMetadata(url);
       return this.addCorsHeaders(response, request);
     }
@@ -1352,6 +1355,34 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   private isClientRegistrationEndpoint(url: URL): boolean {
     if (!this.options.clientRegistrationEndpoint) return false;
     return this.matchEndpoint(url, this.options.clientRegistrationEndpoint);
+  }
+
+  /**
+   * Checks if a URL is a request for OAuth Protected Resource Metadata (RFC 9728).
+   * Matches both the root well-known path and path-suffixed variants per RFC 9728 §3.1.
+   */
+  private isProtectedResourceMetadataRequest(url: URL): boolean {
+    return (
+      url.pathname === PROTECTED_RESOURCE_WELL_KNOWN_PREFIX ||
+      url.pathname.startsWith(PROTECTED_RESOURCE_WELL_KNOWN_PREFIX + '/')
+    );
+  }
+
+  /**
+   * Derives the resource identifier from a protected resource metadata well-known URL.
+   * Per RFC 9728 §3.1, the well-known URI is inserted after the authority and before the path,
+   * so the resource identifier is reconstructed by removing the well-known prefix.
+   *
+   * Examples:
+   *   /.well-known/oauth-protected-resource       → origin (e.g. https://example.com)
+   *   /.well-known/oauth-protected-resource/mcp   → origin + /mcp (e.g. https://example.com/mcp)
+   */
+  private deriveResourceIdentifier(requestUrl: URL): string {
+    const suffix = requestUrl.pathname.slice(PROTECTED_RESOURCE_WELL_KNOWN_PREFIX.length);
+    if (!suffix || suffix === '/') {
+      return requestUrl.origin;
+    }
+    return `${requestUrl.origin}${suffix}`;
   }
 
   /**
@@ -1629,7 +1660,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const authServerOrigin = new URL(tokenEndpointUrl).origin;
 
     const metadata: Record<string, unknown> = {
-      resource: rm?.resource ?? requestUrl.origin,
+      resource: rm?.resource ?? this.deriveResourceIdentifier(requestUrl),
       authorization_servers: rm?.authorization_servers ?? [authServerOrigin],
       scopes_supported: rm?.scopes_supported ?? this.options.scopesSupported,
       bearer_methods_supported: rm?.bearer_methods_supported ?? ['header'],
