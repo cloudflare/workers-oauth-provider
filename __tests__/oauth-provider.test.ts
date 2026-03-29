@@ -3051,9 +3051,11 @@ describe('OAuthProvider', () => {
 
       expect(apiResponse.status).toBe(401);
 
+      // Per RFC 9728 §5.1, resource_metadata URL includes the request path
+      // so the client can discover metadata for the specific resource
       const wwwAuth = apiResponse.headers.get('WWW-Authenticate');
       expect(wwwAuth).toBe(
-        'Bearer realm="OAuth", resource_metadata="https://example.com/.well-known/oauth-protected-resource", error="invalid_token", error_description="Missing or invalid access token"'
+        'Bearer realm="OAuth", resource_metadata="https://example.com/.well-known/oauth-protected-resource/api/test", error="invalid_token", error_description="Missing or invalid access token"'
       );
     });
 
@@ -3235,7 +3237,7 @@ describe('OAuthProvider', () => {
 
       const wwwAuth = apiResponse.headers.get('WWW-Authenticate');
       expect(wwwAuth).toContain('Bearer');
-      expect(wwwAuth).toContain('resource_metadata="https://example.com/.well-known/oauth-protected-resource"');
+      expect(wwwAuth).toContain('resource_metadata="https://example.com/.well-known/oauth-protected-resource/api/test"');
       expect(wwwAuth).toContain('error="invalid_token"');
       expect(wwwAuth).toContain('Invalid audience');
 
