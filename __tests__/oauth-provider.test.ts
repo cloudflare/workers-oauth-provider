@@ -3237,7 +3237,9 @@ describe('OAuthProvider', () => {
 
       const wwwAuth = apiResponse.headers.get('WWW-Authenticate');
       expect(wwwAuth).toContain('Bearer');
-      expect(wwwAuth).toContain('resource_metadata="https://example.com/.well-known/oauth-protected-resource/api/test"');
+      expect(wwwAuth).toContain(
+        'resource_metadata="https://example.com/.well-known/oauth-protected-resource/api/test"'
+      );
       expect(wwwAuth).toContain('error="invalid_token"');
       expect(wwwAuth).toContain('Invalid audience');
 
