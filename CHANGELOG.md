@@ -1,5 +1,13 @@
 # @cloudflare/workers-oauth-provider
 
+## 0.3.2
+
+### Patch Changes
+
+- [#173](https://github.com/cloudflare/workers-oauth-provider/pull/173) [`1fe656e`](https://github.com/cloudflare/workers-oauth-provider/commit/1fe656e896e4253b15b873ce46bdd8cca7e69998) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Support path-suffixed well-known URLs for OAuth Protected Resource Metadata (RFC 9728 §3.1). Resources with path components (e.g. `https://example.com/mcp`) now correctly serve metadata at `/.well-known/oauth-protected-resource/mcp` and return the derived resource identifier in the `resource` field.
+
+- [#174](https://github.com/cloudflare/workers-oauth-provider/pull/174) [`ac120ff`](https://github.com/cloudflare/workers-oauth-provider/commit/ac120ff26b8de627230b778a258ef1dac5bf9266) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Include the request path in the `resource_metadata` URL within `WWW-Authenticate` headers (RFC 9728 §5.1). API endpoints with path components (e.g. `/mcp`) now advertise the correct path-suffixed metadata URL so clients can discover the resource-specific metadata.
+
 ## 0.3.1
 
 ### Patch Changes
