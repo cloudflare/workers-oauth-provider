@@ -1,5 +1,11 @@
 # @cloudflare/workers-oauth-provider
 
+## 0.3.3
+
+### Patch Changes
+
+- [#176](https://github.com/cloudflare/workers-oauth-provider/pull/176) [`38d1e6b`](https://github.com/cloudflare/workers-oauth-provider/commit/38d1e6b3ce555577c0b1bd45daabd6baa5748b0e) Thanks [@threepointone](https://github.com/threepointone)! - Reverting 0.3.2
+
 ## 0.3.2
 
 ### Patch Changes
