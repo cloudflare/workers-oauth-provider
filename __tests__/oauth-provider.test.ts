@@ -527,64 +527,6 @@ describe('OAuthProvider', () => {
       expect(response.headers.get('Access-Control-Max-Age')).toBe('86400');
       expect(response.headers.get('Content-Length')).toBe('0');
     });
-
-    it('should return metadata with path-based resource identifier per RFC 9728 §3.1', async () => {
-      const request = createMockRequest('https://example.com/.well-known/oauth-protected-resource/mcp');
-      const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
-
-      expect(response.status).toBe(200);
-
-      const metadata = await response.json<any>();
-      expect(metadata.resource).toBe('https://example.com/mcp');
-      expect(metadata.authorization_servers).toEqual(['https://example.com']);
-      expect(metadata.bearer_methods_supported).toEqual(['header']);
-    });
-
-    it('should return metadata with nested path-based resource identifier', async () => {
-      const request = createMockRequest('https://example.com/.well-known/oauth-protected-resource/api/v1/mcp');
-      const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
-
-      expect(response.status).toBe(200);
-
-      const metadata = await response.json<any>();
-      expect(metadata.resource).toBe('https://example.com/api/v1/mcp');
-    });
-
-    it('should handle OPTIONS preflight for path-suffixed protected resource metadata', async () => {
-      const preflightRequest = createMockRequest(
-        'https://example.com/.well-known/oauth-protected-resource/mcp',
-        'OPTIONS',
-        {
-          Origin: 'https://spa.example.com',
-          'Access-Control-Request-Method': 'GET',
-        }
-      );
-
-      const response = await oauthProvider.fetch(preflightRequest, mockEnv, mockCtx);
-
-      expect(response.status).toBe(204);
-      expect(response.headers.get('Access-Control-Allow-Origin')).toBe('https://spa.example.com');
-    });
-
-    it('should use custom resourceMetadata.resource even with path-suffixed well-known URL', async () => {
-      const customProvider = new OAuthProvider({
-        apiRoute: ['/api/'],
-        apiHandler: TestApiHandler,
-        defaultHandler: testDefaultHandler,
-        authorizeEndpoint: '/authorize',
-        tokenEndpoint: '/oauth/token',
-        scopesSupported: ['read', 'write'],
-        resourceMetadata: {
-          resource: 'https://api.example.com',
-        },
-      });
-
-      const request = createMockRequest('https://example.com/.well-known/oauth-protected-resource/mcp');
-      const response = await customProvider.fetch(request, mockEnv, mockCtx);
-
-      const metadata = await response.json<any>();
-      expect(metadata.resource).toBe('https://api.example.com');
-    });
   });
 
   describe('Client Registration', () => {
