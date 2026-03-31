@@ -4008,6 +4008,175 @@ describe('OAuthProvider', () => {
     });
   });
 
+  describe('resourceOriginMatching option', () => {
+    let originMatchingProvider: OAuthProvider<TestEnv>;
+
+    beforeEach(() => {
+      originMatchingProvider = new OAuthProvider({
+        apiRoute: ['/api/', 'https://api.example.com/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        scopesSupported: ['read', 'write', 'profile'],
+        accessTokenTTL: 3600,
+        resourceOriginMatching: true,
+      });
+    });
+
+    async function registerClientAndGetCode(
+      provider: OAuthProvider<TestEnv>,
+      resource: string
+    ): Promise<{ clientId: string; clientSecret: string; code: string; redirectUri: string }> {
+      const clientData = {
+        redirect_uris: ['https://client.example.com/callback'],
+        client_name: 'Test Client',
+        token_endpoint_auth_method: 'client_secret_basic',
+      };
+      const registerResponse = await provider.fetch(
+        createMockRequest('https://example.com/oauth/register', 'POST', { 'Content-Type': 'application/json' }, JSON.stringify(clientData)),
+        mockEnv,
+        mockCtx
+      );
+      const client = await registerResponse.json<any>();
+      const redirectUri = 'https://client.example.com/callback';
+
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${client.client_id}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123&resource=${encodeURIComponent(resource)}`
+      );
+      const authResponse = await provider.fetch(authRequest, mockEnv, mockCtx);
+      const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
+
+      return { clientId: client.client_id, clientSecret: client.client_secret, code, redirectUri };
+    }
+
+    it('should allow path-aware resource on token exchange when grant has origin-only resource', async () => {
+      // Grant issued with origin-only resource (pre-0.4.0 behavior)
+      const { clientId, clientSecret, code, redirectUri } = await registerClientAndGetCode(
+        originMatchingProvider,
+        'https://api1.example.com'
+      );
+
+      // Token exchange with path-aware resource (post-0.4.0 client behavior)
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+      params.append('resource', 'https://api1.example.com/mcp');
+
+      const tokenResponse = await originMatchingProvider.fetch(
+        createMockRequest('https://example.com/oauth/token', 'POST', { 'Content-Type': 'application/x-www-form-urlencoded' }, params.toString()),
+        mockEnv,
+        mockCtx
+      );
+
+      expect(tokenResponse.status).toBe(200);
+      const tokens = await tokenResponse.json<any>();
+      expect(tokens.access_token).toBeDefined();
+      expect(tokens.refresh_token).toBeDefined();
+    });
+
+    it('should allow path-aware resource on refresh when grant has origin-only resource', async () => {
+      // Grant with origin-only resource
+      const { clientId, clientSecret, code, redirectUri } = await registerClientAndGetCode(
+        originMatchingProvider,
+        'https://api1.example.com'
+      );
+
+      // Initial token exchange (origin-only, matching grant)
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+      params.append('resource', 'https://api1.example.com');
+
+      const tokenResponse = await originMatchingProvider.fetch(
+        createMockRequest('https://example.com/oauth/token', 'POST', { 'Content-Type': 'application/x-www-form-urlencoded' }, params.toString()),
+        mockEnv,
+        mockCtx
+      );
+      const tokens = await tokenResponse.json<any>();
+
+      // Refresh with path-aware resource (simulating post-upgrade client)
+      const refreshParams = new URLSearchParams();
+      refreshParams.append('grant_type', 'refresh_token');
+      refreshParams.append('refresh_token', tokens.refresh_token);
+      refreshParams.append('client_id', clientId);
+      refreshParams.append('client_secret', clientSecret);
+      refreshParams.append('resource', 'https://api1.example.com/mcp');
+
+      const refreshResponse = await originMatchingProvider.fetch(
+        createMockRequest('https://example.com/oauth/token', 'POST', { 'Content-Type': 'application/x-www-form-urlencoded' }, refreshParams.toString()),
+        mockEnv,
+        mockCtx
+      );
+
+      expect(refreshResponse.status).toBe(200);
+      const refreshedTokens = await refreshResponse.json<any>();
+      expect(refreshedTokens.access_token).toBeDefined();
+    });
+
+    it('should still reject different origins even with resourceOriginMatching enabled', async () => {
+      const { clientId, clientSecret, code, redirectUri } = await registerClientAndGetCode(
+        originMatchingProvider,
+        'https://api1.example.com'
+      );
+
+      // Try token exchange with completely different origin
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+      params.append('resource', 'https://evil.example.com/mcp');
+
+      const tokenResponse = await originMatchingProvider.fetch(
+        createMockRequest('https://example.com/oauth/token', 'POST', { 'Content-Type': 'application/x-www-form-urlencoded' }, params.toString()),
+        mockEnv,
+        mockCtx
+      );
+
+      expect(tokenResponse.status).toBe(400);
+      const error = await tokenResponse.json<any>();
+      expect(error.error).toBe('invalid_target');
+    });
+
+    it('should reject path-aware resource without the flag (default strict matching)', async () => {
+      // Use the default oauthProvider (no resourceOriginMatching)
+      const { clientId, clientSecret, code, redirectUri } = await registerClientAndGetCode(
+        oauthProvider,
+        'https://api1.example.com'
+      );
+
+      // Token exchange with path-aware resource — should fail with strict matching
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+      params.append('resource', 'https://api1.example.com/mcp');
+
+      const tokenResponse = await oauthProvider.fetch(
+        createMockRequest('https://example.com/oauth/token', 'POST', { 'Content-Type': 'application/x-www-form-urlencoded' }, params.toString()),
+        mockEnv,
+        mockCtx
+      );
+
+      expect(tokenResponse.status).toBe(400);
+      const error = await tokenResponse.json<any>();
+      expect(error.error).toBe('invalid_target');
+    });
+  });
+
   describe('CORS Support', () => {
     it('should handle CORS preflight for API requests', async () => {
       const preflightRequest = createMockRequest('https://example.com/api/test', 'OPTIONS', {
