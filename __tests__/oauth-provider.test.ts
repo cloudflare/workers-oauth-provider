@@ -4008,7 +4008,7 @@ describe('OAuthProvider', () => {
     });
   });
 
-  describe('resourceOriginMatching option', () => {
+  describe('resourceMatchOriginOnly option', () => {
     let originMatchingProvider: OAuthProvider<TestEnv>;
 
     beforeEach(() => {
@@ -4021,7 +4021,7 @@ describe('OAuthProvider', () => {
         clientRegistrationEndpoint: '/oauth/register',
         scopesSupported: ['read', 'write', 'profile'],
         accessTokenTTL: 3600,
-        resourceOriginMatching: true,
+        resourceMatchOriginOnly: true,
       });
     });
 
@@ -4143,7 +4143,7 @@ describe('OAuthProvider', () => {
       expect(refreshedTokens.access_token).toBeDefined();
     });
 
-    it('should still reject different origins even with resourceOriginMatching enabled', async () => {
+    it('should still reject different origins even with resourceMatchOriginOnly enabled', async () => {
       const { clientId, clientSecret, code, redirectUri } = await registerClientAndGetCode(
         originMatchingProvider,
         'https://api1.example.com'
@@ -4175,7 +4175,7 @@ describe('OAuthProvider', () => {
     });
 
     it('should reject path-aware resource without the flag (default strict matching)', async () => {
-      // Use the default oauthProvider (no resourceOriginMatching)
+      // Use the default oauthProvider (no resourceMatchOriginOnly)
       const { clientId, clientSecret, code, redirectUri } = await registerClientAndGetCode(
         oauthProvider,
         'https://api1.example.com'

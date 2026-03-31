@@ -343,7 +343,7 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
    *
    * Defaults to false (strict exact matching per RFC 8707).
    */
-  resourceOriginMatching?: boolean;
+  resourceMatchOriginOnly?: boolean;
 
   /**
    * Optional metadata for RFC 9728 OAuth 2.0 Protected Resource Metadata.
@@ -1937,7 +1937,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Parse and validate resource parameter (RFC 8707)
     // Validate downscoping: token request resources must be subset of grant resources
-    const originOnly = !!this.options.resourceOriginMatching;
+    const originOnly = !!this.options.resourceMatchOriginOnly;
     if (body.resource && grantData.resource) {
       const requestedResources = Array.isArray(body.resource) ? body.resource : [body.resource];
       const grantedResources = Array.isArray(grantData.resource) ? grantData.resource : [grantData.resource];
@@ -2214,7 +2214,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Parse and validate resource parameter (RFC 8707)
     // Validate downscoping: token request resources must be subset of grant resources
-    const originOnly = !!this.options.resourceOriginMatching;
+    const originOnly = !!this.options.resourceMatchOriginOnly;
     if (body.resource && grantData.resource) {
       const requestedResources = Array.isArray(body.resource) ? body.resource : [body.resource];
       const grantedResources = Array.isArray(grantData.resource) ? grantData.resource : [grantData.resource];
@@ -2322,7 +2322,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     let tokenScopes: string[] = this.downscope(requestedScopes, grantData.scope);
 
     // Parse and validate resource parameter (RFC 8707) if provided
-    const originOnly = !!this.options.resourceOriginMatching;
+    const originOnly = !!this.options.resourceMatchOriginOnly;
     let newAudience: string | string[] | undefined = tokenSummary.audience;
     if (requestedResource) {
       // Validate downscoping: requested resources must be subset of grant resources if grant had resources
