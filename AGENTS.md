@@ -193,6 +193,10 @@ All checks must pass before merge.
 
 Mention `/bonk` or `@ask-bonk` in PR comments to get AI-powered code review and suggestions. Bonk can analyze code, suggest fixes, and even auto-commit improvements.
 
+### Semver: changes that invalidate tokens or refresh tokens must be minor
+
+Any change that alters the format of data stored on grants (e.g. the `resource` field) can silently invalidate existing refresh tokens. These changes **must** be released as a minor version bump, not a patch. This applies to any change where tokens issued by the previous version would fail validation against the new version.
+
 ### RFC compliance
 
 This library implements multiple OAuth/security RFCs. When making changes, maintain compliance with:

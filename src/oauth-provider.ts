@@ -1,5 +1,7 @@
 import { WorkerEntrypoint } from 'cloudflare:workers';
 
+const PROTECTED_RESOURCE_WELL_KNOWN_PREFIX = '/.well-known/oauth-protected-resource';
+
 // Log CIMD status on module load
 const hasStrictlyPublicFetch =
   typeof Cloudflare !== 'undefined' && Cloudflare.compatibilityFlags?.global_fetch_strictly_public === true;
@@ -331,6 +333,17 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
    * Defaults to false.
    */
   clientIdMetadataDocumentEnabled?: boolean;
+
+  /**
+   * When true, resource validation during token exchange compares origins only
+   * (scheme + host + port) instead of exact URI matching. This allows grants issued
+   * with an origin-only resource (e.g. `https://server.com`) to be used with
+   * path-aware resource requests (e.g. `https://server.com/mcp`), enabling seamless
+   * migration from pre-0.4.0 versions that stored origin-only resource URIs.
+   *
+   * Defaults to false (strict exact matching per RFC 8707).
+   */
+  resourceMatchOriginOnly?: boolean;
 
   /**
    * Optional metadata for RFC 9728 OAuth 2.0 Protected Resource Metadata.
@@ -1178,7 +1191,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       if (
         this.isApiRequest(url) ||
         url.pathname === '/.well-known/oauth-authorization-server' ||
-        url.pathname === '/.well-known/oauth-protected-resource' ||
+        this.isProtectedResourceMetadataRequest(url) ||
         this.isTokenEndpoint(url) ||
         (this.options.clientRegistrationEndpoint && this.isClientRegistrationEndpoint(url))
       ) {
@@ -1202,7 +1215,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     // Handle .well-known/oauth-protected-resource (RFC 9728)
-    if (url.pathname === '/.well-known/oauth-protected-resource') {
+    // Supports both root resource (no path suffix) and path-based resources per RFC 9728 §3.1
+    if (this.isProtectedResourceMetadataRequest(url)) {
       const response = this.handleProtectedResourceMetadata(url);
       return this.addCorsHeaders(response, request);
     }
@@ -1352,6 +1366,34 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   private isClientRegistrationEndpoint(url: URL): boolean {
     if (!this.options.clientRegistrationEndpoint) return false;
     return this.matchEndpoint(url, this.options.clientRegistrationEndpoint);
+  }
+
+  /**
+   * Checks if a URL is a request for OAuth Protected Resource Metadata (RFC 9728).
+   * Matches both the root well-known path and path-suffixed variants per RFC 9728 §3.1.
+   */
+  private isProtectedResourceMetadataRequest(url: URL): boolean {
+    return (
+      url.pathname === PROTECTED_RESOURCE_WELL_KNOWN_PREFIX ||
+      url.pathname.startsWith(PROTECTED_RESOURCE_WELL_KNOWN_PREFIX + '/')
+    );
+  }
+
+  /**
+   * Derives the resource identifier from a protected resource metadata well-known URL.
+   * Per RFC 9728 §3.1, the well-known URI is inserted after the authority and before the path,
+   * so the resource identifier is reconstructed by removing the well-known prefix.
+   *
+   * Examples:
+   *   /.well-known/oauth-protected-resource       → origin (e.g. https://example.com)
+   *   /.well-known/oauth-protected-resource/mcp   → origin + /mcp (e.g. https://example.com/mcp)
+   */
+  private deriveResourceIdentifier(requestUrl: URL): string {
+    const suffix = requestUrl.pathname.slice(PROTECTED_RESOURCE_WELL_KNOWN_PREFIX.length);
+    if (!suffix || suffix === '/') {
+      return requestUrl.origin;
+    }
+    return `${requestUrl.origin}${suffix}`;
   }
 
   /**
@@ -1629,7 +1671,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const authServerOrigin = new URL(tokenEndpointUrl).origin;
 
     const metadata: Record<string, unknown> = {
-      resource: rm?.resource ?? requestUrl.origin,
+      resource: rm?.resource ?? this.deriveResourceIdentifier(requestUrl),
       authorization_servers: rm?.authorization_servers ?? [authServerOrigin],
       scopes_supported: rm?.scopes_supported ?? this.options.scopesSupported,
       bearer_methods_supported: rm?.bearer_methods_supported ?? ['header'],
@@ -1895,13 +1937,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Parse and validate resource parameter (RFC 8707)
     // Validate downscoping: token request resources must be subset of grant resources
+    const originOnly = !!this.options.resourceMatchOriginOnly;
     if (body.resource && grantData.resource) {
       const requestedResources = Array.isArray(body.resource) ? body.resource : [body.resource];
       const grantedResources = Array.isArray(grantData.resource) ? grantData.resource : [grantData.resource];
 
       // Check that all requested resources are in the granted resources
       for (const requested of requestedResources) {
-        if (!grantedResources.includes(requested)) {
+        if (!grantedResources.some((granted) => resourceMatches(requested, granted, originOnly))) {
           return this.createErrorResponse(
             'invalid_target',
             'Requested resource was not included in the authorization request'
@@ -2171,13 +2214,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Parse and validate resource parameter (RFC 8707)
     // Validate downscoping: token request resources must be subset of grant resources
+    const originOnly = !!this.options.resourceMatchOriginOnly;
     if (body.resource && grantData.resource) {
       const requestedResources = Array.isArray(body.resource) ? body.resource : [body.resource];
       const grantedResources = Array.isArray(grantData.resource) ? grantData.resource : [grantData.resource];
 
       // Check that all requested resources are in the granted resources
       for (const requested of requestedResources) {
-        if (!grantedResources.includes(requested)) {
+        if (!grantedResources.some((granted) => resourceMatches(requested, granted, originOnly))) {
           return this.createErrorResponse(
             'invalid_target',
             'Requested resource was not included in the authorization request'
@@ -2278,6 +2322,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     let tokenScopes: string[] = this.downscope(requestedScopes, grantData.scope);
 
     // Parse and validate resource parameter (RFC 8707) if provided
+    const originOnly = !!this.options.resourceMatchOriginOnly;
     let newAudience: string | string[] | undefined = tokenSummary.audience;
     if (requestedResource) {
       // Validate downscoping: requested resources must be subset of grant resources if grant had resources
@@ -2287,7 +2332,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
         // Check that all requested resources are in the granted resources
         for (const requested of requestedResources) {
-          if (!grantedResources.includes(requested)) {
+          if (!grantedResources.some((granted) => resourceMatches(requested, granted, originOnly))) {
             throw new OAuthError('invalid_target', 'Requested resource was not included in the authorization request');
           }
         }
@@ -2737,7 +2782,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    */
   private async handleApiRequest(request: Request, env: any, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
-    const resourceMetadataUrl = `${url.origin}/.well-known/oauth-protected-resource`;
+    // Per RFC 9728 §5.1, include the request path so the resource_metadata URL
+    // points to the correct path-suffixed well-known endpoint (RFC 9728 §3.1)
+    const resourceMetadataUrl = `${url.origin}/.well-known/oauth-protected-resource${url.pathname}`;
 
     // Get access token from Authorization header
     const authHeader = request.headers.get('Authorization');
@@ -3358,6 +3405,22 @@ function parseResourceParameter(value: string | string[] | undefined): string | 
   }
 
   return value;
+}
+
+/**
+ * Checks if a requested resource matches a granted resource.
+ * When originOnly is true, compares only the origin (scheme + host + port),
+ * allowing path-aware resources to match origin-only grants.
+ */
+function resourceMatches(requested: string, granted: string, originOnly: boolean): boolean {
+  if (!originOnly) {
+    return requested === granted;
+  }
+  try {
+    return new URL(requested).origin === new URL(granted).origin;
+  } catch {
+    return requested === granted;
+  }
 }
 
 /**
