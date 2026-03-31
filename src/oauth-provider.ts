@@ -2768,9 +2768,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    */
   private async handleApiRequest(request: Request, env: any, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
-    // Per RFC 9728 §5.1, include the request path so the resource_metadata URL
-    // points to the correct path-suffixed well-known endpoint (RFC 9728 §3.1)
-    const resourceMetadataUrl = `${url.origin}/.well-known/oauth-protected-resource${url.pathname}`;
+    const resourceMetadataUrl = `${url.origin}/.well-known/oauth-protected-resource`;
 
     // Get access token from Authorization header
     const authHeader = request.headers.get('Authorization');

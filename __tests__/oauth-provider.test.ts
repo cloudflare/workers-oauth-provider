@@ -3109,62 +3109,10 @@ describe('OAuthProvider', () => {
 
       expect(apiResponse.status).toBe(401);
 
-      // Per RFC 9728 §5.1, resource_metadata URL includes the request path
-      // so the client can discover metadata for the specific resource
       const wwwAuth = apiResponse.headers.get('WWW-Authenticate');
       expect(wwwAuth).toBe(
-        'Bearer realm="OAuth", resource_metadata="https://example.com/.well-known/oauth-protected-resource/api/test", error="invalid_token", error_description="Missing or invalid access token"'
+        'Bearer realm="OAuth", resource_metadata="https://example.com/.well-known/oauth-protected-resource", error="invalid_token", error_description="Missing or invalid access token"'
       );
-    });
-
-    it('should include correct resource_metadata for root API path', async () => {
-      const rootApiProvider = new OAuthProvider({
-        apiRoute: ['/'],
-        apiHandler: TestApiHandler,
-        defaultHandler: testDefaultHandler,
-        authorizeEndpoint: '/authorize',
-        tokenEndpoint: '/oauth/token',
-        scopesSupported: ['read'],
-      });
-
-      const apiRequest = createMockRequest('https://example.com/');
-      const apiResponse = await rootApiProvider.fetch(apiRequest, mockEnv, mockCtx);
-
-      expect(apiResponse.status).toBe(401);
-      const wwwAuth = apiResponse.headers.get('WWW-Authenticate');
-      expect(wwwAuth).toContain('resource_metadata="https://example.com/.well-known/oauth-protected-resource/"');
-    });
-
-    it('should include correct resource_metadata for nested API path', async () => {
-      const apiRequest = createMockRequest('https://example.com/api/v1/deeply/nested/resource');
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
-
-      expect(apiResponse.status).toBe(401);
-      const wwwAuth = apiResponse.headers.get('WWW-Authenticate');
-      expect(wwwAuth).toContain(
-        'resource_metadata="https://example.com/.well-known/oauth-protected-resource/api/v1/deeply/nested/resource"'
-      );
-    });
-
-    it('should include correct resource_metadata for cross-origin API route', async () => {
-      // The default oauthProvider has apiRoute: ['/api/', 'https://api.example.com/']
-      const apiRequest = createMockRequest('https://api.example.com/data');
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
-
-      expect(apiResponse.status).toBe(401);
-      const wwwAuth = apiResponse.headers.get('WWW-Authenticate');
-      expect(wwwAuth).toContain(
-        'resource_metadata="https://api.example.com/.well-known/oauth-protected-resource/data"'
-      );
-    });
-
-    it('should include correct resource_metadata with trailing slash path', async () => {
-      const apiRequest = createMockRequest('https://example.com/api/');
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
-
-      expect(apiResponse.status).toBe(401);
-      const wwwAuth = apiResponse.headers.get('WWW-Authenticate');
-      expect(wwwAuth).toContain('resource_metadata="https://example.com/.well-known/oauth-protected-resource/api/"');
     });
 
     it('should reject API requests with an invalid token', async () => {
@@ -3345,9 +3293,7 @@ describe('OAuthProvider', () => {
 
       const wwwAuth = apiResponse.headers.get('WWW-Authenticate');
       expect(wwwAuth).toContain('Bearer');
-      expect(wwwAuth).toContain(
-        'resource_metadata="https://example.com/.well-known/oauth-protected-resource/api/test"'
-      );
+      expect(wwwAuth).toContain('resource_metadata="https://example.com/.well-known/oauth-protected-resource"');
       expect(wwwAuth).toContain('error="invalid_token"');
       expect(wwwAuth).toContain('Invalid audience');
 
