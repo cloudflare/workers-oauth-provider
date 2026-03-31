@@ -193,19 +193,9 @@ All checks must pass before merge.
 
 Mention `/bonk` or `@ask-bonk` in PR comments to get AI-powered code review and suggestions. Bonk can analyze code, suggest fixes, and even auto-commit improvements.
 
-### Breaking change: path-aware resource URIs (v0.4.0)
+### Semver: changes that invalidate tokens or refresh tokens must be minor
 
-In v0.3.2, path-suffixed well-known URLs (RFC 9728 §3.1) and path-aware `resource_metadata` in `WWW-Authenticate` headers (RFC 9728 §5.1) were introduced. These were reverted in v0.3.3 because they are **breaking changes** and were re-landed in v0.4.0 as a minor version bump.
-
-**Why this breaks existing deployments:**
-
-The `resource` field stored on grants changes from origin-only (e.g. `https://server.com`) to path-aware (e.g. `https://server.com/mcp`). This means:
-
-1. **Existing refresh tokens break.** Grants issued before the upgrade have `resource: "https://server.com"`. After upgrade, clients discover the path-aware resource URI and send `resource=https://server.com/mcp` on token refresh. The downscoping validation (`grantData.resource` vs `body.resource`) fails with `invalid_target` because `"https://server.com/mcp"` is not in `["https://server.com"]`.
-
-2. **Consumers doing exact resource matching break.** Any server-side code that compares the `resource` parameter against a canonical origin-only value (e.g. `clientResource !== canonicalResourceUri`) will reject path-aware URIs. Consumers must compare origins only, not full URIs.
-
-**When modifying resource handling**, always consider the impact on tokens/grants issued by previous versions of this library. Resource URI format changes invalidate existing grants.
+Any change that alters the format of data stored on grants (e.g. the `resource` field) can silently invalidate existing refresh tokens. These changes **must** be released as a minor version bump, not a patch. This applies to any change where tokens issued by the previous version would fail validation against the new version.
 
 ### RFC compliance
 

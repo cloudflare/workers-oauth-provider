@@ -335,6 +335,17 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
   clientIdMetadataDocumentEnabled?: boolean;
 
   /**
+   * When true, resource validation during token exchange compares origins only
+   * (scheme + host + port) instead of exact URI matching. This allows grants issued
+   * with an origin-only resource (e.g. `https://server.com`) to be used with
+   * path-aware resource requests (e.g. `https://server.com/mcp`), enabling seamless
+   * migration from pre-0.4.0 versions that stored origin-only resource URIs.
+   *
+   * Defaults to false (strict exact matching per RFC 8707).
+   */
+  resourceOriginMatching?: boolean;
+
+  /**
    * Optional metadata for RFC 9728 OAuth 2.0 Protected Resource Metadata.
    * Controls the response served at /.well-known/oauth-protected-resource.
    *
@@ -1926,13 +1937,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Parse and validate resource parameter (RFC 8707)
     // Validate downscoping: token request resources must be subset of grant resources
+    const originOnly = !!this.options.resourceOriginMatching;
     if (body.resource && grantData.resource) {
       const requestedResources = Array.isArray(body.resource) ? body.resource : [body.resource];
       const grantedResources = Array.isArray(grantData.resource) ? grantData.resource : [grantData.resource];
 
       // Check that all requested resources are in the granted resources
       for (const requested of requestedResources) {
-        if (!grantedResources.includes(requested)) {
+        if (!grantedResources.some((granted) => resourceMatches(requested, granted, originOnly))) {
           return this.createErrorResponse(
             'invalid_target',
             'Requested resource was not included in the authorization request'
@@ -2202,13 +2214,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Parse and validate resource parameter (RFC 8707)
     // Validate downscoping: token request resources must be subset of grant resources
+    const originOnly = !!this.options.resourceOriginMatching;
     if (body.resource && grantData.resource) {
       const requestedResources = Array.isArray(body.resource) ? body.resource : [body.resource];
       const grantedResources = Array.isArray(grantData.resource) ? grantData.resource : [grantData.resource];
 
       // Check that all requested resources are in the granted resources
       for (const requested of requestedResources) {
-        if (!grantedResources.includes(requested)) {
+        if (!grantedResources.some((granted) => resourceMatches(requested, granted, originOnly))) {
           return this.createErrorResponse(
             'invalid_target',
             'Requested resource was not included in the authorization request'
@@ -2309,6 +2322,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     let tokenScopes: string[] = this.downscope(requestedScopes, grantData.scope);
 
     // Parse and validate resource parameter (RFC 8707) if provided
+    const originOnly = !!this.options.resourceOriginMatching;
     let newAudience: string | string[] | undefined = tokenSummary.audience;
     if (requestedResource) {
       // Validate downscoping: requested resources must be subset of grant resources if grant had resources
@@ -2318,7 +2332,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
         // Check that all requested resources are in the granted resources
         for (const requested of requestedResources) {
-          if (!grantedResources.includes(requested)) {
+          if (!grantedResources.some((granted) => resourceMatches(requested, granted, originOnly))) {
             throw new OAuthError('invalid_target', 'Requested resource was not included in the authorization request');
           }
         }
@@ -3391,6 +3405,22 @@ function parseResourceParameter(value: string | string[] | undefined): string | 
   }
 
   return value;
+}
+
+/**
+ * Checks if a requested resource matches a granted resource.
+ * When originOnly is true, compares only the origin (scheme + host + port),
+ * allowing path-aware resources to match origin-only grants.
+ */
+function resourceMatches(requested: string, granted: string, originOnly: boolean): boolean {
+  if (!originOnly) {
+    return requested === granted;
+  }
+  try {
+    return new URL(requested).origin === new URL(granted).origin;
+  } catch {
+    return requested === granted;
+  }
 }
 
 /**
