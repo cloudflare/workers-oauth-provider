@@ -4035,7 +4035,12 @@ describe('OAuthProvider', () => {
         token_endpoint_auth_method: 'client_secret_basic',
       };
       const registerResponse = await provider.fetch(
-        createMockRequest('https://example.com/oauth/register', 'POST', { 'Content-Type': 'application/json' }, JSON.stringify(clientData)),
+        createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify(clientData)
+        ),
         mockEnv,
         mockCtx
       );
@@ -4070,7 +4075,12 @@ describe('OAuthProvider', () => {
       params.append('resource', 'https://api1.example.com/mcp');
 
       const tokenResponse = await originMatchingProvider.fetch(
-        createMockRequest('https://example.com/oauth/token', 'POST', { 'Content-Type': 'application/x-www-form-urlencoded' }, params.toString()),
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          params.toString()
+        ),
         mockEnv,
         mockCtx
       );
@@ -4098,7 +4108,12 @@ describe('OAuthProvider', () => {
       params.append('resource', 'https://api1.example.com');
 
       const tokenResponse = await originMatchingProvider.fetch(
-        createMockRequest('https://example.com/oauth/token', 'POST', { 'Content-Type': 'application/x-www-form-urlencoded' }, params.toString()),
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          params.toString()
+        ),
         mockEnv,
         mockCtx
       );
@@ -4113,7 +4128,12 @@ describe('OAuthProvider', () => {
       refreshParams.append('resource', 'https://api1.example.com/mcp');
 
       const refreshResponse = await originMatchingProvider.fetch(
-        createMockRequest('https://example.com/oauth/token', 'POST', { 'Content-Type': 'application/x-www-form-urlencoded' }, refreshParams.toString()),
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          refreshParams.toString()
+        ),
         mockEnv,
         mockCtx
       );
@@ -4139,7 +4159,12 @@ describe('OAuthProvider', () => {
       params.append('resource', 'https://evil.example.com/mcp');
 
       const tokenResponse = await originMatchingProvider.fetch(
-        createMockRequest('https://example.com/oauth/token', 'POST', { 'Content-Type': 'application/x-www-form-urlencoded' }, params.toString()),
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          params.toString()
+        ),
         mockEnv,
         mockCtx
       );
@@ -4166,7 +4191,12 @@ describe('OAuthProvider', () => {
       params.append('resource', 'https://api1.example.com/mcp');
 
       const tokenResponse = await oauthProvider.fetch(
-        createMockRequest('https://example.com/oauth/token', 'POST', { 'Content-Type': 'application/x-www-form-urlencoded' }, params.toString()),
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          params.toString()
+        ),
         mockEnv,
         mockCtx
       );
