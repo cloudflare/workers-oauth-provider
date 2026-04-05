@@ -247,10 +247,21 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
 
   /**
    * Time-to-live for refresh tokens in seconds.
-   * If not specified, refresh tokens do not expire.
+   * Defaults to 30 days (2,592,000 seconds).
+   * Set to 0 to disable refresh tokens entirely.
+   * Set to `undefined` explicitly for refresh tokens that never expire.
    * For example: 3600 = 1 hour, 2592000 = 30 days
    */
   refreshTokenTTL?: number;
+
+  /**
+   * Time-to-live for dynamically registered clients in seconds.
+   * Defaults to 90 days (7,776,000 seconds).
+   * Clients created via the DCR endpoint will automatically expire after this duration.
+   * Clients created via `OAuthHelpers.createClient()` are not affected by this setting.
+   * Set to `undefined` explicitly for clients that never expire.
+   */
+  clientRegistrationTTL?: number;
 
   /**
    * List of scopes supported by this OAuth provider.
@@ -470,6 +481,23 @@ export interface OAuthHelpers {
    * @returns Promise resolving to token response with new access token
    */
   exchangeToken(options: ExchangeTokenOptions): Promise<TokenResponse>;
+
+  /**
+   * Purges expired and orphaned data from the KV namespace.
+   * Designed to be called from a scheduled handler (Cron Trigger) for periodic cleanup.
+   * Processes records in configurable batches to stay within Cloudflare's subrequest limits.
+   *
+   * Performs two sweep phases:
+   * 1. Grant sweep: removes orphaned grants (client deleted) and expired grants (defense-in-depth for KV TTL)
+   * 2. Token sweep: removes orphaned tokens (grant deleted) as defense-in-depth
+   *
+   * Safe to call repeatedly — deleted records disappear from KV, so subsequent invocations
+   * naturally process fresh records without needing a persisted cursor.
+   *
+   * @param options - Optional configuration for batch size and which purge types to enable
+   * @returns Statistics about what was checked and purged, and whether the full scan completed
+   */
+  purgeExpiredData(options?: PurgeOptions): Promise<PurgeResult>;
 }
 
 /**
@@ -907,6 +935,64 @@ export interface ListResult<T> {
 }
 
 /**
+ * Options for the purgeExpiredData garbage collection method
+ */
+export interface PurgeOptions {
+  /**
+   * Maximum number of KV keys to check per phase (grants and tokens) per invocation.
+   * Each phase (grant sweep, token sweep) gets its own budget of this size.
+   * Keep this conservative to stay within Cloudflare's 1000 subrequest limit per invocation,
+   * since each checked key requires at least one KV read, and orphaned grants trigger
+   * additional KV operations via revokeGrant().
+   * Defaults to 50.
+   */
+  batchSize?: number;
+
+  /**
+   * Whether to purge orphaned grants whose client no longer exists in KV.
+   * Grants for CIMD (Client ID Metadata Document) clients are always skipped
+   * since those clients are not stored in KV.
+   * Defaults to true.
+   */
+  purgeOrphanedGrants?: boolean;
+
+  /**
+   * Whether to purge expired grants as defense-in-depth for KV TTL.
+   * Normally KV auto-deletes expired entries, but this catches any stragglers.
+   * Defaults to true.
+   */
+  purgeExpiredGrants?: boolean;
+
+  /**
+   * Whether to purge orphaned tokens whose grant no longer exists.
+   * Tokens already auto-expire via KV TTL (default 1 hour), so this is
+   * defense-in-depth for partial revokeGrant() failures.
+   * Defaults to true.
+   */
+  purgeOrphanedTokens?: boolean;
+}
+
+/**
+ * Result of a purgeExpiredData garbage collection invocation
+ */
+export interface PurgeResult {
+  /** Number of grant records checked in this invocation */
+  grantsChecked: number;
+
+  /** Number of grant records purged (orphaned or expired) */
+  grantsPurged: number;
+
+  /** Number of token records checked in this invocation */
+  tokensChecked: number;
+
+  /** Number of token records purged (orphaned) */
+  tokensPurged: number;
+
+  /** True if the full key space was scanned in this invocation (both grants and tokens) */
+  done: boolean;
+}
+
+/**
  * Public representation of a grant, with sensitive data removed
  * Used for list operations where the complete grant data isn't needed
  */
@@ -1024,6 +1110,18 @@ export class OAuthProvider<Env = Cloudflare.Env> {
   fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     return this.#impl.fetch(request, env, ctx);
   }
+
+  /**
+   * Purges expired and orphaned data from the KV namespace.
+   * Can be called directly from a scheduled handler without needing a request context.
+   *
+   * @param env - Cloudflare Worker environment variables (must include OAUTH_KV binding)
+   * @param options - Optional configuration for batch size and which purge types to enable
+   * @returns Statistics about what was checked and purged
+   */
+  purgeExpiredData(env: Env, options?: PurgeOptions): Promise<PurgeResult> {
+    return this.#impl.createOAuthHelpers(env).purgeExpiredData(options);
+  }
 }
 
 /**
@@ -1123,6 +1221,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     this.options = {
       accessTokenTTL: DEFAULT_ACCESS_TOKEN_TTL,
+      refreshTokenTTL: DEFAULT_REFRESH_TOKEN_TTL,
+      clientRegistrationTTL: DEFAULT_CLIENT_REGISTRATION_TTL,
       onError: ({ status, code, description }) =>
         console.warn(`OAuth error response: ${status} ${code} - ${description}`),
       ...options,
@@ -2739,8 +2839,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       );
     }
 
-    // Store client info
-    await env.OAUTH_KV.put(`client:${clientId}`, JSON.stringify(clientInfo));
+    // Store client info with optional TTL for DCR clients
+    const clientKvOptions: { expirationTtl?: number } = {};
+    if (this.options.clientRegistrationTTL !== undefined) {
+      clientKvOptions.expirationTtl = this.options.clientRegistrationTTL;
+    }
+    await env.OAUTH_KV.put(`client:${clientId}`, JSON.stringify(clientInfo), clientKvOptions);
 
     // Return client information with the original unhashed secret
     const response: Record<string, any> = {
@@ -2763,7 +2867,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Only include client_secret for confidential clients (RFC 7591 §3.2.1)
     if (clientSecret) {
       response.client_secret = clientSecret; // Return the original unhashed secret
-      response.client_secret_expires_at = 0; // Secret does not expire
+      response.client_secret_expires_at =
+        this.options.clientRegistrationTTL && clientInfo.registrationDate
+          ? clientInfo.registrationDate + this.options.clientRegistrationTTL
+          : 0;
       response.client_secret_issued_at = clientInfo.registrationDate;
     }
 
@@ -3053,9 +3160,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   }
 
   /**
-   * Checks if a client_id is a CIMD URL (HTTPS with non-root path)
+   * Checks if a client_id is a CIMD URL (HTTPS with non-root path).
+   * Not private because OAuthHelpersImpl needs access for purgeExpiredData.
    */
-  private isClientMetadataUrl(clientId: string): boolean {
+  isClientMetadataUrl(clientId: string): boolean {
     try {
       const url = new URL(clientId);
       return url.protocol === 'https:' && url.pathname !== '/';
@@ -3310,6 +3418,22 @@ class OAuthError extends Error {
  * Default expiration time for access tokens (1 hour in seconds)
  */
 const DEFAULT_ACCESS_TOKEN_TTL = 60 * 60;
+
+/**
+ * Default expiration time for refresh tokens (30 days in seconds)
+ */
+const DEFAULT_REFRESH_TOKEN_TTL = 30 * 24 * 60 * 60;
+
+/**
+ * Default expiration time for dynamically registered clients (90 days in seconds)
+ */
+const DEFAULT_CLIENT_REGISTRATION_TTL = 90 * 24 * 60 * 60;
+
+/**
+ * Default batch size for purgeExpiredData. Conservative to stay within
+ * Cloudflare's 1000 subrequest limit per invocation.
+ */
+const DEFAULT_PURGE_BATCH_SIZE = 50;
 
 /**
  * Length of generated token strings
@@ -4176,7 +4300,12 @@ class OAuthHelpersImpl implements OAuthHelpers {
       delete updatedClient.clientSecret;
     }
 
-    await this.env.OAUTH_KV.put(`client:${clientId}`, JSON.stringify(updatedClient));
+    // Preserve TTL for DCR clients: re-apply clientRegistrationTTL if configured
+    const clientKvOptions: { expirationTtl?: number } = {};
+    if (this.provider.options.clientRegistrationTTL !== undefined) {
+      clientKvOptions.expirationTtl = this.provider.options.clientRegistrationTTL;
+    }
+    await this.env.OAUTH_KV.put(`client:${clientId}`, JSON.stringify(updatedClient), clientKvOptions);
 
     // Create a response object
     const response = { ...updatedClient };
@@ -4190,12 +4319,40 @@ class OAuthHelpersImpl implements OAuthHelpers {
   }
 
   /**
-   * Deletes an OAuth client
+   * Deletes an OAuth client and revokes all associated grants across all users.
    * @param clientId - The ID of the client to delete
    * @returns A Promise resolving when the deletion is confirmed.
    */
   async deleteClient(clientId: string): Promise<void> {
-    // Delete client
+    // Revoke all grants associated with this client across all users.
+    // Grants are keyed as grant:{userId}:{grantId}, so we scan all grants
+    // and check the clientId stored in each one.
+    let cursor: string | undefined;
+    let allProcessed = false;
+
+    while (!allProcessed) {
+      const listOptions: { prefix: string; cursor?: string } = { prefix: 'grant:' };
+      if (cursor) {
+        listOptions.cursor = cursor;
+      }
+
+      const result = await this.env.OAUTH_KV.list(listOptions);
+
+      for (const key of result.keys) {
+        const grantData: Grant | null = await this.env.OAUTH_KV.get(key.name, { type: 'json' });
+        if (grantData && grantData.clientId === clientId) {
+          await this.revokeGrant(grantData.id, grantData.userId);
+        }
+      }
+
+      if (result.list_complete) {
+        allProcessed = true;
+      } else {
+        cursor = result.cursor;
+      }
+    }
+
+    // Delete the client record
     await this.env.OAUTH_KV.delete(`client:${clientId}`);
   }
 
@@ -4338,6 +4495,145 @@ class OAuthHelpersImpl implements OAuthHelpers {
       clientInfo,
       this.env
     );
+  }
+
+  async purgeExpiredData(options?: PurgeOptions): Promise<PurgeResult> {
+    const batchSize = options?.batchSize ?? DEFAULT_PURGE_BATCH_SIZE;
+    const purgeOrphanedGrants = options?.purgeOrphanedGrants !== false;
+    const purgeExpiredGrants = options?.purgeExpiredGrants !== false;
+    const purgeOrphanedTokens = options?.purgeOrphanedTokens !== false;
+    const now = Math.floor(Date.now() / 1000);
+
+    const result: PurgeResult = {
+      grantsChecked: 0,
+      grantsPurged: 0,
+      tokensChecked: 0,
+      tokensPurged: 0,
+      done: false,
+    };
+
+    // Phase 1: Grant sweep
+    if (purgeOrphanedGrants || purgeExpiredGrants) {
+      const knownGoodClients = new Set<string>();
+      const knownMissingClients = new Set<string>();
+      let grantCursor: string | undefined;
+      let grantsDone = false;
+
+      while (!grantsDone && result.grantsChecked < batchSize) {
+        const listOptions: { prefix: string; cursor?: string; limit?: number } = {
+          prefix: 'grant:',
+          limit: Math.min(1000, batchSize - result.grantsChecked),
+        };
+        if (grantCursor) {
+          listOptions.cursor = grantCursor;
+        }
+
+        const page = await this.env.OAUTH_KV.list(listOptions);
+
+        for (const key of page.keys) {
+          if (result.grantsChecked >= batchSize) break;
+          result.grantsChecked++;
+
+          const grantData: Grant | null = await this.env.OAUTH_KV.get(key.name, { type: 'json' });
+          if (!grantData) continue;
+
+          let shouldPurge = false;
+
+          // Expiry check (defense-in-depth for KV TTL)
+          if (purgeExpiredGrants && grantData.expiresAt !== undefined && now >= grantData.expiresAt) {
+            shouldPurge = true;
+          }
+
+          // Orphan check: skip CIMD clients (URL-based client IDs not stored in KV)
+          if (!shouldPurge && purgeOrphanedGrants && !this.provider.isClientMetadataUrl(grantData.clientId)) {
+            if (knownMissingClients.has(grantData.clientId)) {
+              shouldPurge = true;
+            } else if (!knownGoodClients.has(grantData.clientId)) {
+              const client = await this.env.OAUTH_KV.get(`client:${grantData.clientId}`, { type: 'json' });
+              if (client) {
+                knownGoodClients.add(grantData.clientId);
+              } else {
+                knownMissingClients.add(grantData.clientId);
+                shouldPurge = true;
+              }
+            }
+          }
+
+          if (shouldPurge) {
+            await this.revokeGrant(grantData.id, grantData.userId);
+            result.grantsPurged++;
+          }
+        }
+
+        if (page.list_complete) {
+          grantsDone = true;
+        } else {
+          grantCursor = page.cursor;
+        }
+      }
+
+      // If grant sweep didn't finish, skip token sweep
+      if (!grantsDone) {
+        return result;
+      }
+    }
+
+    // Phase 2: Token sweep
+    if (purgeOrphanedTokens) {
+      const knownGoodGrants = new Set<string>();
+      const knownMissingGrants = new Set<string>();
+      let tokenCursor: string | undefined;
+      let tokensDone = false;
+
+      while (!tokensDone && result.tokensChecked < batchSize) {
+        const listOptions: { prefix: string; cursor?: string; limit?: number } = {
+          prefix: 'token:',
+          limit: Math.min(1000, batchSize - result.tokensChecked),
+        };
+        if (tokenCursor) {
+          listOptions.cursor = tokenCursor;
+        }
+
+        const page = await this.env.OAUTH_KV.list(listOptions);
+
+        for (const key of page.keys) {
+          if (result.tokensChecked >= batchSize) break;
+          result.tokensChecked++;
+
+          const tokenData: Token | null = await this.env.OAUTH_KV.get(key.name, { type: 'json' });
+          if (!tokenData) continue;
+
+          const grantKey = `grant:${tokenData.userId}:${tokenData.grantId}`;
+
+          if (knownMissingGrants.has(grantKey)) {
+            await this.env.OAUTH_KV.delete(key.name);
+            result.tokensPurged++;
+          } else if (!knownGoodGrants.has(grantKey)) {
+            const grantExists = await this.env.OAUTH_KV.get(grantKey);
+            if (grantExists) {
+              knownGoodGrants.add(grantKey);
+            } else {
+              knownMissingGrants.add(grantKey);
+              await this.env.OAUTH_KV.delete(key.name);
+              result.tokensPurged++;
+            }
+          }
+        }
+
+        if (page.list_complete) {
+          tokensDone = true;
+        } else {
+          tokenCursor = page.cursor;
+        }
+      }
+
+      if (!tokensDone) {
+        return result;
+      }
+    }
+
+    result.done = true;
+    return result;
   }
 }
 

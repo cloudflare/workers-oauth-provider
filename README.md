@@ -96,14 +96,20 @@ export default new OAuthProvider({
   disallowPublicClientRegistration: false,
 
   // Optional: Time-to-live for refresh tokens in seconds.
-  // If not specified, refresh tokens do not expire.
+  // Defaults to 30 days (2,592,000 seconds).
   // Set to 0 to disable refresh tokens (only access tokens will be issued).
-  // For example: 3600 = 1 hour, 86400 = 1 day, 2592000 = 30 days
-  refreshTokenTTL: 2592000, // 30 days
+  // Set to `undefined` explicitly for refresh tokens that never expire.
+  refreshTokenTTL: 2592000, // 30 days (the default)
 
   // Optional: Time-to-live for access tokens in seconds.
   // Defaults to 1 hour (3600 seconds) if not specified.
   accessTokenTTL: 3600,
+
+  // Optional: Time-to-live for dynamically registered clients in seconds.
+  // Defaults to 90 days (7,776,000 seconds).
+  // Clients created via OAuthHelpers.createClient() are not affected.
+  // Set to `undefined` explicitly for clients that never expire.
+  clientRegistrationTTL: 7776000, // 90 days (the default)
 
   // Optional: Controls whether OAuth 2.0 Token Exchange (RFC 8693) is allowed.
   // When false, the token exchange grant type will not be advertised in metadata
@@ -226,6 +232,9 @@ The `env.OAUTH_PROVIDER` object available to the fetch handlers provides some me
 - Create, list, modify, and delete client_id registrations (in addition to `lookupClient()`, already shown in the example code).
 - List all active authorization grants for a particular user.
 - Revoke (delete) an authorization grant.
+- Purge expired and orphaned data from the KV namespace.
+
+Note that `deleteClient()` cascades: it revokes all grants (and their associated tokens) for the deleted client across all users.
 
 See the `OAuthHelpers` interface definition for full API details.
 
@@ -325,6 +334,33 @@ new OAuthProvider({
 ```
 
 By default, the `onError` callback is set to ``({ status, code, description }) => console.warn(`OAuth error response: ${status} ${code} - ${description}`)``.
+
+## KV Namespace Cleanup
+
+The library uses KV TTLs to automatically expire access tokens, refresh tokens (grants), and dynamically registered clients. As defense-in-depth, the library also provides a `purgeExpiredData()` method that cleans up orphaned and expired records. This is designed to be called from a [Cron Trigger](https://developers.cloudflare.com/workers/configuration/cron-triggers/) (scheduled handler):
+
+```ts
+const oauthProvider = new OAuthProvider({
+  // ... options ...
+});
+
+export default {
+  fetch(request, env, ctx) {
+    return oauthProvider.fetch(request, env, ctx);
+  },
+  async scheduled(event, env, ctx) {
+    const result = await oauthProvider.purgeExpiredData(env, { batchSize: 100 });
+    console.log(`Checked ${result.grantsChecked} grants, purged ${result.grantsPurged}`);
+  },
+};
+```
+
+The method processes records in configurable batches (default: 50) to stay within Cloudflare's subrequest limits. It performs two sweep phases:
+
+1. **Grant sweep**: Removes orphaned grants (whose client no longer exists) and expired grants.
+2. **Token sweep**: Removes orphaned tokens (whose grant no longer exists).
+
+Call it repeatedly via a cron trigger — deleted records disappear from KV, so subsequent invocations naturally process fresh records without needing a persisted cursor. The `result.done` field indicates whether the full key space was scanned in this invocation.
 
 ## Protected Resource Metadata (RFC 9728)
 
