@@ -1,5 +1,5 @@
 ---
-"@cloudflare/workers-oauth-provider": minor
+'@cloudflare/workers-oauth-provider': minor
 ---
 
 Prevent unbounded KV namespace growth with TTL defaults, cascade deletes, and garbage collection.
