@@ -2558,6 +2558,210 @@ describe('OAuthProvider', () => {
     });
   });
 
+  describe('Client Credentials Grant', () => {
+    let ccProvider: InstanceType<typeof OAuthProvider<TestEnv>>;
+    let ccEnv: any;
+
+    beforeEach(() => {
+      ccEnv = createMockEnv();
+      ccProvider = new OAuthProvider({
+        apiRoute: '/api/',
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        scopesSupported: ['read', 'write', 'admin'],
+        allowClientCredentialsGrant: true,
+      });
+    });
+
+    afterEach(() => {
+      ccEnv.OAUTH_KV.clear();
+    });
+
+    async function registerConfidentialClient() {
+      const request = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify({
+          redirect_uris: ['https://client.example.com/callback'],
+          client_name: 'M2M Client',
+          token_endpoint_auth_method: 'client_secret_basic',
+        })
+      );
+      const response = await ccProvider.fetch(request, ccEnv, new MockExecutionContext());
+      return response.json<any>();
+    }
+
+    it('should issue an access token for a confidential client', async () => {
+      const client = await registerConfidentialClient();
+
+      const request = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${client.client_id}:${client.client_secret}`)}`,
+        },
+        'grant_type=client_credentials&scope=read'
+      );
+
+      const response = await ccProvider.fetch(request, ccEnv, new MockExecutionContext());
+      expect(response.status).toBe(200);
+
+      const body = await response.json<any>();
+      expect(body.access_token).toBeDefined();
+      expect(body.token_type).toBe('bearer');
+      expect(body.expires_in).toBeDefined();
+      expect(body.scope).toBe('read');
+      expect(body.refresh_token).toBeUndefined(); // No refresh token per RFC 6749 §4.4.3
+    });
+
+    it('should reject public clients', async () => {
+      // Register a public client
+      const request = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify({
+          redirect_uris: ['https://spa.example.com/callback'],
+          client_name: 'Public Client',
+          token_endpoint_auth_method: 'none',
+        })
+      );
+      const regResponse = await ccProvider.fetch(request, ccEnv, new MockExecutionContext());
+      const publicClient = await regResponse.json<any>();
+
+      // Try client credentials — should fail because public client has no secret
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        `grant_type=client_credentials&client_id=${publicClient.client_id}`
+      );
+
+      const response = await ccProvider.fetch(tokenRequest, ccEnv, new MockExecutionContext());
+      // Public client without secret fails client authentication
+      expect(response.status).toBe(400);
+    });
+
+    it('should reject unsupported scopes', async () => {
+      const client = await registerConfidentialClient();
+
+      const request = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${client.client_id}:${client.client_secret}`)}`,
+        },
+        'grant_type=client_credentials&scope=nonexistent'
+      );
+
+      const response = await ccProvider.fetch(request, ccEnv, new MockExecutionContext());
+      expect(response.status).toBe(400);
+      const body = await response.json<any>();
+      expect(body.error).toBe('invalid_scope');
+    });
+
+    it('should reject when grant type is not enabled', async () => {
+      const noGrant = new OAuthProvider({
+        apiRoute: '/api/',
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        // allowClientCredentialsGrant: false (default)
+      });
+
+      const client = await registerConfidentialClient();
+
+      const request = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${client.client_id}:${client.client_secret}`)}`,
+        },
+        'grant_type=client_credentials&scope=read'
+      );
+
+      const response = await noGrant.fetch(request, ccEnv, new MockExecutionContext());
+      expect(response.status).toBe(400);
+      const body = await response.json<any>();
+      expect(body.error).toBe('unsupported_grant_type');
+    });
+
+    it('should advertise client_credentials in metadata when enabled', async () => {
+      const request = createMockRequest('https://example.com/.well-known/oauth-authorization-server');
+      const response = await ccProvider.fetch(request, ccEnv, new MockExecutionContext());
+      const metadata = await response.json<any>();
+
+      expect(metadata.grant_types_supported).toContain('client_credentials');
+    });
+
+    it('should allow tokenExchangeCallback to customize M2M tokens', async () => {
+      const callback = vi.fn().mockReturnValue({
+        accessTokenProps: { role: 'service' },
+        accessTokenTTL: 600,
+        accessTokenScope: ['read'],
+      });
+
+      const provider = new OAuthProvider({
+        apiRoute: '/api/',
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        scopesSupported: ['read', 'write'],
+        allowClientCredentialsGrant: true,
+        tokenExchangeCallback: callback,
+      });
+
+      const regReq = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify({
+          redirect_uris: ['https://client.example.com/callback'],
+          client_name: 'Callback M2M',
+          token_endpoint_auth_method: 'client_secret_basic',
+        })
+      );
+      const regRes = await provider.fetch(regReq, ccEnv, new MockExecutionContext());
+      const client = await regRes.json<any>();
+
+      const request = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${client.client_id}:${client.client_secret}`)}`,
+        },
+        'grant_type=client_credentials&scope=read write'
+      );
+
+      const response = await provider.fetch(request, ccEnv, new MockExecutionContext());
+      expect(response.status).toBe(200);
+
+      expect(callback).toHaveBeenCalledOnce();
+      expect(callback).toHaveBeenCalledWith(
+        expect.objectContaining({
+          grantType: 'client_credentials',
+          clientId: client.client_id,
+        })
+      );
+
+      const body = await response.json<any>();
+      expect(body.expires_in).toBe(600);
+      expect(body.scope).toBe('read');
+    });
+  });
+
   describe('Refresh Token TTL', () => {
     let clientId: string;
     let clientSecret: string;
