@@ -140,6 +140,38 @@ export interface TokenExchangeCallbackOptions {
 }
 
 /**
+ * Options for the client registration callback (RFC 7591).
+ */
+export interface ClientRegistrationCallbackOptions {
+  /** Parsed client metadata from the registration request body. */
+  clientMetadata: Record<string, unknown>;
+  /** The original HTTP request (useful for reading auth headers). */
+  request: Request;
+}
+
+/**
+ * Result of the client registration callback.
+ */
+export interface ClientRegistrationCallbackResult {
+  /**
+   * Override non-security-critical client metadata fields (allowlist).
+   * Security fields (clientId, clientSecret, redirectUris, tokenEndpointAuthMethod,
+   * registrationDate, grantTypes, responseTypes) cannot be overridden.
+   */
+  clientMetadataOverrides?: Partial<
+    Pick<ClientInfo, 'clientName' | 'logoUri' | 'clientUri' | 'policyUri' | 'tosUri' | 'jwksUri' | 'contacts'>
+  >;
+  /** Set true to reject the registration. */
+  reject?: boolean;
+  /** OAuth error code when rejecting. Defaults to "access_denied". */
+  rejectCode?: string;
+  /** Error description when rejecting. */
+  rejectDescription?: string;
+  /** HTTP status code when rejecting. Defaults to 403. */
+  rejectStatus?: number;
+}
+
+/**
  * Input parameters for the resolveExternalToken callback function
  */
 export interface ResolveExternalTokenInput {
@@ -299,6 +331,14 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
    * Defaults to false.
    */
   disallowPublicClientRegistration?: boolean;
+
+  /**
+   * Called during DCR (RFC 7591) before the client is stored. Return `{ reject: true }` to
+   * deny, `{ clientMetadataOverrides }` to modify, or void to allow.
+   */
+  clientRegistrationCallback?: (
+    options: ClientRegistrationCallbackOptions
+  ) => Promise<ClientRegistrationCallbackResult | void> | ClientRegistrationCallbackResult | void;
 
   /**
    * Optional callback function that is called during token exchange.
@@ -2837,6 +2877,39 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         'invalid_client_metadata',
         error instanceof Error ? error.message : 'Invalid client metadata'
       );
+    }
+
+    if (this.options.clientRegistrationCallback) {
+      const callbackResult = await Promise.resolve(
+        this.options.clientRegistrationCallback({ clientMetadata, request })
+      );
+
+      if (callbackResult?.reject) {
+        return this.createErrorResponse(
+          callbackResult.rejectCode || 'access_denied',
+          callbackResult.rejectDescription || 'Client registration denied',
+          callbackResult.rejectStatus ?? 403
+        );
+      }
+
+      if (callbackResult?.clientMetadataOverrides) {
+        // Runtime allowlist (defense in depth — matches the Pick<> type constraint)
+        const ALLOWED_OVERRIDE_KEYS = [
+          'clientName',
+          'logoUri',
+          'clientUri',
+          'policyUri',
+          'tosUri',
+          'jwksUri',
+          'contacts',
+        ] as const;
+        const overrides = callbackResult.clientMetadataOverrides;
+        for (const key of ALLOWED_OVERRIDE_KEYS) {
+          if (key in overrides) {
+            (clientInfo as any)[key] = (overrides as any)[key];
+          }
+        }
+      }
     }
 
     // Store client info with optional TTL for DCR clients
