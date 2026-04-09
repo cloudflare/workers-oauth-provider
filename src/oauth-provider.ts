@@ -273,6 +273,9 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
    */
   allowPlainPKCE?: boolean;
 
+  /** Enable DPoP proof-of-possession token binding (RFC 9449). Defaults to false. */
+  allowDPoP?: boolean;
+
   /**
    * Controls whether OAuth 2.0 Token Exchange (RFC 8693) is allowed.
    * When false, the token exchange grant type will not be advertised in metadata
@@ -757,6 +760,9 @@ export interface Grant {
    * Indicates the protected resource(s) for which access is requested
    */
   resource?: string | string[];
+
+  /** DPoP JWK Thumbprint (RFC 9449). Refresh must use the same key. */
+  dpopJkt?: string;
 }
 
 /**
@@ -765,7 +771,7 @@ export interface Grant {
  */
 interface TokenResponse {
   access_token: string;
-  token_type: 'bearer';
+  token_type: 'bearer' | 'DPoP';
   expires_in: number;
   refresh_token?: string;
   scope: string;
@@ -815,6 +821,9 @@ export interface TokenBase {
    * List of scopes on this token
    */
   scope: string[];
+
+  /** DPoP JWK Thumbprint (RFC 9449). */
+  dpopJkt?: string;
 }
 
 /**
@@ -990,6 +999,11 @@ interface CreateAccessTokenOptions {
    * Optional audience/resource
    */
   audience?: string | string[];
+
+  /**
+   * Optional DPoP JWK Thumbprint (RFC 9449)
+   */
+  dpopJkt?: string;
 
   /**
    * Cloudflare Worker environment variables
@@ -1234,7 +1248,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       if (parsed.isRevocationRequest) {
         response = await this.handleRevocationRequest(parsed.body, env);
       } else {
-        response = await this.handleTokenRequest(parsed.body, parsed.clientInfo, env);
+        response = await this.handleTokenRequest(parsed.body, parsed.clientInfo, env, request);
       }
 
       return this.addCorsHeaders(response, request);
@@ -1314,6 +1328,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       createdAt: tokenData.createdAt,
       expiresAt: tokenData.expiresAt,
       audience: tokenData.audience,
+      dpopJkt: tokenData.dpopJkt,
       scope: tokenData.scope || grant.scope, // Use token scope if available, fallback to grant scope for backward compatibility
       grant: {
         clientId: grant.clientId,
@@ -1646,6 +1661,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       // not implemented: introspection_endpoint_auth_methods_supported
       // not implemented: introspection_endpoint_auth_signing_alg_values_supported
       code_challenge_methods_supported: this.options.allowPlainPKCE !== false ? ['plain', 'S256'] : ['S256'], // PKCE support
+      // DPoP (RFC 9449) — advertise supported signing algorithms when enabled
+      dpop_signing_alg_values_supported: this.options.allowDPoP ? DPOP_SUPPORTED_ALGS : undefined,
       // MCP Client ID Metadata Document support (CIMD)
       // Only enabled when global_fetch_strictly_public compat flag is set (for SSRF protection)
       client_id_metadata_document_supported:
@@ -1694,15 +1711,21 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @param env - Cloudflare Worker environment variables
    * @returns Response with token data or error
    */
-  private async handleTokenRequest(body: any, clientInfo: ClientInfo, env: any): Promise<Response> {
+  private async handleTokenRequest(body: any, clientInfo: ClientInfo, env: any, request: Request): Promise<Response> {
+    // Extract DPoP proof if present (RFC 9449)
+    const dpopResult = await this.extractDpopJkt(request, env);
+    if (dpopResult instanceof Response) return dpopResult;
+    const dpopJkt = dpopResult;
+
     // Handle different grant types
     const grantType = body.grant_type;
 
     if (grantType === GrantType.AUTHORIZATION_CODE) {
-      return this.handleAuthorizationCodeGrant(body, clientInfo, env);
+      return this.handleAuthorizationCodeGrant(body, clientInfo, env, dpopJkt);
     } else if (grantType === GrantType.REFRESH_TOKEN) {
-      return this.handleRefreshTokenGrant(body, clientInfo, env);
+      return this.handleRefreshTokenGrant(body, clientInfo, env, dpopJkt);
     } else if (grantType === GrantType.TOKEN_EXCHANGE && this.options.allowTokenExchangeGrant) {
+      // DPoP binding established at initial issuance, not token exchange
       return this.handleTokenExchangeGrant(body, clientInfo, env);
     } else {
       return this.createErrorResponse('unsupported_grant_type', 'Grant type not supported');
@@ -1717,7 +1740,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @param env - Cloudflare Worker environment variables
    * @returns Response with token data or error
    */
-  private async handleAuthorizationCodeGrant(body: any, clientInfo: ClientInfo, env: any): Promise<Response> {
+  private async handleAuthorizationCodeGrant(
+    body: any,
+    clientInfo: ClientInfo,
+    env: any,
+    dpopJkt: string | null = null
+  ): Promise<Response> {
     const code = body.code;
     const redirectUri = body.redirect_uri;
     const codeVerifier = body.code_verifier;
@@ -1932,6 +1960,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       grantData.expiresAt = expiresAt;
     }
 
+    // Bind DPoP key to the grant (RFC 9449 §6) so refresh can't switch keys
+    if (dpopJkt) {
+      grantData.dpopJkt = dpopJkt;
+    }
+
     // Save the updated grant with TTL matching refresh token expiration (if any)
     await this.saveGrantWithTTL(env, grantKey, grantData, now);
 
@@ -1973,13 +2006,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       encryptionKey: accessTokenEncryptionKey,
       expiresIn: accessTokenTTL,
       audience,
+      dpopJkt: dpopJkt ?? undefined,
       env,
     });
 
-    // Build the response
+    // Build the response — use DPoP token type when DPoP-bound (RFC 9449 §5)
     const tokenResponse: TokenResponse = {
       access_token: accessToken,
-      token_type: 'bearer',
+      token_type: dpopJkt ? 'DPoP' : 'bearer',
       expires_in: accessTokenTTL,
       scope: tokenScopes.join(' '),
     };
@@ -2007,7 +2041,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @param env - Cloudflare Worker environment variables
    * @returns Response with token data or error
    */
-  private async handleRefreshTokenGrant(body: any, clientInfo: ClientInfo, env: any): Promise<Response> {
+  private async handleRefreshTokenGrant(
+    body: any,
+    clientInfo: ClientInfo,
+    env: any,
+    dpopJkt: string | null = null
+  ): Promise<Response> {
     const refreshToken = body.refresh_token;
 
     if (!refreshToken) {
@@ -2044,6 +2083,19 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Verify client ID matches
     if (grantData.clientId !== clientInfo.clientId) {
       return this.createErrorResponse('invalid_grant', 'Client ID mismatch');
+    }
+
+    // RFC 9449 §6: if the grant was DPoP-bound, the refresh must use the same key
+    if (grantData.dpopJkt) {
+      if (!dpopJkt) {
+        return this.createErrorResponse('invalid_grant', 'DPoP proof required for DPoP-bound grant');
+      }
+      if (dpopJkt !== grantData.dpopJkt) {
+        return this.createErrorResponse(
+          'invalid_grant',
+          'DPoP key mismatch — must use the same key as the original grant'
+        );
+      }
     }
 
     // Check if the refresh token has expired
@@ -2249,6 +2301,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       expiresAt: accessTokenExpiresAt,
       audience: audience,
       scope: tokenScopes,
+      dpopJkt: dpopJkt ?? undefined,
       wrappedEncryptionKey: accessTokenWrappedKey,
       grant: {
         clientId: grantData.clientId,
@@ -2262,10 +2315,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       expirationTtl: accessTokenTTL,
     });
 
-    // Build the response
+    // Build the response — use DPoP token type when DPoP-bound (RFC 9449 §5)
     const tokenResponse: TokenResponse = {
       access_token: newAccessToken,
-      token_type: 'bearer',
+      token_type: dpopJkt ? 'DPoP' : 'bearer',
       expires_in: accessTokenTTL,
       refresh_token: newRefreshToken,
       scope: tokenScopes.join(' '),
@@ -2786,10 +2839,16 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // points to the correct path-suffixed well-known endpoint (RFC 9728 §3.1)
     const resourceMetadataUrl = `${url.origin}/.well-known/oauth-protected-resource${url.pathname}`;
 
-    // Get access token from Authorization header
     const authHeader = request.headers.get('Authorization');
+    let accessToken: string;
+    let usedDpopScheme = false;
 
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    if (authHeader && authHeader.startsWith('DPoP ')) {
+      accessToken = authHeader.substring(5);
+      usedDpopScheme = true;
+    } else if (authHeader && authHeader.startsWith('Bearer ')) {
+      accessToken = authHeader.substring(7);
+    } else {
       return this.createErrorResponse('invalid_token', 'Missing or invalid access token', 401, {
         'WWW-Authenticate': this.buildWwwAuthenticateHeader(
           resourceMetadataUrl,
@@ -2798,8 +2857,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         ),
       });
     }
-
-    const accessToken = authHeader.substring(7);
     const parts = accessToken.split(':');
     const isPossiblyInternalFormat = parts.length === 3;
 
@@ -2850,6 +2907,59 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
             ),
           });
         }
+      }
+
+      // DPoP validation (RFC 9449 §7.1): DPoP-bound tokens must use the DPoP auth scheme
+      if (tokenData.dpopJkt) {
+        if (!usedDpopScheme) {
+          return this.createErrorResponse(
+            'invalid_token',
+            'DPoP-bound token must use DPoP auth scheme, not Bearer',
+            401,
+            {
+              'WWW-Authenticate': this.buildWwwAuthenticateHeader(
+                resourceMetadataUrl,
+                'invalid_token',
+                'Use Authorization: DPoP scheme'
+              ),
+            }
+          );
+        }
+        const dpopHeader = request.headers.get('DPoP');
+        if (!dpopHeader) {
+          return this.createErrorResponse('invalid_token', 'DPoP proof required for DPoP-bound token', 401, {
+            'WWW-Authenticate': this.buildWwwAuthenticateHeader(
+              resourceMetadataUrl,
+              'invalid_token',
+              'DPoP proof required'
+            ),
+          });
+        }
+        const ath = await computeAccessTokenHash(accessToken);
+        const result = await verifyDpopProof(dpopHeader, request.method, request.url, ath);
+        if (!result || result.jkt !== tokenData.dpopJkt) {
+          return this.createErrorResponse('invalid_token', 'Invalid DPoP proof', 401, {
+            'WWW-Authenticate': this.buildWwwAuthenticateHeader(
+              resourceMetadataUrl,
+              'invalid_token',
+              'Invalid DPoP proof'
+            ),
+          });
+        }
+
+        // jti replay check at resource server
+        const jtiKey = `dpop_jti:${result.jti}`;
+        const seen = await env.OAUTH_KV.get(jtiKey);
+        if (seen) {
+          return this.createErrorResponse('invalid_token', 'DPoP proof replay detected', 401, {
+            'WWW-Authenticate': this.buildWwwAuthenticateHeader(
+              resourceMetadataUrl,
+              'invalid_token',
+              'DPoP proof replay'
+            ),
+          });
+        }
+        await env.OAUTH_KV.put(jtiKey, '1', { expirationTtl: DPOP_MAX_AGE_SECONDS });
       }
 
       // Unwrap the encryption key using the access token
@@ -2986,7 +3096,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @returns The access token string
    */
   private async createAccessToken(params: CreateAccessTokenOptions): Promise<string> {
-    const { userId, grantId, clientId, scope, encryptedProps, encryptionKey, expiresIn, audience, env } = params;
+    const { userId, grantId, clientId, scope, encryptedProps, encryptionKey, expiresIn, audience, dpopJkt, env } =
+      params;
 
     // Generate access token
     const accessTokenSecret = generateRandomString(TOKEN_LENGTH);
@@ -3008,6 +3119,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       expiresAt: accessTokenExpiresAt,
       audience: audience,
       scope: scope,
+      dpopJkt: dpopJkt,
       wrappedEncryptionKey: accessTokenWrappedKey,
       grant: {
         clientId: clientId,
@@ -3022,6 +3134,29 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     });
 
     return accessToken;
+  }
+
+  /** Extract and verify DPoP proof. Returns jkt, null (no proof), or error Response. */
+  private async extractDpopJkt(request: Request, env: any): Promise<string | null | Response> {
+    if (!this.options.allowDPoP) return null;
+
+    const dpopHeader = request.headers.get('DPoP');
+    if (!dpopHeader) return null;
+
+    const result = await verifyDpopProof(dpopHeader, request.method, request.url);
+    if (!result) {
+      return this.createErrorResponse('invalid_dpop_proof', 'Invalid DPoP proof', 400);
+    }
+
+    // RFC 9449 §4.3: check jti for replay — store with 5min TTL
+    const jtiKey = `dpop_jti:${result.jti}`;
+    const seen = await env.OAUTH_KV.get(jtiKey);
+    if (seen) {
+      return this.createErrorResponse('invalid_dpop_proof', 'DPoP proof replay detected', 400);
+    }
+    await env.OAUTH_KV.put(jtiKey, '1', { expirationTtl: DPOP_MAX_AGE_SECONDS });
+
+    return result.jkt;
   }
 
   /**
@@ -3421,6 +3556,121 @@ function resourceMatches(requested: string, granted: string, originOnly: boolean
   } catch {
     return requested === granted;
   }
+}
+
+// DPoP helpers (RFC 9449). Nonce (§8) not implemented — jti replay + 5min freshness window suffice.
+const DPOP_MAX_AGE_SECONDS = 300; // 5 minutes
+const DPOP_SUPPORTED_ALGS = ['RS256', 'ES256'];
+
+function dpopBase64urlDecode(str: string): Uint8Array {
+  const padded = str + '='.repeat((4 - (str.length % 4)) % 4);
+  const binary = atob(padded.replace(/-/g, '+').replace(/_/g, '/'));
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+function dpopBase64urlEncode(data: ArrayBuffer | Uint8Array): string {
+  const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) : data;
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+/** JWK Thumbprint (RFC 7638). */
+async function computeJktThumbprint(jwk: JsonWebKey): Promise<string> {
+  let thumbprintInput: string;
+  if (jwk.kty === 'RSA') {
+    thumbprintInput = JSON.stringify({ e: jwk.e, kty: jwk.kty, n: jwk.n });
+  } else if (jwk.kty === 'EC') {
+    thumbprintInput = JSON.stringify({ crv: jwk.crv, kty: jwk.kty, x: jwk.x, y: jwk.y });
+  } else {
+    throw new Error(`Unsupported key type: ${jwk.kty}`);
+  }
+  const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(thumbprintInput));
+  return dpopBase64urlEncode(hash);
+}
+
+/** Verify a DPoP proof. Returns { jkt, jti } on success, null on failure. */
+async function verifyDpopProof(
+  dpopHeader: string,
+  httpMethod: string,
+  httpUrl: string,
+  accessTokenHash?: string
+): Promise<{ jkt: string; jti: string } | null> {
+  try {
+    const parts = dpopHeader.split('.');
+    if (parts.length !== 3) return null;
+
+    const [headerB64, payloadB64, signatureB64] = parts as [string, string, string];
+    const header = JSON.parse(new TextDecoder().decode(dpopBase64urlDecode(headerB64)));
+    const payload = JSON.parse(new TextDecoder().decode(dpopBase64urlDecode(payloadB64)));
+
+    // Validate header
+    if (header.typ !== 'dpop+jwt') return null;
+    if (!DPOP_SUPPORTED_ALGS.includes(header.alg)) return null;
+    if (!header.jwk || !header.jwk.kty) return null;
+
+    // Validate payload
+    if (!payload.jti || !payload.htm || !payload.htu || !payload.iat) return null;
+
+    // Check method and URL match
+    if (payload.htm.toUpperCase() !== httpMethod.toUpperCase()) return null;
+
+    // Compare htu without query string (RFC 9449 §4.3)
+    const proofUrl = new URL(payload.htu);
+    const requestUrl = new URL(httpUrl);
+    if (proofUrl.origin !== requestUrl.origin || proofUrl.pathname !== requestUrl.pathname) return null;
+
+    // Check freshness (within 5 minutes)
+    const now = Math.floor(Date.now() / 1000);
+    if (Math.abs(now - payload.iat) > DPOP_MAX_AGE_SECONDS) return null;
+
+    // If access token hash is expected, verify it
+    if (accessTokenHash !== undefined && payload.ath !== accessTokenHash) return null;
+
+    // RFC 9449 §4.3: JWK must not contain private key material
+    if (header.jwk.d || header.jwk.p || header.jwk.q || header.jwk.dp || header.jwk.dq || header.jwk.qi) {
+      return null;
+    }
+
+    let algorithm: any;
+    if (header.alg === 'RS256') {
+      if (!header.jwk.n || !header.jwk.e) return null; // required RSA public key fields
+      algorithm = { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' };
+    } else if (header.alg === 'ES256') {
+      if (!header.jwk.crv || !header.jwk.x || !header.jwk.y) return null; // required EC public key fields
+      algorithm = { name: 'ECDSA', namedCurve: 'P-256' };
+    } else {
+      return null;
+    }
+
+    const publicKey = await crypto.subtle.importKey(
+      'jwk',
+      { ...header.jwk, key_ops: ['verify'], ext: true },
+      algorithm,
+      false,
+      ['verify']
+    );
+
+    const signingInput = new TextEncoder().encode(`${headerB64}.${payloadB64}`);
+    const signature = dpopBase64urlDecode(signatureB64);
+
+    const verifyAlg = header.alg === 'ES256' ? { name: 'ECDSA', hash: 'SHA-256' } : 'RSASSA-PKCS1-v1_5';
+    const valid = await crypto.subtle.verify(verifyAlg as any, publicKey, signature, signingInput);
+    if (!valid) return null;
+
+    const jkt = await computeJktThumbprint(header.jwk);
+    return { jkt, jti: payload.jti };
+  } catch {
+    return null;
+  }
+}
+
+/** SHA-256 hash of access token for DPoP `ath` claim. */
+async function computeAccessTokenHash(accessToken: string): Promise<string> {
+  const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(accessToken));
+  return dpopBase64urlEncode(hash);
 }
 
 /**
