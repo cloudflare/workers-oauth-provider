@@ -4218,6 +4218,67 @@ describe('OAuthProvider', () => {
     });
   });
 
+  describe('Cache-Control Headers (RFC 6749 §5.1)', () => {
+    it('should include Cache-Control: no-store on token responses', async () => {
+      // Register a client and do a full auth code flow to get a token response
+      const clientData = {
+        redirect_uris: ['https://client.example.com/callback'],
+        client_name: 'Cache Test Client',
+        token_endpoint_auth_method: 'client_secret_basic',
+      };
+      const regRequest = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify(clientData)
+      );
+      const regResponse = await oauthProvider.fetch(regRequest, mockEnv, mockCtx);
+      const client = await regResponse.json<any>();
+
+      // Registration response should also have no-store (contains client_secret)
+      expect(regResponse.headers.get('Cache-Control')).toBe('no-store');
+
+      // Do authorization
+      const authUrl = new URL('https://example.com/authorize');
+      authUrl.searchParams.set('response_type', 'code');
+      authUrl.searchParams.set('client_id', client.client_id);
+      authUrl.searchParams.set('redirect_uri', 'https://client.example.com/callback');
+      authUrl.searchParams.set('scope', 'read');
+      const authRequest = createMockRequest(authUrl.toString());
+      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const redirectUrl = new URL(authResponse.headers.get('Location')!);
+      const code = redirectUrl.searchParams.get('code')!;
+
+      // Exchange code for token
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${client.client_id}:${client.client_secret}`)}`,
+        },
+        `grant_type=authorization_code&code=${encodeURIComponent(code)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}`
+      );
+      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+
+      expect(tokenResponse.status).toBe(200);
+      expect(tokenResponse.headers.get('Cache-Control')).toBe('no-store');
+    });
+
+    it('should include Cache-Control: no-store on token error responses', async () => {
+      const request = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        'grant_type=authorization_code&code=invalid'
+      );
+      const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
+
+      expect(response.status).toBe(401);
+      expect(response.headers.get('Cache-Control')).toBe('no-store');
+    });
+  });
+
   describe('CORS Support', () => {
     it('should handle CORS preflight for API requests', async () => {
       const preflightRequest = createMockRequest('https://example.com/api/test', 'OPTIONS', {
