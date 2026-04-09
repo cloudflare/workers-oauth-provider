@@ -351,6 +351,24 @@ describe('OAuthProvider', () => {
       expect(metadata.response_types_supported).toContain('token'); // Implicit flow enabled
       expect(metadata.grant_types_supported).toContain('authorization_code');
       expect(metadata.code_challenge_methods_supported).toContain('S256');
+      // Implicit flow is enabled in the default test provider, so fragment mode should be advertised
+      expect(metadata.response_modes_supported).toContain('query');
+      expect(metadata.response_modes_supported).toContain('fragment');
+    });
+
+    it('should not include fragment response mode when implicit flow is disabled', async () => {
+      const providerNoImplicit = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        allowImplicitFlow: false,
+      });
+      const request = createMockRequest('https://example.com/.well-known/oauth-authorization-server');
+      const response = await providerNoImplicit.fetch(request, mockEnv, mockCtx);
+      const metadata = await response.json<any>();
+      expect(metadata.response_modes_supported).toEqual(['query']);
     });
 
     it('should not include token response type when implicit flow is disabled', async () => {
