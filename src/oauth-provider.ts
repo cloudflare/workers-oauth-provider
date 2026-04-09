@@ -30,6 +30,7 @@ export enum GrantType {
   AUTHORIZATION_CODE = 'authorization_code',
   REFRESH_TOKEN = 'refresh_token',
   TOKEN_EXCHANGE = 'urn:ietf:params:oauth:grant-type:token-exchange',
+  DEVICE_CODE = 'urn:ietf:params:oauth:grant-type:device_code',
 }
 
 /** ExecutionContext with writable props — ctx.props is read-only in types but writable at runtime */
@@ -238,6 +239,15 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
    * If provided, the provider will implement dynamic client registration.
    */
   clientRegistrationEndpoint?: string;
+
+  /** Device authorization endpoint URL (RFC 8628). Enables the device code grant. */
+  deviceAuthorizationEndpoint?: string;
+  /** Device code TTL in seconds. Defaults to 900 (15 min). */
+  deviceCodeTTL?: number;
+  /** Polling interval in seconds. Defaults to 5. */
+  deviceCodeInterval?: number;
+  /** Verification URL where users enter device codes. Path or full URL. Defaults to '/device'. */
+  deviceVerificationEndpoint?: string;
 
   /**
    * Time-to-live for access tokens in seconds.
@@ -498,6 +508,15 @@ export interface OAuthHelpers {
    * @returns Statistics about what was checked and purged, and whether the full scan completed
    */
   purgeExpiredData(options?: PurgeOptions): Promise<PurgeResult>;
+
+  /** Look up a pending device code by user code. Returns null if not found/expired. */
+  getDeviceCodeByUserCode(userCode: string): Promise<{ clientId: string; scope: string[] } | null>;
+
+  /** Approve a device authorization. Called from the verification UI. */
+  approveDeviceCode(userCode: string, userId: string): Promise<boolean>;
+
+  /** Deny a device authorization. */
+  denyDeviceCode(userCode: string): Promise<boolean>;
 }
 
 /**
@@ -1293,7 +1312,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         url.pathname === '/.well-known/oauth-authorization-server' ||
         this.isProtectedResourceMetadataRequest(url) ||
         this.isTokenEndpoint(url) ||
-        (this.options.clientRegistrationEndpoint && this.isClientRegistrationEndpoint(url))
+        (this.options.clientRegistrationEndpoint && this.isClientRegistrationEndpoint(url)) ||
+        (this.options.deviceAuthorizationEndpoint && this.matchEndpoint(url, this.options.deviceAuthorizationEndpoint))
       ) {
         // Create an empty 204 No Content response with CORS headers
         return this.addCorsHeaders(
@@ -1343,6 +1363,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Handle client registration endpoint
     if (this.options.clientRegistrationEndpoint && this.isClientRegistrationEndpoint(url)) {
       const response = await this.handleClientRegistration(request, env);
+      return this.addCorsHeaders(response, request);
+    }
+
+    // Handle device authorization endpoint (RFC 8628)
+    if (this.options.deviceAuthorizationEndpoint && this.matchEndpoint(url, this.options.deviceAuthorizationEndpoint)) {
+      const response = await this.handleDeviceAuthorization(request, env);
       return this.addCorsHeaders(response, request);
     }
 
@@ -1717,9 +1743,17 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     // Determine supported grant types
-    const grantTypesSupported = [GrantType.AUTHORIZATION_CODE, GrantType.REFRESH_TOKEN];
+    const grantTypesSupported: string[] = [GrantType.AUTHORIZATION_CODE, GrantType.REFRESH_TOKEN];
     if (this.options.allowTokenExchangeGrant) {
       grantTypesSupported.push(GrantType.TOKEN_EXCHANGE);
+    }
+    if (this.options.deviceAuthorizationEndpoint) {
+      grantTypesSupported.push(GrantType.DEVICE_CODE);
+    }
+
+    let deviceAuthorizationEndpoint: string | undefined = undefined;
+    if (this.options.deviceAuthorizationEndpoint) {
+      deviceAuthorizationEndpoint = this.getFullEndpointUrl(this.options.deviceAuthorizationEndpoint, requestUrl);
     }
 
     const metadata = {
@@ -1728,6 +1762,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       token_endpoint: tokenEndpoint,
       // not implemented: jwks_uri
       registration_endpoint: registrationEndpoint,
+      device_authorization_endpoint: deviceAuthorizationEndpoint,
       scopes_supported: this.options.scopesSupported,
       response_types_supported: responseTypesSupported,
       response_modes_supported: ['query'],
@@ -1804,6 +1839,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       return this.handleRefreshTokenGrant(body, clientInfo, env);
     } else if (grantType === GrantType.TOKEN_EXCHANGE && this.options.allowTokenExchangeGrant) {
       return this.handleTokenExchangeGrant(body, clientInfo, env);
+    } else if (grantType === GrantType.DEVICE_CODE && this.options.deviceAuthorizationEndpoint) {
+      return this.handleDeviceCodeGrant(body, clientInfo, env);
     } else {
       return this.createErrorResponse('unsupported_grant_type', 'Grant type not supported');
     }
@@ -2887,6 +2924,269 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @param ctx - Cloudflare Worker execution context
    * @returns Response from the API handler or error
    */
+
+  // ── Device Authorization Grant (RFC 8628) ────────────────────────────
+
+  /** Generate XXXX-XXXX user code. Unambiguous consonants, rejection sampling. */
+  private generateUserCode(): string {
+    const chars = 'BCDFGHJKMNPQRSTVWXZ';
+    const limit = 256 - (256 % chars.length); // rejection sampling to avoid modulo bias
+    const result: string[] = [];
+    while (result.length < DEVICE_USER_CODE_LENGTH) {
+      const bytes = new Uint8Array(DEVICE_USER_CODE_LENGTH - result.length + 4);
+      crypto.getRandomValues(bytes);
+      for (const b of bytes) {
+        if (b < limit && result.length < DEVICE_USER_CODE_LENGTH) {
+          result.push(chars[b % chars.length]);
+        }
+      }
+    }
+    return result.join(''); // raw code, no hyphen — callers format for display
+  }
+
+  /** Device authorization endpoint (RFC 8628 §3.1). */
+  private async handleDeviceAuthorization(request: Request, env: any): Promise<Response> {
+    if (request.method !== 'POST') {
+      return this.createErrorResponse('invalid_request', 'Method not allowed', 405);
+    }
+
+    const contentType = request.headers.get('Content-Type') || '';
+    if (!contentType.includes('application/x-www-form-urlencoded')) {
+      return this.createErrorResponse('invalid_request', 'Content-Type must be application/x-www-form-urlencoded', 400);
+    }
+
+    const formData = await request.formData();
+    const clientId = formData.get('client_id') as string;
+
+    if (!clientId) {
+      return this.createErrorResponse('invalid_client', 'client_id is required', 400);
+    }
+
+    // Verify client exists
+    const clientInfo = await this.getClient(env, clientId);
+    if (!clientInfo) {
+      return this.createErrorResponse('invalid_client', 'Client not found', 401);
+    }
+
+    // RFC 8628 §3.1: confidential clients MUST authenticate
+    if (clientInfo.tokenEndpointAuthMethod !== 'none') {
+      const authHeader = request.headers.get('Authorization');
+      let clientSecret = formData.get('client_secret') as string;
+
+      if (authHeader && authHeader.startsWith('Basic ')) {
+        const credentials = atob(authHeader.substring(6));
+        const [basicClientId, secret] = credentials.split(':', 2);
+        if (decodeURIComponent(basicClientId || '') !== clientId) {
+          return this.createErrorResponse('invalid_client', 'Client ID mismatch in Basic auth', 401);
+        }
+        clientSecret = decodeURIComponent(secret || '');
+      }
+
+      if (!clientSecret) {
+        return this.createErrorResponse('invalid_client', 'Client authentication required', 401);
+      }
+
+      if (!clientInfo.clientSecret) {
+        return this.createErrorResponse('invalid_client', 'Client has no registered secret', 401);
+      }
+
+      const providedSecretHash = await hashSecret(clientSecret);
+      if (providedSecretHash !== clientInfo.clientSecret) {
+        return this.createErrorResponse('invalid_client', 'Invalid client credentials', 401);
+      }
+    }
+
+    // Parse optional scope
+    const scopeStr = formData.get('scope') as string;
+    const scope = scopeStr ? scopeStr.split(' ').filter(Boolean) : [];
+
+    // Validate scopes if configured
+    if (this.options.scopesSupported && scope.length > 0) {
+      for (const s of scope) {
+        if (!this.options.scopesSupported.includes(s)) {
+          return this.createErrorResponse('invalid_scope', `Unsupported scope: ${s}`);
+        }
+      }
+    }
+
+    const deviceCode = generateRandomString(32);
+    let userCode = this.generateUserCode();
+    for (let retries = 3; retries > 0; retries--) {
+      const existing = await env.OAUTH_KV.get(`user_code:${userCode}`);
+      if (!existing) break;
+      if (retries === 1) {
+        return this.createErrorResponse('server_error', 'Unable to generate unique user code', 503);
+      }
+      userCode = this.generateUserCode();
+    }
+    const ttl = this.options.deviceCodeTTL ?? DEFAULT_DEVICE_CODE_TTL;
+    const interval = this.options.deviceCodeInterval ?? DEFAULT_DEVICE_CODE_INTERVAL;
+    const now = Math.floor(Date.now() / 1000);
+
+    const deviceCodeData: DeviceCode = {
+      userCode,
+      clientId,
+      scope,
+      expiresAt: now + ttl,
+      interval,
+      status: 'pending',
+    };
+
+    // Store by both device_code (for polling) and user_code (for verification)
+    const deviceCodeHash = await generateTokenId(deviceCode);
+    await env.OAUTH_KV.put(`device_code:${deviceCodeHash}`, JSON.stringify(deviceCodeData), {
+      expirationTtl: ttl,
+    });
+    await env.OAUTH_KV.put(`user_code:${userCode}`, deviceCodeHash, {
+      expirationTtl: ttl,
+    });
+
+    // Build verification_uri — configurable via deviceVerificationEndpoint option
+    const requestUrl = new URL(request.url);
+    const verificationPath = this.options.deviceVerificationEndpoint ?? '/device';
+    const verificationUri = verificationPath.startsWith('http')
+      ? verificationPath
+      : `${requestUrl.origin}${verificationPath}`;
+
+    // Format user code with hyphen for display (RFC 8628 §6.1)
+    const displayCode = `${userCode.slice(0, 4)}-${userCode.slice(4)}`;
+    const response = {
+      device_code: deviceCode,
+      user_code: displayCode,
+      verification_uri: verificationUri,
+      verification_uri_complete: `${verificationUri}?user_code=${displayCode}`,
+      expires_in: ttl,
+      interval,
+    };
+
+    return new Response(JSON.stringify(response), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+    });
+  }
+
+  /** Device code token grant — polling endpoint (RFC 8628 §3.4). */
+  private async handleDeviceCodeGrant(body: any, clientInfo: ClientInfo, env: any): Promise<Response> {
+    const deviceCode = body.device_code;
+    if (!deviceCode) {
+      return this.createErrorResponse('invalid_request', 'device_code is required');
+    }
+
+    const deviceCodeHash = await generateTokenId(deviceCode);
+    const deviceCodeData: DeviceCode | null = await env.OAUTH_KV.get(`device_code:${deviceCodeHash}`, {
+      type: 'json',
+    });
+
+    if (!deviceCodeData) {
+      return this.createErrorResponse('invalid_grant', 'Invalid or expired device code');
+    }
+
+    // Verify client matches
+    if (deviceCodeData.clientId !== clientInfo.clientId) {
+      return this.createErrorResponse('invalid_grant', 'Client ID mismatch');
+    }
+
+    // Check expiration
+    const now = Math.floor(Date.now() / 1000);
+    if (now >= deviceCodeData.expiresAt) {
+      return this.createErrorResponse('expired_token', 'The device code has expired');
+    }
+
+    // Check status
+    if (deviceCodeData.status === 'denied') {
+      // Clean up
+      await env.OAUTH_KV.delete(`device_code:${deviceCodeHash}`);
+      await env.OAUTH_KV.delete(`user_code:${deviceCodeData.userCode}`);
+      return this.createErrorResponse('access_denied', 'The user denied the authorization request');
+    }
+
+    if (deviceCodeData.status === 'pending') {
+      // RFC 8628 §3.5: slow_down if client polls faster than the interval
+      if (deviceCodeData.lastPolledAt && now - deviceCodeData.lastPolledAt < deviceCodeData.interval) {
+        deviceCodeData.interval = Math.min(deviceCodeData.interval + 5, 60); // RFC 8628 §3.5, cap at 60s
+        deviceCodeData.lastPolledAt = now;
+        const remainingTtl = deviceCodeData.expiresAt - now;
+        await env.OAUTH_KV.put(`device_code:${deviceCodeHash}`, JSON.stringify(deviceCodeData), {
+          expirationTtl: remainingTtl > 0 ? remainingTtl : 1,
+        });
+        return this.createErrorResponse('slow_down', 'Polling too frequently, increase interval');
+      }
+
+      // Update last polled timestamp
+      deviceCodeData.lastPolledAt = now;
+      const remainingTtl = deviceCodeData.expiresAt - now;
+      await env.OAUTH_KV.put(`device_code:${deviceCodeHash}`, JSON.stringify(deviceCodeData), {
+        expirationTtl: remainingTtl > 0 ? remainingTtl : 1,
+      });
+
+      return this.createErrorResponse('authorization_pending', 'The user has not yet completed authorization');
+    }
+
+    // Status is 'approved' — issue tokens
+    const userId = deviceCodeData.userId!;
+    const scope = deviceCodeData.scope;
+    const grantId = generateRandomString(32);
+
+    // Create props and encrypt
+    const props = { clientId: clientInfo.clientId };
+    const { encryptedData: encryptedProps, key: encryptionKey } = await encryptProps(props);
+
+    // Determine TTL
+    const accessTokenTTL = this.options.accessTokenTTL ?? DEFAULT_ACCESS_TOKEN_TTL;
+
+    // Store grant
+    const refreshTokenSecret = generateRandomString(TOKEN_LENGTH);
+    const refreshToken = `${userId}:${grantId}:${refreshTokenSecret}`;
+    const refreshTokenId = await generateTokenId(refreshToken);
+    const refreshTokenWrappedKey = await wrapKeyWithToken(refreshToken, encryptionKey);
+
+    const refreshTokenTTL = this.options.refreshTokenTTL;
+    const grantData: Grant = {
+      id: grantId,
+      clientId: clientInfo.clientId,
+      userId,
+      scope,
+      metadata: {},
+      encryptedProps,
+      createdAt: now,
+      expiresAt: refreshTokenTTL ? now + refreshTokenTTL : undefined,
+      refreshTokenId,
+      refreshTokenWrappedKey,
+    };
+
+    await this.saveGrantWithTTL(env, `grant:${userId}:${grantId}`, grantData, now);
+
+    // Create access token
+    const accessToken = await this.createAccessToken({
+      userId,
+      grantId,
+      clientId: clientInfo.clientId,
+      scope,
+      encryptedProps,
+      encryptionKey,
+      expiresIn: accessTokenTTL,
+      env,
+    });
+
+    // Clean up device code entries
+    await env.OAUTH_KV.delete(`device_code:${deviceCodeHash}`);
+    await env.OAUTH_KV.delete(`user_code:${deviceCodeData.userCode}`);
+
+    const tokenResponse: TokenResponse = {
+      access_token: accessToken,
+      token_type: 'bearer',
+      expires_in: accessTokenTTL,
+      refresh_token: refreshToken,
+      scope: scope.join(' '),
+    };
+
+    return new Response(JSON.stringify(tokenResponse), {
+      headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+    });
+  }
+
+  // ── End Device Authorization Grant ────────────────────────────────────
+
   private async handleApiRequest(request: Request, env: any, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     // Per RFC 9728 §5.1, include the request path so the resource_metadata URL
@@ -3418,6 +3718,25 @@ class OAuthError extends Error {
  * Default expiration time for access tokens (1 hour in seconds)
  */
 const DEFAULT_ACCESS_TOKEN_TTL = 60 * 60;
+const DEFAULT_DEVICE_CODE_TTL = 900; // 15 minutes per RFC 8628 §3.2
+const DEFAULT_DEVICE_CODE_INTERVAL = 5; // seconds per RFC 8628 §3.2
+const DEVICE_USER_CODE_LENGTH = 8; // XXXX-XXXX format
+
+/**
+ * Device authorization code stored in KV (RFC 8628)
+ */
+interface DeviceCode {
+  /** Raw user code (no hyphen) for lookup */
+  userCode: string;
+  clientId: string;
+  scope: string[];
+  expiresAt: number;
+  interval: number;
+  status: 'pending' | 'approved' | 'denied';
+  userId?: string;
+  /** Timestamp of last poll, for slow_down enforcement */
+  lastPolledAt?: number;
+}
 
 /**
  * Default expiration time for refresh tokens (30 days in seconds)
@@ -4634,6 +4953,49 @@ class OAuthHelpersImpl implements OAuthHelpers {
 
     result.done = true;
     return result;
+  }
+
+  async getDeviceCodeByUserCode(userCode: string): Promise<{ clientId: string; scope: string[] } | null> {
+    const normalizedCode = userCode.toUpperCase().replace(/[\s-]/g, '');
+    const deviceCodeHash: string | null = await this.env.OAUTH_KV.get(`user_code:${normalizedCode}`);
+    if (!deviceCodeHash) return null;
+    const data: DeviceCode | null = await this.env.OAUTH_KV.get(`device_code:${deviceCodeHash}`, { type: 'json' });
+    if (!data || data.status !== 'pending') return null;
+    const now = Math.floor(Date.now() / 1000);
+    if (now >= data.expiresAt) return null;
+    return { clientId: data.clientId, scope: data.scope };
+  }
+
+  async approveDeviceCode(userCode: string, userId: string): Promise<boolean> {
+    const normalizedCode = userCode.toUpperCase().replace(/[\s-]/g, '');
+    const deviceCodeHash: string | null = await this.env.OAUTH_KV.get(`user_code:${normalizedCode}`);
+    if (!deviceCodeHash) return false;
+    const data: DeviceCode | null = await this.env.OAUTH_KV.get(`device_code:${deviceCodeHash}`, { type: 'json' });
+    if (!data || data.status !== 'pending') return false;
+    const now = Math.floor(Date.now() / 1000);
+    if (now >= data.expiresAt) return false;
+    data.status = 'approved';
+    data.userId = userId;
+    const remainingTtl = data.expiresAt - now;
+    await this.env.OAUTH_KV.put(`device_code:${deviceCodeHash}`, JSON.stringify(data), {
+      expirationTtl: remainingTtl > 0 ? remainingTtl : 1,
+    });
+    return true;
+  }
+
+  async denyDeviceCode(userCode: string): Promise<boolean> {
+    const normalizedCode = userCode.toUpperCase().replace(/[\s-]/g, '');
+    const deviceCodeHash: string | null = await this.env.OAUTH_KV.get(`user_code:${normalizedCode}`);
+    if (!deviceCodeHash) return false;
+    const data: DeviceCode | null = await this.env.OAUTH_KV.get(`device_code:${deviceCodeHash}`, { type: 'json' });
+    if (!data || data.status !== 'pending') return false;
+    data.status = 'denied';
+    const now = Math.floor(Date.now() / 1000);
+    const remainingTtl = data.expiresAt - now;
+    await this.env.OAUTH_KV.put(`device_code:${deviceCodeHash}`, JSON.stringify(data), {
+      expirationTtl: remainingTtl > 0 ? remainingTtl : 1,
+    });
+    return true;
   }
 }
 
