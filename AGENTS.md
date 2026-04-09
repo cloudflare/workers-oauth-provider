@@ -29,9 +29,9 @@ When in doubt about OAuth behavior, the MCP specification takes precedence for M
 ```
 workers-oauth-provider/
 ├── src/
-│   └── oauth-provider.ts      # Single source file (~4,100 lines)
+│   └── oauth-provider.ts      # Single source file (~4,600 lines)
 ├── __tests__/
-│   ├── oauth-provider.test.ts # Comprehensive test suite (~6,400 lines)
+│   ├── oauth-provider.test.ts # Comprehensive test suite (~9,400 lines)
 │   ├── setup.ts               # Vitest setup and mocking
 │   └── mocks/
 │       └── cloudflare-workers.ts

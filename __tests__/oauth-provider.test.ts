@@ -11,11 +11,17 @@ import { WorkerEntrypoint } from 'cloudflare:workers';
 class MockKV {
   private storage: Map<string, { value: any; expiration?: number }> = new Map();
 
-  async put(key: string, value: string | ArrayBuffer, options?: { expirationTtl?: number }): Promise<void> {
+  async put(
+    key: string,
+    value: string | ArrayBuffer,
+    options?: { expirationTtl?: number; expiration?: number }
+  ): Promise<void> {
     let expirationTime: number | undefined = undefined;
 
     if (options?.expirationTtl) {
       expirationTime = Date.now() + options.expirationTtl * 1000;
+    } else if (options?.expiration) {
+      expirationTime = options.expiration * 1000;
     }
 
     this.storage.set(key, { value, expiration: expirationTime });
@@ -50,24 +56,28 @@ class MockKV {
     cursor?: string;
   }> {
     const { prefix, limit = 1000 } = options;
-    let keys: { name: string }[] = [];
+    const allKeys: string[] = [];
 
+    // Collect all matching, non-expired keys
     for (const key of this.storage.keys()) {
       if (key.startsWith(prefix)) {
         const item = this.storage.get(key);
         if (item && (!item.expiration || item.expiration >= Date.now())) {
-          keys.push({ name: key });
+          allKeys.push(key);
         }
-      }
-
-      if (keys.length >= limit) {
-        break;
       }
     }
 
+    // Handle cursor-based pagination: cursor is the index to start from
+    const startIndex = options.cursor ? parseInt(options.cursor, 10) : 0;
+    const pageKeys = allKeys.slice(startIndex, startIndex + limit);
+    const nextIndex = startIndex + pageKeys.length;
+    const listComplete = nextIndex >= allKeys.length;
+
     return {
-      keys,
-      list_complete: true,
+      keys: pageKeys.map((name) => ({ name })),
+      list_complete: listComplete,
+      cursor: listComplete ? undefined : String(nextIndex),
     };
   }
 
@@ -609,7 +619,7 @@ describe('OAuthProvider', () => {
       const registeredClient = await response.json<any>();
       expect(registeredClient.client_id).toBeDefined();
       expect(registeredClient.client_secret).toBeDefined();
-      expect(registeredClient.client_secret_expires_at).toBe(0);
+      expect(registeredClient.client_secret_expires_at).toBeGreaterThan(0);
       expect(registeredClient.client_secret_issued_at).toEqual(expect.any(Number));
       expect(registeredClient.redirect_uris).toEqual(['https://client.example.com/callback']);
       expect(registeredClient.client_name).toBe('Test Client');
@@ -2826,7 +2836,8 @@ describe('OAuthProvider', () => {
       expect(refreshResponse.status).toBe(400);
       const error = await refreshResponse.json<any>();
       expect(error.error).toBe('invalid_grant');
-      expect(error.error_description).toBe('Refresh token has expired');
+      // KV auto-deletes expired entries, so the grant is gone before the expiry check runs
+      expect(error.error_description).toBe('Grant not found');
     });
 
     it('should allow overriding refresh token TTL via callback', async () => {
@@ -8369,6 +8380,1053 @@ describe('OAuthProvider', () => {
         // Different path, should not match any registered URI
         await expect(makeAuthRequest('http://127.0.0.1:55555/callback')).rejects.toThrow('Invalid redirect URI');
       });
+    });
+  });
+
+  describe('Default Refresh Token TTL', () => {
+    let clientId: string;
+    let clientSecret: string;
+    const redirectUri = 'https://client.example.com/callback';
+
+    async function registerTestClient(provider: OAuthProvider<TestEnv>) {
+      const request = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify({
+          redirect_uris: [redirectUri],
+          client_name: 'TTL Test Client',
+          token_endpoint_auth_method: 'client_secret_basic',
+        })
+      );
+      const response = await provider.fetch(request, mockEnv, mockCtx);
+      const client = await response.json<any>();
+      clientId = client.client_id;
+      clientSecret = client.client_secret;
+    }
+
+    async function getAuthCodeAndExchange(provider: OAuthProvider<TestEnv>) {
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}&scope=read%20write&state=xyz123`
+      );
+      const authResponse = await provider.fetch(authRequest, mockEnv, mockCtx);
+      const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
+
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      );
+      const tokenResponse = await provider.fetch(tokenRequest, mockEnv, mockCtx);
+      return tokenResponse.json<any>();
+    }
+
+    it('should apply 30-day default refresh token TTL when not specified', async () => {
+      const provider = new OAuthProvider({
+        apiRoute: '/api/',
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+      });
+      await registerTestClient(provider);
+      const tokens = await getAuthCodeAndExchange(provider);
+
+      expect(tokens.refresh_token).toBeDefined();
+
+      const grantEntries = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      const grant = await mockEnv.OAUTH_KV.get(grantEntries.keys[0].name, { type: 'json' });
+      const now = Math.floor(Date.now() / 1000);
+      const thirtyDays = 30 * 24 * 60 * 60;
+
+      expect(grant.expiresAt).toBeDefined();
+      expect(grant.expiresAt).toBeGreaterThan(now);
+      expect(grant.expiresAt).toBeLessThanOrEqual(now + thirtyDays);
+    });
+
+    it('should allow opting into infinite TTL by explicitly passing undefined', async () => {
+      const provider = new OAuthProvider({
+        apiRoute: '/api/',
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        refreshTokenTTL: undefined,
+      });
+      await registerTestClient(provider);
+      const tokens = await getAuthCodeAndExchange(provider);
+
+      expect(tokens.refresh_token).toBeDefined();
+
+      const grantEntries = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      const grant = await mockEnv.OAUTH_KV.get(grantEntries.keys[0].name, { type: 'json' });
+
+      expect(grant.expiresAt).toBeUndefined();
+    });
+
+    it('should allow overriding the default TTL with a custom value', async () => {
+      const provider = new OAuthProvider({
+        apiRoute: '/api/',
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        refreshTokenTTL: 86400,
+      });
+      await registerTestClient(provider);
+      const tokens = await getAuthCodeAndExchange(provider);
+
+      expect(tokens.refresh_token).toBeDefined();
+
+      const grantEntries = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      const grant = await mockEnv.OAUTH_KV.get(grantEntries.keys[0].name, { type: 'json' });
+      const now = Math.floor(Date.now() / 1000);
+
+      expect(grant.expiresAt).toBeDefined();
+      expect(grant.expiresAt).toBeLessThanOrEqual(now + 86400);
+      expect(grant.expiresAt).toBeGreaterThan(now + 86300);
+    });
+
+    it('should clamp access token TTL during refresh when remaining lifetime is shorter', async () => {
+      const shortRefreshTTL = 1800;
+      const provider = new OAuthProvider({
+        apiRoute: '/api/',
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        accessTokenTTL: 3600,
+        refreshTokenTTL: shortRefreshTTL,
+      });
+      await registerTestClient(provider);
+      const tokens = await getAuthCodeAndExchange(provider);
+
+      // Initial access token is not clamped (full refresh TTL remaining)
+      expect(tokens.access_token).toBeDefined();
+      expect(tokens.refresh_token).toBeDefined();
+
+      // Use the refresh token to get a new access token
+      const refreshParams = new URLSearchParams();
+      refreshParams.append('grant_type', 'refresh_token');
+      refreshParams.append('refresh_token', tokens.refresh_token);
+      refreshParams.append('client_id', clientId);
+      refreshParams.append('client_secret', clientSecret);
+
+      const refreshRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        refreshParams.toString()
+      );
+      const refreshResponse = await provider.fetch(refreshRequest, mockEnv, mockCtx);
+      const refreshedTokens = await refreshResponse.json<any>();
+
+      // Refreshed access token TTL should be clamped to remaining refresh token lifetime
+      expect(refreshedTokens.expires_in).toBeLessThanOrEqual(shortRefreshTTL);
+    });
+  });
+
+  describe('Client Registration TTL', () => {
+    it('should store DCR clients with TTL when clientRegistrationTTL is set', async () => {
+      const ttl = 7776000; // 90 days
+      const provider = new OAuthProvider({
+        apiRoute: '/api/',
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        clientRegistrationTTL: ttl,
+      });
+
+      const request = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify({
+          redirect_uris: ['https://app.example.com/callback'],
+          client_name: 'TTL Client',
+          token_endpoint_auth_method: 'client_secret_basic',
+        })
+      );
+      const response = await provider.fetch(request, mockEnv, mockCtx);
+      expect(response.status).toBe(201);
+
+      const client = await response.json<any>();
+      const now = Math.floor(Date.now() / 1000);
+
+      // client_secret_expires_at should reflect the TTL
+      expect(client.client_secret_expires_at).toBeGreaterThan(now);
+      expect(client.client_secret_expires_at).toBeLessThanOrEqual(now + ttl);
+
+      // Verify the client exists in KV
+      const stored = await mockEnv.OAUTH_KV.get(`client:${client.client_id}`, { type: 'json' });
+      expect(stored).not.toBeNull();
+    });
+
+    it('should auto-expire DCR clients after TTL elapses', async () => {
+      const provider = new OAuthProvider({
+        apiRoute: '/api/',
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        clientRegistrationTTL: 1, // 1 second
+      });
+
+      const request = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify({
+          redirect_uris: ['https://app.example.com/callback'],
+          client_name: 'Short-lived Client',
+          token_endpoint_auth_method: 'client_secret_basic',
+        })
+      );
+      const response = await provider.fetch(request, mockEnv, mockCtx);
+      const client = await response.json<any>();
+
+      // Client should exist immediately
+      expect(await mockEnv.OAUTH_KV.get(`client:${client.client_id}`, { type: 'json' })).not.toBeNull();
+
+      // Wait for expiry
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+
+      // Client should be auto-deleted by KV TTL
+      expect(await mockEnv.OAUTH_KV.get(`client:${client.client_id}`, { type: 'json' })).toBeNull();
+    });
+
+    it('should return client_secret_expires_at = 0 when clientRegistrationTTL is explicitly undefined', async () => {
+      const provider = new OAuthProvider({
+        apiRoute: '/api/',
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        clientRegistrationTTL: undefined,
+      });
+
+      const request = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify({
+          redirect_uris: ['https://app.example.com/callback'],
+          client_name: 'Permanent Client',
+          token_endpoint_auth_method: 'client_secret_basic',
+        })
+      );
+      const response = await provider.fetch(request, mockEnv, mockCtx);
+      const client = await response.json<any>();
+
+      expect(client.client_secret_expires_at).toBe(0);
+    });
+
+    it('should not include client_secret_expires_at for public clients', async () => {
+      const provider = new OAuthProvider({
+        apiRoute: '/api/',
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        clientRegistrationTTL: 7776000,
+      });
+
+      const request = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify({
+          redirect_uris: ['https://spa.example.com/callback'],
+          client_name: 'SPA',
+          token_endpoint_auth_method: 'none',
+        })
+      );
+      const response = await provider.fetch(request, mockEnv, mockCtx);
+      const client = await response.json<any>();
+
+      expect(client.client_secret).toBeUndefined();
+      expect(client.client_secret_expires_at).toBeUndefined();
+    });
+
+    it('should not apply clientRegistrationTTL to clients created via OAuthHelpers.createClient', async () => {
+      const provider = new OAuthProvider({
+        apiRoute: '/api/',
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        clientRegistrationTTL: 1, // 1 second
+      });
+
+      // Use the default handler to trigger a request that populates OAUTH_PROVIDER
+      const initRequest = createMockRequest('https://example.com/');
+      await provider.fetch(initRequest, mockEnv, mockCtx);
+
+      // Create a client via OAuthHelpers (programmatic, not DCR)
+      const client = await mockEnv.OAUTH_PROVIDER!.createClient({
+        redirectUris: ['https://app.example.com/callback'],
+        clientName: 'Manual Client',
+      });
+
+      // Wait for the DCR TTL to elapse
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+
+      // Client created via createClient should still exist (not affected by clientRegistrationTTL)
+      const stored = await mockEnv.OAUTH_KV.get(`client:${client.clientId}`, { type: 'json' });
+      expect(stored).not.toBeNull();
+    });
+
+    it('should preserve TTL when updating a DCR client via updateClient', async () => {
+      const provider = new OAuthProvider({
+        apiRoute: '/api/',
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        clientRegistrationTTL: 1, // 1 second
+      });
+
+      // Register a DCR client
+      const request = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify({
+          redirect_uris: ['https://app.example.com/callback'],
+          client_name: 'Update TTL Client',
+          token_endpoint_auth_method: 'client_secret_basic',
+        })
+      );
+      const response = await provider.fetch(request, mockEnv, mockCtx);
+      const client = await response.json<any>();
+
+      // Initialize OAUTH_PROVIDER
+      const initRequest = createMockRequest('https://example.com/');
+      await provider.fetch(initRequest, mockEnv, mockCtx);
+
+      // Update the client (should re-apply TTL, not strip it)
+      await mockEnv.OAUTH_PROVIDER!.updateClient(client.client_id, {
+        clientName: 'Updated Name',
+      });
+
+      // Client should still exist immediately after update
+      const stored = await mockEnv.OAUTH_KV.get(`client:${client.client_id}`, { type: 'json' });
+      expect(stored).not.toBeNull();
+      expect(stored.clientName).toBe('Updated Name');
+
+      // Wait for TTL to expire
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+
+      // Client should have expired (TTL was preserved on update)
+      const expired = await mockEnv.OAUTH_KV.get(`client:${client.client_id}`, { type: 'json' });
+      expect(expired).toBeNull();
+    });
+  });
+
+  describe('deleteClient cascading to grants', () => {
+    let provider: OAuthProvider<TestEnv>;
+    let clientId: string;
+    let clientSecret: string;
+    const redirectUri = 'https://client.example.com/callback';
+
+    beforeEach(async () => {
+      provider = new OAuthProvider({
+        apiRoute: '/api/',
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        refreshTokenTTL: undefined, // infinite, to avoid expiry during test
+      });
+
+      // Initialize OAUTH_PROVIDER
+      const initRequest = createMockRequest('https://example.com/');
+      await provider.fetch(initRequest, mockEnv, mockCtx);
+
+      // Register a client via DCR
+      const request = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify({
+          redirect_uris: [redirectUri],
+          client_name: 'Cascade Test Client',
+          token_endpoint_auth_method: 'client_secret_basic',
+        })
+      );
+      const response = await provider.fetch(request, mockEnv, mockCtx);
+      const client = await response.json<any>();
+      clientId = client.client_id;
+      clientSecret = client.client_secret;
+    });
+
+    async function authorizeAndGetTokens(userId: string) {
+      // Create a custom default handler for this specific userId
+      const customDefaultHandler = {
+        async fetch(request: Request, env: TestEnv, ctx: ExecutionContext) {
+          const url = new URL(request.url);
+          if (url.pathname === '/authorize') {
+            const oauthReqInfo = await env.OAUTH_PROVIDER!.parseAuthRequest(request);
+            const { redirectTo } = await env.OAUTH_PROVIDER!.completeAuthorization({
+              request: oauthReqInfo,
+              userId,
+              metadata: { test: true },
+              scope: oauthReqInfo.scope,
+              props: { userId },
+              revokeExistingGrants: false,
+            });
+            return Response.redirect(redirectTo, 302);
+          }
+          return new Response('Default handler', { status: 200 });
+        },
+      };
+
+      const customProvider = new OAuthProvider({
+        apiRoute: '/api/',
+        apiHandler: TestApiHandler,
+        defaultHandler: customDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        refreshTokenTTL: undefined,
+      });
+
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}&scope=read%20write&state=abc`
+      );
+      const authResponse = await customProvider.fetch(authRequest, mockEnv, mockCtx);
+      const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
+
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      );
+      const tokenResponse = await customProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      return tokenResponse.json<any>();
+    }
+
+    it('should delete all grants and tokens when a client is deleted', async () => {
+      // Create grants for two different users
+      const tokens1 = await authorizeAndGetTokens('user-1');
+      const tokens2 = await authorizeAndGetTokens('user-2');
+
+      // Verify grants and tokens exist
+      const grantsBefore = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      const tokensBefore = await mockEnv.OAUTH_KV.list({ prefix: 'token:' });
+      expect(grantsBefore.keys.length).toBe(2);
+      expect(tokensBefore.keys.length).toBe(2);
+
+      // Verify access tokens work
+      const apiRequest1 = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: `Bearer ${tokens1.access_token}`,
+      });
+      const apiResponse1 = await provider.fetch(apiRequest1, mockEnv, mockCtx);
+      expect(apiResponse1.status).toBe(200);
+
+      // Delete the client
+      await mockEnv.OAUTH_PROVIDER!.deleteClient(clientId);
+
+      // Verify all grants are gone
+      const grantsAfter = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      expect(grantsAfter.keys.length).toBe(0);
+
+      // Verify all tokens are gone
+      const tokensAfter = await mockEnv.OAUTH_KV.list({ prefix: 'token:' });
+      expect(tokensAfter.keys.length).toBe(0);
+
+      // Verify the client itself is gone
+      const clientData = await mockEnv.OAUTH_KV.get(`client:${clientId}`, { type: 'json' });
+      expect(clientData).toBeNull();
+
+      // Verify access tokens no longer work
+      const apiRequest2 = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: `Bearer ${tokens1.access_token}`,
+      });
+      const apiResponse2 = await provider.fetch(apiRequest2, mockEnv, mockCtx);
+      expect(apiResponse2.status).toBe(401);
+    });
+
+    it('should only delete grants belonging to the specified client', async () => {
+      // Create a second client
+      const request2 = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify({
+          redirect_uris: ['https://other.example.com/callback'],
+          client_name: 'Other Client',
+          token_endpoint_auth_method: 'client_secret_basic',
+        })
+      );
+      const response2 = await provider.fetch(request2, mockEnv, mockCtx);
+      const otherClient = await response2.json<any>();
+
+      // Authorize the first client
+      await authorizeAndGetTokens('user-1');
+
+      // Authorize the second client manually using the default handler
+      const authRequest2 = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${otherClient.client_id}` +
+          `&redirect_uri=${encodeURIComponent('https://other.example.com/callback')}&scope=read&state=abc`
+      );
+      const authResponse2 = await provider.fetch(authRequest2, mockEnv, mockCtx);
+      const code2 = new URL(authResponse2.headers.get('Location')!).searchParams.get('code')!;
+
+      const params2 = new URLSearchParams();
+      params2.append('grant_type', 'authorization_code');
+      params2.append('code', code2);
+      params2.append('redirect_uri', 'https://other.example.com/callback');
+      params2.append('client_id', otherClient.client_id);
+      params2.append('client_secret', otherClient.client_secret);
+      const tokenRequest2 = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params2.toString()
+      );
+      await provider.fetch(tokenRequest2, mockEnv, mockCtx);
+
+      // Verify we have 2 grants total
+      const grantsBefore = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      expect(grantsBefore.keys.length).toBe(2);
+
+      // Delete only the first client
+      await mockEnv.OAUTH_PROVIDER!.deleteClient(clientId);
+
+      // Only the second client's grant should remain
+      const grantsAfter = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      expect(grantsAfter.keys.length).toBe(1);
+      const remainingGrant = await mockEnv.OAUTH_KV.get(grantsAfter.keys[0].name, { type: 'json' });
+      expect(remainingGrant.clientId).toBe(otherClient.client_id);
+
+      // Second client should still exist
+      const otherClientData = await mockEnv.OAUTH_KV.get(`client:${otherClient.client_id}`, { type: 'json' });
+      expect(otherClientData).not.toBeNull();
+    });
+
+    it('should handle deleting a client with no grants', async () => {
+      // Delete the client that has no grants yet
+      await mockEnv.OAUTH_PROVIDER!.deleteClient(clientId);
+
+      const clientData = await mockEnv.OAUTH_KV.get(`client:${clientId}`, { type: 'json' });
+      expect(clientData).toBeNull();
+    });
+
+    it('should handle deleting a non-existent client gracefully', async () => {
+      // Should not throw
+      await mockEnv.OAUTH_PROVIDER!.deleteClient('non-existent-client-id');
+    });
+  });
+
+  describe('purgeExpiredData', () => {
+    let provider: OAuthProvider<TestEnv>;
+    const redirectUri = 'https://client.example.com/callback';
+
+    beforeEach(() => {
+      provider = new OAuthProvider({
+        apiRoute: '/api/',
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        refreshTokenTTL: undefined,
+      });
+    });
+
+    async function initHelpers() {
+      const initRequest = createMockRequest('https://example.com/');
+      await provider.fetch(initRequest, mockEnv, mockCtx);
+    }
+
+    async function registerClient(): Promise<{ clientId: string; clientSecret: string }> {
+      const request = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify({
+          redirect_uris: [redirectUri],
+          client_name: 'Purge Test Client',
+          token_endpoint_auth_method: 'client_secret_basic',
+        })
+      );
+      const response = await provider.fetch(request, mockEnv, mockCtx);
+      const client = await response.json<any>();
+      return { clientId: client.client_id, clientSecret: client.client_secret };
+    }
+
+    async function authorizeClient(clientId: string, clientSecret: string, userId: string = 'test-user-123') {
+      const customHandler = {
+        async fetch(request: Request, env: TestEnv, ctx: ExecutionContext) {
+          const url = new URL(request.url);
+          if (url.pathname === '/authorize') {
+            const oauthReqInfo = await env.OAUTH_PROVIDER!.parseAuthRequest(request);
+            const { redirectTo } = await env.OAUTH_PROVIDER!.completeAuthorization({
+              request: oauthReqInfo,
+              userId,
+              metadata: { test: true },
+              scope: oauthReqInfo.scope,
+              props: { userId },
+              revokeExistingGrants: false,
+            });
+            return Response.redirect(redirectTo, 302);
+          }
+          return new Response('Default handler', { status: 200 });
+        },
+      };
+
+      const customProvider = new OAuthProvider({
+        apiRoute: '/api/',
+        apiHandler: TestApiHandler,
+        defaultHandler: customHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        refreshTokenTTL: undefined,
+      });
+
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}&scope=read%20write&state=abc`
+      );
+      const authResponse = await customProvider.fetch(authRequest, mockEnv, mockCtx);
+      const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
+
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      );
+      const tokenResponse = await customProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      return tokenResponse.json<any>();
+    }
+
+    it('should return done:true and zero counts when namespace is empty', async () => {
+      await initHelpers();
+      const result = await mockEnv.OAUTH_PROVIDER!.purgeExpiredData();
+
+      expect(result.grantsChecked).toBe(0);
+      expect(result.grantsPurged).toBe(0);
+      expect(result.tokensChecked).toBe(0);
+      expect(result.tokensPurged).toBe(0);
+      expect(result.done).toBe(true);
+    });
+
+    it('should not purge healthy grants', async () => {
+      await initHelpers();
+      const { clientId, clientSecret } = await registerClient();
+      await authorizeClient(clientId, clientSecret);
+
+      const grantsBefore = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      expect(grantsBefore.keys.length).toBe(1);
+
+      const result = await mockEnv.OAUTH_PROVIDER!.purgeExpiredData();
+
+      expect(result.grantsChecked).toBe(1);
+      expect(result.grantsPurged).toBe(0);
+      expect(result.done).toBe(true);
+
+      const grantsAfter = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      expect(grantsAfter.keys.length).toBe(1);
+    });
+
+    it('should purge orphaned grants when client is deleted directly from KV', async () => {
+      await initHelpers();
+      const { clientId, clientSecret } = await registerClient();
+      await authorizeClient(clientId, clientSecret, 'user-1');
+      await authorizeClient(clientId, clientSecret, 'user-2');
+
+      // Delete the client directly from KV (bypassing deleteClient cascade)
+      await mockEnv.OAUTH_KV.delete(`client:${clientId}`);
+
+      const grantsBefore = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      expect(grantsBefore.keys.length).toBe(2);
+
+      const result = await mockEnv.OAUTH_PROVIDER!.purgeExpiredData();
+
+      expect(result.grantsChecked).toBe(2);
+      expect(result.grantsPurged).toBe(2);
+      expect(result.done).toBe(true);
+
+      const grantsAfter = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      expect(grantsAfter.keys.length).toBe(0);
+    });
+
+    it('should also clean up tokens when purging orphaned grants', async () => {
+      await initHelpers();
+      const { clientId, clientSecret } = await registerClient();
+      await authorizeClient(clientId, clientSecret);
+
+      const tokensBefore = await mockEnv.OAUTH_KV.list({ prefix: 'token:' });
+      expect(tokensBefore.keys.length).toBe(1);
+
+      // Delete client directly from KV
+      await mockEnv.OAUTH_KV.delete(`client:${clientId}`);
+
+      const result = await mockEnv.OAUTH_PROVIDER!.purgeExpiredData();
+
+      expect(result.grantsPurged).toBe(1);
+
+      const tokensAfter = await mockEnv.OAUTH_KV.list({ prefix: 'token:' });
+      expect(tokensAfter.keys.length).toBe(0);
+    });
+
+    it('should purge expired grants as defense-in-depth', async () => {
+      await initHelpers();
+      const { clientId, clientSecret } = await registerClient();
+      await authorizeClient(clientId, clientSecret);
+
+      // Manually set grant expiresAt to the past (simulating KV TTL not firing)
+      const grantEntries = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      const grantKey = grantEntries.keys[0].name;
+      const grantData = await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' });
+      grantData.expiresAt = Math.floor(Date.now() / 1000) - 100;
+      await mockEnv.OAUTH_KV.put(grantKey, JSON.stringify(grantData));
+
+      const result = await mockEnv.OAUTH_PROVIDER!.purgeExpiredData();
+
+      expect(result.grantsChecked).toBe(1);
+      expect(result.grantsPurged).toBe(1);
+      expect(result.done).toBe(true);
+    });
+
+    it('should not purge grants whose expiresAt is in the future', async () => {
+      await initHelpers();
+      const { clientId, clientSecret } = await registerClient();
+      await authorizeClient(clientId, clientSecret);
+
+      // Set expiresAt to the future
+      const grantEntries = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      const grantKey = grantEntries.keys[0].name;
+      const grantData = await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' });
+      grantData.expiresAt = Math.floor(Date.now() / 1000) + 86400;
+      await mockEnv.OAUTH_KV.put(grantKey, JSON.stringify(grantData));
+
+      const result = await mockEnv.OAUTH_PROVIDER!.purgeExpiredData();
+
+      expect(result.grantsPurged).toBe(0);
+    });
+
+    it('should only purge grants for the deleted client, not others', async () => {
+      await initHelpers();
+      const client1 = await registerClient();
+      const client2 = await registerClient();
+      await authorizeClient(client1.clientId, client1.clientSecret);
+      await authorizeClient(client2.clientId, client2.clientSecret);
+
+      // Delete only client1 directly from KV
+      await mockEnv.OAUTH_KV.delete(`client:${client1.clientId}`);
+
+      const result = await mockEnv.OAUTH_PROVIDER!.purgeExpiredData();
+
+      expect(result.grantsPurged).toBe(1);
+
+      const grantsAfter = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      expect(grantsAfter.keys.length).toBe(1);
+      const remainingGrant = await mockEnv.OAUTH_KV.get(grantsAfter.keys[0].name, { type: 'json' });
+      expect(remainingGrant.clientId).toBe(client2.clientId);
+    });
+
+    it('should not purge grants for CIMD clients', async () => {
+      await initHelpers();
+
+      // Manually insert a grant with a CIMD-style client ID (HTTPS URL)
+      const cimdGrant = {
+        id: 'cimd-grant-1',
+        clientId: 'https://app.example.com/.well-known/oauth-client',
+        userId: 'cimd-user',
+        scope: ['read'],
+        metadata: {},
+        encryptedProps: 'encrypted',
+        createdAt: Math.floor(Date.now() / 1000),
+      };
+      await mockEnv.OAUTH_KV.put(`grant:cimd-user:cimd-grant-1`, JSON.stringify(cimdGrant));
+
+      const result = await mockEnv.OAUTH_PROVIDER!.purgeExpiredData();
+
+      // Grant should be checked but NOT purged (CIMD client not in KV is normal)
+      expect(result.grantsChecked).toBe(1);
+      expect(result.grantsPurged).toBe(0);
+
+      const grantsAfter = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      expect(grantsAfter.keys.length).toBe(1);
+    });
+
+    it('should purge CIMD client grants if they are expired', async () => {
+      await initHelpers();
+
+      const cimdGrant = {
+        id: 'cimd-grant-expired',
+        clientId: 'https://app.example.com/.well-known/oauth-client',
+        userId: 'cimd-user',
+        scope: ['read'],
+        metadata: {},
+        encryptedProps: 'encrypted',
+        createdAt: Math.floor(Date.now() / 1000) - 200,
+        expiresAt: Math.floor(Date.now() / 1000) - 100,
+      };
+      await mockEnv.OAUTH_KV.put(`grant:cimd-user:cimd-grant-expired`, JSON.stringify(cimdGrant));
+
+      const result = await mockEnv.OAUTH_PROVIDER!.purgeExpiredData();
+
+      expect(result.grantsPurged).toBe(1);
+    });
+
+    it('should respect batchSize and return done:false when budget is exhausted', async () => {
+      await initHelpers();
+      const { clientId, clientSecret } = await registerClient();
+
+      // Create 5 grants
+      for (let i = 0; i < 5; i++) {
+        await authorizeClient(clientId, clientSecret, `user-${i}`);
+      }
+
+      // Delete the client to make all grants orphaned
+      await mockEnv.OAUTH_KV.delete(`client:${clientId}`);
+
+      // Purge with batchSize of 2
+      const result = await mockEnv.OAUTH_PROVIDER!.purgeExpiredData({ batchSize: 2 });
+
+      expect(result.grantsChecked).toBe(2);
+      expect(result.grantsPurged).toBe(2);
+      expect(result.done).toBe(false);
+
+      // 3 grants should remain
+      const grantsAfter = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      expect(grantsAfter.keys.length).toBe(3);
+    });
+
+    it('should converge to done:true over multiple invocations', async () => {
+      await initHelpers();
+      const { clientId, clientSecret } = await registerClient();
+
+      for (let i = 0; i < 5; i++) {
+        await authorizeClient(clientId, clientSecret, `user-${i}`);
+      }
+      await mockEnv.OAUTH_KV.delete(`client:${clientId}`);
+
+      // First batch: purge 3
+      const result1 = await mockEnv.OAUTH_PROVIDER!.purgeExpiredData({ batchSize: 3 });
+      expect(result1.grantsPurged).toBe(3);
+      expect(result1.done).toBe(false);
+
+      // Second batch: purge remaining 2
+      const result2 = await mockEnv.OAUTH_PROVIDER!.purgeExpiredData({ batchSize: 3 });
+      expect(result2.grantsPurged).toBe(2);
+      expect(result2.done).toBe(true);
+
+      const grantsAfter = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      expect(grantsAfter.keys.length).toBe(0);
+    });
+
+    it('should purge orphaned tokens whose grant no longer exists', async () => {
+      await initHelpers();
+
+      // Manually insert an orphaned token (no corresponding grant)
+      const orphanedToken = {
+        id: 'orphan-token-id',
+        grantId: 'deleted-grant',
+        userId: 'some-user',
+        createdAt: Math.floor(Date.now() / 1000),
+        expiresAt: Math.floor(Date.now() / 1000) + 3600,
+        wrappedEncryptionKey: 'key',
+        scope: ['read'],
+        grant: { clientId: 'deleted-client', scope: ['read'], encryptedProps: 'data' },
+      };
+      await mockEnv.OAUTH_KV.put(`token:some-user:deleted-grant:orphan-token-id`, JSON.stringify(orphanedToken));
+
+      const result = await mockEnv.OAUTH_PROVIDER!.purgeExpiredData();
+
+      expect(result.tokensChecked).toBe(1);
+      expect(result.tokensPurged).toBe(1);
+      expect(result.done).toBe(true);
+
+      const tokensAfter = await mockEnv.OAUTH_KV.list({ prefix: 'token:' });
+      expect(tokensAfter.keys.length).toBe(0);
+    });
+
+    it('should not purge tokens whose grant still exists', async () => {
+      await initHelpers();
+      const { clientId, clientSecret } = await registerClient();
+      await authorizeClient(clientId, clientSecret);
+
+      const tokensBefore = await mockEnv.OAUTH_KV.list({ prefix: 'token:' });
+      expect(tokensBefore.keys.length).toBe(1);
+
+      const result = await mockEnv.OAUTH_PROVIDER!.purgeExpiredData();
+
+      expect(result.tokensChecked).toBe(1);
+      expect(result.tokensPurged).toBe(0);
+
+      const tokensAfter = await mockEnv.OAUTH_KV.list({ prefix: 'token:' });
+      expect(tokensAfter.keys.length).toBe(1);
+    });
+
+    it('should skip grant sweep when purgeOrphanedGrants and purgeExpiredGrants are false', async () => {
+      await initHelpers();
+      const { clientId, clientSecret } = await registerClient();
+      await authorizeClient(clientId, clientSecret);
+      await mockEnv.OAUTH_KV.delete(`client:${clientId}`);
+
+      // Insert an orphaned token
+      const orphanedToken = {
+        id: 'orphan-id',
+        grantId: 'no-grant',
+        userId: 'some-user',
+        createdAt: Math.floor(Date.now() / 1000),
+        expiresAt: Math.floor(Date.now() / 1000) + 3600,
+        wrappedEncryptionKey: 'key',
+        scope: ['read'],
+        grant: { clientId: 'x', scope: ['read'], encryptedProps: 'data' },
+      };
+      await mockEnv.OAUTH_KV.put(`token:some-user:no-grant:orphan-id`, JSON.stringify(orphanedToken));
+
+      const result = await mockEnv.OAUTH_PROVIDER!.purgeExpiredData({
+        purgeOrphanedGrants: false,
+        purgeExpiredGrants: false,
+      });
+
+      // Grant sweep should be skipped entirely
+      expect(result.grantsChecked).toBe(0);
+      expect(result.grantsPurged).toBe(0);
+      // Token sweep should still run
+      expect(result.tokensChecked).toBe(2); // 1 real token + 1 orphaned
+      expect(result.tokensPurged).toBe(1); // only orphaned one
+    });
+
+    it('should skip token sweep when purgeOrphanedTokens is false', async () => {
+      await initHelpers();
+
+      // Insert an orphaned token
+      const orphanedToken = {
+        id: 'orphan-id',
+        grantId: 'no-grant',
+        userId: 'some-user',
+        createdAt: Math.floor(Date.now() / 1000),
+        expiresAt: Math.floor(Date.now() / 1000) + 3600,
+        wrappedEncryptionKey: 'key',
+        scope: ['read'],
+        grant: { clientId: 'x', scope: ['read'], encryptedProps: 'data' },
+      };
+      await mockEnv.OAUTH_KV.put(`token:some-user:no-grant:orphan-id`, JSON.stringify(orphanedToken));
+
+      const result = await mockEnv.OAUTH_PROVIDER!.purgeExpiredData({
+        purgeOrphanedTokens: false,
+      });
+
+      expect(result.tokensChecked).toBe(0);
+      expect(result.tokensPurged).toBe(0);
+      expect(result.done).toBe(true);
+
+      // Orphaned token should still be there
+      const tokensAfter = await mockEnv.OAUTH_KV.list({ prefix: 'token:' });
+      expect(tokensAfter.keys.length).toBe(1);
+    });
+
+    it('should cache client lookups across multiple grants for the same client', async () => {
+      await initHelpers();
+      const { clientId, clientSecret } = await registerClient();
+
+      // Create multiple grants for the same client
+      await authorizeClient(clientId, clientSecret, 'user-1');
+      await authorizeClient(clientId, clientSecret, 'user-2');
+      await authorizeClient(clientId, clientSecret, 'user-3');
+
+      // Spy on KV get to count client lookups
+      const originalGet = mockEnv.OAUTH_KV.get.bind(mockEnv.OAUTH_KV);
+      let clientLookups = 0;
+      mockEnv.OAUTH_KV.get = async (key: string, options?: any) => {
+        if (key.startsWith('client:')) clientLookups++;
+        return originalGet(key, options);
+      };
+
+      await mockEnv.OAUTH_PROVIDER!.purgeExpiredData();
+
+      // Should only look up the client once (cached for subsequent grants)
+      expect(clientLookups).toBe(1);
+    });
+
+    it('should work when called via OAuthProvider.purgeExpiredData', async () => {
+      await initHelpers();
+
+      // Insert an orphaned grant
+      const orphanedGrant = {
+        id: 'orphan-grant',
+        clientId: 'deleted-client',
+        userId: 'some-user',
+        scope: ['read'],
+        metadata: {},
+        encryptedProps: 'encrypted',
+        createdAt: Math.floor(Date.now() / 1000),
+      };
+      await mockEnv.OAUTH_KV.put(`grant:some-user:orphan-grant`, JSON.stringify(orphanedGrant));
+
+      // Call via OAuthProvider class (not OAuthHelpers)
+      const result = await provider.purgeExpiredData(mockEnv);
+
+      expect(result.grantsPurged).toBe(1);
+      expect(result.done).toBe(true);
+    });
+
+    it('should handle grants with colons in userId', async () => {
+      await initHelpers();
+
+      // Insert a grant with colons in the userId
+      const grant = {
+        id: 'grant-with-colons',
+        clientId: 'deleted-client',
+        userId: 'oauth2|provider|12345',
+        scope: ['read'],
+        metadata: {},
+        encryptedProps: 'encrypted',
+        createdAt: Math.floor(Date.now() / 1000),
+      };
+      await mockEnv.OAUTH_KV.put(`grant:oauth2|provider|12345:grant-with-colons`, JSON.stringify(grant));
+
+      const result = await mockEnv.OAUTH_PROVIDER!.purgeExpiredData();
+
+      // Should purge the orphaned grant using grantData.id and grantData.userId
+      expect(result.grantsPurged).toBe(1);
+      expect(result.done).toBe(true);
     });
   });
 });

@@ -48,7 +48,7 @@ Client records store OAuth client application information.
 
 > **Note:** The `clientSecret` is stored as a SHA-256 hash, not in plaintext. The actual secret is only returned to the client when initially created or updated, and never stored.
 
-**TTL:** No expiration (persistent storage)
+**TTL:** Dynamically registered clients (DCR) default to 90 days. Clients created via `OAuthHelpers.createClient()` have no expiration. Configurable via the `clientRegistrationTTL` option.
 
 ### Authorization Grants
 
@@ -120,9 +120,9 @@ Grant records store information about permissions a user has granted to an appli
 **TTL:**
 
 - Initially 10 minutes (during authorization process)
-- No expiration after the authorization code is exchanged for tokens
+- After code exchange, TTL matches the refresh token expiration (defaults to 30 days, configurable via `refreshTokenTTL`)
 
-> **Note:** The grant record includes the hash of the authorization code initially, which is replaced by the hash of the refresh token after the code is exchanged. The record also has a TTL during the authorization process, which is removed when the code is exchanged for tokens to make the grant permanent.
+> **Note:** The grant record includes the hash of the authorization code initially, which is replaced by the hash of the refresh token after the code is exchanged. The record has a 10-minute TTL during authorization, which is replaced by the refresh token TTL when the code is exchanged.
 
 ### Tokens
 
@@ -232,12 +232,12 @@ Token records store metadata about issued access tokens, including denormalized 
 
 5. Access tokens expire automatically after their TTL.
 
-6. Refresh tokens do not expire and are stored directly in the grant; they remain valid until the grant is revoked.
+6. Refresh tokens expire based on the configured `refreshTokenTTL` (default: 30 days) and are stored directly in the grant.
    - For security, the provider issues a new refresh token with each refresh operation
    - It keeps track of both the current and previous tokens, along with their wrapped keys
    - When the new token is used, the previous token is invalidated, but can still be used until replaced
 
-7. When a grant is revoked:
+7. When a grant is revoked (or when `deleteClient()` is called, which cascades to all grants for that client):
    - All associated access tokens are found using the key prefix `token:{userId}:{grantId}:` and deleted
    - The grant record is deleted, which also effectively revokes the refresh token and all encrypted data
 
@@ -246,4 +246,5 @@ Token records store metadata about issued access tokens, including denormalized 
 - For high-traffic applications, consider using a caching layer in front of KV to reduce read operations on frequently accessed data.
 - Monitor KV usage metrics to ensure you stay within Cloudflare's limits for your plan.
 - The design uses KV's `list()` capability with key prefixes to efficiently query related data like all grants for a user, eliminating the need for separate list indexes.
-- If a grant is revoked, associated tokens are not immediately deleted from KV, but rely on TTL expiration. Add a cleanup process if immediate revocation is required.
+- When a grant is revoked via `revokeGrant()`, associated tokens are immediately deleted. When a client is deleted via `deleteClient()`, all grants and tokens for that client are also deleted.
+- The `purgeExpiredData()` method provides defense-in-depth garbage collection for orphaned grants and tokens. It is designed to be called from a scheduled handler (Cron Trigger).
