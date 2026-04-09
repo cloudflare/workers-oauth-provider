@@ -6274,6 +6274,70 @@ describe('OAuthProvider', () => {
       expect(newTokens.access_token).toBeDefined();
       expect(newTokens.refresh_token).toBeDefined();
     });
+
+    it('should not revoke tokens belonging to a different client (RFC 7009 §2.1)', async () => {
+      // Get tokens via full auth flow for client A
+      const authUrl = new URL('https://example.com/authorize');
+      authUrl.searchParams.set('response_type', 'code');
+      authUrl.searchParams.set('client_id', clientId);
+      authUrl.searchParams.set('redirect_uri', redirectUri);
+      authUrl.searchParams.set('scope', 'read');
+      const authRequest = createMockRequest(authUrl.toString());
+      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+        },
+        `grant_type=authorization_code&code=${encodeURIComponent(code)}&redirect_uri=${encodeURIComponent(redirectUri)}`
+      );
+      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      expect(tokenResponse.status).toBe(200);
+      const tokens = await tokenResponse.json<any>();
+      const accessToken = tokens.access_token;
+
+      // Register a DIFFERENT client (client B)
+      const otherClientRes = await oauthProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify({
+            redirect_uris: ['https://other.example.com/callback'],
+            client_name: 'Other Client',
+            token_endpoint_auth_method: 'client_secret_basic',
+          })
+        ),
+        mockEnv,
+        mockCtx
+      );
+      const otherClient = await otherClientRes.json<any>();
+
+      // Client B tries to revoke client A's token — should silently succeed
+      // per RFC 7009 §2.2 (200 OK, but token NOT actually revoked)
+      const revokeRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${otherClient.client_id}:${otherClient.client_secret}`)}`,
+        },
+        `token=${encodeURIComponent(accessToken)}`
+      );
+      const revokeResponse = await oauthProvider.fetch(revokeRequest, mockEnv, mockCtx);
+      expect(revokeResponse.status).toBe(200);
+
+      // Verify client A's token is still valid (was NOT revoked by client B)
+      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: `Bearer ${accessToken}`,
+      });
+      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+      expect(apiResponse.status).toBe(200);
+    });
   });
 
   describe('Client ID Metadata Document (CIMD)', () => {
