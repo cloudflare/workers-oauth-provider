@@ -4207,6 +4207,178 @@ describe('OAuthProvider', () => {
     });
   });
 
+  describe('Device Authorization Grant (RFC 8628)', () => {
+    let deviceProvider: InstanceType<typeof OAuthProvider<TestEnv>>;
+    let deviceEnv: any;
+
+    beforeEach(() => {
+      deviceEnv = createMockEnv();
+      deviceProvider = new OAuthProvider({
+        apiRoute: '/api/',
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        deviceAuthorizationEndpoint: '/device/code',
+        scopesSupported: ['read', 'write'],
+      });
+    });
+
+    afterEach(() => {
+      deviceEnv.OAUTH_KV.clear();
+    });
+
+    async function registerClient() {
+      const regRequest = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify({
+          redirect_uris: ['https://client.example.com/callback'],
+          client_name: 'Device Client',
+          token_endpoint_auth_method: 'client_secret_basic',
+        })
+      );
+      const regResponse = await deviceProvider.fetch(regRequest, deviceEnv, new MockExecutionContext());
+      return regResponse.json<any>();
+    }
+
+    it('should return device_code, user_code, and verification_uri', async () => {
+      const client = await registerClient();
+      const request = createMockRequest(
+        'https://example.com/device/code',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${client.client_id}:${client.client_secret}`)}`,
+        },
+        `client_id=${client.client_id}&scope=read`
+      );
+      const response = await deviceProvider.fetch(request, deviceEnv, new MockExecutionContext());
+      expect(response.status).toBe(200);
+      const body = await response.json<any>();
+      expect(body.device_code).toBeDefined();
+      expect(body.user_code).toMatch(/^[A-Z]{4}-[A-Z]{4}$/);
+      expect(body.verification_uri).toBe('https://example.com/device');
+      expect(body.verification_uri_complete).toContain('user_code=');
+      expect(body.expires_in).toBe(900);
+      expect(body.interval).toBe(5);
+    });
+
+    it('should return authorization_pending when polling before approval', async () => {
+      const client = await registerClient();
+      const deviceRequest = createMockRequest(
+        'https://example.com/device/code',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${client.client_id}:${client.client_secret}`)}`,
+        },
+        `client_id=${client.client_id}&scope=read`
+      );
+      const deviceResponse = await deviceProvider.fetch(deviceRequest, deviceEnv, new MockExecutionContext());
+      const device = await deviceResponse.json<any>();
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${client.client_id}:${client.client_secret}`)}`,
+        },
+        `grant_type=urn:ietf:params:oauth:grant-type:device_code&device_code=${device.device_code}`
+      );
+      const tokenResponse = await deviceProvider.fetch(tokenRequest, deviceEnv, new MockExecutionContext());
+      expect(tokenResponse.status).toBe(400);
+      const body = await tokenResponse.json<any>();
+      expect(body.error).toBe('authorization_pending');
+    });
+
+    it('should issue tokens after user approves', async () => {
+      const client = await registerClient();
+      const deviceRequest = createMockRequest(
+        'https://example.com/device/code',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${client.client_id}:${client.client_secret}`)}`,
+        },
+        `client_id=${client.client_id}&scope=read`
+      );
+      const deviceResponse = await deviceProvider.fetch(deviceRequest, deviceEnv, new MockExecutionContext());
+      const device = await deviceResponse.json<any>();
+
+      // Simulate user approval by manipulating KV directly (strip hyphen for raw code lookup)
+      const rawCode = device.user_code.replace(/-/g, '');
+      const deviceCodeHash = await deviceEnv.OAUTH_KV.get(`user_code:${rawCode}`);
+      const codeData = JSON.parse(await deviceEnv.OAUTH_KV.get(`device_code:${deviceCodeHash}`));
+      codeData.status = 'approved';
+      codeData.userId = 'test-user-123';
+      await deviceEnv.OAUTH_KV.put(`device_code:${deviceCodeHash}`, JSON.stringify(codeData));
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${client.client_id}:${client.client_secret}`)}`,
+        },
+        `grant_type=urn:ietf:params:oauth:grant-type:device_code&device_code=${device.device_code}`
+      );
+      const tokenResponse = await deviceProvider.fetch(tokenRequest, deviceEnv, new MockExecutionContext());
+      expect(tokenResponse.status).toBe(200);
+      const tokens = await tokenResponse.json<any>();
+      expect(tokens.access_token).toBeDefined();
+      expect(tokens.refresh_token).toBeDefined();
+      expect(tokens.token_type).toBe('bearer');
+      expect(tokens.scope).toBe('read');
+    });
+
+    it('should return access_denied when user denies', async () => {
+      const client = await registerClient();
+      const deviceRequest = createMockRequest(
+        'https://example.com/device/code',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${client.client_id}:${client.client_secret}`)}`,
+        },
+        `client_id=${client.client_id}&scope=read`
+      );
+      const deviceResponse = await deviceProvider.fetch(deviceRequest, deviceEnv, new MockExecutionContext());
+      const device = await deviceResponse.json<any>();
+
+      const rawCode = device.user_code.replace(/-/g, '');
+      const deviceCodeHash = await deviceEnv.OAUTH_KV.get(`user_code:${rawCode}`);
+      const codeData = JSON.parse(await deviceEnv.OAUTH_KV.get(`device_code:${deviceCodeHash}`));
+      codeData.status = 'denied';
+      await deviceEnv.OAUTH_KV.put(`device_code:${deviceCodeHash}`, JSON.stringify(codeData));
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${client.client_id}:${client.client_secret}`)}`,
+        },
+        `grant_type=urn:ietf:params:oauth:grant-type:device_code&device_code=${device.device_code}`
+      );
+      const tokenResponse = await deviceProvider.fetch(tokenRequest, deviceEnv, new MockExecutionContext());
+      expect(tokenResponse.status).toBe(400);
+      const body = await tokenResponse.json<any>();
+      expect(body.error).toBe('access_denied');
+    });
+
+    it('should advertise device_authorization_endpoint in metadata', async () => {
+      const request = createMockRequest('https://example.com/.well-known/oauth-authorization-server');
+      const response = await deviceProvider.fetch(request, deviceEnv, new MockExecutionContext());
+      const metadata = await response.json<any>();
+      expect(metadata.device_authorization_endpoint).toBe('https://example.com/device/code');
+      expect(metadata.grant_types_supported).toContain('urn:ietf:params:oauth:grant-type:device_code');
+    });
+  });
+
   describe('CORS Support', () => {
     it('should handle CORS preflight for API requests', async () => {
       const preflightRequest = createMockRequest('https://example.com/api/test', 'OPTIONS', {
