@@ -2561,6 +2561,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    */
   private async revokeToken(body: any, env: any): Promise<Response> {
     const token = body.token;
+    // RFC 7009 §2.1: token_type_hint helps the server optimize lookup order
+    const tokenTypeHint = body.token_type_hint;
 
     if (!token) {
       return this.createErrorResponse('invalid_request', 'Token parameter is required');
@@ -2573,13 +2575,31 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const [userId, grantId, _] = tokenParts;
     const tokenId = await generateTokenId(token);
 
-    const isAccessToken = await this.validateAccessToken(tokenId, userId, grantId, env);
-    const isRefreshToken = await this.validateRefreshToken(tokenId, userId, grantId, env);
-
-    if (isAccessToken) {
-      await this.revokeSpecificAccessToken(tokenId, userId, grantId, env);
-    } else if (isRefreshToken) {
-      await this.createOAuthHelpers(env).revokeGrant(grantId, userId);
+    // Use token_type_hint to check the hinted type first, then fall back to the other.
+    // Per RFC 7009 §2.1: "the server SHOULD be able to handle the hint being incorrect"
+    if (tokenTypeHint === 'refresh_token') {
+      const isRefreshToken = await this.validateRefreshToken(tokenId, userId, grantId, env);
+      if (isRefreshToken) {
+        await this.createOAuthHelpers(env).revokeGrant(grantId, userId);
+        return new Response('', { status: 200 });
+      }
+      // Hint was wrong — fall back to access token check
+      const isAccessToken = await this.validateAccessToken(tokenId, userId, grantId, env);
+      if (isAccessToken) {
+        await this.revokeSpecificAccessToken(tokenId, userId, grantId, env);
+      }
+    } else {
+      // Default: check access token first (matches token_type_hint=access_token or no hint)
+      const isAccessToken = await this.validateAccessToken(tokenId, userId, grantId, env);
+      if (isAccessToken) {
+        await this.revokeSpecificAccessToken(tokenId, userId, grantId, env);
+        return new Response('', { status: 200 });
+      }
+      // Fall back to refresh token check
+      const isRefreshToken = await this.validateRefreshToken(tokenId, userId, grantId, env);
+      if (isRefreshToken) {
+        await this.createOAuthHelpers(env).revokeGrant(grantId, userId);
+      }
     }
     return new Response('', { status: 200 });
   }
