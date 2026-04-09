@@ -1730,7 +1730,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       registration_endpoint: registrationEndpoint,
       scopes_supported: this.options.scopesSupported,
       response_types_supported: responseTypesSupported,
-      response_modes_supported: ['query'],
+      response_modes_supported: this.options.allowImplicitFlow ? ['query', 'fragment'] : ['query'],
       grant_types_supported: grantTypesSupported,
       // Support "none" auth method for public clients
       token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post', 'none'],
