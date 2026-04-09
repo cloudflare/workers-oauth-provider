@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
-import { OAuthError, OAuthProvider, type OAuthHelpers } from '../src/oauth-provider';
+import { OAuthError, OAuthProvider, type OAuthHelpers, type Token } from '../src/oauth-provider';
 import type { ExecutionContext } from '@cloudflare/workers-types';
 // We're importing WorkerEntrypoint from our mock implementation
 // The actual import is mocked in setup.ts
@@ -8518,7 +8518,6 @@ describe('OAuthProvider', () => {
     beforeEach(async () => {
       redirectUri = 'https://client.example.com/callback';
 
-      // Create a test client
       const clientResponse = await oauthProvider.fetch(
         createMockRequest(
           'https://example.com/oauth/register',
@@ -8542,67 +8541,192 @@ describe('OAuthProvider', () => {
       clientSecret = client.client_secret;
     });
 
-    it('should connect revokeGrant to token endpoint ', async () => {
-      // Step 1: Get tokens through normal OAuth flow
-      const authRequest = createMockRequest(
-        `https://example.com/authorize?response_type=code&client_id=${encodeURIComponent(clientId)}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=read&state=test-state`
-      );
-      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
-      const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code');
+    async function issueTokens() {
+      const authUrl = new URL('https://example.com/authorize');
+      authUrl.searchParams.set('response_type', 'code');
+      authUrl.searchParams.set('client_id', clientId);
+      authUrl.searchParams.set('redirect_uri', redirectUri);
+      authUrl.searchParams.set('scope', 'read');
+      authUrl.searchParams.set('state', 'test-state');
 
-      const tokenRequest = createMockRequest(
-        'https://example.com/oauth/token',
-        'POST',
-        {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
-        },
-        `grant_type=authorization_code&code=${code}&redirect_uri=${encodeURIComponent(redirectUri)}`
+      const authResponse = await oauthProvider.fetch(createMockRequest(authUrl.toString()), mockEnv, mockCtx);
+      const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
+
+      const tokenResponse = await oauthProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+          },
+          `grant_type=authorization_code&code=${encodeURIComponent(code)}&redirect_uri=${encodeURIComponent(redirectUri)}`
+        ),
+        mockEnv,
+        mockCtx
       );
 
-      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
       expect(tokenResponse.status).toBe(200);
-      const tokens = await tokenResponse.json<any>();
+      return tokenResponse.json<any>();
+    }
 
-      // Step 2:this should successfully revoke the token
-      const revokeRequest = createMockRequest(
-        'https://example.com/oauth/token',
-        'POST',
-        {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
-        },
-        `token=${tokens.access_token}`
+    async function registerOtherClient() {
+      const otherClientRes = await oauthProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify({
+            redirect_uris: ['https://other.example.com/callback'],
+            client_name: 'Other Client',
+            token_endpoint_auth_method: 'client_secret_basic',
+          })
+        ),
+        mockEnv,
+        mockCtx
       );
 
-      const revokeResponse = await oauthProvider.fetch(revokeRequest, mockEnv, mockCtx);
-      // Verify response doesn't contain unsupported_grant_type error
-      const revokeResponseText = await revokeResponse.text();
-      expect(revokeResponseText).not.toContain('unsupported_grant_type');
+      expect(otherClientRes.status).toBe(201);
+      return otherClientRes.json<any>();
+    }
 
-      // Step 3: Verify the access token is actually revoked
-      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
-        Authorization: `Bearer ${tokens.access_token}`,
-      });
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
-      expect(apiResponse.status).toBe(401); // Access token should no longer work
+    async function revokeAs(
+      token: string,
+      client: { client_id: string; client_secret: string },
+      tokenTypeHint?: string
+    ): Promise<Response> {
+      const body = new URLSearchParams({ token });
+      if (tokenTypeHint) {
+        body.set('token_type_hint', tokenTypeHint);
+      }
 
-      // Step 4: Verify refresh token still works
-      const refreshRequest = createMockRequest(
-        'https://example.com/oauth/token',
-        'POST',
-        {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
-        },
-        `grant_type=refresh_token&refresh_token=${tokens.refresh_token}`
+      return oauthProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            Authorization: `Basic ${btoa(`${client.client_id}:${client.client_secret}`)}`,
+          },
+          body.toString()
+        ),
+        mockEnv,
+        mockCtx
       );
+    }
 
-      const refreshResponse = await oauthProvider.fetch(refreshRequest, mockEnv, mockCtx);
-      expect(refreshResponse.status).toBe(200); // Refresh token should still work
+    async function callApi(accessToken: string): Promise<Response> {
+      return oauthProvider.fetch(
+        createMockRequest('https://example.com/api/test', 'GET', {
+          Authorization: `Bearer ${accessToken}`,
+        }),
+        mockEnv,
+        mockCtx
+      );
+    }
+
+    async function refreshWith(refreshToken: string): Promise<Response> {
+      return oauthProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+          },
+          `grant_type=refresh_token&refresh_token=${encodeURIComponent(refreshToken)}`
+        ),
+        mockEnv,
+        mockCtx
+      );
+    }
+
+    it('should connect revokeGrant to token endpoint', async () => {
+      const tokens = await issueTokens();
+
+      const revokeResponse = await revokeAs(tokens.access_token, { client_id: clientId, client_secret: clientSecret });
+      expect(revokeResponse.status).toBe(200);
+      expect(await revokeResponse.text()).not.toContain('unsupported_grant_type');
+
+      expect((await callApi(tokens.access_token)).status).toBe(401);
+
+      const refreshResponse = await refreshWith(tokens.refresh_token);
+      expect(refreshResponse.status).toBe(200);
       const newTokens = await refreshResponse.json<any>();
       expect(newTokens.access_token).toBeDefined();
       expect(newTokens.refresh_token).toBeDefined();
+    });
+
+    it('should not revoke access tokens belonging to a different client (RFC 7009 §2.1)', async () => {
+      const tokens = await issueTokens();
+      const otherClient = await registerOtherClient();
+
+      const revokeResponse = await revokeAs(tokens.access_token, otherClient);
+      expect(revokeResponse.status).toBe(200);
+
+      expect((await callApi(tokens.access_token)).status).toBe(200);
+    });
+
+    it('should verify legacy access-token ownership from the backing grant', async () => {
+      const tokens = await issueTokens();
+      const [userId, grantId] = tokens.access_token.split(':');
+      const tokenList = await mockEnv.OAUTH_KV.list({ prefix: `token:${userId}:${grantId}:` });
+      expect(tokenList.keys.length).toBe(1);
+
+      const tokenKey = tokenList.keys[0].name;
+      const tokenData = (await mockEnv.OAUTH_KV.get(tokenKey, { type: 'json' })) as Token | null;
+      expect(tokenData).not.toBeNull();
+      delete (tokenData as Partial<Token>).grant;
+      await mockEnv.OAUTH_KV.put(tokenKey, JSON.stringify(tokenData));
+
+      const otherClient = await registerOtherClient();
+      const wrongClientRevokeResponse = await revokeAs(tokens.access_token, otherClient);
+      expect(wrongClientRevokeResponse.status).toBe(200);
+      expect(await mockEnv.OAUTH_KV.get(tokenKey, { type: 'json' })).not.toBeNull();
+
+      const revokeResponse = await revokeAs(tokens.access_token, { client_id: clientId, client_secret: clientSecret });
+      expect(revokeResponse.status).toBe(200);
+
+      expect(await mockEnv.OAUTH_KV.get(tokenKey, { type: 'json' })).toBeNull();
+    });
+
+    it('should revoke a refresh token grant when token_type_hint is refresh_token', async () => {
+      const tokens = await issueTokens();
+
+      const revokeResponse = await revokeAs(
+        tokens.refresh_token,
+        { client_id: clientId, client_secret: clientSecret },
+        'refresh_token'
+      );
+      expect(revokeResponse.status).toBe(200);
+
+      expect((await callApi(tokens.access_token)).status).toBe(401);
+      expect((await refreshWith(tokens.refresh_token)).status).toBe(400);
+    });
+
+    it('should still find a refresh token when token_type_hint is wrong', async () => {
+      const tokens = await issueTokens();
+
+      const revokeResponse = await revokeAs(
+        tokens.refresh_token,
+        { client_id: clientId, client_secret: clientSecret },
+        'access_token'
+      );
+      expect(revokeResponse.status).toBe(200);
+
+      expect((await callApi(tokens.access_token)).status).toBe(401);
+      expect((await refreshWith(tokens.refresh_token)).status).toBe(400);
+    });
+
+    it('should not revoke refresh tokens belonging to a different client (RFC 7009 §2.1)', async () => {
+      const tokens = await issueTokens();
+      const otherClient = await registerOtherClient();
+
+      const revokeResponse = await revokeAs(tokens.refresh_token, otherClient, 'refresh_token');
+      expect(revokeResponse.status).toBe(200);
+
+      expect((await callApi(tokens.access_token)).status).toBe(200);
+      expect((await refreshWith(tokens.refresh_token)).status).toBe(200);
     });
   });
 
