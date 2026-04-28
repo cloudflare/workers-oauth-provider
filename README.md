@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/cloudflare-workers-oauth-provider-badge.png)](https://mseep.ai/app/cloudflare-workers-oauth-provider)
+
 # OAuth 2.1 Provider Framework for Cloudflare Workers
 
 This is a TypeScript library that implements the provider side of the OAuth 2.1 protocol with PKCE support. The library is intended to be used on Cloudflare Workers.
