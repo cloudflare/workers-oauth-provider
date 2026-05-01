@@ -282,7 +282,32 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
    */
   allowTokenExchangeGrant?: boolean;
 
-  /** Enable client_credentials grant for M2M auth (RFC 6749 §4.4). Defaults to false. */
+  /**
+   * Enable client_credentials grant for M2M auth (RFC 6749 §4.4). Defaults to false.
+   *
+   * When enabled, confidential clients can request access tokens via:
+   *   POST /oauth/token
+   *   Authorization: Basic <client_id:client_secret>
+   *   Content-Type: application/x-www-form-urlencoded
+   *
+   *   grant_type=client_credentials&scope=...&resource=...
+   *
+   * No refresh token is issued (RFC 6749 §4.4.3). Public clients are rejected.
+   *
+   * **Grant identification**: M2M grants are stored with `userId === clientId`
+   * and `type: GrantType.CLIENT_CREDENTIALS`. API handlers should detect M2M via
+   * `props.clientId` and/or the grant's `type` field rather than by inspecting
+   * `userId`.
+   *
+   * **Audience binding**: callbacks may pass `resource` (RFC 8707) to bind the
+   * token to a specific resource server. For MCP-targeting deployments, this is
+   * required: per the MCP authorization spec, MCP servers MUST validate that
+   * tokens were issued specifically for them.
+   *
+   * **`tokenExchangeCallback`** fires for client_credentials with
+   * `grantType: 'client_credentials'`, allowing the implementer to override
+   * scope, TTL, or props.
+   */
   allowClientCredentialsGrant?: boolean;
 
   /**
@@ -677,12 +702,24 @@ export interface Grant {
   id: string;
 
   /**
+   * Grant type that produced this record. When absent, treat as
+   * `authorization_code` for backward compatibility with grants written
+   * before this field existed. Used by the library and API handlers to
+   * distinguish user-driven grants from machine-to-machine
+   * (`client_credentials`) grants.
+   */
+  type?: GrantType;
+
+  /**
    * Client that received this grant
    */
   clientId: string;
 
   /**
-   * User who authorized this grant
+   * The principal the grant authorizes. For user-driven grants this is the
+   * application-supplied user identifier. For `client_credentials` grants
+   * (M2M) this equals `clientId` — the client itself is the principal —
+   * and `type` is set to `GrantType.CLIENT_CREDENTIALS` to distinguish it.
    */
   userId: string;
 
@@ -2583,9 +2620,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       audience = parsedResource;
     }
 
-    // Synthetic userId for M2M — hash avoids ':' in token format and collision with real users
-    const clientIdHash = await generateTokenId(clientInfo.clientId);
-    const syntheticUserId = `cc_${clientIdHash}`;
+    // For client_credentials grants, the client *is* the principal — there is
+    // no resource owner. Using `clientId` as the userId is collision-safe in
+    // practice (clientIds are 16 random chars from the library's alphabet,
+    // ~2^95 entropy), and the explicit `type: CLIENT_CREDENTIALS` field on the
+    // grant lets API handlers and library code discriminate M2M grants
+    // structurally instead of via userId-prefix string matching.
+    const userId = clientInfo.clientId;
     const grantId = generateRandomString(32);
 
     // Create fresh encrypted props for this grant
@@ -2603,7 +2644,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       const callbackOptions: TokenExchangeCallbackOptions = {
         grantType: GrantType.CLIENT_CREDENTIALS,
         clientId: clientInfo.clientId,
-        userId: syntheticUserId,
+        userId,
         scope: grantedScope,
         requestedScope: grantedScope,
         props,
@@ -2634,22 +2675,24 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const now = Math.floor(Date.now() / 1000);
     const grantData: Grant = {
       id: grantId,
+      type: GrantType.CLIENT_CREDENTIALS,
       clientId: clientInfo.clientId,
-      userId: syntheticUserId,
+      userId,
       scope: grantedScope,
+      // M2M grants have no user-supplied metadata (no redirectUri / codeVerifier / etc.)
       metadata: {},
       encryptedProps,
       createdAt: now,
       expiresAt: now + accessTokenTTL,
     };
 
-    await env.OAUTH_KV.put(`grant:${syntheticUserId}:${grantId}`, JSON.stringify(grantData), {
+    await env.OAUTH_KV.put(`grant:${userId}:${grantId}`, JSON.stringify(grantData), {
       expirationTtl: accessTokenTTL,
     });
 
     // Create access token
     const accessToken = await this.createAccessToken({
-      userId: syntheticUserId,
+      userId,
       grantId,
       clientId: clientInfo.clientId,
       scope: grantedScope,
@@ -2668,9 +2711,15 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       scope: grantedScope.join(' '),
     };
 
+    // RFC 6749 §5.1: token responses MUST set both `Cache-Control: no-store`
+    // and `Pragma: no-cache` to prevent intermediary caching of credentials.
     return new Response(JSON.stringify(tokenResponse), {
       status: 200,
-      headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+      headers: {
+        'Content-Type': 'application/json',
+        'Cache-Control': 'no-store',
+        Pragma: 'no-cache',
+      },
     });
   }
 

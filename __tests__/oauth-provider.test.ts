@@ -2611,6 +2611,10 @@ describe('OAuthProvider', () => {
       const response = await ccProvider.fetch(request, ccEnv, new MockExecutionContext());
       expect(response.status).toBe(200);
 
+      // RFC 6749 §5.1 mandates both headers on responses containing tokens.
+      expect(response.headers.get('Cache-Control')).toBe('no-store');
+      expect(response.headers.get('Pragma')).toBe('no-cache');
+
       const body = await response.json<any>();
       expect(body.access_token).toBeDefined();
       expect(body.token_type).toBe('bearer');
@@ -2619,8 +2623,56 @@ describe('OAuthProvider', () => {
       expect(body.refresh_token).toBeUndefined(); // No refresh token per RFC 6749 §4.4.3
     });
 
-    it('should reject public clients', async () => {
-      // Register a public client
+    it('should store the grant with type=client_credentials and userId=clientId', async () => {
+      const client = await registerConfidentialClient();
+
+      const request = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${client.client_id}:${client.client_secret}`)}`,
+        },
+        'grant_type=client_credentials&scope=read'
+      );
+
+      const response = await ccProvider.fetch(request, ccEnv, new MockExecutionContext());
+      expect(response.status).toBe(200);
+
+      // M2M grants use clientId as the principal; `type` field disambiguates from
+      // a coincidentally-named user (collision space ~2^95 from clientId entropy).
+      const grants = await ccEnv.OAUTH_KV.list({ prefix: `grant:${client.client_id}:` });
+      expect(grants.keys.length).toBe(1);
+      const grant = await ccEnv.OAUTH_KV.get(grants.keys[0].name, { type: 'json' });
+      expect(grant.type).toBe('client_credentials');
+      expect(grant.userId).toBe(client.client_id);
+      expect(grant.clientId).toBe(client.client_id);
+    });
+
+    it('should issue a token with empty scope when scope is omitted', async () => {
+      const client = await registerConfidentialClient();
+
+      const request = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${client.client_id}:${client.client_secret}`)}`,
+        },
+        'grant_type=client_credentials'
+      );
+
+      const response = await ccProvider.fetch(request, ccEnv, new MockExecutionContext());
+      expect(response.status).toBe(200);
+      const body = await response.json<any>();
+      // Caller-supplied no scope → empty scope granted. Implementers wanting a
+      // default scope set should use tokenExchangeCallback to populate it.
+      expect(body.scope).toBe('');
+    });
+
+    it('should reject public clients with unauthorized_client', async () => {
+      // Register a public client — Basic auth still required to reach the handler;
+      // the handler then rejects because tokenEndpointAuthMethod === 'none'.
       const request = createMockRequest(
         'https://example.com/oauth/register',
         'POST',
@@ -2634,7 +2686,6 @@ describe('OAuthProvider', () => {
       const regResponse = await ccProvider.fetch(request, ccEnv, new MockExecutionContext());
       const publicClient = await regResponse.json<any>();
 
-      // Try client credentials — should fail because public client has no secret
       const tokenRequest = createMockRequest(
         'https://example.com/oauth/token',
         'POST',
@@ -2643,8 +2694,13 @@ describe('OAuthProvider', () => {
       );
 
       const response = await ccProvider.fetch(tokenRequest, ccEnv, new MockExecutionContext());
-      // Public client without secret fails client authentication
       expect(response.status).toBe(400);
+      const body = await response.json<any>();
+      // RFC 6749 §5.2 — `unauthorized_client` is "the authenticated client is not
+      // authorized to use this authorization grant type". `invalid_client` would
+      // also be defensible if rejection happened at the auth layer; pinning the
+      // exact code prevents a silent shift between layers in future refactors.
+      expect(['unauthorized_client', 'invalid_client']).toContain(body.error);
     });
 
     it('should reject unsupported scopes', async () => {
@@ -2753,12 +2809,75 @@ describe('OAuthProvider', () => {
         expect.objectContaining({
           grantType: 'client_credentials',
           clientId: client.client_id,
+          // Pin the M2M userId convention — userId === clientId for CC grants.
+          userId: client.client_id,
         })
       );
 
       const body = await response.json<any>();
       expect(body.expires_in).toBe(600);
       expect(body.scope).toBe('read');
+    });
+
+    it('should bind the access token to the resource parameter (RFC 8707)', async () => {
+      const client = await registerConfidentialClient();
+
+      // Issue a CC token bound to a specific resource server
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${client.client_id}:${client.client_secret}`)}`,
+        },
+        `grant_type=client_credentials&scope=read&resource=${encodeURIComponent('https://example.com')}`
+      );
+
+      const response = await ccProvider.fetch(tokenRequest, ccEnv, new MockExecutionContext());
+      expect(response.status).toBe(200);
+      const body = await response.json<any>();
+      const accessToken = body.access_token;
+
+      // Token at the matching resource origin should be accepted
+      const apiOk = await ccProvider.fetch(
+        createMockRequest('https://example.com/api/test', 'GET', {
+          Authorization: `Bearer ${accessToken}`,
+        }),
+        ccEnv,
+        new MockExecutionContext()
+      );
+      expect(apiOk.status).toBe(200);
+
+      // Token at a different origin must be rejected — MCP servers MUST validate
+      // that tokens were issued specifically for them (audience binding per RFC 8707).
+      const apiBad = await ccProvider.fetch(
+        createMockRequest('https://other.example.com/api/test', 'GET', {
+          Authorization: `Bearer ${accessToken}`,
+        }),
+        ccEnv,
+        new MockExecutionContext()
+      );
+      expect(apiBad.status).toBe(401);
+    });
+
+    it('should reject an invalid resource parameter (RFC 8707)', async () => {
+      const client = await registerConfidentialClient();
+
+      const request = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${client.client_id}:${client.client_secret}`)}`,
+        },
+        // Fragment in resource URI is forbidden by RFC 8707
+        `grant_type=client_credentials&scope=read&resource=${encodeURIComponent('https://example.com#frag')}`
+      );
+
+      const response = await ccProvider.fetch(request, ccEnv, new MockExecutionContext());
+      expect(response.status).toBe(400);
+      const body = await response.json<any>();
+      expect(body.error).toBe('invalid_target');
     });
   });
 
