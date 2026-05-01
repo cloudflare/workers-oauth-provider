@@ -61,6 +61,50 @@ type TypedHandler<Env = Cloudflare.Env> =
  * Configuration options for the OAuth Provider
  */
 /**
+ * Registered OAuth 2.0 error codes that the `/token` endpoint may return.
+ *
+ * Union of:
+ *   - RFC 6749 §5.2 (token endpoint)
+ *   - RFC 6750 §3.1 (bearer / resource server) — included so callbacks
+ *     doing audience validation can use them
+ *   - RFC 8693 §2.2.2 (token exchange)
+ */
+export type OAuthTokenErrorCode =
+  | 'invalid_request'
+  | 'invalid_client'
+  | 'invalid_grant'
+  | 'unauthorized_client'
+  | 'unsupported_grant_type'
+  | 'invalid_scope'
+  | 'invalid_token'
+  | 'insufficient_scope'
+  | 'invalid_target'
+  | 'server_error'
+  | 'temporarily_unavailable';
+
+const OAUTH_TOKEN_ERROR_CODES: ReadonlySet<string> = new Set([
+  'invalid_request',
+  'invalid_client',
+  'invalid_grant',
+  'unauthorized_client',
+  'unsupported_grant_type',
+  'invalid_scope',
+  'invalid_token',
+  'insufficient_scope',
+  'invalid_target',
+  'server_error',
+  'temporarily_unavailable',
+]);
+
+function isOAuthTokenErrorCode(code: string): code is OAuthTokenErrorCode {
+  return OAUTH_TOKEN_ERROR_CODES.has(code);
+}
+
+function isStringRecord(value: unknown): value is Record<string, string> {
+  return !!value && typeof value === 'object' && Object.values(value).every((v) => typeof v === 'string');
+}
+
+/**
  * Result of a token exchange callback function.
  * Allows updating the props stored in both the access token and the grant.
  */
@@ -1795,18 +1839,87 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @returns Response with token data or error
    */
   private async handleTokenRequest(body: any, clientInfo: ClientInfo, env: any): Promise<Response> {
-    // Handle different grant types
-    const grantType = body.grant_type;
+    // Handle different grant types. Any `OAuthError` thrown from below
+    // (typically from `tokenExchangeCallback` or any code it calls) is
+    // converted into a structured OAuth 2.0 `/token` error response.
+    // Non-`OAuthError` exceptions are re-thrown so unexpected failures
+    // surface as `500 Internal Server Error` and stay visible.
+    try {
+      const grantType = body.grant_type;
 
-    if (grantType === GrantType.AUTHORIZATION_CODE) {
-      return this.handleAuthorizationCodeGrant(body, clientInfo, env);
-    } else if (grantType === GrantType.REFRESH_TOKEN) {
-      return this.handleRefreshTokenGrant(body, clientInfo, env);
-    } else if (grantType === GrantType.TOKEN_EXCHANGE && this.options.allowTokenExchangeGrant) {
-      return this.handleTokenExchangeGrant(body, clientInfo, env);
-    } else {
-      return this.createErrorResponse('unsupported_grant_type', 'Grant type not supported');
+      if (grantType === GrantType.AUTHORIZATION_CODE) {
+        return await this.handleAuthorizationCodeGrant(body, clientInfo, env);
+      } else if (grantType === GrantType.REFRESH_TOKEN) {
+        return await this.handleRefreshTokenGrant(body, clientInfo, env);
+      } else if (grantType === GrantType.TOKEN_EXCHANGE && this.options.allowTokenExchangeGrant) {
+        return await this.handleTokenExchangeGrant(body, clientInfo, env);
+      } else {
+        return this.createErrorResponse('unsupported_grant_type', 'Grant type not supported');
+      }
+    } catch (error) {
+      const response = this.createOAuthErrorResponse(error);
+      if (response) return response;
+      throw error;
     }
+  }
+
+  /**
+   * Build a structured OAuth `/token` error response from an OAuth error.
+   *
+   * The recommended form is throwing this package's exported `OAuthError`.
+   * To avoid forcing applications with an existing OAuthError class to
+   * catch/rethrow, we also accept real `Error` instances named `OAuthError`
+   * when they carry a registered token-endpoint `code`. Plain objects are
+   * not accepted — unexpected non-Error throws still surface as 500s.
+   *
+   * Use `headers['Retry-After']` for rate-limit / transient-failure backoff
+   * hints (see RFC 7231 §7.1.3 — either an integer seconds value or an
+   * HTTP-date is allowed).
+   */
+  private createOAuthErrorResponse(error: unknown): Response | undefined {
+    const oauthError = this.getOAuthError(error);
+    if (!oauthError) return undefined;
+    return this.createErrorResponse(oauthError.code, oauthError.description, oauthError.statusCode, oauthError.headers);
+  }
+
+  private getOAuthError(error: unknown):
+    | {
+        code: OAuthTokenErrorCode;
+        description: string;
+        statusCode: number;
+        headers?: Record<string, string>;
+      }
+    | undefined {
+    if (error instanceof OAuthError) {
+      return {
+        code: error.code,
+        description: error.description,
+        statusCode: error.statusCode,
+        headers: error.headers,
+      };
+    }
+
+    if (!(error instanceof Error) || error.name !== 'OAuthError') {
+      return undefined;
+    }
+
+    const maybeOAuthError = error as Error & {
+      code?: unknown;
+      description?: unknown;
+      statusCode?: unknown;
+      headers?: unknown;
+    };
+    if (typeof maybeOAuthError.code !== 'string' || !isOAuthTokenErrorCode(maybeOAuthError.code)) {
+      return undefined;
+    }
+
+    return {
+      code: maybeOAuthError.code,
+      description:
+        typeof maybeOAuthError.description === 'string' ? maybeOAuthError.description : maybeOAuthError.message,
+      statusCode: typeof maybeOAuthError.statusCode === 'number' ? maybeOAuthError.statusCode : 400,
+      headers: isStringRecord(maybeOAuthError.headers) ? maybeOAuthError.headers : undefined,
+    };
   }
 
   /**
@@ -2632,11 +2745,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         headers: { 'Content-Type': 'application/json' },
       });
     } catch (error) {
-      // Convert OAuthError to HTTP error response
-      if (error instanceof OAuthError) {
-        return this.createErrorResponse(error.code, error.message);
-      }
-      // Re-throw unexpected errors
+      // Convert OAuth errors into structured `/token` error responses,
+      // preserving status, description, and headers. Anything else (e.g.
+      // an unexpected runtime error from a callback) is re-thrown so it
+      // surfaces as `500 Internal Server Error` and stays visible.
+      const response = this.createOAuthErrorResponse(error);
+      if (response) return response;
       throw error;
     }
   }
@@ -3404,13 +3518,82 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
  * Error class for OAuth operations
  * Carries OAuth error code and description for proper error responses
  */
-class OAuthError extends Error {
-  constructor(
-    public code: string,
-    message: string
-  ) {
-    super(message);
+/**
+ * Options accepted by the {@link OAuthError} constructor.
+ */
+export interface OAuthErrorOptions {
+  /**
+   * HTTP status code for the error response. Defaults to `400`.
+   */
+  statusCode?: number;
+
+  /**
+   * Additional response headers.
+   *
+   * For transient failures (e.g. upstream rate limits), set
+   * `Retry-After` here so well-behaved clients back off instead of
+   * retry-storming. Per RFC 7231 §7.1.3 the value may be either a
+   * number of seconds or an HTTP-date.
+   */
+  headers?: Record<string, string>;
+}
+
+/**
+ * Structured OAuth 2.0 error.
+ *
+ * Throw from a `tokenExchangeCallback` (or any code it calls — the error
+ * propagates naturally up through deep call stacks) to surface a standard
+ * `/token` error response (`{ error, error_description }`) instead of a
+ * generic `500 Internal Server Error`.
+ *
+ * Anything thrown that is **not** an `OAuthError` continues to surface as
+ * a 500 so unexpected failures remain visible — the provider does not
+ * catch-everything-and-return-400.
+ *
+ * @example
+ * ```ts
+ * import { OAuthError } from '@cloudflare/workers-oauth-provider';
+ *
+ * tokenExchangeCallback: async (options) => {
+ *   if (options.grantType === 'refresh_token') {
+ *     // refreshUpstream() may throw OAuthError from any depth
+ *     return { newProps: await refreshUpstream(options.props) };
+ *   }
+ * }
+ *
+ * async function refreshUpstream(props) {
+ *   const res = await fetch(...);
+ *   if (res.status === 401) {
+ *     throw new OAuthError('invalid_grant', 'upstream refresh token is invalid');
+ *   }
+ *   if (res.status === 429) {
+ *     // Mirror upstream's Retry-After if present, otherwise pick a default.
+ *     throw new OAuthError('temporarily_unavailable', 'upstream rate limited', {
+ *       statusCode: 429,
+ *       headers: { 'Retry-After': res.headers.get('retry-after') ?? '60' },
+ *     });
+ *   }
+ *   return await res.json();
+ * }
+ * ```
+ */
+export class OAuthError extends Error {
+  /** OAuth 2.0 error code. */
+  public readonly code: OAuthTokenErrorCode;
+  /** Human-readable description sent in the `error_description` field. */
+  public readonly description: string;
+  /** HTTP status code for the error response. */
+  public readonly statusCode: number;
+  /** Additional response headers. */
+  public readonly headers?: Record<string, string>;
+
+  constructor(code: OAuthTokenErrorCode, description: string, options: OAuthErrorOptions = {}) {
+    super(description);
     this.name = 'OAuthError';
+    this.code = code;
+    this.description = description;
+    this.statusCode = options.statusCode ?? 400;
+    this.headers = options.headers;
   }
 }
 
