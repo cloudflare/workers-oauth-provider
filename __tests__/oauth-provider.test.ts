@@ -705,7 +705,7 @@ describe('OAuthProvider', () => {
       );
     });
 
-    it('should reject registration when callback returns reject: true', async () => {
+    it('should reject registration with RFC 7591 §3.2.2 defaults when callback returns reject: true', async () => {
       const provider = new OAuthProvider({
         apiRoute: '/api/',
         apiHandler: TestApiHandler,
@@ -734,9 +734,10 @@ describe('OAuthProvider', () => {
 
       const response = await provider.fetch(request, mockEnv, mockCtx);
 
-      expect(response.status).toBe(403);
+      // Defaults follow RFC 7591 §3.2.2: `invalid_client_metadata` / 400
+      expect(response.status).toBe(400);
       const body = await response.json<any>();
-      expect(body.error).toBe('access_denied');
+      expect(body.error).toBe('invalid_client_metadata');
       expect(body.error_description).toBe('Registration requires approval');
 
       // Verify no client was stored
@@ -814,10 +815,88 @@ describe('OAuthProvider', () => {
       expect(response.status).toBe(201);
       const registeredClient = await response.json<any>();
 
-      // Verify overrides were applied in KV
+      // Response body must reflect overrides — clients depend on this per
+      // RFC 7591 §3.2.1 to determine if registration is sufficient for use.
+      expect(registeredClient.client_name).toBe('Overridden Name');
+      expect(registeredClient.contacts).toEqual(['admin@example.com']);
+
+      // Verify overrides were also applied in KV
       const savedClient = await mockEnv.OAUTH_KV.get(`client:${registeredClient.client_id}`, { type: 'json' });
       expect(savedClient.clientName).toBe('Overridden Name');
       expect(savedClient.contacts).toEqual(['admin@example.com']);
+    });
+
+    it('should return 500 server_error when callback throws', async () => {
+      const provider = new OAuthProvider({
+        apiRoute: '/api/',
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        clientRegistrationCallback: () => {
+          throw new Error('upstream allowlist service unavailable');
+        },
+      });
+
+      const clientData = {
+        redirect_uris: ['https://client.example.com/callback'],
+        client_name: 'Test Client',
+        token_endpoint_auth_method: 'client_secret_basic',
+      };
+
+      const request = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify(clientData)
+      );
+
+      const response = await provider.fetch(request, mockEnv, mockCtx);
+
+      expect(response.status).toBe(500);
+      const body = await response.json<any>();
+      expect(body.error).toBe('server_error');
+      expect(body.error_description).toBe('upstream allowlist service unavailable');
+
+      // No client should have been stored
+      const keys = await mockEnv.OAUTH_KV.list({ prefix: 'client:' });
+      expect(keys.keys.length).toBe(0);
+    });
+
+    it('should expose request body to the callback (cloned before parsing)', async () => {
+      const seenBodies: string[] = [];
+      const provider = new OAuthProvider({
+        apiRoute: '/api/',
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        clientRegistrationCallback: async ({ request }) => {
+          // Body should be readable here even though the library has already parsed it
+          seenBodies.push(await request.text());
+        },
+      });
+
+      const clientData = {
+        redirect_uris: ['https://client.example.com/callback'],
+        client_name: 'Body Reader Client',
+        token_endpoint_auth_method: 'client_secret_basic',
+      };
+
+      const rawBody = JSON.stringify(clientData);
+      const request = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        rawBody
+      );
+
+      const response = await provider.fetch(request, mockEnv, mockCtx);
+
+      expect(response.status).toBe(201);
+      expect(seenBodies).toEqual([rawBody]);
     });
 
     it('should support async callback', async () => {
@@ -829,11 +908,15 @@ describe('OAuthProvider', () => {
         tokenEndpoint: '/oauth/token',
         clientRegistrationEndpoint: '/oauth/register',
         clientRegistrationCallback: async ({ request }) => {
-          // Simulate async validation (e.g. checking an initial access token)
+          // Simulate async validation (e.g. checking an initial access token).
+          // IAT failure is an auth problem, not a metadata problem, so we
+          // override the RFC 7591 §3.2.2 defaults to return 401/invalid_token.
           const authHeader = request.headers.get('Authorization');
           if (!authHeader || authHeader !== 'Bearer valid-initial-token') {
             return {
               reject: true,
+              rejectCode: 'invalid_token',
+              rejectStatus: 401,
               rejectDescription: 'Valid initial access token required',
             };
           }
@@ -855,7 +938,9 @@ describe('OAuthProvider', () => {
       );
 
       const rejectedResponse = await provider.fetch(rejectedRequest, mockEnv, mockCtx);
-      expect(rejectedResponse.status).toBe(403);
+      expect(rejectedResponse.status).toBe(401);
+      const rejectedBody = await rejectedResponse.json<any>();
+      expect(rejectedBody.error).toBe('invalid_token');
 
       // With valid token — should succeed
       const approvedRequest = createMockRequest(
