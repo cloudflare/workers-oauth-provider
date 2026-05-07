@@ -4218,6 +4218,255 @@ describe('OAuthProvider', () => {
     });
   });
 
+  describe('DPoP Support (RFC 9449)', () => {
+    let dpopProvider: InstanceType<typeof OAuthProvider<TestEnv>>;
+    let dpopEnv: any;
+    let clientId: string;
+    let clientSecret: string;
+    let keyPair: CryptoKeyPair;
+    const redirectUri = 'https://client.example.com/callback';
+
+    // Helper to create a DPoP proof JWT
+    async function createDpopProof(method: string, url: string, keys: CryptoKeyPair, ath?: string): Promise<string> {
+      const fullJwk = (await crypto.subtle.exportKey('jwk', keys.publicKey)) as JsonWebKey & {
+        crv?: string;
+        x?: string;
+        y?: string;
+      };
+      // Clean JWK to only include required fields (RFC 7638 canonical form)
+      const jwk = { kty: fullJwk.kty, crv: fullJwk.crv, x: fullJwk.x, y: fullJwk.y };
+      const header = { typ: 'dpop+jwt', alg: 'ES256', jwk };
+      const payload: Record<string, unknown> = {
+        jti: crypto.randomUUID(),
+        htm: method,
+        htu: url,
+        iat: Math.floor(Date.now() / 1000),
+      };
+      if (ath) payload.ath = ath;
+
+      function b64url(data: ArrayBuffer | Uint8Array): string {
+        const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) : data;
+        let binary = '';
+        for (const byte of bytes) binary += String.fromCharCode(byte);
+        return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+      }
+
+      const headerB64 = b64url(new TextEncoder().encode(JSON.stringify(header)));
+      const payloadB64 = b64url(new TextEncoder().encode(JSON.stringify(payload)));
+      const signingInput = new TextEncoder().encode(`${headerB64}.${payloadB64}`);
+      const signature = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, keys.privateKey, signingInput);
+      return `${headerB64}.${payloadB64}.${b64url(signature)}`;
+    }
+
+    // Helper to compute access token hash
+    async function computeAth(accessToken: string): Promise<string> {
+      const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(accessToken));
+      const bytes = new Uint8Array(hash);
+      let binary = '';
+      for (const byte of bytes) binary += String.fromCharCode(byte);
+      return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    }
+
+    beforeEach(async () => {
+      dpopEnv = createMockEnv();
+      dpopProvider = new OAuthProvider({
+        apiRoute: '/api/',
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        scopesSupported: ['read', 'write'],
+        allowDPoP: true,
+      });
+
+      // Generate EC key pair for DPoP proofs
+      keyPair = (await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, [
+        'sign',
+        'verify',
+      ])) as CryptoKeyPair;
+
+      // Register a confidential client
+      const regRequest = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify({
+          redirect_uris: [redirectUri],
+          client_name: 'DPoP Test Client',
+          token_endpoint_auth_method: 'client_secret_basic',
+        })
+      );
+      const regResponse = await dpopProvider.fetch(regRequest, dpopEnv, new MockExecutionContext());
+      const client = await regResponse.json<any>();
+      clientId = client.client_id;
+      clientSecret = client.client_secret;
+    });
+
+    afterEach(() => {
+      dpopEnv.OAUTH_KV.clear();
+    });
+
+    async function authorizeAndGetCode(): Promise<string> {
+      const authUrl = new URL('https://example.com/authorize');
+      authUrl.searchParams.set('response_type', 'code');
+      authUrl.searchParams.set('client_id', clientId);
+      authUrl.searchParams.set('redirect_uri', redirectUri);
+      authUrl.searchParams.set('scope', 'read');
+      const authResponse = await dpopProvider.fetch(
+        createMockRequest(authUrl.toString()),
+        dpopEnv,
+        new MockExecutionContext()
+      );
+      return new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
+    }
+
+    it('should issue a DPoP-bound token when DPoP proof is provided', async () => {
+      const code = await authorizeAndGetCode();
+      const dpopProof = await createDpopProof('POST', 'https://example.com/oauth/token', keyPair);
+
+      const request = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+          DPoP: dpopProof,
+        },
+        `grant_type=authorization_code&code=${encodeURIComponent(code)}&redirect_uri=${encodeURIComponent(redirectUri)}`
+      );
+
+      const response = await dpopProvider.fetch(request, dpopEnv, new MockExecutionContext());
+      expect(response.status).toBe(200);
+      const body = await response.json<any>();
+      expect(body.token_type).toBe('DPoP');
+      expect(body.access_token).toBeDefined();
+    });
+
+    it('should issue a bearer token when no DPoP proof is provided', async () => {
+      const code = await authorizeAndGetCode();
+
+      const request = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+        },
+        `grant_type=authorization_code&code=${encodeURIComponent(code)}&redirect_uri=${encodeURIComponent(redirectUri)}`
+      );
+
+      const response = await dpopProvider.fetch(request, dpopEnv, new MockExecutionContext());
+      expect(response.status).toBe(200);
+      const body = await response.json<any>();
+      expect(body.token_type).toBe('bearer');
+    });
+
+    it('should require DPoP proof at resource server for DPoP-bound tokens', async () => {
+      const code = await authorizeAndGetCode();
+      const dpopProof = await createDpopProof('POST', 'https://example.com/oauth/token', keyPair);
+
+      // Get DPoP-bound token
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+          DPoP: dpopProof,
+        },
+        `grant_type=authorization_code&code=${encodeURIComponent(code)}&redirect_uri=${encodeURIComponent(redirectUri)}`
+      );
+      const tokenResponse = await dpopProvider.fetch(tokenRequest, dpopEnv, new MockExecutionContext());
+      const tokens = await tokenResponse.json<any>();
+      const accessToken = tokens.access_token;
+
+      // Try to use without DPoP proof — should fail
+      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: `Bearer ${accessToken}`,
+      });
+      const apiResponse = await dpopProvider.fetch(apiRequest, dpopEnv, new MockExecutionContext());
+      expect(apiResponse.status).toBe(401);
+
+      // Bearer scheme with DPoP-bound token — should fail (RFC 9449 §7.1)
+      const ath = await computeAth(accessToken);
+      const apiDpopProof = await createDpopProof('GET', 'https://example.com/api/test', keyPair, ath);
+      const bearerWithDpop = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: `Bearer ${accessToken}`,
+        DPoP: apiDpopProof,
+      });
+      const bearerReject = await dpopProvider.fetch(bearerWithDpop, dpopEnv, new MockExecutionContext());
+      expect(bearerReject.status).toBe(401);
+
+      // DPoP scheme with valid proof — should succeed
+      const apiDpopProof2 = await createDpopProof('GET', 'https://example.com/api/test', keyPair, ath);
+      const apiRequestWithDpop = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: `DPoP ${accessToken}`,
+        DPoP: apiDpopProof2,
+      });
+      const apiResponseWithDpop = await dpopProvider.fetch(apiRequestWithDpop, dpopEnv, new MockExecutionContext());
+      expect(apiResponseWithDpop.status).toBe(200);
+    });
+
+    it('should reject DPoP proof from a different key', async () => {
+      const code = await authorizeAndGetCode();
+      const dpopProof = await createDpopProof('POST', 'https://example.com/oauth/token', keyPair);
+
+      // Get DPoP-bound token
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+          DPoP: dpopProof,
+        },
+        `grant_type=authorization_code&code=${encodeURIComponent(code)}&redirect_uri=${encodeURIComponent(redirectUri)}`
+      );
+      const tokenResponse = await dpopProvider.fetch(tokenRequest, dpopEnv, new MockExecutionContext());
+      const tokens = await tokenResponse.json<any>();
+      const accessToken = tokens.access_token;
+
+      // Generate a DIFFERENT key pair and use it for the resource request
+      const otherKeyPair = (await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, [
+        'sign',
+        'verify',
+      ])) as CryptoKeyPair;
+      const ath = await computeAth(accessToken);
+      const wrongProof = await createDpopProof('GET', 'https://example.com/api/test', otherKeyPair, ath);
+
+      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: `DPoP ${accessToken}`,
+        DPoP: wrongProof,
+      });
+      const apiResponse = await dpopProvider.fetch(apiRequest, dpopEnv, new MockExecutionContext());
+      expect(apiResponse.status).toBe(401);
+    });
+
+    it('should advertise dpop_signing_alg_values_supported in metadata', async () => {
+      const request = createMockRequest('https://example.com/.well-known/oauth-authorization-server');
+      const response = await dpopProvider.fetch(request, dpopEnv, new MockExecutionContext());
+      const metadata = await response.json<any>();
+
+      expect(metadata.dpop_signing_alg_values_supported).toEqual(['RS256', 'ES256']);
+    });
+
+    it('should not advertise DPoP in metadata when disabled', async () => {
+      const noDpopProvider = new OAuthProvider({
+        apiRoute: '/api/',
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+      });
+      const request = createMockRequest('https://example.com/.well-known/oauth-authorization-server');
+      const response = await noDpopProvider.fetch(request, dpopEnv, new MockExecutionContext());
+      const metadata = await response.json<any>();
+
+      expect(metadata.dpop_signing_alg_values_supported).toBeUndefined();
+    });
+  });
+
   describe('CORS Support', () => {
     it('should handle CORS preflight for API requests', async () => {
       const preflightRequest = createMockRequest('https://example.com/api/test', 'OPTIONS', {
