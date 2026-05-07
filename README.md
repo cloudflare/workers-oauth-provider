@@ -308,7 +308,7 @@ The `props` values are end-to-end encrypted, so they can safely contain sensitiv
 
 ### Reporting errors from the callback
 
-When the upstream OAuth provider rejects a refresh, returns a transient failure, or otherwise prevents you from completing the token exchange, throw an `OAuthError` to surface this to the client as a standard OAuth `/token` error response (`{ error, error_description }`):
+Throw `OAuthError` from `tokenExchangeCallback` to return a structured OAuth `/token` error (`{ error, error_description }`) instead of a generic 500:
 
 ```ts
 import { OAuthError, OAuthProvider } from '@cloudflare/workers-oauth-provider';
@@ -317,8 +317,6 @@ new OAuthProvider({
   // …
   tokenExchangeCallback: async (options) => {
     if (options.grantType === 'refresh_token') {
-      // `refreshUpstream` may throw `OAuthError` from any depth — the
-      // provider catches it and returns a structured /token response.
       return { newProps: await refreshUpstream(options.props) };
     }
   },
@@ -326,34 +324,33 @@ new OAuthProvider({
 
 async function refreshUpstream(props) {
   const res = await fetch(/* upstream token endpoint */);
+
   if (res.status === 401) {
     throw new OAuthError('invalid_grant', {
       description: 'upstream refresh token is invalid',
     });
   }
+
   if (res.status === 429) {
-    // Mirror the upstream's Retry-After if it sent one, otherwise pick
-    // a sensible default. RFC 7231 §7.1.3 allows seconds or HTTP-date.
     throw new OAuthError('temporarily_unavailable', {
       description: 'upstream rate limited',
       statusCode: 429,
       headers: { 'Retry-After': res.headers.get('retry-after') ?? '60' },
     });
   }
+
   return await res.json();
 }
 ```
 
-Throwing is the only way to signal an OAuth error from a callback — errors propagate naturally up through deep call stacks, so you don't have to plumb result objects back through every helper. If your application already has its own `OAuthError` class, you don't need to catch and rethrow this package's exact class: real `Error` instances named `OAuthError` with a string `code` are also converted into structured responses.
-
 `OAuthError(code, options)` takes:
 
-- `code` (positional, required) — the OAuth error code returned in the `error` field. For standard OAuth 2.0 token-endpoint error codes, this package exports the `OAuthTokenErrorCode` type (`invalid_request`, `invalid_client`, `invalid_grant`, `unauthorized_client`, `unsupported_grant_type`, `invalid_scope`, `invalid_token`, `insufficient_scope`, `invalid_target`, `server_error`, `temporarily_unavailable`).
+- `code` — OAuth error code returned in the `error` field. This may be a standard code (`OAuthTokenErrorCode`) or an application-defined string.
 - `options.description` — human-readable text returned in `error_description`.
 - `options.statusCode` — HTTP status code (default `400`).
-- `options.headers` — additional response headers. Set `Retry-After` here for transient failures (e.g. 429 rate limits) to ask clients to back off; per RFC 7231 §7.1.3 the value may be either a number of seconds or an HTTP-date. There is no implicit default — if you don't set it, no `Retry-After` is sent.
+- `options.headers` — additional response headers, such as `Retry-After` for transient failures. There is no implicit `Retry-After` default for callback-thrown errors.
 
-This package's `OAuthError` class is the recommended form. Existing application-specific OAuth error classes also work if they throw a real `Error` with `name === 'OAuthError'`, a string `code`, and optional `description` / `statusCode` / `headers` fields. Anything else thrown — plain `Error`, plain objects with a `code` field, etc. — continues to surface as `500 Internal Server Error` so unexpected failures stay visible. The provider does **not** catch-everything-and-return-400.
+Only `OAuthError` from this package is converted into a structured `/token` response. Plain errors, plain objects with a `code` field, and app-local error classes continue to surface as 500s so unexpected failures stay visible. Import `OAuthError` from `@cloudflare/workers-oauth-provider` rather than copying or re-implementing it.
 
 ## Custom Error Responses
 

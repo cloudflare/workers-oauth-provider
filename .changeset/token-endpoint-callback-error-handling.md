@@ -3,7 +3,7 @@
 ---
 
 Convert `OAuthError` thrown from `tokenExchangeCallback` into structured
-`/token` responses.
+`/token` responses and convert token storage KV rate limits into retryable OAuth errors.
 
 Previously, an error thrown from `tokenExchangeCallback` during the
 `authorization_code` or `refresh_token` grant flows would bubble up as an
@@ -14,7 +14,10 @@ clients to keep retrying with the same dead refresh token, producing
 The provider now catches `OAuthError` thrown from the callback (or any code
 it calls — errors propagate naturally up through deep call stacks) and
 returns a standard `{ error, error_description }` response with the supplied
-status code and headers.
+status code and headers. KV `429 Too Many Requests` write failures while issuing
+tokens are also returned as `temporarily_unavailable` with `Retry-After: 30`,
+so transient storage pressure does not leak Worker `500` responses from the
+token endpoint.
 
 ```ts
 import { OAuthError } from '@cloudflare/workers-oauth-provider';
@@ -56,13 +59,10 @@ async function refreshUpstream(props) {
   §7.1.3 the value may be either seconds or an HTTP-date. No implicit
   default — if you don't set it, no `Retry-After` is sent.
 
-This package's `OAuthError` class is the recommended form. Existing
-application-specific OAuth error classes also work if they throw a real
-`Error` with `name === 'OAuthError'`, a string `code`, and optional
-`description` / `statusCode` / `headers` fields. Anything else — plain
-`Error`, plain objects with a `code` field, etc. — continues to surface as
-`500 Internal Server Error` so unexpected failures stay visible. The
-provider does not
+Throwing this package's `OAuthError` class is the supported form. Anything
+else — plain `Error`, plain objects with a `code` field, app-local OAuth
+error classes, etc. — continues to surface as `500 Internal Server Error`
+so unexpected failures stay visible. The provider does not
 catch-everything-and-return-400.
 
 The exported `OAuthError` class supersedes the previously-internal one: the
