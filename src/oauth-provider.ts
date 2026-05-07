@@ -82,24 +82,6 @@ export type OAuthTokenErrorCode =
   | 'server_error'
   | 'temporarily_unavailable';
 
-const OAUTH_TOKEN_ERROR_CODES: ReadonlySet<string> = new Set([
-  'invalid_request',
-  'invalid_client',
-  'invalid_grant',
-  'unauthorized_client',
-  'unsupported_grant_type',
-  'invalid_scope',
-  'invalid_token',
-  'insufficient_scope',
-  'invalid_target',
-  'server_error',
-  'temporarily_unavailable',
-]);
-
-function isOAuthTokenErrorCode(code: string): code is OAuthTokenErrorCode {
-  return OAUTH_TOKEN_ERROR_CODES.has(code);
-}
-
 function isStringRecord(value: unknown): value is Record<string, string> {
   return !!value && typeof value === 'object' && Object.values(value).every((v) => typeof v === 'string');
 }
@@ -1869,8 +1851,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * The recommended form is throwing this package's exported `OAuthError`.
    * To avoid forcing applications with an existing OAuthError class to
    * catch/rethrow, we also accept real `Error` instances named `OAuthError`
-   * when they carry a registered token-endpoint `code`. Plain objects are
-   * not accepted — unexpected non-Error throws still surface as 500s.
+   * when they carry a string `code`. Plain objects are not accepted —
+   * unexpected non-Error throws still surface as 500s.
    *
    * Use `headers['Retry-After']` for rate-limit / transient-failure backoff
    * hints (see RFC 7231 §7.1.3 — either an integer seconds value or an
@@ -1884,7 +1866,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
   private getOAuthError(error: unknown):
     | {
-        code: OAuthTokenErrorCode;
+        code: string;
         description: string;
         statusCode: number;
         headers?: Record<string, string>;
@@ -1909,7 +1891,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       statusCode?: unknown;
       headers?: unknown;
     };
-    if (typeof maybeOAuthError.code !== 'string' || !isOAuthTokenErrorCode(maybeOAuthError.code)) {
+    if (typeof maybeOAuthError.code !== 'string') {
       return undefined;
     }
 
@@ -3586,7 +3568,7 @@ export interface OAuthErrorOptions {
  */
 export class OAuthError extends Error {
   /** OAuth 2.0 error code. */
-  public readonly code: OAuthTokenErrorCode;
+  public readonly code: string;
   /** Human-readable description sent in the `error_description` field. */
   public readonly description: string;
   /** HTTP status code for the error response. */
@@ -3594,14 +3576,7 @@ export class OAuthError extends Error {
   /** Additional response headers. */
   public readonly headers?: Record<string, string>;
 
-  constructor(code: OAuthTokenErrorCode, options: OAuthErrorOptions) {
-    if (!isOAuthTokenErrorCode(code)) {
-      throw new TypeError(`Unsupported OAuth /token error code: ${code}`);
-    }
-    if (!options || typeof options.description !== 'string') {
-      throw new TypeError('OAuthError options.description must be a string');
-    }
-
+  constructor(code: string, options: OAuthErrorOptions) {
     super(options.description);
     this.name = 'OAuthError';
     this.code = code;

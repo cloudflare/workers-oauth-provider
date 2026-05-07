@@ -5914,19 +5914,11 @@ describe('OAuthProvider', () => {
       });
     });
 
-    it('rejects unregistered codes in the exported OAuthError class', () => {
-      // OAuth error codes are standardized/registered; callers should
-      // not mint arbitrary client-facing values.
-      expect(() => new OAuthError('access_denied' as any, { description: 'not a token endpoint error' })).toThrow(
-        'Unsupported OAuth /token error code: access_denied'
-      );
-    });
-
     it('converts user-defined OAuthError classes into structured responses', async () => {
       // Existing apps may already have their own OAuthError class. As
-      // long as they throw a real Error named OAuthError with a
-      // registered token-endpoint code, they should not have to catch
-      // and rethrow this package's exact class.
+      // long as they throw a real Error named OAuthError with a string
+      // code, they should not have to catch and rethrow this package's
+      // exact class.
       class LocalOAuthError extends Error {
         name = 'OAuthError';
         constructor(
@@ -5959,7 +5951,7 @@ describe('OAuthProvider', () => {
       });
     });
 
-    it('lets named OAuthError throws with non-token-endpoint codes surface as 500', async () => {
+    it('converts named OAuthError throws with custom codes into structured responses', async () => {
       class LocalOAuthError extends Error {
         name = 'OAuthError';
         constructor(
@@ -5980,7 +5972,12 @@ describe('OAuthProvider', () => {
       await registerClient(provider);
       const { refreshToken } = await getRefreshToken(provider);
 
-      await expect(refreshWithToken(provider, refreshToken)).rejects.toThrow('not a token endpoint error');
+      const response = await refreshWithToken(provider, refreshToken);
+      expect(response.status).toBe(403);
+      await expect(response.json()).resolves.toEqual({
+        error: 'access_denied',
+        error_description: 'not a token endpoint error',
+      });
     });
 
     it('lets non-OAuthError throws surface as 500 (does not swallow real bugs)', async () => {

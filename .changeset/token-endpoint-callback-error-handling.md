@@ -46,8 +46,9 @@ async function refreshUpstream(props) {
 
 `OAuthError(code, options)` takes:
 
-- `code` (positional, required) — must be one of the registered OAuth
-  `/token` error codes supported by this package.
+- `code` (positional, required) — the OAuth error code returned in the
+  `error` field. For standard codes, this package exports the
+  `OAuthTokenErrorCode` type.
 - `options.description` — human-readable text returned in `error_description`.
 - `options.statusCode` — HTTP status code (default `400`).
 - `options.headers` — additional response headers. Set `Retry-After` here
@@ -57,11 +58,11 @@ async function refreshUpstream(props) {
 
 This package's `OAuthError` class is the recommended form. Existing
 application-specific OAuth error classes also work if they throw a real
-`Error` with `name === 'OAuthError'`, a registered token-endpoint `code`,
-and optional `description` / `statusCode` / `headers` fields. Anything
-else — plain `Error`, plain objects with a `code` field, OAuth errors with
-non-token-endpoint codes, etc. — continues to surface as `500 Internal
-Server Error` so unexpected failures stay visible. The provider does not
+`Error` with `name === 'OAuthError'`, a string `code`, and optional
+`description` / `statusCode` / `headers` fields. Anything else — plain
+`Error`, plain objects with a `code` field, etc. — continues to surface as
+`500 Internal Server Error` so unexpected failures stay visible. The
+provider does not
 catch-everything-and-return-400.
 
 The exported `OAuthError` class supersedes the previously-internal one: the

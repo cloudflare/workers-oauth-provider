@@ -344,16 +344,16 @@ async function refreshUpstream(props) {
 }
 ```
 
-Throwing is the only way to signal an OAuth error from a callback — errors propagate naturally up through deep call stacks, so you don't have to plumb result objects back through every helper. If your application already has its own `OAuthError` class, you don't need to catch and rethrow this package's exact class: real `Error` instances named `OAuthError` with a registered token-endpoint `code` are also converted into structured responses.
+Throwing is the only way to signal an OAuth error from a callback — errors propagate naturally up through deep call stacks, so you don't have to plumb result objects back through every helper. If your application already has its own `OAuthError` class, you don't need to catch and rethrow this package's exact class: real `Error` instances named `OAuthError` with a string `code` are also converted into structured responses.
 
 `OAuthError(code, options)` takes:
 
-- `code` (positional, required) — one of the registered OAuth 2.0 token-endpoint error codes (`invalid_request`, `invalid_client`, `invalid_grant`, `unauthorized_client`, `unsupported_grant_type`, `invalid_scope`, `invalid_token`, `insufficient_scope`, `invalid_target`, `server_error`, `temporarily_unavailable`). Enforced at compile time via the exported `OAuthTokenErrorCode` type and validated at runtime.
+- `code` (positional, required) — the OAuth error code returned in the `error` field. For standard OAuth 2.0 token-endpoint error codes, this package exports the `OAuthTokenErrorCode` type (`invalid_request`, `invalid_client`, `invalid_grant`, `unauthorized_client`, `unsupported_grant_type`, `invalid_scope`, `invalid_token`, `insufficient_scope`, `invalid_target`, `server_error`, `temporarily_unavailable`).
 - `options.description` — human-readable text returned in `error_description`.
 - `options.statusCode` — HTTP status code (default `400`).
 - `options.headers` — additional response headers. Set `Retry-After` here for transient failures (e.g. 429 rate limits) to ask clients to back off; per RFC 7231 §7.1.3 the value may be either a number of seconds or an HTTP-date. There is no implicit default — if you don't set it, no `Retry-After` is sent.
 
-This package's `OAuthError` class is the recommended form. Existing application-specific OAuth error classes also work if they throw a real `Error` with `name === 'OAuthError'`, a registered token-endpoint `code`, and optional `description` / `statusCode` / `headers` fields. Anything else thrown — plain `Error`, plain objects with a `code` field, OAuth errors with non-token-endpoint codes, etc. — continues to surface as `500 Internal Server Error` so unexpected failures stay visible. The provider does **not** catch-everything-and-return-400.
+This package's `OAuthError` class is the recommended form. Existing application-specific OAuth error classes also work if they throw a real `Error` with `name === 'OAuthError'`, a string `code`, and optional `description` / `statusCode` / `headers` fields. Anything else thrown — plain `Error`, plain objects with a `code` field, etc. — continues to surface as `500 Internal Server Error` so unexpected failures stay visible. The provider does **not** catch-everything-and-return-400.
 
 ## Custom Error Responses
 
