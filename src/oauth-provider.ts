@@ -140,6 +140,56 @@ export interface TokenExchangeCallbackOptions {
 }
 
 /**
+ * Options for the client registration callback (RFC 7591).
+ */
+export interface ClientRegistrationCallbackOptions {
+  /**
+   * Parsed client metadata from the registration request body.
+   *
+   * Note: This is the raw JSON body. RFC 7591 §3.1.1 `software_statement` claims
+   * are NOT currently merged in by the library — if `software_statement` is present
+   * the callback is responsible for verifying the JWT and applying its claims.
+   */
+  clientMetadata: Record<string, unknown>;
+  /**
+   * A clone of the registration HTTP request. The body has not been consumed,
+   * so the callback may call `request.text()` / `request.json()` if needed
+   * (e.g. to validate a signature over the raw body).
+   */
+  request: Request;
+}
+
+/**
+ * Result of the client registration callback.
+ */
+export interface ClientRegistrationCallbackResult {
+  /**
+   * Override non-security-critical client metadata fields (allowlist).
+   * Security fields (clientId, clientSecret, redirectUris, tokenEndpointAuthMethod,
+   * registrationDate, grantTypes, responseTypes) cannot be overridden.
+   */
+  clientMetadataOverrides?: Partial<
+    Pick<ClientInfo, 'clientName' | 'logoUri' | 'clientUri' | 'policyUri' | 'tosUri' | 'jwksUri' | 'contacts'>
+  >;
+  /** Set true to reject the registration. */
+  reject?: boolean;
+  /**
+   * OAuth error code when rejecting. Defaults to `invalid_client_metadata`
+   * (RFC 7591 §3.2.2). For non-metadata rejections (e.g. missing initial access
+   * token, untrusted origin), set this to a more specific code such as
+   * `access_denied` or `invalid_token`.
+   */
+  rejectCode?: string;
+  /** Error description when rejecting. */
+  rejectDescription?: string;
+  /**
+   * HTTP status code when rejecting. Defaults to 400 (RFC 7591 §3.2.2). Override
+   * for auth-style failures (e.g. 401 for missing IAT, 403 for policy denial).
+   */
+  rejectStatus?: number;
+}
+
+/**
  * Input parameters for the resolveExternalToken callback function
  */
 export interface ResolveExternalTokenInput {
@@ -299,6 +349,14 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
    * Defaults to false.
    */
   disallowPublicClientRegistration?: boolean;
+
+  /**
+   * Called during DCR (RFC 7591) before the client is stored. Return `{ reject: true }` to
+   * deny, `{ clientMetadataOverrides }` to modify, or void to allow.
+   */
+  clientRegistrationCallback?: (
+    options: ClientRegistrationCallbackOptions
+  ) => Promise<ClientRegistrationCallbackResult | void> | ClientRegistrationCallbackResult | void;
 
   /**
    * Optional callback function that is called during token exchange.
@@ -2760,6 +2818,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       return this.createErrorResponse('invalid_request', 'Request payload too large, must be under 1 MiB', 413);
     }
 
+    // Clone before reading the body so a downstream clientRegistrationCallback
+    // can still consume it (e.g. to verify a signature over the raw bytes).
+    const callbackRequest = request.clone();
+
     // Parse client metadata with a size limitation
     let clientMetadata;
     try {
@@ -2837,6 +2899,55 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         'invalid_client_metadata',
         error instanceof Error ? error.message : 'Invalid client metadata'
       );
+    }
+
+    if (this.options.clientRegistrationCallback) {
+      // Note: RFC 7591 §3.1.1 `software_statement` claims are not processed by
+      // this library. If the request body includes a `software_statement` JWT,
+      // the callback is responsible for verifying its signature and applying
+      // its claims (which per §2 MUST take precedence over plain JSON values).
+      let callbackResult;
+      try {
+        callbackResult = await Promise.resolve(
+          this.options.clientRegistrationCallback({ clientMetadata, request: callbackRequest })
+        );
+      } catch (error) {
+        return this.createErrorResponse(
+          'server_error',
+          error instanceof Error ? error.message : 'Client registration callback failed',
+          500
+        );
+      }
+
+      if (callbackResult?.reject) {
+        // Default to RFC 7591 §3.2.2 — `invalid_client_metadata` / 400. Callbacks
+        // rejecting for non-metadata reasons (missing IAT, policy denial) should
+        // override `rejectCode` / `rejectStatus` explicitly.
+        return this.createErrorResponse(
+          callbackResult.rejectCode || 'invalid_client_metadata',
+          callbackResult.rejectDescription || 'Client registration denied',
+          callbackResult.rejectStatus ?? 400
+        );
+      }
+
+      if (callbackResult?.clientMetadataOverrides) {
+        // Runtime allowlist (defense in depth — matches the Pick<> type constraint)
+        const ALLOWED_OVERRIDE_KEYS = [
+          'clientName',
+          'logoUri',
+          'clientUri',
+          'policyUri',
+          'tosUri',
+          'jwksUri',
+          'contacts',
+        ] as const;
+        const overrides = callbackResult.clientMetadataOverrides;
+        for (const key of ALLOWED_OVERRIDE_KEYS) {
+          if (key in overrides) {
+            (clientInfo as any)[key] = (overrides as any)[key];
+          }
+        }
+      }
     }
 
     // Store client info with optional TTL for DCR clients
