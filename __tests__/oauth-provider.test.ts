@@ -6287,6 +6287,212 @@ describe('OAuthProvider', () => {
     });
   });
 
+  describe('Token Introspection (RFC 7662)', () => {
+    let introProvider: InstanceType<typeof OAuthProvider<TestEnv>>;
+    let introEnv: any;
+    let clientId: string;
+    let clientSecret: string;
+    const redirectUri = 'https://client.example.com/callback';
+
+    beforeEach(async () => {
+      introEnv = createMockEnv();
+      introProvider = new OAuthProvider({
+        apiRoute: '/api/',
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        introspectionEndpoint: '/oauth/introspect',
+        scopesSupported: ['read', 'write'],
+      });
+
+      // Register a confidential client
+      const regRequest = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify({
+          redirect_uris: [redirectUri],
+          client_name: 'Introspection Test Client',
+          token_endpoint_auth_method: 'client_secret_basic',
+        })
+      );
+      const regResponse = await introProvider.fetch(regRequest, introEnv, new MockExecutionContext());
+      const client = await regResponse.json<any>();
+      clientId = client.client_id;
+      clientSecret = client.client_secret;
+    });
+
+    afterEach(() => {
+      introEnv.OAUTH_KV.clear();
+    });
+
+    async function getAccessToken(): Promise<string> {
+      // Authorize
+      const authUrl = new URL('https://example.com/authorize');
+      authUrl.searchParams.set('response_type', 'code');
+      authUrl.searchParams.set('client_id', clientId);
+      authUrl.searchParams.set('redirect_uri', redirectUri);
+      authUrl.searchParams.set('scope', 'read write');
+      const authResponse = await introProvider.fetch(
+        createMockRequest(authUrl.toString()),
+        introEnv,
+        new MockExecutionContext()
+      );
+      const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
+
+      // Exchange
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+        },
+        `grant_type=authorization_code&code=${encodeURIComponent(code)}&redirect_uri=${encodeURIComponent(redirectUri)}`
+      );
+      const tokenResponse = await introProvider.fetch(tokenRequest, introEnv, new MockExecutionContext());
+      const tokens = await tokenResponse.json<any>();
+      return tokens.access_token;
+    }
+
+    it('should return active:true for a valid token', async () => {
+      const accessToken = await getAccessToken();
+
+      const request = createMockRequest(
+        'https://example.com/oauth/introspect',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+        },
+        `token=${encodeURIComponent(accessToken)}`
+      );
+
+      const response = await introProvider.fetch(request, introEnv, new MockExecutionContext());
+      expect(response.status).toBe(200);
+      expect(response.headers.get('Cache-Control')).toBe('no-store');
+
+      const body = await response.json<any>();
+      expect(body.active).toBe(true);
+      expect(body.iss).toBe('https://example.com');
+      expect(body.client_id).toBe(clientId);
+      expect(body.token_type).toBe('bearer');
+      expect(body.sub).toBeDefined();
+      expect(body.exp).toBeDefined();
+      expect(body.iat).toBeDefined();
+      expect(body.scope).toBe('read write');
+    });
+
+    it('should return active:false for an invalid token', async () => {
+      const request = createMockRequest(
+        'https://example.com/oauth/introspect',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+        },
+        'token=invalid:token:value'
+      );
+
+      const response = await introProvider.fetch(request, introEnv, new MockExecutionContext());
+      expect(response.status).toBe(200);
+
+      const body = await response.json<any>();
+      expect(body.active).toBe(false);
+    });
+
+    it('should reject public clients', async () => {
+      // Register a public client
+      const pubRegReq = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify({
+          redirect_uris: ['https://spa.example.com/callback'],
+          client_name: 'Public Client',
+          token_endpoint_auth_method: 'none',
+        })
+      );
+      const pubRegRes = await introProvider.fetch(pubRegReq, introEnv, new MockExecutionContext());
+      const pubClient = await pubRegRes.json<any>();
+
+      const request = createMockRequest(
+        'https://example.com/oauth/introspect',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        `token=some:token:value&client_id=${pubClient.client_id}`
+      );
+
+      const response = await introProvider.fetch(request, introEnv, new MockExecutionContext());
+      expect(response.status).toBe(401);
+    });
+
+    it('should require the token parameter', async () => {
+      const request = createMockRequest(
+        'https://example.com/oauth/introspect',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+        },
+        'not_a_token=foo'
+      );
+
+      const response = await introProvider.fetch(request, introEnv, new MockExecutionContext());
+      expect(response.status).toBe(400);
+      const body = await response.json<any>();
+      expect(body.error).toBe('invalid_request');
+    });
+
+    it('should return active:false when a different client introspects the token', async () => {
+      const accessToken = await getAccessToken();
+
+      // Register a different confidential client
+      const otherRegReq = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify({
+          redirect_uris: ['https://other.example.com/callback'],
+          client_name: 'Other Client',
+          token_endpoint_auth_method: 'client_secret_basic',
+        })
+      );
+      const otherRegRes = await introProvider.fetch(otherRegReq, introEnv, new MockExecutionContext());
+      const otherClient = await otherRegRes.json<any>();
+
+      const request = createMockRequest(
+        'https://example.com/oauth/introspect',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${otherClient.client_id}:${otherClient.client_secret}`)}`,
+        },
+        `token=${encodeURIComponent(accessToken)}`
+      );
+
+      const response = await introProvider.fetch(request, introEnv, new MockExecutionContext());
+      expect(response.status).toBe(200);
+      const body = await response.json<any>();
+      // RFC 7662 §2.1: tokens not issued to the requesting client report as inactive
+      expect(body.active).toBe(false);
+    });
+
+    it('should advertise introspection_endpoint in metadata', async () => {
+      const request = createMockRequest('https://example.com/.well-known/oauth-authorization-server');
+      const response = await introProvider.fetch(request, introEnv, new MockExecutionContext());
+      const metadata = await response.json<any>();
+
+      expect(metadata.introspection_endpoint).toBe('https://example.com/oauth/introspect');
+      expect(metadata.introspection_endpoint_auth_methods_supported).toEqual([
+        'client_secret_basic',
+        'client_secret_post',
+      ]);
+    });
+  });
+
   describe('Client ID Metadata Document (CIMD)', () => {
     let originalFetch: typeof globalThis.fetch;
     let originalCloudflare: Cloudflare | undefined;
