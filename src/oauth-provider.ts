@@ -30,6 +30,7 @@ export enum GrantType {
   AUTHORIZATION_CODE = 'authorization_code',
   REFRESH_TOKEN = 'refresh_token',
   TOKEN_EXCHANGE = 'urn:ietf:params:oauth:grant-type:token-exchange',
+  CLIENT_CREDENTIALS = 'client_credentials',
 }
 
 /** ExecutionContext with writable props — ctx.props is read-only in types but writable at runtime */
@@ -291,6 +292,34 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
    * Defaults to false.
    */
   allowTokenExchangeGrant?: boolean;
+
+  /**
+   * Enable client_credentials grant for M2M auth (RFC 6749 §4.4). Defaults to false.
+   *
+   * When enabled, confidential clients can request access tokens via:
+   *   POST /oauth/token
+   *   Authorization: Basic <client_id:client_secret>
+   *   Content-Type: application/x-www-form-urlencoded
+   *
+   *   grant_type=client_credentials&scope=...&resource=...
+   *
+   * No refresh token is issued (RFC 6749 §4.4.3). Public clients are rejected.
+   *
+   * **Grant identification**: M2M grants are stored with `userId === clientId`
+   * and `type: GrantType.CLIENT_CREDENTIALS`. API handlers should detect M2M via
+   * `props.clientId` and/or the grant's `type` field rather than by inspecting
+   * `userId`.
+   *
+   * **Audience binding**: callbacks may pass `resource` (RFC 8707) to bind the
+   * token to a specific resource server. For MCP-targeting deployments, this is
+   * required: per the MCP authorization spec, MCP servers MUST validate that
+   * tokens were issued specifically for them.
+   *
+   * **`tokenExchangeCallback`** fires for client_credentials with
+   * `grantType: 'client_credentials'`, allowing the implementer to override
+   * scope, TTL, or props.
+   */
+  allowClientCredentialsGrant?: boolean;
 
   /**
    * Controls whether public clients (clients without a secret, like SPAs) can register via the
@@ -701,12 +730,24 @@ export interface Grant {
   id: string;
 
   /**
+   * Grant type that produced this record. When absent, treat as
+   * `authorization_code` for backward compatibility with grants written
+   * before this field existed. Used by the library and API handlers to
+   * distinguish user-driven grants from machine-to-machine
+   * (`client_credentials`) grants.
+   */
+  type?: GrantType;
+
+  /**
    * Client that received this grant
    */
   clientId: string;
 
   /**
-   * User who authorized this grant
+   * The principal the grant authorizes. For user-driven grants this is the
+   * application-supplied user identifier. For `client_credentials` grants
+   * (M2M) this equals `clientId` — the client itself is the principal —
+   * and `type` is set to `GrantType.CLIENT_CREDENTIALS` to distinguish it.
    */
   userId: string;
 
@@ -1717,9 +1758,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     // Determine supported grant types
-    const grantTypesSupported = [GrantType.AUTHORIZATION_CODE, GrantType.REFRESH_TOKEN];
+    const grantTypesSupported: string[] = [GrantType.AUTHORIZATION_CODE, GrantType.REFRESH_TOKEN];
     if (this.options.allowTokenExchangeGrant) {
       grantTypesSupported.push(GrantType.TOKEN_EXCHANGE);
+    }
+    if (this.options.allowClientCredentialsGrant) {
+      grantTypesSupported.push(GrantType.CLIENT_CREDENTIALS);
     }
 
     const metadata = {
@@ -1804,6 +1848,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       return this.handleRefreshTokenGrant(body, clientInfo, env);
     } else if (grantType === GrantType.TOKEN_EXCHANGE && this.options.allowTokenExchangeGrant) {
       return this.handleTokenExchangeGrant(body, clientInfo, env);
+    } else if (grantType === GrantType.CLIENT_CREDENTIALS && this.options.allowClientCredentialsGrant) {
+      return this.handleClientCredentialsGrant(body, clientInfo, env);
     } else {
       return this.createErrorResponse('unsupported_grant_type', 'Grant type not supported');
     }
@@ -2641,6 +2687,142 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
   }
 
+  /** Client credentials grant (RFC 6749 §4.4). Confidential clients only, no refresh token. */
+  private async handleClientCredentialsGrant(body: any, clientInfo: ClientInfo, env: any): Promise<Response> {
+    // Client credentials grant requires a confidential client (RFC 6749 §4.4.2)
+    if (clientInfo.tokenEndpointAuthMethod === 'none') {
+      return this.createErrorResponse('unauthorized_client', 'Client credentials grant requires a confidential client');
+    }
+
+    // Parse and validate scope parameter
+    const requestedScope = body.scope ? body.scope.split(' ').filter(Boolean) : [];
+
+    // If scopes_supported is configured, validate requested scopes against it
+    let grantedScope = requestedScope;
+    if (this.options.scopesSupported && requestedScope.length > 0) {
+      for (const scope of requestedScope) {
+        if (!this.options.scopesSupported.includes(scope)) {
+          return this.createErrorResponse('invalid_scope', `Unsupported scope: ${scope}`);
+        }
+      }
+    }
+
+    // Parse and validate resource parameter (RFC 8707) if provided
+    let audience: string | string[] | undefined;
+    if (body.resource) {
+      const parsedResource = parseResourceParameter(body.resource);
+      if (!parsedResource) {
+        return this.createErrorResponse(
+          'invalid_target',
+          'The resource parameter must be a valid absolute URI without a fragment'
+        );
+      }
+      audience = parsedResource;
+    }
+
+    // For client_credentials grants, the client *is* the principal — there is
+    // no resource owner. Using `clientId` as the userId is collision-safe in
+    // practice (clientIds are 16 random chars from the library's alphabet,
+    // ~2^95 entropy), and the explicit `type: CLIENT_CREDENTIALS` field on the
+    // grant lets API handlers and library code discriminate M2M grants
+    // structurally instead of via userId-prefix string matching.
+    const userId = clientInfo.clientId;
+    const grantId = generateRandomString(32);
+
+    // Create fresh encrypted props for this grant
+    const props = { clientId: clientInfo.clientId };
+    const { encryptedData: encryptedProps, key: encryptionKey } = await encryptProps(props);
+
+    // Determine TTL
+    let accessTokenTTL = this.options.accessTokenTTL ?? DEFAULT_ACCESS_TOKEN_TTL;
+
+    // tokenExchangeCallback also fires for client_credentials (grantType distinguishes them)
+    let accessTokenEncryptionKey = encryptionKey;
+    let encryptedAccessTokenProps = encryptedProps;
+
+    if (this.options.tokenExchangeCallback) {
+      const callbackOptions: TokenExchangeCallbackOptions = {
+        grantType: GrantType.CLIENT_CREDENTIALS,
+        clientId: clientInfo.clientId,
+        userId,
+        scope: grantedScope,
+        requestedScope: grantedScope,
+        props,
+      };
+
+      const callbackResult = await Promise.resolve(this.options.tokenExchangeCallback(callbackOptions));
+
+      if (callbackResult) {
+        if (callbackResult.accessTokenTTL !== undefined) {
+          accessTokenTTL = callbackResult.accessTokenTTL;
+        }
+
+        if (callbackResult.accessTokenScope) {
+          grantedScope = callbackResult.accessTokenScope;
+        }
+
+        // Re-encrypt props if callback changed them
+        const newProps = callbackResult.accessTokenProps ?? callbackResult.newProps;
+        if (newProps) {
+          const tokenResult = await encryptProps(newProps);
+          encryptedAccessTokenProps = tokenResult.encryptedData;
+          accessTokenEncryptionKey = tokenResult.key;
+        }
+      }
+    }
+
+    // Store the grant (short-lived, matching the access token TTL since no refresh)
+    const now = Math.floor(Date.now() / 1000);
+    const grantData: Grant = {
+      id: grantId,
+      type: GrantType.CLIENT_CREDENTIALS,
+      clientId: clientInfo.clientId,
+      userId,
+      scope: grantedScope,
+      // M2M grants have no user-supplied metadata (no redirectUri / codeVerifier / etc.)
+      metadata: {},
+      encryptedProps,
+      createdAt: now,
+      expiresAt: now + accessTokenTTL,
+    };
+
+    await env.OAUTH_KV.put(`grant:${userId}:${grantId}`, JSON.stringify(grantData), {
+      expirationTtl: accessTokenTTL,
+    });
+
+    // Create access token
+    const accessToken = await this.createAccessToken({
+      userId,
+      grantId,
+      clientId: clientInfo.clientId,
+      scope: grantedScope,
+      encryptedProps: encryptedAccessTokenProps,
+      encryptionKey: accessTokenEncryptionKey,
+      expiresIn: accessTokenTTL,
+      audience,
+      env,
+    });
+
+    // Build response — no refresh token per RFC 6749 §4.4.3
+    const tokenResponse: TokenResponse = {
+      access_token: accessToken,
+      token_type: 'bearer',
+      expires_in: accessTokenTTL,
+      scope: grantedScope.join(' '),
+    };
+
+    // RFC 6749 §5.1: token responses MUST set both `Cache-Control: no-store`
+    // and `Pragma: no-cache` to prevent intermediary caching of credentials.
+    return new Response(JSON.stringify(tokenResponse), {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/json',
+        'Cache-Control': 'no-store',
+        Pragma: 'no-cache',
+      },
+    });
+  }
+
   /**
    * Handles OAuth 2.0 token revocation requests (RFC 7009)
    * @param body - The parsed request body containing revocation parameters
@@ -2822,6 +3004,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
           GrantType.AUTHORIZATION_CODE,
           GrantType.REFRESH_TOKEN,
           ...(this.options.allowTokenExchangeGrant ? [GrantType.TOKEN_EXCHANGE] : []),
+          ...(this.options.allowClientCredentialsGrant ? [GrantType.CLIENT_CREDENTIALS] : []),
         ],
         responseTypes: OAuthProviderImpl.validateStringArray(clientMetadata.response_types) || ['code'],
         registrationDate: Math.floor(Date.now() / 1000),
@@ -4184,6 +4367,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
         GrantType.AUTHORIZATION_CODE,
         GrantType.REFRESH_TOKEN,
         ...(this.provider.options.allowTokenExchangeGrant ? [GrantType.TOKEN_EXCHANGE] : []),
+        ...(this.provider.options.allowClientCredentialsGrant ? [GrantType.CLIENT_CREDENTIALS] : []),
       ],
       responseTypes: clientInfo.responseTypes || ['code'],
       registrationDate: Math.floor(Date.now() / 1000),
