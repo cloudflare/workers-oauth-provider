@@ -29,10 +29,13 @@ tokenExchangeCallback: async (options) => {
 async function refreshUpstream(props) {
   const res = await fetch(/* upstream token endpoint */);
   if (res.status === 401) {
-    throw new OAuthError('invalid_grant', 'upstream refresh token is invalid');
+    throw new OAuthError('invalid_grant', {
+      description: 'upstream refresh token is invalid',
+    });
   }
   if (res.status === 429) {
-    throw new OAuthError('temporarily_unavailable', 'upstream rate limited', {
+    throw new OAuthError('temporarily_unavailable', {
+      description: 'upstream rate limited',
       statusCode: 429,
       headers: { 'Retry-After': res.headers.get('retry-after') ?? '60' },
     });
@@ -41,9 +44,11 @@ async function refreshUpstream(props) {
 }
 ```
 
-`OAuthError(code, description, options?)` takes:
+`OAuthError(code, options)` takes:
 
-- `code` and `description` (positional, required).
+- `code` (positional, required) — must be one of the registered OAuth
+  `/token` error codes supported by this package.
+- `options.description` — human-readable text returned in `error_description`.
 - `options.statusCode` — HTTP status code (default `400`).
 - `options.headers` — additional response headers. Set `Retry-After` here
   for transient failures so well-behaved clients back off; per RFC 7231
@@ -60,9 +65,9 @@ Server Error` so unexpected failures stay visible. The provider does not
 catch-everything-and-return-400.
 
 The exported `OAuthError` class supersedes the previously-internal one: the
-constructor signature is now `(code, description, options?)` rather than
-`(code, message)`. Internal call sites are updated; the 2-arg form is
-unchanged behaviourally (`description` is the new name of `message`).
+constructor signature is now `(code, options)` rather than `(code, message)`.
+Internal call sites are updated; `description` now lives alongside
+`statusCode` and `headers` in the options object.
 
 **New exports:** `OAuthError` (class), `OAuthErrorOptions` (interface),
 `OAuthTokenErrorCode` (type union of registered codes).

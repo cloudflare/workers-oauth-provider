@@ -327,12 +327,15 @@ new OAuthProvider({
 async function refreshUpstream(props) {
   const res = await fetch(/* upstream token endpoint */);
   if (res.status === 401) {
-    throw new OAuthError('invalid_grant', 'upstream refresh token is invalid');
+    throw new OAuthError('invalid_grant', {
+      description: 'upstream refresh token is invalid',
+    });
   }
   if (res.status === 429) {
     // Mirror the upstream's Retry-After if it sent one, otherwise pick
     // a sensible default. RFC 7231 §7.1.3 allows seconds or HTTP-date.
-    throw new OAuthError('temporarily_unavailable', 'upstream rate limited', {
+    throw new OAuthError('temporarily_unavailable', {
+      description: 'upstream rate limited',
       statusCode: 429,
       headers: { 'Retry-After': res.headers.get('retry-after') ?? '60' },
     });
@@ -343,10 +346,10 @@ async function refreshUpstream(props) {
 
 Throwing is the only way to signal an OAuth error from a callback — errors propagate naturally up through deep call stacks, so you don't have to plumb result objects back through every helper. If your application already has its own `OAuthError` class, you don't need to catch and rethrow this package's exact class: real `Error` instances named `OAuthError` with a registered token-endpoint `code` are also converted into structured responses.
 
-`OAuthError(code, description, options?)` takes:
+`OAuthError(code, options)` takes:
 
-- `code` (positional, required) — one of the registered OAuth 2.0 token-endpoint error codes (`invalid_request`, `invalid_client`, `invalid_grant`, `unauthorized_client`, `unsupported_grant_type`, `invalid_scope`, `invalid_token`, `insufficient_scope`, `invalid_target`, `server_error`, `temporarily_unavailable`). Enforced at compile time via the exported `OAuthTokenErrorCode` type.
-- `description` (positional, required) — human-readable text returned in `error_description`.
+- `code` (positional, required) — one of the registered OAuth 2.0 token-endpoint error codes (`invalid_request`, `invalid_client`, `invalid_grant`, `unauthorized_client`, `unsupported_grant_type`, `invalid_scope`, `invalid_token`, `insufficient_scope`, `invalid_target`, `server_error`, `temporarily_unavailable`). Enforced at compile time via the exported `OAuthTokenErrorCode` type and validated at runtime.
+- `options.description` — human-readable text returned in `error_description`.
 - `options.statusCode` — HTTP status code (default `400`).
 - `options.headers` — additional response headers. Set `Retry-After` here for transient failures (e.g. 429 rate limits) to ask clients to back off; per RFC 7231 §7.1.3 the value may be either a number of seconds or an HTTP-date. There is no implicit default — if you don't set it, no `Retry-After` is sent.
 

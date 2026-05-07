@@ -2521,14 +2521,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Unwrap and validate the subject token
     const tokenSummary = await this.unwrapToken(subjectToken, env);
     if (!tokenSummary) {
-      throw new OAuthError('invalid_grant', 'Invalid or expired subject token');
+      throw new OAuthError('invalid_grant', { description: 'Invalid or expired subject token' });
     }
 
     // Get the grant to access resource information
     const grantKey = `grant:${tokenSummary.userId}:${tokenSummary.grantId}`;
     const grantData: Grant | null = await env.OAUTH_KV.get(grantKey, { type: 'json' });
     if (!grantData) {
-      throw new OAuthError('invalid_grant', 'Grant not found');
+      throw new OAuthError('invalid_grant', { description: 'Grant not found' });
     }
 
     // If scopes are requested, validate they are a subset of the original grant scopes
@@ -2546,7 +2546,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         // Check that all requested resources are in the granted resources
         for (const requested of requestedResources) {
           if (!grantedResources.some((granted) => resourceMatches(requested, granted, originOnly))) {
-            throw new OAuthError('invalid_target', 'Requested resource was not included in the authorization request');
+            throw new OAuthError('invalid_target', {
+              description: 'Requested resource was not included in the authorization request',
+            });
           }
         }
       }
@@ -2554,10 +2556,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       // Parse and validate the resource parameter
       const parsedResource = parseResourceParameter(requestedResource);
       if (!parsedResource) {
-        throw new OAuthError(
-          'invalid_target',
-          'The resource parameter must be a valid absolute URI without a fragment'
-        );
+        throw new OAuthError('invalid_target', {
+          description: 'The resource parameter must be a valid absolute URI without a fragment',
+        });
       }
       newAudience = parsedResource;
     }
@@ -2570,7 +2571,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // If expiresIn is provided, use it but clamp to subject token's remaining lifetime
     if (expiresIn !== undefined) {
       if (expiresIn <= 0) {
-        throw new OAuthError('invalid_request', 'Invalid expires_in parameter');
+        throw new OAuthError('invalid_request', { description: 'Invalid expires_in parameter' });
       }
       accessTokenTTL = Math.min(expiresIn, subjectTokenRemainingLifetime);
     } else {
@@ -2585,7 +2586,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     );
 
     if (!subjectTokenData) {
-      throw new OAuthError('invalid_grant', 'Subject token data not found');
+      throw new OAuthError('invalid_grant', { description: 'Subject token data not found' });
     }
 
     // Unwrap the encryption key from the subject token
@@ -3523,6 +3524,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
  */
 export interface OAuthErrorOptions {
   /**
+   * Human-readable text returned in the `error_description` field.
+   */
+  description: string;
+
+  /**
    * HTTP status code for the error response. Defaults to `400`.
    */
   statusCode?: number;
@@ -3564,11 +3570,12 @@ export interface OAuthErrorOptions {
  * async function refreshUpstream(props) {
  *   const res = await fetch(...);
  *   if (res.status === 401) {
- *     throw new OAuthError('invalid_grant', 'upstream refresh token is invalid');
+ *     throw new OAuthError('invalid_grant', { description: 'upstream refresh token is invalid' });
  *   }
  *   if (res.status === 429) {
  *     // Mirror upstream's Retry-After if present, otherwise pick a default.
- *     throw new OAuthError('temporarily_unavailable', 'upstream rate limited', {
+ *     throw new OAuthError('temporarily_unavailable', {
+ *       description: 'upstream rate limited',
  *       statusCode: 429,
  *       headers: { 'Retry-After': res.headers.get('retry-after') ?? '60' },
  *     });
@@ -3587,11 +3594,18 @@ export class OAuthError extends Error {
   /** Additional response headers. */
   public readonly headers?: Record<string, string>;
 
-  constructor(code: OAuthTokenErrorCode, description: string, options: OAuthErrorOptions = {}) {
-    super(description);
+  constructor(code: OAuthTokenErrorCode, options: OAuthErrorOptions) {
+    if (!isOAuthTokenErrorCode(code)) {
+      throw new TypeError(`Unsupported OAuth /token error code: ${code}`);
+    }
+    if (!options || typeof options.description !== 'string') {
+      throw new TypeError('OAuthError options.description must be a string');
+    }
+
+    super(options.description);
     this.name = 'OAuthError';
     this.code = code;
-    this.description = description;
+    this.description = options.description;
     this.statusCode = options.statusCode ?? 400;
     this.headers = options.headers;
   }

@@ -5767,7 +5767,7 @@ describe('OAuthProvider', () => {
       // OAuth `invalid_grant` so it stops retrying with a dead token.
       const provider = buildProvider(async (options: any) => {
         if (options.grantType === 'refresh_token') {
-          throw new OAuthError('invalid_grant', 'upstream refresh token is invalid');
+          throw new OAuthError('invalid_grant', { description: 'upstream refresh token is invalid' });
         }
         return undefined;
       });
@@ -5790,7 +5790,8 @@ describe('OAuthProvider', () => {
       // whatever Retry-After the upstream sent (or picks their own).
       const provider = buildProvider(async (options: any) => {
         if (options.grantType === 'refresh_token') {
-          throw new OAuthError('temporarily_unavailable', 'refresh already in progress', {
+          throw new OAuthError('temporarily_unavailable', {
+            description: 'refresh already in progress',
             statusCode: 429,
             headers: { 'Retry-After': '12' },
           });
@@ -5815,7 +5816,7 @@ describe('OAuthProvider', () => {
       // otherwise we don't pretend to know.
       const provider = buildProvider(async (options: any) => {
         if (options.grantType === 'refresh_token') {
-          throw new OAuthError('temporarily_unavailable', 'unavailable', { statusCode: 429 });
+          throw new OAuthError('temporarily_unavailable', { description: 'unavailable', statusCode: 429 });
         }
         return undefined;
       });
@@ -5830,7 +5831,8 @@ describe('OAuthProvider', () => {
     it('passes through additional custom headers from `headers`', async () => {
       const provider = buildProvider(async (options: any) => {
         if (options.grantType === 'refresh_token') {
-          throw new OAuthError('invalid_grant', 'upstream rejected', {
+          throw new OAuthError('invalid_grant', {
+            description: 'upstream rejected',
             headers: { 'X-Trace-Id': 'abc-123' },
           });
         }
@@ -5847,7 +5849,7 @@ describe('OAuthProvider', () => {
     it('converts a thrown OAuthError on authorization_code into a structured response', async () => {
       const provider = buildProvider(async (options: any) => {
         if (options.grantType === 'authorization_code') {
-          throw new OAuthError('invalid_grant', 'upstream code rejected');
+          throw new OAuthError('invalid_grant', { description: 'upstream code rejected' });
         }
         return undefined;
       });
@@ -5890,7 +5892,7 @@ describe('OAuthProvider', () => {
       // bubble naturally without each layer having to plumb a result
       // object back up.
       async function inner() {
-        throw new OAuthError('invalid_grant', 'upstream refresh token is invalid');
+        throw new OAuthError('invalid_grant', { description: 'upstream refresh token is invalid' });
       }
       async function middle() {
         return await inner();
@@ -5910,6 +5912,14 @@ describe('OAuthProvider', () => {
         error: 'invalid_grant',
         error_description: 'upstream refresh token is invalid',
       });
+    });
+
+    it('rejects unregistered codes in the exported OAuthError class', () => {
+      // OAuth error codes are standardized/registered; callers should
+      // not mint arbitrary client-facing values.
+      expect(() => new OAuthError('access_denied' as any, { description: 'not a token endpoint error' })).toThrow(
+        'Unsupported OAuth /token error code: access_denied'
+      );
     });
 
     it('converts user-defined OAuthError classes into structured responses', async () => {
