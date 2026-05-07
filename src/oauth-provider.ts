@@ -2093,9 +2093,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       tokenResponse.resource = audience;
     }
 
-    // Return the tokens
+    // Return the tokens (RFC 6749 §5.1 requires Cache-Control: no-store)
     return new Response(JSON.stringify(tokenResponse), {
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
     });
   }
 
@@ -2376,9 +2376,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       tokenResponse.resource = audience;
     }
 
-    // Return the tokens
+    // Return the tokens (RFC 6749 §5.1 requires Cache-Control: no-store)
     return new Response(JSON.stringify(tokenResponse), {
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
     });
   }
 
@@ -2627,9 +2627,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         env
       );
 
-      // Return the token
+      // Return the token (RFC 6749 §5.1 requires Cache-Control: no-store)
       return new Response(JSON.stringify(tokenResponse), {
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
       });
     } catch (error) {
       // Convert OAuthError to HTTP error response
@@ -2874,9 +2874,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       response.client_secret_issued_at = clientInfo.registrationDate;
     }
 
+    // RFC 7591 §3.2.1: response may contain client_secret — prevent caching
     return new Response(JSON.stringify(response), {
       status: 201,
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
     });
   }
 
@@ -3389,10 +3390,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       error_description: description,
     });
 
+    // RFC 6749 §5.2 requires Cache-Control: no-store for token endpoint error responses.
+    // Applied to all error responses since it's harmless on non-token errors and ensures
+    // no error response containing sensitive info (e.g. client auth failures) is cached.
     return new Response(body, {
       status,
       headers: {
         'Content-Type': 'application/json',
+        'Cache-Control': 'no-store',
         ...headers,
       },
     });
