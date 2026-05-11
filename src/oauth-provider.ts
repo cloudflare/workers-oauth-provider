@@ -30,6 +30,7 @@ export enum GrantType {
   AUTHORIZATION_CODE = 'authorization_code',
   REFRESH_TOKEN = 'refresh_token',
   TOKEN_EXCHANGE = 'urn:ietf:params:oauth:grant-type:token-exchange',
+  JWT_BEARER = 'urn:ietf:params:oauth:grant-type:jwt-bearer',
 }
 
 /** ExecutionContext with writable props — ctx.props is read-only in types but writable at runtime */
@@ -137,6 +138,133 @@ export interface TokenExchangeCallbackOptions {
    * Application-specific properties currently associated with this grant
    */
   props: any;
+}
+
+/**
+ * Claims expected in an MCP Enterprise-Managed Authorization ID-JAG assertion.
+ * Additional issuer-specific claims, such as `email`, are preserved for applications.
+ */
+export interface EnterpriseIdJagClaims {
+  /** Identity provider issuer URL. */
+  iss: string;
+
+  /** Enterprise subject identifier for the resource owner. */
+  sub: string;
+
+  /** Authorization server issuer URL or URLs for which this assertion is intended. */
+  aud: string | string[];
+
+  /** RFC 9728 resource identifier of the MCP server. */
+  resource: string;
+
+  /** OAuth client identifier this assertion was issued to. */
+  client_id: string;
+
+  /** Unique assertion identifier used for replay protection. */
+  jti: string;
+
+  /** Assertion expiration time as a Unix timestamp in seconds. */
+  exp: number;
+
+  /** Assertion issued-at time as a Unix timestamp in seconds. */
+  iat: number;
+
+  /** Optional space-separated OAuth scope string. */
+  scope?: string;
+
+  /** Optional email claim supplied by the enterprise IdP. */
+  email?: string;
+
+  /** Additional enterprise IdP claims. */
+  [claim: string]: unknown;
+}
+
+/**
+ * Trusted enterprise IdP configuration for ID-JAG validation.
+ */
+export interface EnterpriseTrustedIssuer {
+  /** Issuer URL that must exactly match the assertion `iss` claim. */
+  issuer: string;
+
+  /** HTTPS JWKS endpoint used to validate assertion signatures. */
+  jwksUri: string;
+
+  /** Allowed JWT signing algorithms for this issuer. Defaults to `['RS256']`. */
+  algorithms?: string[];
+
+  /** Expected authorization server audience. Defaults to this provider's issuer URL. */
+  audience?: string;
+}
+
+/**
+ * Input passed to `enterpriseManagedAuthorization.mapClaims` after ID-JAG validation.
+ */
+export interface EnterpriseClaimsMapperInput<Env = Cloudflare.Env> {
+  /** Validated ID-JAG claims. */
+  claims: EnterpriseIdJagClaims;
+
+  /** Authenticated OAuth client that presented the assertion. */
+  clientInfo: ClientInfo;
+
+  /** Validated MCP resource identifier from the assertion. */
+  resource: string;
+
+  /** Requested scopes after downscoping to the assertion's scope claim, if present. */
+  requestedScope: string[];
+
+  /** Cloudflare Worker environment variables. */
+  env: Env;
+}
+
+/**
+ * Result returned by `enterpriseManagedAuthorization.mapClaims`.
+ */
+export interface EnterpriseClaimsMapperResult {
+  /** User ID to associate with the issued grant and access token. */
+  userId: string;
+
+  /** Scopes to grant to the issued access token. */
+  scope: string[];
+
+  /** Optional grant metadata used for audit and grant listing. This is not encrypted. */
+  metadata?: unknown;
+
+  /** Application props encrypted into the issued access token and exposed to API handlers. */
+  props: unknown;
+
+  /** Optional access token TTL override in seconds. This is clamped to the assertion lifetime. */
+  accessTokenTTL?: number;
+}
+
+/**
+ * Maps validated enterprise ID-JAG claims to this provider's local user, scopes, metadata, and props.
+ * Return `null` to deny token issuance.
+ */
+export type EnterpriseClaimsMapper<Env = Cloudflare.Env> = (
+  input: EnterpriseClaimsMapperInput<Env>
+) => Promise<EnterpriseClaimsMapperResult | null> | EnterpriseClaimsMapperResult | null;
+
+/**
+ * Experimental MCP Enterprise-Managed Authorization configuration.
+ */
+export interface EnterpriseManagedAuthorizationOptions<Env = Cloudflare.Env> {
+  /** Explicitly enables the JWT bearer ID-JAG grant flow. */
+  enabled?: boolean;
+
+  /** Enterprise IdPs trusted to issue ID-JAG assertions. */
+  trustedIssuers: EnterpriseTrustedIssuer[];
+
+  /** Maps validated enterprise claims to local token data. */
+  mapClaims: EnterpriseClaimsMapper<Env>;
+
+  /** JWKS cache TTL in seconds. Defaults to 300 seconds. */
+  jwksCacheTtl?: number;
+
+  /** Allowed clock skew for `exp` and `iat` checks in seconds. Defaults to 60 seconds. */
+  clockSkewSeconds?: number;
+
+  /** Maximum accepted assertion lifetime in seconds. Defaults to 300 seconds. */
+  maxAssertionLifetime?: number;
 }
 
 /**
@@ -291,6 +419,16 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
    * Defaults to false.
    */
   allowTokenExchangeGrant?: boolean;
+
+  /**
+   * Experimental support for the MCP Enterprise-Managed Authorization extension.
+   * When enabled, the token endpoint accepts ID-JAG assertions using the JWT bearer
+   * grant type (`urn:ietf:params:oauth:grant-type:jwt-bearer`).
+   *
+   * This feature is opt-in because the MCP extension and underlying OAuth drafts are
+   * still evolving. Trusted issuers and a claim mapper are required.
+   */
+  enterpriseManagedAuthorization?: EnterpriseManagedAuthorizationOptions<Env>;
 
   /**
    * Controls whether public clients (clients without a secret, like SPAs) can register via the
@@ -1083,6 +1221,36 @@ interface CreateAccessTokenOptions {
   env: any;
 }
 
+type OAuthJsonWebKey = JsonWebKey & {
+  kid?: string;
+  alg?: string;
+  use?: string;
+  key_ops?: string[];
+  kty?: string;
+};
+
+interface JsonWebKeySet {
+  keys?: OAuthJsonWebKey[];
+}
+
+interface CachedJwks {
+  jwks: JsonWebKeySet;
+  expiresAt: number;
+}
+
+interface ParsedJwt {
+  header: Record<string, unknown>;
+  claims: Record<string, unknown>;
+  signingInput: Uint8Array;
+  signature: Uint8Array;
+}
+
+interface ValidatedEnterpriseAssertion {
+  claims: EnterpriseIdJagClaims;
+  resource: string;
+  assertionScopes: string[];
+}
+
 /**
  * OAuth 2.0 Provider implementation for Cloudflare Workers
  * Implements authorization code flow with support for refresh tokens
@@ -1162,6 +1330,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   private typedApiHandlers: Array<[string, TypedHandler<Env>]>;
 
   /**
+   * In-memory JWKS cache keyed by issuer URL.
+   */
+  private jwksCache: Map<string, CachedJwks> = new Map();
+
+  /**
    * Creates a new OAuth provider instance
    * @param options - Configuration options for the provider
    */
@@ -1227,6 +1400,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         console.warn(`OAuth error response: ${status} ${code} - ${description}`),
       ...options,
     };
+
+    this.validateEnterpriseManagedAuthorizationOptions(this.options.enterpriseManagedAuthorization);
   }
 
   /**
@@ -1272,6 +1447,74 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     throw new TypeError(
       `${name} must be either an ExportedHandler object with a fetch method or a class extending WorkerEntrypoint`
     );
+  }
+
+  /**
+   * Validates experimental enterprise-managed authorization configuration.
+   */
+  private validateEnterpriseManagedAuthorizationOptions(
+    options: EnterpriseManagedAuthorizationOptions<Env> | undefined
+  ): void {
+    if (!options?.enabled) {
+      return;
+    }
+
+    if (!Array.isArray(options.trustedIssuers) || options.trustedIssuers.length === 0) {
+      throw new TypeError('enterpriseManagedAuthorization.trustedIssuers must contain at least one issuer');
+    }
+
+    if (typeof options.mapClaims !== 'function') {
+      throw new TypeError('enterpriseManagedAuthorization.mapClaims must be a function');
+    }
+
+    for (const [index, issuer] of options.trustedIssuers.entries()) {
+      try {
+        new URL(issuer.issuer);
+      } catch {
+        throw new TypeError(`enterpriseManagedAuthorization.trustedIssuers[${index}].issuer must be a valid URL`);
+      }
+
+      let jwksUrl: URL;
+      try {
+        jwksUrl = new URL(issuer.jwksUri);
+      } catch {
+        throw new TypeError(`enterpriseManagedAuthorization.trustedIssuers[${index}].jwksUri must be a valid URL`);
+      }
+
+      if (jwksUrl.protocol !== 'https:') {
+        throw new TypeError(`enterpriseManagedAuthorization.trustedIssuers[${index}].jwksUri must use HTTPS`);
+      }
+
+      const algorithms = issuer.algorithms ?? [ENTERPRISE_DEFAULT_JWT_ALGORITHM];
+      if (algorithms.length === 0) {
+        throw new TypeError(`enterpriseManagedAuthorization.trustedIssuers[${index}].algorithms must not be empty`);
+      }
+      for (const alg of algorithms) {
+        if (!ENTERPRISE_SUPPORTED_JWT_ALGORITHMS.has(alg)) {
+          throw new TypeError(
+            `enterpriseManagedAuthorization.trustedIssuers[${index}].algorithms contains unsupported alg`
+          );
+        }
+      }
+
+      if (issuer.audience !== undefined) {
+        try {
+          new URL(issuer.audience);
+        } catch {
+          throw new TypeError(`enterpriseManagedAuthorization.trustedIssuers[${index}].audience must be a valid URL`);
+        }
+      }
+    }
+
+    if (options.jwksCacheTtl !== undefined && options.jwksCacheTtl <= 0) {
+      throw new TypeError('enterpriseManagedAuthorization.jwksCacheTtl must be greater than 0');
+    }
+    if (options.clockSkewSeconds !== undefined && options.clockSkewSeconds < 0) {
+      throw new TypeError('enterpriseManagedAuthorization.clockSkewSeconds must be non-negative');
+    }
+    if (options.maxAssertionLifetime !== undefined && options.maxAssertionLifetime <= 0) {
+      throw new TypeError('enterpriseManagedAuthorization.maxAssertionLifetime must be greater than 0');
+    }
   }
 
   /**
@@ -1334,7 +1577,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       if (parsed.isRevocationRequest) {
         response = await this.handleRevocationRequest(parsed.body, env);
       } else {
-        response = await this.handleTokenRequest(parsed.body, parsed.clientInfo, env);
+        response = await this.handleTokenRequest(parsed.body, parsed.clientInfo, env, url);
       }
 
       return this.addCorsHeaders(response, request);
@@ -1664,6 +1907,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   }
 
   /**
+   * Gets the authorization server issuer using the same derivation as RFC 8414 metadata.
+   */
+  private getAuthorizationServerIssuer(requestUrl: URL): string {
+    const tokenEndpoint = this.getFullEndpointUrl(this.options.tokenEndpoint, requestUrl);
+    return new URL(tokenEndpoint).origin;
+  }
+
+  /**
    * Adds CORS headers to a response
    * @param response - The response to add CORS headers to
    * @param request - The original request
@@ -1720,6 +1971,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const grantTypesSupported = [GrantType.AUTHORIZATION_CODE, GrantType.REFRESH_TOKEN];
     if (this.options.allowTokenExchangeGrant) {
       grantTypesSupported.push(GrantType.TOKEN_EXCHANGE);
+    }
+    if (this.options.enterpriseManagedAuthorization?.enabled) {
+      grantTypesSupported.push(GrantType.JWT_BEARER);
     }
 
     const metadata = {
@@ -1794,7 +2048,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @param env - Cloudflare Worker environment variables
    * @returns Response with token data or error
    */
-  private async handleTokenRequest(body: any, clientInfo: ClientInfo, env: any): Promise<Response> {
+  private async handleTokenRequest(body: any, clientInfo: ClientInfo, env: any, requestUrl: URL): Promise<Response> {
     // Handle different grant types
     const grantType = body.grant_type;
 
@@ -1804,6 +2058,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       return this.handleRefreshTokenGrant(body, clientInfo, env);
     } else if (grantType === GrantType.TOKEN_EXCHANGE && this.options.allowTokenExchangeGrant) {
       return this.handleTokenExchangeGrant(body, clientInfo, env);
+    } else if (grantType === GrantType.JWT_BEARER) {
+      return this.handleJwtBearerGrant(body, clientInfo, env, requestUrl);
     } else {
       return this.createErrorResponse('unsupported_grant_type', 'Grant type not supported');
     }
@@ -2642,6 +2898,446 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   }
 
   /**
+   * Handles the MCP Enterprise-Managed Authorization JWT bearer grant.
+   * The client presents an enterprise IdP-issued ID-JAG assertion and receives
+   * a normal opaque access token for this MCP resource server.
+   */
+  private async handleJwtBearerGrant(body: any, clientInfo: ClientInfo, env: any, requestUrl: URL): Promise<Response> {
+    const enterpriseOptions = this.options.enterpriseManagedAuthorization;
+    if (!enterpriseOptions?.enabled) {
+      return this.createErrorResponse('unsupported_grant_type', 'Grant type not supported');
+    }
+
+    if (clientInfo.tokenEndpointAuthMethod === 'none') {
+      return this.createErrorResponse(
+        'invalid_client',
+        'Enterprise-managed authorization requires client authentication',
+        401
+      );
+    }
+
+    const assertion = body.assertion;
+    if (typeof assertion !== 'string' || assertion.length === 0) {
+      return this.createErrorResponse('invalid_request', 'assertion is required');
+    }
+
+    if (assertion.length > ENTERPRISE_MAX_JWT_BYTES) {
+      return this.createErrorResponse('invalid_grant', 'Invalid assertion');
+    }
+
+    let validated: ValidatedEnterpriseAssertion;
+    let requestedScope: string[];
+    try {
+      validated = await this.validateEnterpriseAssertion(assertion, clientInfo, env, requestUrl);
+      requestedScope = this.getEnterpriseRequestedScopes(body.scope, validated.assertionScopes);
+    } catch (error) {
+      if (error instanceof OAuthError) {
+        return this.createErrorResponse(error.code, error.message);
+      }
+      return this.createErrorResponse('invalid_grant', 'Invalid assertion');
+    }
+
+    const mapperResult = await Promise.resolve(
+      enterpriseOptions.mapClaims({
+        claims: validated.claims,
+        clientInfo,
+        resource: validated.resource,
+        requestedScope,
+        env,
+      })
+    );
+
+    if (!mapperResult) {
+      return this.createErrorResponse('invalid_grant', 'Assertion was not authorized');
+    }
+
+    if (
+      typeof mapperResult.userId !== 'string' ||
+      mapperResult.userId.length === 0 ||
+      mapperResult.userId.includes(':')
+    ) {
+      return this.createErrorResponse('invalid_grant', 'Invalid mapped user');
+    }
+
+    if (
+      !Array.isArray(mapperResult.scope) ||
+      !mapperResult.scope.every((scope) => typeof scope === 'string' && isValidOAuthScopeToken(scope))
+    ) {
+      return this.createErrorResponse('invalid_grant', 'Invalid mapped scope');
+    }
+
+    if (!('props' in mapperResult) || mapperResult.props === undefined) {
+      return this.createErrorResponse('invalid_grant', 'Invalid mapped props');
+    }
+
+    let tokenScopes = mapperResult.scope;
+    if (validated.assertionScopes.length > 0) {
+      tokenScopes = this.downscope(tokenScopes, validated.assertionScopes);
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    const assertionRemainingLifetime = validated.claims.exp - now;
+    let accessTokenTTL = Math.min(this.options.accessTokenTTL ?? DEFAULT_ACCESS_TOKEN_TTL, assertionRemainingLifetime);
+
+    if (mapperResult.accessTokenTTL !== undefined) {
+      if (mapperResult.accessTokenTTL <= 0) {
+        return this.createErrorResponse('invalid_grant', 'Invalid access token TTL');
+      }
+      accessTokenTTL = Math.min(accessTokenTTL, mapperResult.accessTokenTTL);
+    }
+
+    if (accessTokenTTL <= 0) {
+      return this.createErrorResponse('invalid_grant', 'Assertion has expired');
+    }
+
+    const grantId = generateRandomString(16);
+    const { encryptedData, key: encryptionKey } = await encryptProps(mapperResult.props);
+    const grant: Grant = {
+      id: grantId,
+      clientId: clientInfo.clientId,
+      userId: mapperResult.userId,
+      scope: tokenScopes,
+      metadata: mapperResult.metadata ?? null,
+      encryptedProps: encryptedData,
+      createdAt: now,
+      expiresAt: now + accessTokenTTL,
+      resource: validated.resource,
+    };
+
+    await this.saveGrantWithTTL(env, `grant:${mapperResult.userId}:${grantId}`, grant, now);
+
+    const accessToken = await this.createAccessToken({
+      userId: mapperResult.userId,
+      grantId,
+      clientId: clientInfo.clientId,
+      scope: tokenScopes,
+      encryptedProps: encryptedData,
+      encryptionKey,
+      expiresIn: accessTokenTTL,
+      audience: validated.resource,
+      env,
+    });
+
+    const tokenResponse: TokenResponse = {
+      access_token: accessToken,
+      token_type: 'bearer',
+      expires_in: accessTokenTTL,
+      scope: tokenScopes.join(' '),
+      resource: validated.resource,
+    };
+
+    return new Response(JSON.stringify(tokenResponse), {
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  /**
+   * Validates an enterprise ID-JAG assertion and records its `jti` for replay protection.
+   */
+  private async validateEnterpriseAssertion(
+    assertion: string,
+    clientInfo: ClientInfo,
+    env: any,
+    requestUrl: URL
+  ): Promise<ValidatedEnterpriseAssertion> {
+    const parsed = this.parseJwt(assertion);
+
+    const typ = OAuthProviderImpl.validateStringField(parsed.header.typ, 'typ');
+    if (typ !== ENTERPRISE_ID_JAG_JWT_TYPE) {
+      throw new OAuthError('invalid_grant', 'Invalid assertion');
+    }
+
+    const alg = OAuthProviderImpl.validateStringField(parsed.header.alg, 'alg');
+    if (!alg || alg === 'none') {
+      throw new OAuthError('invalid_grant', 'Invalid assertion');
+    }
+
+    if (!ENTERPRISE_SUPPORTED_JWT_ALGORITHMS.has(alg)) {
+      throw new OAuthError('invalid_grant', 'Invalid assertion');
+    }
+
+    const issuer = this.getRequiredClaimString(parsed.claims, 'iss');
+    const trustedIssuer = this.options.enterpriseManagedAuthorization!.trustedIssuers.find(
+      (candidate) => candidate.issuer === issuer
+    );
+
+    if (!trustedIssuer) {
+      throw new OAuthError('invalid_grant', 'Invalid assertion');
+    }
+
+    const allowedAlgorithms = trustedIssuer.algorithms ?? [ENTERPRISE_DEFAULT_JWT_ALGORITHM];
+    if (!allowedAlgorithms.includes(alg)) {
+      throw new OAuthError('invalid_grant', 'Invalid assertion');
+    }
+
+    const signatureValid = await this.verifyEnterpriseJwtSignature(parsed, trustedIssuer, alg);
+    if (!signatureValid) {
+      throw new OAuthError('invalid_grant', 'Invalid assertion');
+    }
+
+    const claims = this.validateEnterpriseClaims(parsed.claims, clientInfo, trustedIssuer, requestUrl);
+    await this.storeEnterpriseAssertionJti(env, claims.iss, claims.jti, claims.exp);
+
+    return {
+      claims,
+      resource: claims.resource,
+      assertionScopes: parseScopeString(claims.scope),
+    };
+  }
+
+  /**
+   * Parses and validates signed enterprise ID-JAG claims after signature verification.
+   */
+  private validateEnterpriseClaims(
+    rawClaims: Record<string, unknown>,
+    clientInfo: ClientInfo,
+    trustedIssuer: EnterpriseTrustedIssuer,
+    requestUrl: URL
+  ): EnterpriseIdJagClaims {
+    const claims: EnterpriseIdJagClaims = {
+      ...rawClaims,
+      iss: this.getRequiredClaimString(rawClaims, 'iss'),
+      sub: this.getRequiredClaimString(rawClaims, 'sub'),
+      aud: this.getRequiredAudienceClaim(rawClaims),
+      resource: this.getRequiredClaimString(rawClaims, 'resource'),
+      client_id: this.getRequiredClaimString(rawClaims, 'client_id'),
+      jti: this.getRequiredClaimString(rawClaims, 'jti'),
+      exp: this.getRequiredNumericDateClaim(rawClaims, 'exp'),
+      iat: this.getRequiredNumericDateClaim(rawClaims, 'iat'),
+    };
+
+    if (rawClaims.scope !== undefined) {
+      claims.scope = this.getRequiredClaimString(rawClaims, 'scope');
+    }
+
+    const expectedAudience = trustedIssuer.audience ?? this.getAuthorizationServerIssuer(requestUrl);
+    const audiences = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
+    if (!audiences.includes(expectedAudience)) {
+      throw new OAuthError('invalid_grant', 'Invalid assertion');
+    }
+
+    if (claims.client_id !== clientInfo.clientId) {
+      throw new OAuthError('invalid_grant', 'Invalid assertion');
+    }
+
+    if (!validateResourceUri(claims.resource)) {
+      throw new OAuthError('invalid_target', 'Invalid resource');
+    }
+
+    const configuredResource = this.options.resourceMetadata?.resource;
+    if (
+      configuredResource &&
+      !resourceMatches(claims.resource, configuredResource, !!this.options.resourceMatchOriginOnly)
+    ) {
+      throw new OAuthError('invalid_target', 'Invalid resource');
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    const enterpriseOptions = this.options.enterpriseManagedAuthorization!;
+    const clockSkew = enterpriseOptions.clockSkewSeconds ?? ENTERPRISE_DEFAULT_CLOCK_SKEW_SECONDS;
+    const maxLifetime = enterpriseOptions.maxAssertionLifetime ?? ENTERPRISE_DEFAULT_MAX_ASSERTION_LIFETIME_SECONDS;
+
+    if (claims.exp <= now) {
+      throw new OAuthError('invalid_grant', 'Invalid assertion');
+    }
+
+    if (claims.iat > now + clockSkew) {
+      throw new OAuthError('invalid_grant', 'Invalid assertion');
+    }
+
+    if (claims.exp - claims.iat > maxLifetime + clockSkew) {
+      throw new OAuthError('invalid_grant', 'Invalid assertion');
+    }
+
+    parseScopeString(claims.scope);
+
+    return claims;
+  }
+
+  /**
+   * Reads the token request `scope` parameter and downscopes it to assertion scopes when present.
+   */
+  private getEnterpriseRequestedScopes(scope: unknown, assertionScopes: string[]): string[] {
+    let requestedScopes: string[];
+    if (scope === undefined) {
+      requestedScopes = assertionScopes;
+    } else if (typeof scope === 'string') {
+      requestedScopes = parseScopeString(scope, 'invalid_request', 'Invalid scope parameter format');
+    } else if (Array.isArray(scope) && scope.every((value) => typeof value === 'string')) {
+      requestedScopes = scope.flatMap((value) =>
+        parseScopeString(value, 'invalid_request', 'Invalid scope parameter format')
+      );
+    } else {
+      throw new OAuthError('invalid_request', 'Invalid scope parameter format');
+    }
+
+    return assertionScopes.length > 0 ? this.downscope(requestedScopes, assertionScopes) : requestedScopes;
+  }
+
+  /**
+   * Parses a compact JWT into header, claims, signing input, and signature.
+   */
+  private parseJwt(assertion: string): ParsedJwt {
+    const parts = assertion.split('.');
+    if (parts.length !== 3 || parts.some((part) => part.length === 0)) {
+      throw new OAuthError('invalid_grant', 'Invalid assertion');
+    }
+
+    const [encodedHeader, encodedClaims, encodedSignature] = parts;
+    const header = parseJwtJsonPart(encodedHeader);
+    const claims = parseJwtJsonPart(encodedClaims);
+    const signingInput = new TextEncoder().encode(`${encodedHeader}.${encodedClaims}`);
+    const signature = base64UrlToBytes(encodedSignature);
+
+    return { header, claims, signingInput, signature };
+  }
+
+  /**
+   * Verifies an ID-JAG JWT signature against the configured enterprise IdP JWKS.
+   */
+  private async verifyEnterpriseJwtSignature(
+    parsed: ParsedJwt,
+    trustedIssuer: EnterpriseTrustedIssuer,
+    alg: string
+  ): Promise<boolean> {
+    const kid = OAuthProviderImpl.validateStringField(parsed.header.kid, 'kid');
+    let jwks = await this.fetchEnterpriseJwks(trustedIssuer);
+    let jwk = this.selectJwk(jwks, alg, kid);
+
+    if (!jwk && kid) {
+      jwks = await this.fetchEnterpriseJwks(trustedIssuer, true);
+      jwk = this.selectJwk(jwks, alg, kid);
+    }
+
+    if (!jwk) {
+      return false;
+    }
+
+    try {
+      const { importAlgorithm, verifyAlgorithm } = getJwtCryptoAlgorithms(alg);
+      const key = await crypto.subtle.importKey('jwk', jwk, importAlgorithm, false, ['verify']);
+      return await crypto.subtle.verify(verifyAlgorithm, key, parsed.signature, parsed.signingInput);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Fetches and caches an enterprise issuer JWKS.
+   */
+  private async fetchEnterpriseJwks(
+    trustedIssuer: EnterpriseTrustedIssuer,
+    forceRefresh = false
+  ): Promise<JsonWebKeySet> {
+    const now = Math.floor(Date.now() / 1000);
+    const cached = this.jwksCache.get(trustedIssuer.issuer);
+    if (!forceRefresh && cached && cached.expiresAt > now) {
+      return cached.jwks;
+    }
+
+    const abortController = new AbortController();
+    const timeoutId = setTimeout(() => abortController.abort(), ENTERPRISE_JWKS_FETCH_TIMEOUT_MS);
+
+    try {
+      const response = await fetch(trustedIssuer.jwksUri, {
+        headers: { Accept: 'application/json' },
+        signal: abortController.signal,
+        cf: { cacheEverything: true },
+      });
+
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        throw new OAuthError('invalid_grant', 'Invalid assertion');
+      }
+
+      const contentLength = response.headers.get('content-length');
+      if (contentLength && parseInt(contentLength, 10) > ENTERPRISE_JWKS_MAX_SIZE_BYTES) {
+        throw new OAuthError('invalid_grant', 'Invalid assertion');
+      }
+
+      const rawJwks = await this.readJsonWithSizeLimit(response, ENTERPRISE_JWKS_MAX_SIZE_BYTES);
+      if (!Array.isArray(rawJwks.keys)) {
+        throw new OAuthError('invalid_grant', 'Invalid assertion');
+      }
+
+      const jwks: JsonWebKeySet = { keys: rawJwks.keys as OAuthJsonWebKey[] };
+      const ttl =
+        this.options.enterpriseManagedAuthorization?.jwksCacheTtl ?? ENTERPRISE_DEFAULT_JWKS_CACHE_TTL_SECONDS;
+      this.jwksCache.set(trustedIssuer.issuer, { jwks, expiresAt: now + ttl });
+      return jwks;
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  /**
+   * Selects a signing JWK that matches the assertion header.
+   */
+  private selectJwk(jwks: JsonWebKeySet, alg: string, kid?: string): OAuthJsonWebKey | undefined {
+    const keys = jwks.keys ?? [];
+    const matchingKeys = keys.filter((key) => {
+      if (kid && key.kid !== kid) return false;
+      if (key.alg && key.alg !== alg) return false;
+      if (key.use && key.use !== 'sig') return false;
+      if (Array.isArray(key.key_ops) && !key.key_ops.includes('verify')) return false;
+      if (alg.startsWith('RS') && key.kty !== 'RSA') return false;
+      if (alg.startsWith('ES') && key.kty !== 'EC') return false;
+      return true;
+    });
+
+    if (kid) {
+      return matchingKeys[0];
+    }
+
+    return matchingKeys.length === 1 ? matchingKeys[0] : undefined;
+  }
+
+  /**
+   * Stores an assertion `jti` marker to reject replayed ID-JAG assertions.
+   */
+  private async storeEnterpriseAssertionJti(env: any, issuer: string, jti: string, exp: number): Promise<void> {
+    const now = Math.floor(Date.now() / 1000);
+    const ttl = Math.max(1, exp - now);
+    const jtiHash = await generateTokenId(`${issuer}\n${jti}`);
+    const key = `enterprise-jti:${jtiHash}`;
+    const existing = await env.OAUTH_KV.get(key);
+
+    if (existing) {
+      throw new OAuthError('invalid_grant', 'Invalid assertion');
+    }
+
+    await env.OAUTH_KV.put(key, '1', { expirationTtl: ttl });
+  }
+
+  private getRequiredClaimString(claims: Record<string, unknown>, claimName: string): string {
+    const value = claims[claimName];
+    if (typeof value !== 'string' || value.length === 0) {
+      throw new OAuthError('invalid_grant', 'Invalid assertion');
+    }
+    return value;
+  }
+
+  private getRequiredAudienceClaim(claims: Record<string, unknown>): string | string[] {
+    const aud = claims.aud;
+    if (typeof aud === 'string' && aud.length > 0) {
+      return aud;
+    }
+    if (Array.isArray(aud) && aud.length > 0 && aud.every((value) => typeof value === 'string' && value.length > 0)) {
+      return aud;
+    }
+    throw new OAuthError('invalid_grant', 'Invalid assertion');
+  }
+
+  private getRequiredNumericDateClaim(claims: Record<string, unknown>, claimName: string): number {
+    const value = claims[claimName];
+    if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+      throw new OAuthError('invalid_grant', 'Invalid assertion');
+    }
+    return value;
+  }
+
+  /**
    * Handles OAuth 2.0 token revocation requests (RFC 7009)
    * @param body - The parsed request body containing revocation parameters
    * @param env - Cloudflare Worker environment variables
@@ -3440,6 +4136,56 @@ const DEFAULT_PURGE_BATCH_SIZE = 50;
  */
 const TOKEN_LENGTH = 32;
 
+/**
+ * JWT `typ` header required for enterprise-managed ID-JAG assertions.
+ */
+const ENTERPRISE_ID_JAG_JWT_TYPE = 'oauth-id-jag+jwt';
+
+/**
+ * Maximum compact JWT assertion size accepted at the token endpoint.
+ */
+const ENTERPRISE_MAX_JWT_BYTES = 16 * 1024;
+
+/**
+ * Maximum JWKS response size accepted from a trusted enterprise IdP.
+ */
+const ENTERPRISE_JWKS_MAX_SIZE_BYTES = 64 * 1024;
+
+/**
+ * Request timeout for enterprise JWKS fetches.
+ */
+const ENTERPRISE_JWKS_FETCH_TIMEOUT_MS = 10_000;
+
+/**
+ * Default in-memory JWKS cache TTL.
+ */
+const ENTERPRISE_DEFAULT_JWKS_CACHE_TTL_SECONDS = 5 * 60;
+
+/**
+ * Default allowed clock skew for ID-JAG time claim validation.
+ */
+const ENTERPRISE_DEFAULT_CLOCK_SKEW_SECONDS = 60;
+
+/**
+ * Default maximum accepted ID-JAG lifetime.
+ */
+const ENTERPRISE_DEFAULT_MAX_ASSERTION_LIFETIME_SECONDS = 5 * 60;
+
+/**
+ * Default JWT signing algorithm for enterprise trusted issuers.
+ */
+const ENTERPRISE_DEFAULT_JWT_ALGORITHM = 'RS256';
+
+/**
+ * JWT signing algorithms currently supported by the built-in WebCrypto verifier.
+ */
+const ENTERPRISE_SUPPORTED_JWT_ALGORITHMS = new Set(['RS256', 'ES256']);
+
+/**
+ * RFC 6749 Section 3.3 scope-token grammar.
+ */
+const OAUTH_SCOPE_TOKEN_PATTERN = /^[\x21\x23-\x5B\x5D-\x7E]+$/;
+
 // Helper Functions
 /**
  * Validates a resource URI per RFC 8707 Section 2
@@ -3698,6 +4444,82 @@ function isValidRedirectUri(requestUri: string, registeredUris: string[]): boole
  */
 function base64UrlEncode(str: string): string {
   return btoa(str).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+}
+
+/**
+ * Decodes a base64url-encoded string to bytes.
+ */
+function base64UrlToBytes(base64Url: string): Uint8Array {
+  const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+  const padded = base64.padEnd(base64.length + ((4 - (base64.length % 4)) % 4), '=');
+  const binaryString = atob(padded);
+  const bytes = new Uint8Array(binaryString.length);
+  for (let i = 0; i < binaryString.length; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return bytes;
+}
+
+/**
+ * Parses a base64url-encoded JWT JSON part into an object.
+ */
+function parseJwtJsonPart(encoded: string): Record<string, unknown> {
+  try {
+    const json = new TextDecoder().decode(base64UrlToBytes(encoded));
+    const parsed = JSON.parse(json);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      throw new Error('JWT part must be an object');
+    }
+    return parsed as Record<string, unknown>;
+  } catch {
+    throw new OAuthError('invalid_grant', 'Invalid assertion');
+  }
+}
+
+/**
+ * Parses a space-separated OAuth scope string.
+ */
+function parseScopeString(
+  scope: string | undefined,
+  errorCode = 'invalid_grant',
+  errorDescription = 'Invalid assertion'
+): string[] {
+  if (!scope) {
+    return [];
+  }
+  const scopes = scope.split(' ').filter(Boolean);
+  for (const scopeToken of scopes) {
+    if (!isValidOAuthScopeToken(scopeToken)) {
+      throw new OAuthError(errorCode, errorDescription);
+    }
+  }
+  return scopes;
+}
+
+function isValidOAuthScopeToken(scopeToken: string): boolean {
+  return OAUTH_SCOPE_TOKEN_PATTERN.test(scopeToken);
+}
+
+/**
+ * Gets WebCrypto import and verify parameters for supported JOSE algorithms.
+ */
+function getJwtCryptoAlgorithms(alg: string): {
+  importAlgorithm: Parameters<SubtleCrypto['importKey']>[2];
+  verifyAlgorithm: Parameters<SubtleCrypto['verify']>[0];
+} {
+  if (alg === 'RS256') {
+    const algorithm = { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' };
+    return { importAlgorithm: algorithm, verifyAlgorithm: algorithm };
+  }
+
+  if (alg === 'ES256') {
+    return {
+      importAlgorithm: { name: 'ECDSA', namedCurve: 'P-256' },
+      verifyAlgorithm: { name: 'ECDSA', hash: 'SHA-256' },
+    };
+  }
+
+  throw new Error(`Unsupported JWT alg: ${alg}`);
 }
 
 /**
