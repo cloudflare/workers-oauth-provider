@@ -117,6 +117,10 @@ export default new OAuthProvider({
   // Defaults to false.
   allowTokenExchangeGrant: false,
 
+  // Optional: Experimental MCP Enterprise-Managed Authorization support.
+  // When enabled, the token endpoint accepts ID-JAG JWTs with the JWT bearer grant.
+  enterpriseManagedAuthorization: undefined,
+
   // Optional: Explicitly enable Client ID Metadata Document (CIMD) support.
   // When true, URL-formatted client_ids will be fetched as metadata documents.
   // Requires the 'global_fetch_strictly_public' compatibility flag.
@@ -306,6 +310,61 @@ The `accessTokenTTL` override is particularly useful when the application is als
 
 The `props` values are end-to-end encrypted, so they can safely contain sensitive information.
 
+## Enterprise-Managed Authorization (Experimental)
+
+This library can experimentally accept MCP Enterprise-Managed Authorization ID-JAG assertions at the token endpoint. An enterprise IdP issues an ID-JAG JWT to an MCP client, and the MCP client exchanges it for a normal opaque access token issued by this provider.
+
+```ts
+new OAuthProvider({
+  // ... other options ...
+  resourceMetadata: {
+    resource: 'https://mcp.example.com/mcp',
+  },
+  enterpriseManagedAuthorization: {
+    enabled: true,
+    trustedIssuers: [
+      {
+        issuer: 'https://idp.example.com',
+        jwksUri: 'https://idp.example.com/.well-known/jwks.json',
+        algorithms: ['RS256'],
+      },
+    ],
+    async mapClaims({ claims, requestedScope }) {
+      return {
+        // The current opaque token format uses ':' as a separator, so mapped user IDs
+        // for this flow must not contain ':'. Hash or otherwise encode compound IDs.
+        userId: `enterprise-${claims.sub}`,
+        scope: requestedScope,
+        metadata: {
+          enterpriseIssuer: claims.iss,
+          enterpriseSubject: claims.sub,
+        },
+        props: {
+          enterprise: true,
+          subject: claims.sub,
+          email: claims.email,
+        },
+      };
+    },
+  },
+});
+```
+
+When enabled, the authorization server metadata advertises `urn:ietf:params:oauth:grant-type:jwt-bearer`. The token endpoint accepts:
+
+```http
+POST /oauth/token HTTP/1.1
+Content-Type: application/x-www-form-urlencoded
+Authorization: Basic <client credentials>
+
+grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer
+&assertion=<id-jag-jwt>
+```
+
+Validation includes the ID-JAG `typ` header, trusted issuer, JWKS signature, audience, client binding, resource URI, expiration, issued-at time, maximum assertion lifetime, and `jti` replay protection. Access token TTL is clamped to the assertion lifetime. Refresh tokens are not issued for this grant type.
+
+This support is experimental because the MCP extension is still a draft. It is disabled by default and should only be enabled with explicit trusted IdP configuration.
+
 ## Custom Error Responses
 
 By using the `onError` option, you can emit notifications or take other actions when an error response was to be emitted:
@@ -388,6 +447,7 @@ This library implements the following OAuth and MCP specifications:
 - [OAuth 2.0 Protected Resource Metadata (RFC 9728)](https://datatracker.ietf.org/doc/html/rfc9728) — `/.well-known/oauth-protected-resource` discovery endpoint
 - [OAuth 2.0 Dynamic Client Registration (RFC 7591)](https://datatracker.ietf.org/doc/html/rfc7591) — Dynamic client registration endpoint
 - [OAuth Client ID Metadata Documents (draft-ietf-oauth-client-id-metadata-document)](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-client-id-metadata-document) — HTTPS URLs as client IDs
+- [MCP Enterprise-Managed Authorization extension](https://modelcontextprotocol.io/extensions/auth/enterprise-managed-authorization) — experimental ID-JAG JWT bearer grant support
 
 These are the specifications required by the [MCP authorization specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization).
 

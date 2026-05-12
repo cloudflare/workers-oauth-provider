@@ -107,6 +107,13 @@ type TestEnv = {
   OAUTH_PROVIDER: OAuthHelpers | null;
 };
 
+type TestJsonWebKey = JsonWebKey & {
+  kid?: string;
+  alg?: string;
+  use?: string;
+  key_ops?: string[];
+};
+
 // Simple API handler for testing
 class TestApiHandler extends WorkerEntrypoint<TestEnv> {
   fetch(request: Request) {
@@ -180,6 +187,80 @@ function createMockEnv(): TestEnv {
     OAUTH_KV: new MockKV(),
     OAUTH_PROVIDER: null, // Will be populated by the OAuthProvider
   };
+}
+
+function bytesToBase64Url(bytes: Uint8Array): string {
+  let binary = '';
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+}
+
+function jsonToBase64Url(value: Record<string, unknown>): string {
+  return bytesToBase64Url(new TextEncoder().encode(JSON.stringify(value)));
+}
+
+async function createRsaJwtKey(kid = 'test-key'): Promise<{ privateKey: CryptoKey; publicJwk: TestJsonWebKey }> {
+  const keyPair = (await crypto.subtle.generateKey(
+    {
+      name: 'RSASSA-PKCS1-v1_5',
+      modulusLength: 2048,
+      publicExponent: new Uint8Array([1, 0, 1]),
+      hash: 'SHA-256',
+    },
+    true,
+    ['sign', 'verify']
+  )) as CryptoKeyPair;
+
+  const publicJwk = (await crypto.subtle.exportKey('jwk', keyPair.publicKey)) as TestJsonWebKey;
+  return {
+    privateKey: keyPair.privateKey,
+    publicJwk: {
+      ...publicJwk,
+      kid,
+      alg: 'RS256',
+      use: 'sig',
+      key_ops: ['verify'],
+    },
+  };
+}
+
+async function createEcJwtKey(kid = 'ec-key'): Promise<{ privateKey: CryptoKey; publicJwk: TestJsonWebKey }> {
+  const keyPair = (await crypto.subtle.generateKey(
+    {
+      name: 'ECDSA',
+      namedCurve: 'P-256',
+    },
+    true,
+    ['sign', 'verify']
+  )) as CryptoKeyPair;
+
+  const publicJwk = (await crypto.subtle.exportKey('jwk', keyPair.publicKey)) as TestJsonWebKey;
+  return {
+    privateKey: keyPair.privateKey,
+    publicJwk: {
+      ...publicJwk,
+      kid,
+      alg: 'ES256',
+      use: 'sig',
+      key_ops: ['verify'],
+    },
+  };
+}
+
+async function signJwt(
+  privateKey: CryptoKey,
+  claims: Record<string, unknown>,
+  header: Record<string, unknown> = {}
+): Promise<string> {
+  const jwtHeader = { alg: 'RS256', typ: 'oauth-id-jag+jwt', kid: 'test-key', ...header };
+  const encodedHeader = jsonToBase64Url(jwtHeader);
+  const encodedClaims = jsonToBase64Url(claims);
+  const signingInput = `${encodedHeader}.${encodedClaims}`;
+  const signAlgorithm = jwtHeader.alg === 'ES256' ? { name: 'ECDSA', hash: 'SHA-256' } : { name: 'RSASSA-PKCS1-v1_5' };
+  const signature = await crypto.subtle.sign(signAlgorithm, privateKey, new TextEncoder().encode(signingInput));
+  return `${signingInput}.${bytesToBase64Url(new Uint8Array(signature))}`;
 }
 
 describe('OAuthProvider', () => {
@@ -2565,6 +2646,675 @@ describe('OAuthProvider', () => {
       expect(callbackOptions.grantType).toBe('urn:ietf:params:oauth:grant-type:token-exchange');
       expect(callbackOptions.scope).toEqual(['read', 'write']); // Grant scopes
       expect(callbackOptions.requestedScope).toEqual(['read', 'write']); // Requested scopes (no downscoping in this test)
+    });
+  });
+
+  describe('Enterprise-Managed Authorization JWT Bearer Grant', () => {
+    let privateKey: CryptoKey;
+    let publicJwk: TestJsonWebKey;
+    let clientId: string;
+    let clientSecret: string;
+    let enterpriseProvider: OAuthProvider<TestEnv>;
+    const issuer = 'https://idp.example.com';
+    const resource = 'https://example.com/api';
+
+    beforeEach(async () => {
+      const key = await createRsaJwtKey();
+      privateKey = key.privateKey;
+      publicJwk = key.publicJwk;
+
+      vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+        if (input === `${issuer}/jwks.json`) {
+          return new Response(JSON.stringify({ keys: [publicJwk] }), {
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        return new Response('not found', { status: 404 });
+      });
+
+      enterpriseProvider = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        scopesSupported: ['read', 'write', 'profile'],
+        accessTokenTTL: 3600,
+        resourceMetadata: { resource },
+        enterpriseManagedAuthorization: {
+          enabled: true,
+          trustedIssuers: [{ issuer, jwksUri: `${issuer}/jwks.json`, algorithms: ['RS256'] }],
+          mapClaims: async ({ claims, requestedScope }) => ({
+            userId: `enterprise-${claims.sub}`,
+            scope: requestedScope,
+            metadata: { enterpriseIssuer: claims.iss, enterpriseSubject: claims.sub },
+            props: { enterprise: true, subject: claims.sub, email: claims.email },
+          }),
+        },
+      });
+
+      const registerRequest = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify({
+          redirect_uris: ['https://client.example.com/callback'],
+          client_name: 'Enterprise Client',
+          token_endpoint_auth_method: 'client_secret_basic',
+        })
+      );
+
+      const registerResponse = await enterpriseProvider.fetch(registerRequest, mockEnv, mockCtx);
+      const client = await registerResponse.json<any>();
+      clientId = client.client_id;
+      clientSecret = client.client_secret;
+    });
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    async function createAssertion(overrides: Record<string, unknown> = {}, header: Record<string, unknown> = {}) {
+      const now = Math.floor(Date.now() / 1000);
+      return signJwt(
+        privateKey,
+        {
+          iss: issuer,
+          sub: 'employee-123',
+          aud: 'https://example.com',
+          resource,
+          client_id: clientId,
+          jti: crypto.randomUUID(),
+          iat: now,
+          exp: now + 300,
+          scope: 'read write',
+          email: 'employee@example.com',
+          ...overrides,
+        },
+        header
+      );
+    }
+
+    async function exchangeAssertion(assertion: string, id = clientId, secret = clientSecret) {
+      const params = new URLSearchParams();
+      params.append('grant_type', 'urn:ietf:params:oauth:grant-type:jwt-bearer');
+      params.append('assertion', assertion);
+
+      return enterpriseProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            Authorization: `Basic ${btoa(`${id}:${secret}`)}`,
+          },
+          params.toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+    }
+
+    it('should advertise jwt-bearer grant only when enterprise-managed authorization is enabled', async () => {
+      const enabledResponse = await enterpriseProvider.fetch(
+        createMockRequest('https://example.com/.well-known/oauth-authorization-server'),
+        mockEnv,
+        mockCtx
+      );
+      const enabledMetadata = await enabledResponse.json<any>();
+      expect(enabledMetadata.grant_types_supported).toContain('urn:ietf:params:oauth:grant-type:jwt-bearer');
+
+      const defaultResponse = await oauthProvider.fetch(
+        createMockRequest('https://example.com/.well-known/oauth-authorization-server'),
+        mockEnv,
+        mockCtx
+      );
+      const defaultMetadata = await defaultResponse.json<any>();
+      expect(defaultMetadata.grant_types_supported).not.toContain('urn:ietf:params:oauth:grant-type:jwt-bearer');
+    });
+
+    it('should exchange a valid ID-JAG for an access token with mapped props', async () => {
+      const tokenResponse = await exchangeAssertion(await createAssertion());
+      expect(tokenResponse.status).toBe(200);
+      const tokens = await tokenResponse.json<any>();
+
+      expect(tokens.access_token).toBeDefined();
+      expect(tokens.refresh_token).toBeUndefined();
+      expect(tokens.token_type).toBe('bearer');
+      expect(tokens.expires_in).toBeLessThanOrEqual(300);
+      expect(tokens.scope).toBe('read write');
+      expect(tokens.resource).toBe(resource);
+
+      const apiResponse = await enterpriseProvider.fetch(
+        createMockRequest('https://example.com/api/test', 'GET', {
+          Authorization: `Bearer ${tokens.access_token}`,
+        }),
+        mockEnv,
+        mockCtx
+      );
+      expect(apiResponse.status).toBe(200);
+      const apiResult = await apiResponse.json<any>();
+      expect(apiResult.user).toEqual({
+        enterprise: true,
+        subject: 'employee-123',
+        email: 'employee@example.com',
+      });
+    });
+
+    it('should accept ES256 assertions when the trusted issuer allows ES256', async () => {
+      const ecKey = await createEcJwtKey();
+      privateKey = ecKey.privateKey;
+      publicJwk = ecKey.publicJwk;
+
+      const esProvider = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        resourceMetadata: { resource },
+        enterpriseManagedAuthorization: {
+          enabled: true,
+          trustedIssuers: [{ issuer, jwksUri: `${issuer}/jwks.json`, algorithms: ['ES256'] }],
+          mapClaims: async ({ requestedScope }) => ({
+            userId: 'enterprise-employee-123',
+            scope: requestedScope,
+            metadata: null,
+            props: { enterprise: true },
+          }),
+        },
+      });
+
+      const registerResponse = await esProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify({
+            redirect_uris: ['https://client.example.com/callback'],
+            client_name: 'Enterprise Client',
+            token_endpoint_auth_method: 'client_secret_basic',
+          })
+        ),
+        mockEnv,
+        mockCtx
+      );
+      const client = await registerResponse.json<any>();
+      const assertion = await createAssertion({ client_id: client.client_id }, { alg: 'ES256', kid: 'ec-key' });
+      const params = new URLSearchParams();
+      params.append('grant_type', 'urn:ietf:params:oauth:grant-type:jwt-bearer');
+      params.append('assertion', assertion);
+
+      const response = await esProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            Authorization: `Basic ${btoa(`${client.client_id}:${client.client_secret}`)}`,
+          },
+          params.toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+      const tokens = await response.json<any>();
+
+      expect(response.status).toBe(200);
+      expect(tokens.access_token).toBeDefined();
+      expect(tokens.scope).toBe('read write');
+    });
+
+    it('should reject jwt-bearer grant when enterprise-managed authorization is disabled', async () => {
+      const assertion = await createAssertion();
+      const params = new URLSearchParams();
+      params.append('grant_type', 'urn:ietf:params:oauth:grant-type:jwt-bearer');
+      params.append('assertion', assertion);
+
+      const response = await oauthProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+          },
+          params.toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+
+      expect(response.status).toBe(400);
+      expect(await response.json<any>()).toMatchObject({ error: 'unsupported_grant_type' });
+    });
+
+    it('should reject assertions with invalid typ', async () => {
+      const response = await exchangeAssertion(await createAssertion({}, { typ: 'JWT' }));
+      expect(response.status).toBe(400);
+      expect(await response.json<any>()).toMatchObject({ error: 'invalid_grant' });
+    });
+
+    it('should reject missing or malformed assertions', async () => {
+      const missingParams = new URLSearchParams();
+      missingParams.append('grant_type', 'urn:ietf:params:oauth:grant-type:jwt-bearer');
+
+      const missingResponse = await enterpriseProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+          },
+          missingParams.toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+      expect(missingResponse.status).toBe(400);
+      expect(await missingResponse.json<any>()).toMatchObject({ error: 'invalid_request' });
+
+      const malformedResponse = await exchangeAssertion('not-a-jwt');
+      expect(malformedResponse.status).toBe(400);
+      expect(await malformedResponse.json<any>()).toMatchObject({ error: 'invalid_grant' });
+    });
+
+    it('should reject alg none assertions', async () => {
+      const response = await exchangeAssertion(await createAssertion({}, { alg: 'none' }));
+      expect(response.status).toBe(400);
+      expect(await response.json<any>()).toMatchObject({ error: 'invalid_grant' });
+    });
+
+    it('should reject assertions with invalid audience', async () => {
+      const response = await exchangeAssertion(await createAssertion({ aud: 'https://other.example.com' }));
+      expect(response.status).toBe(400);
+      expect(await response.json<any>()).toMatchObject({ error: 'invalid_grant' });
+    });
+
+    it('should reject assertions from unknown issuers', async () => {
+      const response = await exchangeAssertion(await createAssertion({ iss: 'https://unknown-idp.example.com' }));
+      expect(response.status).toBe(400);
+      expect(await response.json<any>()).toMatchObject({ error: 'invalid_grant' });
+    });
+
+    it('should reject assertions for a different client_id', async () => {
+      const response = await exchangeAssertion(await createAssertion({ client_id: 'other-client' }));
+      expect(response.status).toBe(400);
+      expect(await response.json<any>()).toMatchObject({ error: 'invalid_grant' });
+    });
+
+    it('should reject assertions for an unacceptable resource', async () => {
+      const response = await exchangeAssertion(await createAssertion({ resource: 'https://evil.example.com/api' }));
+      expect(response.status).toBe(400);
+      expect(await response.json<any>()).toMatchObject({ error: 'invalid_target' });
+    });
+
+    it('should reject assertions with invalid OAuth scope-token characters', async () => {
+      const response = await exchangeAssertion(await createAssertion({ scope: 'read "write"' }));
+      expect(response.status).toBe(400);
+      expect(await response.json<any>()).toMatchObject({ error: 'invalid_grant' });
+    });
+
+    it('should reject expired assertions', async () => {
+      const now = Math.floor(Date.now() / 1000);
+      const response = await exchangeAssertion(await createAssertion({ iat: now - 600, exp: now - 1 }));
+      expect(response.status).toBe(400);
+      expect(await response.json<any>()).toMatchObject({ error: 'invalid_grant' });
+    });
+
+    it('should reject assertions with excessive lifetimes', async () => {
+      const now = Math.floor(Date.now() / 1000);
+      const response = await exchangeAssertion(await createAssertion({ iat: now, exp: now + 3600 }));
+      expect(response.status).toBe(400);
+      expect(await response.json<any>()).toMatchObject({ error: 'invalid_grant' });
+    });
+
+    it('should reject assertions issued too far in the future', async () => {
+      const now = Math.floor(Date.now() / 1000);
+      const response = await exchangeAssertion(await createAssertion({ iat: now + 120, exp: now + 300 }));
+      expect(response.status).toBe(400);
+      expect(await response.json<any>()).toMatchObject({ error: 'invalid_grant' });
+    });
+
+    it('should reject replayed assertion jti values', async () => {
+      const assertion = await createAssertion({ jti: 'fixed-jti' });
+      const firstResponse = await exchangeAssertion(assertion);
+      expect(firstResponse.status).toBe(200);
+
+      const secondResponse = await exchangeAssertion(assertion);
+      expect(secondResponse.status).toBe(400);
+      expect(await secondResponse.json<any>()).toMatchObject({ error: 'invalid_grant' });
+    });
+
+    it('should reject assertions signed by an unknown key', async () => {
+      const otherKey = await createRsaJwtKey('other-key');
+      const now = Math.floor(Date.now() / 1000);
+      const assertion = await signJwt(
+        otherKey.privateKey,
+        {
+          iss: issuer,
+          sub: 'employee-123',
+          aud: 'https://example.com',
+          resource,
+          client_id: clientId,
+          jti: crypto.randomUUID(),
+          iat: now,
+          exp: now + 300,
+          scope: 'read',
+        },
+        { kid: 'other-key' }
+      );
+
+      const response = await exchangeAssertion(assertion);
+      expect(response.status).toBe(400);
+      expect(await response.json<any>()).toMatchObject({ error: 'invalid_grant' });
+    });
+
+    it('should downscope requested and mapped scopes to assertion scopes', async () => {
+      const downscopingProvider = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        resourceMetadata: { resource },
+        enterpriseManagedAuthorization: {
+          enabled: true,
+          trustedIssuers: [{ issuer, jwksUri: `${issuer}/jwks.json`, algorithms: ['RS256'] }],
+          mapClaims: async ({ requestedScope }) => ({
+            userId: 'employee-123',
+            scope: [...requestedScope, 'admin'],
+            metadata: null,
+            props: { ok: true },
+          }),
+        },
+      });
+
+      const registerResponse = await downscopingProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify({
+            redirect_uris: ['https://client.example.com/callback'],
+            client_name: 'Enterprise Client',
+            token_endpoint_auth_method: 'client_secret_basic',
+          })
+        ),
+        mockEnv,
+        mockCtx
+      );
+      const client = await registerResponse.json<any>();
+      const assertion = await createAssertion({ client_id: client.client_id, scope: 'read write' });
+      const params = new URLSearchParams();
+      params.append('grant_type', 'urn:ietf:params:oauth:grant-type:jwt-bearer');
+      params.append('assertion', assertion);
+      params.append('scope', 'read admin');
+
+      const response = await downscopingProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            Authorization: `Basic ${btoa(`${client.client_id}:${client.client_secret}`)}`,
+          },
+          params.toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+      const tokens = await response.json<any>();
+      expect(response.status).toBe(200);
+      expect(tokens.scope).toBe('read');
+    });
+
+    it('should reject mapped scopes with invalid OAuth scope-token characters', async () => {
+      const invalidScopeProvider = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        resourceMetadata: { resource },
+        enterpriseManagedAuthorization: {
+          enabled: true,
+          trustedIssuers: [{ issuer, jwksUri: `${issuer}/jwks.json`, algorithms: ['RS256'] }],
+          mapClaims: async () => ({
+            userId: 'employee-123',
+            scope: ['read', 'bad scope'],
+            metadata: null,
+            props: { ok: true },
+          }),
+        },
+      });
+
+      const registerResponse = await invalidScopeProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify({
+            redirect_uris: ['https://client.example.com/callback'],
+            client_name: 'Enterprise Client',
+            token_endpoint_auth_method: 'client_secret_basic',
+          })
+        ),
+        mockEnv,
+        mockCtx
+      );
+      const client = await registerResponse.json<any>();
+      const assertion = await createAssertion({ client_id: client.client_id });
+      const params = new URLSearchParams();
+      params.append('grant_type', 'urn:ietf:params:oauth:grant-type:jwt-bearer');
+      params.append('assertion', assertion);
+
+      const response = await invalidScopeProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            Authorization: `Basic ${btoa(`${client.client_id}:${client.client_secret}`)}`,
+          },
+          params.toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+
+      expect(response.status).toBe(400);
+      expect(await response.json<any>()).toMatchObject({ error: 'invalid_grant' });
+    });
+
+    it('should reject public clients for enterprise-managed authorization', async () => {
+      const publicRegisterResponse = await enterpriseProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify({
+            redirect_uris: ['https://public.example.com/callback'],
+            client_name: 'Public Enterprise Client',
+            token_endpoint_auth_method: 'none',
+          })
+        ),
+        mockEnv,
+        mockCtx
+      );
+      const publicClient = await publicRegisterResponse.json<any>();
+      const assertion = await createAssertion({ client_id: publicClient.client_id });
+      const params = new URLSearchParams();
+      params.append('grant_type', 'urn:ietf:params:oauth:grant-type:jwt-bearer');
+      params.append('assertion', assertion);
+      params.append('client_id', publicClient.client_id);
+
+      const response = await enterpriseProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          params.toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+
+      expect(response.status).toBe(401);
+      expect(await response.json<any>()).toMatchObject({ error: 'invalid_client' });
+    });
+
+    it('should deny issuance when mapClaims returns null', async () => {
+      const denyingProvider = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        resourceMetadata: { resource },
+        enterpriseManagedAuthorization: {
+          enabled: true,
+          trustedIssuers: [{ issuer, jwksUri: `${issuer}/jwks.json`, algorithms: ['RS256'] }],
+          mapClaims: async () => null,
+        },
+      });
+
+      const registerResponse = await denyingProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify({
+            redirect_uris: ['https://client.example.com/callback'],
+            client_name: 'Enterprise Client',
+            token_endpoint_auth_method: 'client_secret_basic',
+          })
+        ),
+        mockEnv,
+        mockCtx
+      );
+      const client = await registerResponse.json<any>();
+      const assertion = await createAssertion({ client_id: client.client_id });
+      const params = new URLSearchParams();
+      params.append('grant_type', 'urn:ietf:params:oauth:grant-type:jwt-bearer');
+      params.append('assertion', assertion);
+
+      const response = await denyingProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            Authorization: `Basic ${btoa(`${client.client_id}:${client.client_secret}`)}`,
+          },
+          params.toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+
+      expect(response.status).toBe(400);
+      expect(await response.json<any>()).toMatchObject({ error: 'invalid_grant' });
+    });
+
+    it('should validate enterprise issuer options at construction time', () => {
+      const baseOptions = {
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+      };
+
+      expect(
+        () =>
+          new OAuthProvider({
+            ...baseOptions,
+            enterpriseManagedAuthorization: {
+              enabled: true,
+              trustedIssuers: [{ issuer, jwksUri: 'http://idp.example.com/jwks.json' }],
+              mapClaims: async () => ({ userId: 'user', scope: [], props: null }),
+            },
+          })
+      ).toThrow(/jwksUri must use HTTPS/);
+
+      expect(
+        () =>
+          new OAuthProvider({
+            ...baseOptions,
+            enterpriseManagedAuthorization: {
+              enabled: true,
+              trustedIssuers: [{ issuer, jwksUri: `${issuer}/jwks.json`, algorithms: ['HS256'] }],
+              mapClaims: async () => ({ userId: 'user', scope: [], props: null }),
+            },
+          })
+      ).toThrow(/unsupported alg/);
+    });
+
+    it('should reject mapped user IDs that cannot be represented in opaque token format', async () => {
+      const colonUserProvider = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        resourceMetadata: { resource },
+        enterpriseManagedAuthorization: {
+          enabled: true,
+          trustedIssuers: [{ issuer, jwksUri: `${issuer}/jwks.json`, algorithms: ['RS256'] }],
+          mapClaims: async ({ claims, requestedScope }) => ({
+            userId: `${claims.iss}:${claims.sub}`,
+            scope: requestedScope,
+            metadata: null,
+            props: { ok: true },
+          }),
+        },
+      });
+
+      const registerResponse = await colonUserProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify({
+            redirect_uris: ['https://client.example.com/callback'],
+            client_name: 'Enterprise Client',
+            token_endpoint_auth_method: 'client_secret_basic',
+          })
+        ),
+        mockEnv,
+        mockCtx
+      );
+      const client = await registerResponse.json<any>();
+      const assertion = await createAssertion({ client_id: client.client_id });
+      const params = new URLSearchParams();
+      params.append('grant_type', 'urn:ietf:params:oauth:grant-type:jwt-bearer');
+      params.append('assertion', assertion);
+
+      const response = await colonUserProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            Authorization: `Basic ${btoa(`${client.client_id}:${client.client_secret}`)}`,
+          },
+          params.toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+
+      expect(response.status).toBe(400);
+      expect(await response.json<any>()).toMatchObject({ error: 'invalid_grant' });
     });
   });
 
