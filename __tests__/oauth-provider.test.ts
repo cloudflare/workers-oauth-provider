@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
-import { OAuthProvider, type OAuthHelpers } from '../src/oauth-provider';
+import { OAuthError, OAuthProvider, type OAuthHelpers } from '../src/oauth-provider';
 import type { ExecutionContext } from '@cloudflare/workers-types';
 // We're importing WorkerEntrypoint from our mock implementation
 // The actual import is mocked in setup.ts
@@ -1847,6 +1847,72 @@ describe('OAuthProvider', () => {
 
       expect(grant.previousRefreshTokenId).toBeDefined(); // Old refresh token should be tracked
       expect(grant.refreshTokenId).toBeDefined(); // New refresh token should be set
+    });
+
+    it('should return a retryable OAuth error when refresh grant rotation is KV rate limited', async () => {
+      const originalPut = mockEnv.OAUTH_KV.put.bind(mockEnv.OAUTH_KV);
+      mockEnv.OAUTH_KV.put = vi.fn(async (key: string, value: string | ArrayBuffer, options?: any) => {
+        if (key.startsWith('grant:')) {
+          throw new Error('KV PUT failed: 429 Too Many Requests');
+        }
+        return originalPut(key, value, options);
+      });
+
+      const params = new URLSearchParams();
+      params.append('grant_type', 'refresh_token');
+      params.append('refresh_token', refreshToken);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+
+      const refreshRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      );
+
+      const refreshResponse = await oauthProvider.fetch(refreshRequest, mockEnv, mockCtx);
+      const error = await refreshResponse.json<any>();
+
+      expect(refreshResponse.status).toBe(429);
+      expect(refreshResponse.headers.get('Retry-After')).toBe('30');
+      expect(error).toEqual({
+        error: 'temporarily_unavailable',
+        error_description: 'Token issuance is temporarily unavailable; retry shortly',
+      });
+    });
+
+    it('should return a retryable OAuth error when refresh access-token write is KV rate limited', async () => {
+      const originalPut = mockEnv.OAUTH_KV.put.bind(mockEnv.OAUTH_KV);
+      mockEnv.OAUTH_KV.put = vi.fn(async (key: string, value: string | ArrayBuffer, options?: any) => {
+        if (key.startsWith('token:')) {
+          throw new Error('KV PUT failed: 429 Too Many Requests');
+        }
+        return originalPut(key, value, options);
+      });
+
+      const params = new URLSearchParams();
+      params.append('grant_type', 'refresh_token');
+      params.append('refresh_token', refreshToken);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+
+      const refreshRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      );
+
+      const refreshResponse = await oauthProvider.fetch(refreshRequest, mockEnv, mockCtx);
+      const error = await refreshResponse.json<any>();
+
+      expect(refreshResponse.status).toBe(429);
+      expect(refreshResponse.headers.get('Retry-After')).toBe('30');
+      expect(error).toEqual({
+        error: 'temporarily_unavailable',
+        error_description: 'Token issuance is temporarily unavailable; retry shortly',
+      });
     });
 
     it('should allow using the previous refresh token once', async () => {
@@ -5623,6 +5689,433 @@ describe('OAuthProvider', () => {
       // Callback requested ['read', 'admin'] but grant only had ['read', 'write']
       // downscope() should filter to just 'read'
       expect(tokens.scope).toBe('read');
+    });
+  });
+
+  describe('Token Endpoint Callback Error Handling', () => {
+    // Tests covering structured `/token` error responses produced when a
+    // `tokenExchangeCallback` (or any code it calls) throws an `OAuthError`.
+    // The provider catches `OAuthError` instances at the token endpoint
+    // and converts them into standard OAuth 2.0 error responses; anything
+    // else thrown surfaces as `500 Internal Server Error`.
+
+    let mockEnv: TestEnv;
+    let mockCtx: MockExecutionContext;
+    let clientId: string;
+    let clientSecret: string;
+    const redirectUri = 'https://client.example.com/callback';
+
+    function buildProvider(callback: (options: any) => Promise<any> | any): OAuthProvider<TestEnv> {
+      return new OAuthProvider({
+        apiRoute: ['/api/', 'https://api.example.com/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        scopesSupported: ['read', 'write'],
+        accessTokenTTL: 3600,
+        allowTokenExchangeGrant: true,
+        tokenExchangeCallback: callback,
+      });
+    }
+
+    async function registerClient(provider: OAuthProvider<TestEnv>) {
+      const registerRequest = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify({
+          redirect_uris: [redirectUri],
+          client_name: 'Test Client',
+          token_endpoint_auth_method: 'client_secret_basic',
+        })
+      );
+      const response = await provider.fetch(registerRequest, mockEnv, mockCtx);
+      const client = await response.json<any>();
+      clientId = client.client_id;
+      clientSecret = client.client_secret;
+    }
+
+    async function getRefreshToken(
+      provider: OAuthProvider<TestEnv>
+    ): Promise<{ accessToken: string; refreshToken: string }> {
+      // Run an authorization_code flow to mint a refresh token.
+      // We use a no-op callback for this leg so the callback errors
+      // under test only fire on the refresh_token grant we run after.
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123`
+      );
+      const authResponse = await provider.fetch(authRequest, mockEnv, mockCtx);
+      const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
+
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+
+      const tokenResponse = await provider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          params.toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+      expect(tokenResponse.status).toBe(200);
+      const tokens = await tokenResponse.json<any>();
+      return { accessToken: tokens.access_token, refreshToken: tokens.refresh_token };
+    }
+
+    async function refreshWithToken(provider: OAuthProvider<TestEnv>, refreshToken: string): Promise<Response> {
+      const params = new URLSearchParams();
+      params.append('grant_type', 'refresh_token');
+      params.append('refresh_token', refreshToken);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+      return provider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          params.toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+    }
+
+    async function exchangeAccessToken(provider: OAuthProvider<TestEnv>, accessToken: string): Promise<Response> {
+      const params = new URLSearchParams();
+      params.append('grant_type', 'urn:ietf:params:oauth:grant-type:token-exchange');
+      params.append('subject_token', accessToken);
+      params.append('subject_token_type', 'urn:ietf:params:oauth:token-type:access_token');
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+      return provider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          params.toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+    }
+
+    beforeEach(() => {
+      vi.resetAllMocks();
+      mockEnv = createMockEnv();
+      mockCtx = new MockExecutionContext();
+    });
+
+    afterEach(() => {
+      mockEnv.OAUTH_KV.clear();
+    });
+
+    it('preserves successful refresh token exchanges (regression guard)', async () => {
+      // The new try/catch must not affect callbacks that return a normal
+      // success result — only ones that throw `OAuthError`. This guards
+      // against accidentally swallowing the happy path.
+      let calls = 0;
+      const provider = buildProvider(async (options: any) => {
+        calls++;
+        if (options.grantType === 'refresh_token') {
+          return { newProps: { ...options.props, rotated: true }, accessTokenTTL: 1234 };
+        }
+        return undefined;
+      });
+      await registerClient(provider);
+      const { refreshToken } = await getRefreshToken(provider);
+
+      const response = await refreshWithToken(provider, refreshToken);
+      expect(response.status).toBe(200);
+      const tokens = await response.json<any>();
+      expect(tokens.access_token).toEqual(expect.any(String));
+      expect(tokens.refresh_token).toEqual(expect.any(String));
+      expect(tokens.expires_in).toBe(1234);
+      expect(tokens.token_type).toBe('bearer');
+      expect(tokens.scope).toBe('read write');
+      expect(calls).toBeGreaterThanOrEqual(2); // auth_code + refresh_token
+    });
+
+    it('converts a thrown OAuthError on refresh_token into a structured response', async () => {
+      // Primary use case: the upstream OAuth provider rejected our
+      // refresh token. We surface this to the client as a standard
+      // OAuth `invalid_grant` so it stops retrying with a dead token.
+      const provider = buildProvider(async (options: any) => {
+        if (options.grantType === 'refresh_token') {
+          throw new OAuthError('invalid_grant', { description: 'upstream refresh token is invalid' });
+        }
+        return undefined;
+      });
+      await registerClient(provider);
+      const { refreshToken } = await getRefreshToken(provider);
+
+      const response = await refreshWithToken(provider, refreshToken);
+      expect(response.status).toBe(400);
+      expect(response.headers.get('Content-Type')).toBe('application/json');
+      await expect(response.json()).resolves.toEqual({
+        error: 'invalid_grant',
+        error_description: 'upstream refresh token is invalid',
+      });
+      // No `Retry-After` unless the caller sets one in `headers`.
+      expect(response.headers.get('Retry-After')).toBeNull();
+    });
+
+    it('emits Retry-After from `headers` on a 429 OAuthError', async () => {
+      // The standard "upstream rate-limited us" case. The caller mirrors
+      // whatever Retry-After the upstream sent (or picks their own).
+      const provider = buildProvider(async (options: any) => {
+        if (options.grantType === 'refresh_token') {
+          throw new OAuthError('temporarily_unavailable', {
+            description: 'refresh already in progress',
+            statusCode: 429,
+            headers: { 'Retry-After': '12' },
+          });
+        }
+        return undefined;
+      });
+      await registerClient(provider);
+      const { refreshToken } = await getRefreshToken(provider);
+
+      const response = await refreshWithToken(provider, refreshToken);
+      expect(response.status).toBe(429);
+      expect(response.headers.get('Retry-After')).toBe('12');
+      await expect(response.json()).resolves.toEqual({
+        error: 'temporarily_unavailable',
+        error_description: 'refresh already in progress',
+      });
+    });
+
+    it('does not add Retry-After by default on 429 (no magic value)', async () => {
+      // Pinning that the library does not invent a Retry-After. If the
+      // caller cares about retries they must set the header explicitly;
+      // otherwise we don't pretend to know.
+      const provider = buildProvider(async (options: any) => {
+        if (options.grantType === 'refresh_token') {
+          throw new OAuthError('temporarily_unavailable', { description: 'unavailable', statusCode: 429 });
+        }
+        return undefined;
+      });
+      await registerClient(provider);
+      const { refreshToken } = await getRefreshToken(provider);
+
+      const response = await refreshWithToken(provider, refreshToken);
+      expect(response.status).toBe(429);
+      expect(response.headers.get('Retry-After')).toBeNull();
+    });
+
+    it('passes through additional custom headers from `headers`', async () => {
+      const provider = buildProvider(async (options: any) => {
+        if (options.grantType === 'refresh_token') {
+          throw new OAuthError('invalid_grant', {
+            description: 'upstream rejected',
+            headers: { 'X-Trace-Id': 'abc-123' },
+          });
+        }
+        return undefined;
+      });
+      await registerClient(provider);
+      const { refreshToken } = await getRefreshToken(provider);
+
+      const response = await refreshWithToken(provider, refreshToken);
+      expect(response.status).toBe(400);
+      expect(response.headers.get('X-Trace-Id')).toBe('abc-123');
+    });
+
+    it('converts a thrown OAuthError on authorization_code into a structured response', async () => {
+      const provider = buildProvider(async (options: any) => {
+        if (options.grantType === 'authorization_code') {
+          throw new OAuthError('invalid_grant', { description: 'upstream code rejected' });
+        }
+        return undefined;
+      });
+      await registerClient(provider);
+
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read&state=xyz123`
+      );
+      const authResponse = await provider.fetch(authRequest, mockEnv, mockCtx);
+      const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
+
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+
+      const tokenResponse = await provider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          params.toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+      expect(tokenResponse.status).toBe(400);
+      await expect(tokenResponse.json()).resolves.toEqual({
+        error: 'invalid_grant',
+        error_description: 'upstream code rejected',
+      });
+    });
+
+    it('converts a thrown OAuthError on token-exchange into a structured response', async () => {
+      // Token exchange has its own inner catch to convert OAuthError from the
+      // core exchange helper, so keep explicit coverage that callback-thrown
+      // OAuthError still reaches the token endpoint structured response path.
+      const provider = buildProvider(async (options: any) => {
+        if (options.grantType === 'urn:ietf:params:oauth:grant-type:token-exchange') {
+          throw new OAuthError('invalid_grant', { description: 'upstream token exchange rejected' });
+        }
+        return undefined;
+      });
+      await registerClient(provider);
+      const { accessToken } = await getRefreshToken(provider);
+
+      const tokenResponse = await exchangeAccessToken(provider, accessToken);
+      expect(tokenResponse.status).toBe(400);
+      await expect(tokenResponse.json()).resolves.toEqual({
+        error: 'invalid_grant',
+        error_description: 'upstream token exchange rejected',
+      });
+    });
+
+    it('propagates OAuthError thrown deep in the callback call stack', async () => {
+      // The whole point of `throw OAuthError`: errors from any depth
+      // bubble naturally without each layer having to plumb a result
+      // object back up.
+      async function inner() {
+        throw new OAuthError('invalid_grant', { description: 'upstream refresh token is invalid' });
+      }
+      async function middle() {
+        return await inner();
+      }
+      const provider = buildProvider(async (options: any) => {
+        if (options.grantType === 'refresh_token') {
+          return { newProps: await middle() };
+        }
+        return undefined;
+      });
+      await registerClient(provider);
+      const { refreshToken } = await getRefreshToken(provider);
+
+      const response = await refreshWithToken(provider, refreshToken);
+      expect(response.status).toBe(400);
+      await expect(response.json()).resolves.toEqual({
+        error: 'invalid_grant',
+        error_description: 'upstream refresh token is invalid',
+      });
+    });
+
+    it('allows custom string codes in the exported OAuthError class', async () => {
+      const provider = buildProvider(async (options: any) => {
+        if (options.grantType === 'refresh_token') {
+          throw new OAuthError('access_denied', {
+            description: 'custom code understood by this client',
+            statusCode: 403,
+          });
+        }
+        return undefined;
+      });
+      await registerClient(provider);
+      const { refreshToken } = await getRefreshToken(provider);
+
+      const response = await refreshWithToken(provider, refreshToken);
+      expect(response.status).toBe(403);
+      await expect(response.json()).resolves.toEqual({
+        error: 'access_denied',
+        error_description: 'custom code understood by this client',
+      });
+    });
+
+    it('lets app-local OAuthError classes surface as 500 (use the exported class)', async () => {
+      class LocalOAuthError extends Error {
+        name = 'OAuthError';
+        constructor(
+          public code: string,
+          public description: string,
+          public statusCode = 400
+        ) {
+          super(description);
+        }
+      }
+
+      const provider = buildProvider(async (options: any) => {
+        if (options.grantType === 'refresh_token') {
+          throw new LocalOAuthError('temporarily_unavailable', 'local OAuthError class', 429);
+        }
+        return undefined;
+      });
+      await registerClient(provider);
+      const { refreshToken } = await getRefreshToken(provider);
+
+      await expect(refreshWithToken(provider, refreshToken)).rejects.toThrow('local OAuthError class');
+    });
+
+    it('lets non-OAuthError throws surface as 500 (does not swallow real bugs)', async () => {
+      // Anything that is not an OAuthError must bubble up so
+      // unexpected failures stay visible — we deliberately do not
+      // catch-everything-and-return-400, which would mask real bugs.
+      const provider = buildProvider(async (options: any) => {
+        if (options.grantType === 'refresh_token') {
+          throw new Error('unexpected failure');
+        }
+        return undefined;
+      });
+      await registerClient(provider);
+      const { refreshToken } = await getRefreshToken(provider);
+
+      await expect(refreshWithToken(provider, refreshToken)).rejects.toThrow('unexpected failure');
+    });
+
+    it('lets Error instances with a `code` field surface as 500', async () => {
+      // Confirms we are not duck-typing arbitrary Error instances. Only this
+      // package's exported OAuthError class is converted into a structured
+      // response.
+      const provider = buildProvider(async (options: any) => {
+        if (options.grantType === 'refresh_token') {
+          const err: any = new Error('looks like an OAuth error but is not');
+          err.code = 'invalid_grant';
+          throw err;
+        }
+        return undefined;
+      });
+      await registerClient(provider);
+      const { refreshToken } = await getRefreshToken(provider);
+
+      await expect(refreshWithToken(provider, refreshToken)).rejects.toThrow('looks like an OAuth error but is not');
+    });
+
+    it('lets thrown plain objects with a `code` field surface as 500', async () => {
+      // Confirms we are not duck-typing arbitrary objects. Only this
+      // package's exported OAuthError class is converted into a structured
+      // response.
+      const provider = buildProvider(async (options: any) => {
+        if (options.grantType === 'refresh_token') {
+          throw { code: 'invalid_grant', message: 'plain object OAuth-ish error' };
+        }
+        return undefined;
+      });
+      await registerClient(provider);
+      const { refreshToken } = await getRefreshToken(provider);
+
+      await expect(refreshWithToken(provider, refreshToken)).rejects.toMatchObject({
+        code: 'invalid_grant',
+        message: 'plain object OAuth-ish error',
+      });
     });
   });
 
