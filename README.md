@@ -306,6 +306,52 @@ The `accessTokenTTL` override is particularly useful when the application is als
 
 The `props` values are end-to-end encrypted, so they can safely contain sensitive information.
 
+### Reporting errors from the callback
+
+Throw `OAuthError` from `tokenExchangeCallback` to return a structured OAuth `/token` error (`{ error, error_description }`) instead of a generic 500:
+
+```ts
+import { OAuthError, OAuthProvider } from '@cloudflare/workers-oauth-provider';
+
+new OAuthProvider({
+  // …
+  tokenExchangeCallback: async (options) => {
+    if (options.grantType === 'refresh_token') {
+      return { newProps: await refreshUpstream(options.props) };
+    }
+  },
+});
+
+async function refreshUpstream(props) {
+  const res = await fetch(/* upstream token endpoint */);
+
+  if (res.status === 401) {
+    throw new OAuthError('invalid_grant', {
+      description: 'upstream refresh token is invalid',
+    });
+  }
+
+  if (res.status === 429) {
+    throw new OAuthError('temporarily_unavailable', {
+      description: 'upstream rate limited',
+      statusCode: 429,
+      headers: { 'Retry-After': res.headers.get('retry-after') ?? '60' },
+    });
+  }
+
+  return await res.json();
+}
+```
+
+`OAuthError(code, options)` takes:
+
+- `code` — OAuth error code returned in the `error` field. This may be a standard code (`OAuthTokenErrorCode`) or an application-defined string.
+- `options.description` — human-readable text returned in `error_description`.
+- `options.statusCode` — HTTP status code (default `400`).
+- `options.headers` — additional response headers, such as `Retry-After` for transient failures. There is no implicit `Retry-After` default for callback-thrown errors.
+
+Only `OAuthError` from this package is converted into a structured `/token` response. Plain errors, plain objects with a `code` field, and app-local error classes continue to surface as 500s so unexpected failures stay visible. Import `OAuthError` from `@cloudflare/workers-oauth-provider` rather than copying or re-implementing it.
+
 ## Custom Error Responses
 
 By using the `onError` option, you can emit notifications or take other actions when an error response was to be emitted:
