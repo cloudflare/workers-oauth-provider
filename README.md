@@ -238,6 +238,92 @@ Note that `deleteClient()` cascades: it revokes all grants (and their associated
 
 See the `OAuthHelpers` interface definition for full API details.
 
+## Permission attenuation during authorization
+
+Authorization UIs can add application-specific steps before calling `completeAuthorization()`. This is useful when the
+user should narrow a grant to a workspace, account, project, or other resource subset before the provider stores the
+grant's `scope` and encrypted `props`.
+
+The safe pattern is to parse the original OAuth request once, keep that parsed request server-side while the additional
+UI runs, and then call `completeAuthorization()` with the narrowed grant. Do not rebuild the OAuth request from form
+fields supplied by the client.
+
+```ts
+import type { AuthRequest } from '@cloudflare/workers-oauth-provider';
+
+async function storePendingAuthorization(env, oauthReqInfo: AuthRequest) {
+  let authorizationId = crypto.randomUUID();
+  await env.AUTHORIZATION_SESSIONS.put(authorizationId, JSON.stringify(oauthReqInfo), {
+    expirationTtl: 300,
+  });
+  return authorizationId;
+}
+
+async function takePendingAuthorization(env, authorizationId: string) {
+  let value = await env.AUTHORIZATION_SESSIONS.get(authorizationId);
+  if (!value) return null;
+  await env.AUTHORIZATION_SESSIONS.delete(authorizationId);
+  return JSON.parse(value) as AuthRequest;
+}
+
+const defaultHandler = {
+  async fetch(request: Request, env) {
+    let url = new URL(request.url);
+
+    if (url.pathname == '/authorize') {
+      let oauthReqInfo = await env.OAUTH_PROVIDER.parseAuthRequest(request);
+      let clientInfo = await env.OAUTH_PROVIDER.lookupClient(oauthReqInfo.clientId);
+
+      // Render a consent screen that lets the user choose the resource boundary
+      // for this client, such as a workspace, account, or project.
+      let authorizationId = await storePendingAuthorization(env, oauthReqInfo);
+
+      return renderWorkspacePicker({ authorizationId, clientInfo });
+    }
+
+    if (url.pathname == '/authorize/workspace' && request.method == 'POST') {
+      let form = await request.formData();
+      let authorizationId = form.get('authorizationId');
+      let workspaceId = form.get('workspaceId');
+
+      if (typeof authorizationId != 'string' || typeof workspaceId != 'string') {
+        return new Response('Bad request', { status: 400 });
+      }
+
+      let oauthReqInfo = await takePendingAuthorization(env, authorizationId);
+      if (!oauthReqInfo) {
+        return new Response('Authorization expired', { status: 400 });
+      }
+
+      let { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
+        request: oauthReqInfo,
+        userId: '1234',
+        metadata: { workspaceId },
+
+        // Grant only the scopes that are valid for the selected resource.
+        scope: ['document.read'],
+
+        // API handlers receive these narrowed props as ctx.props.
+        props: {
+          userId: '1234',
+          workspaceId,
+          permissions: ['document.read'],
+        },
+      });
+
+      return Response.redirect(redirectTo, 302);
+    }
+
+    return new Response('Not found', { status: 404 });
+  },
+};
+```
+
+For production, store pending authorizations in a server-side session or durable store with a short TTL, bind the
+additional UI submission to the authenticated user/session, and validate that the selected resource belongs to that
+user before completing the authorization. The OAuth provider persists only the final attenuated `scope`, `metadata`, and
+`props` supplied to `completeAuthorization()`.
+
 ## Token Exchange Callback
 
 This library allows you to update the `props` value during token exchanges by configuring a callback function. This is useful for scenarios where the application needs to perform additional processing when tokens are issued or refreshed.
