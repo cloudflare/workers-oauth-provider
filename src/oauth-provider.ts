@@ -1687,9 +1687,22 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Process application/x-www-form-urlencoded
     const formData = await request.formData();
+    const processedKeys = new Set<string>();
     for (const [key, value] of formData.entries()) {
+      if (processedKeys.has(key)) {
+        continue;
+      }
+      processedKeys.add(key);
+
       // RFC 8707: resource parameter can appear multiple times
       const allValues = formData.getAll(key);
+      if (key !== 'resource' && allValues.length > 1) {
+        return this.createErrorResponse('invalid_request', {
+          description: `Request parameter "${key}" must not be repeated`,
+          statusCode: 400,
+        });
+      }
+
       body[key] = allValues.length > 1 ? allValues : value;
     }
 
@@ -1699,11 +1712,27 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     let clientSecret = '';
 
     if (authHeader && authHeader.startsWith('Basic ')) {
+      if (body.client_id || body.client_secret) {
+        return this.createErrorResponse('invalid_request', {
+          description: 'Client must not use multiple authentication methods',
+          statusCode: 400,
+        });
+      }
+
       // Basic auth
       const credentials = atob(authHeader.substring(6));
-      const [id, secret] = credentials.split(':', 2);
-      clientId = decodeURIComponent(id);
-      clientSecret = decodeURIComponent(secret || '');
+      const separatorIndex = credentials.indexOf(':');
+      if (separatorIndex === -1) {
+        return this.createErrorResponse('invalid_client', {
+          description: 'Client authentication failed: invalid Basic credentials',
+          statusCode: 401,
+        });
+      }
+
+      const id = credentials.substring(0, separatorIndex);
+      const secret = credentials.substring(separatorIndex + 1);
+      clientId = decodeFormUrlEncodedComponent(id);
+      clientSecret = decodeFormUrlEncodedComponent(secret);
     } else {
       // Form parameters
       clientId = body.client_id;
@@ -4322,6 +4351,15 @@ export function resourceMatches(requested: string, granted: string, originOnly: 
 async function hashSecret(secret: string): Promise<string> {
   // Use the same approach as generateTokenId for consistency
   return generateTokenId(secret);
+}
+
+/**
+ * Decodes an application/x-www-form-urlencoded component.
+ * @param value - The encoded component value
+ * @returns The decoded component value
+ */
+function decodeFormUrlEncodedComponent(value: string): string {
+  return decodeURIComponent(value.replace(/\+/g, ' '));
 }
 
 /**
