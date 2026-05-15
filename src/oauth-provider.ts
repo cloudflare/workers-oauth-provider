@@ -1354,7 +1354,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
       let response: Response;
       if (parsed.isRevocationRequest) {
-        response = await this.handleRevocationRequest(parsed.body, env);
+        response = await this.handleRevocationRequest(parsed.body, parsed.clientInfo, env);
       } else {
         response = await this.handleTokenRequest(parsed.body, parsed.clientInfo, env);
       }
@@ -2714,20 +2714,23 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @param env - Cloudflare Worker environment variables
    * @returns Response confirming revocation or error
    */
-  private async handleRevocationRequest(body: any, env: any): Promise<Response> {
-    // Handle the revocation request
-    return this.revokeToken(body, env);
+  private async handleRevocationRequest(body: any, clientInfo: ClientInfo, env: any): Promise<Response> {
+    // Handle the revocation request with client ownership verification
+    return this.revokeToken(body, clientInfo, env);
   }
 
   /**
    * - Access tokens: Revokes only the specific token
    * - Refresh tokens: Revokes the entire grant (access + refresh tokens)
+   * Per RFC 7009 §2.1, the server MUST verify the token was issued to the client making the request.
    * @param body - The parsed request body containing token parameter
+   * @param clientInfo - The authenticated client information
    * @param env - Cloudflare Worker environment variables
    * @returns Response confirming revocation or error
    */
-  private async revokeToken(body: any, env: any): Promise<Response> {
+  private async revokeToken(body: any, clientInfo: ClientInfo, env: any): Promise<Response> {
     const token = body.token;
+    const tokenTypeHint = body.token_type_hint;
 
     if (!token) {
       return this.createErrorResponse('invalid_request', { description: 'Token parameter is required' });
@@ -2740,15 +2743,57 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const [userId, grantId, _] = tokenParts;
     const tokenId = await generateTokenId(token);
 
-    const isAccessToken = await this.validateAccessToken(tokenId, userId, grantId, env);
-    const isRefreshToken = await this.validateRefreshToken(tokenId, userId, grantId, env);
-
-    if (isAccessToken) {
-      await this.revokeSpecificAccessToken(tokenId, userId, grantId, env);
-    } else if (isRefreshToken) {
-      await this.createOAuthHelpers(env).revokeGrant(grantId, userId);
+    // Use token_type_hint to check the hinted type first (RFC 7009 §2.1).
+    // Both paths verify client ownership before revoking (RFC 7009 §2.1).
+    if (tokenTypeHint === 'refresh_token') {
+      if (await this.revokeRefreshIfOwned(tokenId, userId, grantId, clientInfo, env)) {
+        return new Response('', { status: 200 });
+      }
+      if (await this.revokeAccessIfOwned(tokenId, userId, grantId, clientInfo, env)) {
+        return new Response('', { status: 200 });
+      }
+    } else {
+      // Default: access token first (matches hint=access_token or no hint)
+      if (await this.revokeAccessIfOwned(tokenId, userId, grantId, clientInfo, env)) {
+        return new Response('', { status: 200 });
+      }
+      if (await this.revokeRefreshIfOwned(tokenId, userId, grantId, clientInfo, env)) {
+        return new Response('', { status: 200 });
+      }
     }
     return new Response('', { status: 200 });
+  }
+
+  /** Revoke an access token if it exists and belongs to the requesting client. */
+  private async revokeAccessIfOwned(
+    tokenId: string,
+    userId: string,
+    grantId: string,
+    clientInfo: ClientInfo,
+    env: any
+  ): Promise<boolean> {
+    const tokenData: Token | null = await env.OAUTH_KV.get(`token:${userId}:${grantId}:${tokenId}`, { type: 'json' });
+    if (!tokenData) return false;
+    if (tokenData.grant.clientId !== clientInfo.clientId) return false;
+    await this.revokeSpecificAccessToken(tokenId, userId, grantId, env);
+    return true;
+  }
+
+  /** Revoke a refresh token (and its grant) if it exists and belongs to the requesting client. */
+  private async revokeRefreshIfOwned(
+    tokenId: string,
+    userId: string,
+    grantId: string,
+    clientInfo: ClientInfo,
+    env: any
+  ): Promise<boolean> {
+    const grantData: Grant | null = await env.OAUTH_KV.get(`grant:${userId}:${grantId}`, { type: 'json' });
+    if (!grantData) return false;
+    const isRefreshToken = grantData.refreshTokenId === tokenId || grantData.previousRefreshTokenId === tokenId;
+    if (!isRefreshToken) return false;
+    if (grantData.clientId !== clientInfo.clientId) return false;
+    await this.createOAuthHelpers(env).revokeGrant(grantId, userId);
+    return true;
   }
 
   /**
