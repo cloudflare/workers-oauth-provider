@@ -117,6 +117,10 @@ export default new OAuthProvider({
   // Defaults to false.
   allowTokenExchangeGrant: false,
 
+  // Optional: Experimental MCP Enterprise-Managed Authorization support.
+  // When enabled, the token endpoint accepts ID-JAG JWTs with the JWT bearer grant.
+  enterpriseManagedAuthorization: undefined,
+
   // Optional: Explicitly enable Client ID Metadata Document (CIMD) support.
   // When true, URL-formatted client_ids will be fetched as metadata documents.
   // Requires the 'global_fetch_strictly_public' compatibility flag.
@@ -352,6 +356,42 @@ async function refreshUpstream(props) {
 
 Only `OAuthError` from this package is converted into a structured `/token` response. Plain errors, plain objects with a `code` field, and app-local error classes continue to surface as 500s so unexpected failures stay visible. Import `OAuthError` from `@cloudflare/workers-oauth-provider` rather than copying or re-implementing it.
 
+## Enterprise-Managed Authorization (Experimental)
+
+Accepts ID-JAG assertions at `/token` per the [MCP Enterprise-Managed Authorization extension](https://modelcontextprotocol.io/extensions/auth/enterprise-managed-authorization). The enterprise IdP issues an ID-JAG JWT and the MCP client exchanges it here for an opaque access token.
+
+```ts
+new OAuthProvider({
+  // ... other options ...
+  resourceMetadata: { resource: 'https://mcp.example.com/mcp' },
+  enterpriseManagedAuthorization: {
+    trustedIssuers: ({ iss }) =>
+      iss === 'https://idp.example.com'
+        ? { issuer: iss, jwksUri: 'https://idp.example.com/.well-known/jwks.json', algorithms: ['RS256'] }
+        : null,
+    async mapClaims({ claims, requestedScope }) {
+      return {
+        // Opaque tokens use ':' as a separator — encode subjects that may contain it.
+        userId: `enterprise-${claims.sub}`,
+        scope: requestedScope,
+        metadata: { enterpriseIssuer: claims.iss, enterpriseSubject: claims.sub },
+        props: { enterprise: true, subject: claims.sub, email: claims.email },
+      };
+    },
+  },
+});
+```
+
+Setup:
+
+1. Configure your IdP as an ID-JAG issuer with this worker's origin as the resource and a public JWKS endpoint.
+2. Set `resourceMetadata.resource` to the MCP endpoint URL (required when EMA is enabled).
+3. Implement `trustedIssuers` as a resolver — for multi-tenant deployments it can read `env` / `clientInfo` to look up per-tenant IdP config without redeploying.
+
+The AS enforces `resolved.issuer === iss` (confused-deputy guard) and validates ID-JAG `typ`, signature, audience, client binding, resource, `exp` / `iat` / `nbf`, max lifetime, and `jti` replay. Access token TTL is clamped to the assertion lifetime; refresh tokens are not issued for this grant. Default in-memory JWKS cache and KV-backed JTI store can be replaced via `jwksProvider` / `jtiStore` adapters.
+
+Experimental — the MCP extension is still a draft.
+
 ## Custom Error Responses
 
 By using the `onError` option, you can emit notifications or take other actions when an error response was to be emitted:
@@ -434,6 +474,7 @@ This library implements the following OAuth and MCP specifications:
 - [OAuth 2.0 Protected Resource Metadata (RFC 9728)](https://datatracker.ietf.org/doc/html/rfc9728) — `/.well-known/oauth-protected-resource` discovery endpoint
 - [OAuth 2.0 Dynamic Client Registration (RFC 7591)](https://datatracker.ietf.org/doc/html/rfc7591) — Dynamic client registration endpoint
 - [OAuth Client ID Metadata Documents (draft-ietf-oauth-client-id-metadata-document)](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-client-id-metadata-document) — HTTPS URLs as client IDs
+- [MCP Enterprise-Managed Authorization extension](https://modelcontextprotocol.io/extensions/auth/enterprise-managed-authorization) — experimental ID-JAG JWT bearer grant support
 
 These are the specifications required by the [MCP authorization specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization).
 
