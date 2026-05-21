@@ -1896,8 +1896,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     if (this.options.allowTokenExchangeGrant) {
       grantTypesSupported.push(GrantType.TOKEN_EXCHANGE);
     }
+    const authorizationGrantProfilesSupported: string[] = [];
     if (this.options.enterpriseManagedAuthorization) {
       grantTypesSupported.push(GrantType.JWT_BEARER);
+      authorizationGrantProfilesSupported.push('urn:ietf:params:oauth:grant-profile:id-jag');
     }
 
     const metadata = {
@@ -1910,6 +1912,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       response_types_supported: responseTypesSupported,
       response_modes_supported: ['query'],
       grant_types_supported: grantTypesSupported,
+      // MCP Enterprise-Managed Authorization grant profile (only when EMA is configured).
+      ...(authorizationGrantProfilesSupported.length > 0
+        ? { authorization_grant_profiles_supported: authorizationGrantProfilesSupported }
+        : {}),
       // Support "none" auth method for public clients
       token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post', 'none'],
       // not implemented: token_endpoint_auth_signing_alg_values_supported
