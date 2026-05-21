@@ -480,4 +480,11 @@ describe('emaErrorToWire', () => {
       message: 'Invalid assertion',
     });
   });
+
+  it('maps mapper_threw to invalid_grant with the same message as mapper_denied', () => {
+    const threwWire = emaErrorToWire({ reason: 'mapper_threw' });
+    const deniedWire = emaErrorToWire({ reason: 'mapper_denied' });
+    expect(threwWire).toEqual({ code: 'invalid_grant', message: 'Assertion was not authorized' });
+    expect(threwWire).toEqual(deniedWire);
+  });
 });

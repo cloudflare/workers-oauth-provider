@@ -2996,11 +2996,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const mapped = validateEmaMapperResult(mapperOutput);
     if (!mapped.ok) return mapped;
 
+    // Fresh clock read so the `exp` check inside `computeEmaAccessTokenTTL`
+    // catches assertions that crossed `exp` during JWKS fetch + mapper execution
+    // — the pipeline-start `now` is too old for this TOCTOU guard.
     const ttl = computeEmaAccessTokenTTL({
       configuredDefaultSeconds: this.options.accessTokenTTL ?? DEFAULT_ACCESS_TOKEN_TTL,
       assertionExp: claims.value.claims.exp,
       mapperTtl: mapped.value.accessTokenTTL,
-      now,
+      now: Math.floor(Date.now() / 1000),
     });
     if (!ttl.ok) return ttl;
 

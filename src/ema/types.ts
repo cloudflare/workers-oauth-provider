@@ -163,7 +163,13 @@ export type EmaJwksFetchResult =
  * last layer rather than the only one.
  */
 export interface EmaJtiStore {
-  markUsed(input: { issuer: string; jti: string; exp: number; now: number; env: any }): Promise<EmaJtiMarkResult>;
+  markUsed(input: {
+    issuer: string;
+    jti: string;
+    exp: number;
+    now: number;
+    env: { OAUTH_KV: KVNamespace };
+  }): Promise<EmaJtiMarkResult>;
 }
 
 export type EmaJtiMarkResult = { readonly ok: true } | { readonly ok: false; readonly reason: 'replayed' };

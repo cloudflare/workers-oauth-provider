@@ -121,11 +121,14 @@ export async function resolveTrustedIssuer<Env>(
  * static-array shape used to get for free.
  */
 function isWellFormedTrustedIssuer(issuer: EmaTrustedIssuer): boolean {
+  // RFC 8414 §2 requires the issuer identifier to be an HTTPS URL.
+  let issuerUrl: URL;
   try {
-    new URL(issuer.issuer);
+    issuerUrl = new URL(issuer.issuer);
   } catch {
     return false;
   }
+  if (issuerUrl.protocol !== 'https:') return false;
 
   let jwksUrl: URL;
   try {
@@ -262,11 +265,11 @@ export function validateIdJagClaims(input: ValidateClaimsInput): Result<Validate
     const parsed = readRequiredString(rawClaims, 'scope');
     if (!parsed.ok) return parsed;
     const tokens = parseScopeGrammar(parsed.value);
-    if (!tokens.ok) {
+    if (tokens === null) {
       return err({ reason: 'invalid_claim', claim: 'scope' });
     }
     scope = parsed.value;
-    assertionScopes = tokens.value;
+    assertionScopes = tokens;
   }
 
   const claims: EmaIdJagClaims = {
@@ -301,14 +304,14 @@ export function parseEmaScopeParam(
     requested = [...assertionScopes];
   } else if (typeof scope === 'string') {
     const parsed = parseScopeGrammar(scope);
-    if (!parsed.ok) return err({ reason: 'invalid_scope_param' });
-    requested = parsed.value;
+    if (parsed === null) return err({ reason: 'invalid_scope_param' });
+    requested = parsed;
   } else if (Array.isArray(scope) && scope.every((value) => typeof value === 'string')) {
     requested = [];
     for (const part of scope as string[]) {
       const parsed = parseScopeGrammar(part);
-      if (!parsed.ok) return err({ reason: 'invalid_scope_param' });
-      requested.push(...parsed.value);
+      if (parsed === null) return err({ reason: 'invalid_scope_param' });
+      requested.push(...parsed);
     }
   } else {
     return err({ reason: 'invalid_scope_param' });
@@ -423,11 +426,18 @@ function readNumericDateClaim(claims: Record<string, unknown>, claimName: string
   return ok(value);
 }
 
-function parseScopeGrammar(scope: string): Result<string[], { reason: 'invalid_scope_grammar' }> {
-  if (!scope) return ok([]);
+/**
+ * Split and validate an RFC 6749 §3.3 scope string. Returns `null` on
+ * malformed input — callers attach whatever `EmaValidationError` arm fits
+ * their context (claim vs. param vs. mapped). No Result here because the
+ * error variant would only ever carry a constant reason that downstream
+ * discards.
+ */
+function parseScopeGrammar(scope: string): string[] | null {
+  if (!scope) return [];
   const tokens = scope.split(' ').filter(Boolean);
   for (const token of tokens) {
-    if (!isValidOAuthScopeToken(token)) return err({ reason: 'invalid_scope_grammar' });
+    if (!isValidOAuthScopeToken(token)) return null;
   }
-  return ok(tokens);
+  return tokens;
 }

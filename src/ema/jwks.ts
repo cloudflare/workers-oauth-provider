@@ -44,7 +44,12 @@ export function createDefaultJwksProvider(opts: DefaultJwksProviderOptions = {})
       }
 
       // Anti-DoS: serve the cached JWKS rather than spam the IdP when a
-      // force-refresh is requested too soon after the previous one.
+      // force-refresh is requested too soon after the previous one. The
+      // `force_refresh_throttled` variant is intentionally NOT produced
+      // here — the default provider degrades silently to the cached copy.
+      // The variant exists for callers (or future custom providers) that
+      // want stricter signalling, and the pipeline's defensive handler
+      // collapses it to `jwks_fetch_failed` for safety.
       if (forceRefresh && cached && cached.nextForceRefreshAllowedAt > now) {
         return { ok: true, jwks: cached.jwks };
       }
