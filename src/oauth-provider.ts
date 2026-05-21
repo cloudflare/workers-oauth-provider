@@ -2967,11 +2967,15 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     });
     if (!claims.ok) return claims;
 
+    // Fresh clock read so the JTI KV TTL reflects the assertion's remaining
+    // lifetime at the moment of write, not at pipeline start (JWKS fetch
+    // already burned several ms; mapper hasn't run yet).
+    const markNow = Math.floor(Date.now() / 1000);
     const replay = await jtiStore.markUsed({
       issuer: claims.value.claims.iss,
       jti: claims.value.claims.jti,
       exp: claims.value.claims.exp,
-      now,
+      now: markNow,
       env,
     });
     if (!replay.ok) return replay;
@@ -3080,6 +3084,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     env: any;
     now: number;
   }): Promise<TokenResponse> {
+    // Defense-in-depth downscope: the mapper's output is filtered through the
+    // assertion's scope claim (when present) so that a mapper returning an
+    // out-of-band `admin` scope cannot escalate beyond what the IdP authorized.
+    // `parseEmaScopeParam` already downscoped the *requested* scope before
+    // the mapper saw it; this is the second layer that bounds the *mapper's*
+    // output too. When the assertion carries no scope claim, the mapper has
+    // full discretion (no ceiling to enforce).
     const tokenScopes =
       args.assertionScopes.length > 0 ? this.downscope(args.mapperScope, args.assertionScopes) : args.mapperScope;
 
