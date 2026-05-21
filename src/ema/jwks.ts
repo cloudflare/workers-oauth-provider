@@ -1,11 +1,8 @@
 /**
  * JWKS provider — fetches IdP signing keys with caching and a force-refresh
  * cool-down to defend against attackers that spam random `kid` values to
- * amplify load on the IdP's JWKS endpoint.
- *
- * The default implementation is a closure over an in-memory `Map`. Deployers
- * who need a stronger cache (e.g. shared across isolates) can supply a
- * custom `EmaJwksProvider` via `EmaOptions.jwksProvider`.
+ * amplify load on the IdP's JWKS endpoint. Implemented as a closure over
+ * an in-memory `Map`.
  */
 
 import {
@@ -138,13 +135,7 @@ async function readJsonWithSizeLimit(response: Response, maxBytes: number): Prom
 
 type EmaJwksReadResult = { ok: true; value: { keys?: unknown } } | { ok: false; reason: 'fetch_failed' };
 
-// Re-export the wire-level Result type so callers don't have to dig.
-export type { EmaJwksFetchResult, EmaJwksProvider } from './types';
-
-/**
- * Translate an `EmaJwksProvider` adapter result into the in-band Result type
- * used by the EMA pipeline. Local helper for `OAuthProviderImpl.fetchJwks`.
- */
+/** Translate an `EmaJwksProvider` fetch result into the in-band Result type used by the EMA pipeline. */
 export function jwksFetchResultToResult(
   result: EmaJwksFetchResult
 ): import('./result').Result<JsonWebKeySet, import('./result').EmaValidationError> {

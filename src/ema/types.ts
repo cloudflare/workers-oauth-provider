@@ -130,11 +130,7 @@ export type EmaClaimsMapper<Env = Cloudflare.Env> = (
   input: EmaClaimsMapperInput<Env>
 ) => Promise<EmaClaimsMapperResult | null> | EmaClaimsMapperResult | null;
 
-/**
- * Adapter for fetching an IdP's JWKS. Deployers can supply a custom
- * implementation (e.g. backed by the Workers Cache API or a Durable Object)
- * by passing it via `EmaOptions.jwksProvider`.
- */
+/** Internal adapter for fetching an IdP's JWKS during ID-JAG signature verification. */
 export interface EmaJwksProvider {
   fetch(issuer: EmaTrustedIssuer, opts: { forceRefresh: boolean; now: number }): Promise<EmaJwksFetchResult>;
 }
@@ -145,21 +141,14 @@ export type EmaJwksFetchResult =
   | { readonly ok: false; readonly reason: 'force_refresh_throttled' };
 
 /**
- * Adapter for replay protection of ID-JAG `jti` values.
+ * Internal adapter for replay protection of ID-JAG `jti` values.
  *
- * The default implementation is KV-backed and therefore **best-effort**:
- * KV is eventually consistent, so two near-simultaneous token requests
- * presenting the same assertion from different colos can both read "not
- * seen" and both succeed. This catches the common attacker case (replay
- * after seconds/minutes/hours) but does not give strict-once semantics
- * under concurrency. Replay is also defended by the surrounding checks —
- * short `exp`, `nbf`, `aud`, `resource`, client binding, and signature
- * verification — so the `jti` store is the last layer rather than the
- * only one.
- *
- * Deployers needing strict-once semantics can supply a custom store via
- * `EmaOptions.jtiStore`, e.g. backed by a Durable Object for strongly
- * consistent reads/writes.
+ * The default KV-backed implementation is **best-effort** — KV is eventually
+ * consistent, so two near-simultaneous token requests presenting the same
+ * assertion from different colos can both read "not seen" and both succeed.
+ * Replay is also defended by the surrounding checks (short `exp`, `nbf`,
+ * `aud`, `resource`, client binding, signature) — so the `jti` store is the
+ * last layer rather than the only one.
  */
 export interface EmaJtiStore {
   markUsed(input: { issuer: string; jti: string; exp: number; now: number; env: any }): Promise<EmaJtiMarkResult>;
@@ -247,19 +236,6 @@ export interface EmaOptions<Env = Cloudflare.Env> {
 
   /** Maximum accepted assertion lifetime in seconds. Defaults to 300 seconds. */
   maxAssertionLifetimeSeconds?: number;
-
-  /**
-   * Optional custom JWKS provider. Defaults to the built-in HTTP fetcher with
-   * a per-issuer in-memory cache and force-refresh cool-down.
-   */
-  jwksProvider?: EmaJwksProvider;
-
-  /**
-   * Optional custom JTI replay store. Defaults to a KV-backed best-effort
-   * implementation; supply a Durable Object-backed implementation if you
-   * need strict-once semantics under concurrent requests.
-   */
-  jtiStore?: EmaJtiStore;
 }
 
 // ─── Internal types (used inside the EMA pipeline) ────────────────────────────

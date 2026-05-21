@@ -24,10 +24,6 @@ export type {
   EmaClaimsMapperInput,
   EmaClaimsMapperResult,
   EmaIdJagClaims,
-  EmaJtiMarkResult,
-  EmaJtiStore,
-  EmaJwksFetchResult,
-  EmaJwksProvider,
   EmaOptions,
   EmaTrustedIssuer,
   EmaTrustedIssuerResolver,
@@ -1254,21 +1250,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    */
   private typedApiHandlers: Array<[string, TypedHandler<Env>]>;
 
-  /**
-   * Adapter used to fetch IdP JWKS for ID-JAG signature verification.
-   * Defaults to the in-memory cached fetcher (`createDefaultJwksProvider`).
-   * Deployers may supply a custom implementation via
-   * `EmaOptions.jwksProvider` (e.g. one backed by the Workers Cache API).
-   */
+  /** In-memory cached IdP JWKS fetcher used during ID-JAG signature verification. */
   private readonly jwksProvider: EmaJwksProvider;
 
-  /**
-   * Adapter used to record ID-JAG `jti` values for replay protection.
-   * Defaults to a KV-backed best-effort store (`createKvJtiStore`).
-   * Deployers may supply a Durable Object-backed implementation via
-   * `EmaOptions.jtiStore` if strict-once semantics are required under
-   * concurrent requests.
-   */
+  /** KV-backed best-effort store recording ID-JAG `jti` values for replay protection. */
   private readonly jtiStore: EmaJtiStore;
 
   /**
@@ -1340,12 +1325,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     this.validateEmaOptions(this.options.enterpriseManagedAuthorization);
 
-    this.jwksProvider =
-      this.options.enterpriseManagedAuthorization?.jwksProvider ??
-      createDefaultJwksProvider({
-        cacheTtlSeconds: this.options.enterpriseManagedAuthorization?.jwksCacheTtlSeconds,
-      });
-    this.jtiStore = this.options.enterpriseManagedAuthorization?.jtiStore ?? createKvJtiStore();
+    this.jwksProvider = createDefaultJwksProvider({
+      cacheTtlSeconds: this.options.enterpriseManagedAuthorization?.jwksCacheTtlSeconds,
+    });
+    this.jtiStore = createKvJtiStore();
   }
 
   /**

@@ -1,12 +1,11 @@
 /**
  * JTI replay-protection store.
  *
- * The default implementation uses the provider's `OAUTH_KV` binding. KV is
- * eventually-consistent and does not provide compare-and-set, so two
- * concurrent requests with the same `jti` can both observe "not seen" and
- * succeed — the trade-off accepted for the default. Deployers needing
- * strict-once semantics under concurrency should supply a Durable
- * Object-backed `EmaJtiStore` via `EmaOptions.jtiStore`.
+ * Uses the provider's `OAUTH_KV` binding. KV is eventually-consistent and
+ * does not provide compare-and-set, so two concurrent requests with the
+ * same `jti` can both observe "not seen" and succeed — the trade-off
+ * accepted for the default. Other claim checks (signature, `exp`, `nbf`,
+ * `aud`, `resource`, client binding) constrain the practical attack window.
  */
 
 import { sha256Hex } from './util';
@@ -45,5 +44,3 @@ export function jtiMarkResultToResult(
   if (result.ok) return { ok: true, value: undefined };
   return { ok: false, error: { reason: 'replayed', jti } };
 }
-
-export type { EmaJtiMarkResult, EmaJtiStore } from './types';

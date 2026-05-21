@@ -2,8 +2,7 @@
  * JWK selection and ID-JAG signature verification.
  *
  * `selectJwk` is a pure picker; `verifyIdJagSignature` is the I/O-bearing
- * WebCrypto call. Both operate over the already-fetched JWKS — the actual
- * fetching lives behind `EmaJwksProvider`.
+ * WebCrypto call. Both operate over an already-fetched JWKS.
  */
 
 import { getJwtCryptoAlgorithms } from '../oauth-provider';

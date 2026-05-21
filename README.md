@@ -388,7 +388,7 @@ Setup:
 2. Set `resourceMetadata.resource` to the MCP endpoint URL (required when EMA is enabled).
 3. Implement `trustedIssuers` as a resolver — for multi-tenant deployments it can read `env` / `clientInfo` to look up per-tenant IdP config without redeploying.
 
-The AS enforces `resolved.issuer === iss` (confused-deputy guard) and validates ID-JAG `typ`, signature, audience, client binding, resource, `exp` / `iat` / `nbf`, max lifetime, and `jti` replay. Access token TTL is clamped to the assertion lifetime; refresh tokens are not issued for this grant. Default in-memory JWKS cache and KV-backed JTI store can be replaced via `jwksProvider` / `jtiStore` adapters.
+The AS enforces `resolved.issuer === iss` (confused-deputy guard) and validates ID-JAG `typ`, signature, audience, client binding, resource, `exp` / `iat` / `nbf`, max lifetime, and `jti` replay. Refresh tokens are not issued for this grant — the ID-JAG itself is the renewable assertion.
 
 Experimental — the MCP extension is still a draft.
 
