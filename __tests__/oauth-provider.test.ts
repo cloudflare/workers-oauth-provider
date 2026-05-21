@@ -4663,6 +4663,8 @@ describe('OAuthProvider', () => {
       const callbackArgs = callbackInvocations[0];
       expect(callbackArgs.grantType).toBe('authorization_code');
       expect(callbackArgs.clientId).toBe(clientId);
+      expect(callbackArgs.grantId).toEqual(expect.any(String));
+      expect(callbackArgs.grantId.length).toBeGreaterThan(0);
       expect(callbackArgs.props).toEqual({ userId: 'test-user-123', username: 'TestUser' });
 
       // Use the token to access API
@@ -4744,6 +4746,8 @@ describe('OAuthProvider', () => {
       const callbackArgs = callbackInvocations[0];
       expect(callbackArgs.grantType).toBe('refresh_token');
       expect(callbackArgs.clientId).toBe(clientId);
+      expect(callbackArgs.grantId).toEqual(expect.any(String));
+      expect(callbackArgs.grantId.length).toBeGreaterThan(0);
 
       // The props are from the updated grant during auth code flow
       expect(callbackArgs.props).toEqual({
@@ -4793,6 +4797,64 @@ describe('OAuthProvider', () => {
       // Check that the refresh count was incremented in the grant props
       expect(callbackInvocations.length).toBe(1);
       expect(callbackInvocations[0].props.refreshCount).toBe(1);
+    });
+
+    it('should expose the same grantId to the callback across the auth-code exchange and subsequent refreshes', async () => {
+      // Drive a fresh auth-code -> token exchange and capture grantId.
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=stable-grant-id`
+      );
+      const authResponse = await oauthProviderWithCallback.fetch(authRequest, mockEnv, mockCtx);
+      const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
+
+      const codeParams = new URLSearchParams();
+      codeParams.append('grant_type', 'authorization_code');
+      codeParams.append('code', code);
+      codeParams.append('redirect_uri', redirectUri);
+      codeParams.append('client_id', clientId);
+      codeParams.append('client_secret', clientSecret);
+
+      callbackInvocations = [];
+      const tokenResponse = await oauthProviderWithCallback.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          codeParams.toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+      expect(tokenResponse.status).toBe(200);
+      const tokens = await tokenResponse.json<any>();
+      expect(callbackInvocations.length).toBe(1);
+      const grantIdFromAuthCode = callbackInvocations[0].grantId;
+      expect(grantIdFromAuthCode).toEqual(expect.any(String));
+      expect(grantIdFromAuthCode.length).toBeGreaterThan(0);
+
+      // Refresh once and assert the grantId is the same value.
+      const refreshParams = new URLSearchParams();
+      refreshParams.append('grant_type', 'refresh_token');
+      refreshParams.append('refresh_token', tokens.refresh_token);
+      refreshParams.append('client_id', clientId);
+      refreshParams.append('client_secret', clientSecret);
+
+      callbackInvocations = [];
+      const refreshResponse = await oauthProviderWithCallback.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          refreshParams.toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+      expect(refreshResponse.status).toBe(200);
+      expect(callbackInvocations.length).toBe(1);
+      expect(callbackInvocations[0].grantId).toBe(grantIdFromAuthCode);
     });
 
     it('should update token props during refresh when explicitly provided', async () => {

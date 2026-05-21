@@ -145,6 +145,15 @@ export interface TokenExchangeCallbackOptions {
   userId: string;
 
   /**
+   * Identifier of the grant record this callback is operating on. Stable across
+   * refreshes for the lifetime of the grant. Pass this together with `userId`
+   * to {@link OAuthHelpers.revokeGrant} when the callback decides the grant
+   * should be torn down (for example, after an upstream refresh fails with a
+   * terminal error code).
+   */
+  grantId: string;
+
+  /**
    * List of scopes that were granted
    */
   scope: string[];
@@ -2001,6 +2010,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         grantType: GrantType.AUTHORIZATION_CODE,
         clientId: clientInfo.clientId,
         userId: userId,
+        grantId: grantId,
         scope: grantData.scope,
         requestedScope: tokenScopes,
         props: decryptedProps,
@@ -2257,6 +2267,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         grantType: GrantType.REFRESH_TOKEN,
         clientId: clientInfo.clientId,
         userId: userId,
+        grantId: grantId,
         scope: grantData.scope,
         requestedScope: tokenScopes,
         props: decryptedProps,
@@ -2552,6 +2563,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         grantType: GrantType.TOKEN_EXCHANGE,
         clientId: clientInfo.clientId,
         userId: tokenSummary.userId,
+        grantId: tokenSummary.grantId,
         scope: tokenSummary.grant.scope,
         requestedScope: tokenScopes,
         props: decryptedProps,
