@@ -2919,9 +2919,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   }): Promise<Result<TokenResponse, EmaValidationError>> {
     const { body, clientInfo, env, requestUrl, request, enterpriseOptions } = args;
     const { jwksProvider, jtiStore } = this;
+    const configuredResource = this.options.resourceMetadata?.resource;
     // Unreachable: handleJwtBearerGrant short-circuits when enterpriseOptions is absent,
-    // and the constructor instantiates these adapters whenever enterpriseOptions is set.
-    if (!jwksProvider || !jtiStore) {
+    // and validateEmaOptions enforces these invariants at construction time.
+    if (!jwksProvider || !jtiStore || !configuredResource) {
       throw new Error('EMA pipeline invoked without configured adapters');
     }
     const now = Math.floor(Date.now() / 1000);
@@ -2957,7 +2958,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       trustedIssuer: trustedIssuer.value,
       expectedAudience: trustedIssuer.value.audience ?? this.getAuthorizationServerIssuer(requestUrl),
       clientId: clientInfo.clientId,
-      configuredResource: this.options.resourceMetadata!.resource!,
+      configuredResource,
       matchOriginOnly: !!this.options.resourceMatchOriginOnly,
       now,
       clockSkewSeconds: enterpriseOptions.clockSkewSeconds ?? EMA_DEFAULT_CLOCK_SKEW_SECONDS,

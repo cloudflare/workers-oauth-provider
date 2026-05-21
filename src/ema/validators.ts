@@ -27,7 +27,7 @@ import type {
 /**
  * Validate the JOSE header of an ID-JAG. Enforces the `typ=oauth-id-jag+jwt`
  * marker (RFC 8725 §3.11) and an `alg` within the AS's global allowlist.
- * Per-issuer `algorithms` is checked separately in `selectTrustedIssuer`.
+ * Per-issuer `algorithms` is checked separately in `resolveTrustedIssuer`.
  */
 export function validateIdJagHeader(
   header: Record<string, unknown>,
@@ -191,7 +191,7 @@ export function validateIdJagClaims(input: ValidateClaimsInput): Result<Validate
   if (!iss.ok) return iss;
 
   // Defense-in-depth: trustedIssuer.issuer must equal claims.iss because that's
-  // how `selectTrustedIssuer` picked it. Reassert here so the function is
+  // how `resolveTrustedIssuer` picked it. Reassert here so the function is
   // self-contained and the type narrows.
   if (iss.value !== trustedIssuer.issuer) {
     return err({ reason: 'issuer_not_trusted', iss: iss.value });
