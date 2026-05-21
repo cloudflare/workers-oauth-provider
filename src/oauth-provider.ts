@@ -9,8 +9,8 @@ import {
   EMA_SUPPORTED_JWT_ALGORITHMS,
   type EmaSupportedAlg,
 } from './ema/constants';
-import { createKvJtiStore, jtiMarkResultToResult } from './ema/jti';
-import { createDefaultJwksProvider, jwksFetchResultToResult } from './ema/jwks';
+import { createKvJtiStore } from './ema/jti';
+import { createDefaultJwksProvider } from './ema/jwks';
 import { parseIdJag } from './ema/parser';
 import { emaErrorToWire, err, ok, type EmaValidationError, type Result } from './ema/result';
 import { selectJwk, verifyIdJagSignature } from './ema/signature';
@@ -2965,16 +2965,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     });
     if (!claims.ok) return claims;
 
-    const replay = jtiMarkResultToResult(
-      await jtiStore.markUsed({
-        issuer: claims.value.claims.iss,
-        jti: claims.value.claims.jti,
-        exp: claims.value.claims.exp,
-        now,
-        env,
-      }),
-      claims.value.claims.jti
-    );
+    const replay = await jtiStore.markUsed({
+      issuer: claims.value.claims.iss,
+      jti: claims.value.claims.jti,
+      exp: claims.value.claims.exp,
+      now,
+      env,
+    });
     if (!replay.ok) return replay;
 
     const requestedScope = parseEmaScopeParam(body.scope, claims.value.assertionScopes);
@@ -3038,16 +3035,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const alg = args.header.alg as EmaSupportedAlg;
     const { jwksProvider } = args;
 
-    const initialJwks = jwksFetchResultToResult(
-      await jwksProvider.fetch(args.trustedIssuer, { forceRefresh: false, now: args.now })
-    );
+    const initialJwks = await jwksProvider.fetch(args.trustedIssuer, { forceRefresh: false, now: args.now });
     if (!initialJwks.ok) return initialJwks;
 
     let jwk = selectJwk(initialJwks.value, alg, args.header.kid);
     if (!jwk.ok && args.header.kid) {
-      const refreshed = jwksFetchResultToResult(
-        await jwksProvider.fetch(args.trustedIssuer, { forceRefresh: true, now: args.now })
-      );
+      const refreshed = await jwksProvider.fetch(args.trustedIssuer, { forceRefresh: true, now: args.now });
       if (!refreshed.ok) return refreshed;
       jwk = selectJwk(refreshed.value, alg, args.header.kid);
     }

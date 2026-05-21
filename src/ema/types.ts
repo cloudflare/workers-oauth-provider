@@ -3,6 +3,7 @@
  */
 
 import type { ClientInfo } from '../oauth-provider';
+import type { EmaValidationError, Result } from './result';
 
 // ─── Public types (deployer-facing) ───────────────────────────────────────────
 
@@ -142,25 +143,22 @@ export type EmaClaimsMapper<Env = Cloudflare.Env> = (
   input: EmaClaimsMapperInput<Env>
 ) => Promise<EmaClaimsMapperResult | null>;
 
-/** Internal adapter for fetching an IdP's JWKS during ID-JAG signature verification. */
+/** Internal provider for fetching an IdP's JWKS during ID-JAG signature verification. */
 export interface EmaJwksProvider {
-  fetch(issuer: EmaTrustedIssuer, opts: { forceRefresh: boolean; now: number }): Promise<EmaJwksFetchResult>;
+  fetch(
+    issuer: EmaTrustedIssuer,
+    opts: { forceRefresh: boolean; now: number }
+  ): Promise<Result<JsonWebKeySet, EmaValidationError>>;
 }
 
-export type EmaJwksFetchResult =
-  | { readonly ok: true; readonly jwks: JsonWebKeySet }
-  | { readonly ok: false; readonly reason: 'fetch_failed'; readonly status?: number }
-  | { readonly ok: false; readonly reason: 'force_refresh_throttled' };
-
 /**
- * Internal adapter for replay protection of ID-JAG `jti` values.
+ * Internal store for replay protection of ID-JAG `jti` values.
  *
- * The default KV-backed implementation is **best-effort** — KV is eventually
+ * The default KV-backed implementation is best-effort — KV is eventually
  * consistent, so two near-simultaneous token requests presenting the same
  * assertion from different colos can both read "not seen" and both succeed.
- * Replay is also defended by the surrounding checks (short `exp`, `nbf`,
- * `aud`, `resource`, client binding, signature) — so the `jti` store is the
- * last layer rather than the only one.
+ * Surrounding checks (signature, short `exp`, `nbf`, `aud`, `resource`,
+ * client binding) constrain the practical attack window.
  */
 export interface EmaJtiStore {
   markUsed(input: {
@@ -169,10 +167,8 @@ export interface EmaJtiStore {
     exp: number;
     now: number;
     env: { OAUTH_KV: KVNamespace };
-  }): Promise<EmaJtiMarkResult>;
+  }): Promise<Result<void, EmaValidationError>>;
 }
-
-export type EmaJtiMarkResult = { readonly ok: true } | { readonly ok: false; readonly reason: 'replayed' };
 
 /**
  * Input passed to a dynamic `EmaTrustedIssuerResolver`.

@@ -1,22 +1,21 @@
 /**
- * JTI replay-protection store.
+ * Default `EmaJtiStore`: KV-backed `jti` replay marker.
  *
- * Uses the provider's `OAUTH_KV` binding. KV is eventually-consistent and
- * does not provide compare-and-set, so two concurrent requests with the
- * same `jti` can both observe "not seen" and succeed — the trade-off
- * accepted for the default. Other claim checks (signature, `exp`, `nbf`,
- * `aud`, `resource`, client binding) constrain the practical attack window.
+ * KV is eventually-consistent and does not provide compare-and-set, so two
+ * concurrent requests with the same `jti` can both observe "not seen" and
+ * succeed — the trade-off accepted here. Surrounding claim checks
+ * (signature, `exp`, `nbf`, `aud`, `resource`, client binding) constrain
+ * the practical attack window.
  */
 
+import { err, ok } from './result';
+import type { EmaJtiStore } from './types';
 import { sha256Hex } from './util';
-import type { EmaJtiMarkResult, EmaJtiStore } from './types';
 
 /** Storage key prefix for replay markers. Stable across versions. */
 const EMA_JTI_KV_PREFIX = 'enterprise-jti:';
 
-/**
- * Create the default KV-backed JTI store. KV TTL handles cleanup.
- */
+/** Create the default KV-backed JTI store. KV TTL handles cleanup. */
 export function createKvJtiStore(): EmaJtiStore {
   return {
     async markUsed({ issuer, jti, exp, now, env }) {
@@ -25,22 +24,10 @@ export function createKvJtiStore(): EmaJtiStore {
       const key = `${EMA_JTI_KV_PREFIX}${jtiHash}`;
       const existing = await env.OAUTH_KV.get(key);
       if (existing) {
-        return { ok: false, reason: 'replayed' };
+        return err({ reason: 'replayed', jti });
       }
       await env.OAUTH_KV.put(key, '1', { expirationTtl: ttl });
-      return { ok: true };
+      return ok(undefined);
     },
   };
-}
-
-/**
- * Translate an `EmaJtiStore.markUsed` result into the in-band Result type
- * used by the EMA pipeline.
- */
-export function jtiMarkResultToResult(
-  result: EmaJtiMarkResult,
-  jti: string
-): import('./result').Result<void, import('./result').EmaValidationError> {
-  if (result.ok) return { ok: true, value: undefined };
-  return { ok: false, error: { reason: 'replayed', jti } };
 }

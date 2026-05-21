@@ -264,9 +264,9 @@ export function validateIdJagClaims(input: ValidateClaimsInput): Result<Validate
   if (rawClaims.scope !== undefined) {
     const parsed = readRequiredString(rawClaims, 'scope');
     if (!parsed.ok) return parsed;
-    const tokens = parseScopeGrammar(parsed.value);
-    if (tokens === null) {
-      return err({ reason: 'invalid_claim', claim: 'scope' });
+    const tokens = parsed.value.split(' ').filter(Boolean);
+    for (const token of tokens) {
+      if (!isValidOAuthScopeToken(token)) return err({ reason: 'invalid_claim', claim: 'scope' });
     }
     scope = parsed.value;
     assertionScopes = tokens;
@@ -303,15 +303,19 @@ export function parseEmaScopeParam(
   if (scope === undefined) {
     requested = [...assertionScopes];
   } else if (typeof scope === 'string') {
-    const parsed = parseScopeGrammar(scope);
-    if (parsed === null) return err({ reason: 'invalid_scope_param' });
-    requested = parsed;
+    const tokens = scope.split(' ').filter(Boolean);
+    for (const token of tokens) {
+      if (!isValidOAuthScopeToken(token)) return err({ reason: 'invalid_scope_param' });
+    }
+    requested = tokens;
   } else if (Array.isArray(scope) && scope.every((value) => typeof value === 'string')) {
     requested = [];
     for (const part of scope as string[]) {
-      const parsed = parseScopeGrammar(part);
-      if (parsed === null) return err({ reason: 'invalid_scope_param' });
-      requested.push(...parsed);
+      const tokens = part.split(' ').filter(Boolean);
+      for (const token of tokens) {
+        if (!isValidOAuthScopeToken(token)) return err({ reason: 'invalid_scope_param' });
+      }
+      requested.push(...tokens);
     }
   } else {
     return err({ reason: 'invalid_scope_param' });
@@ -424,20 +428,4 @@ function readNumericDateClaim(claims: Record<string, unknown>, claimName: string
     return err({ reason: 'invalid_claim', claim: claimName });
   }
   return ok(value);
-}
-
-/**
- * Split and validate an RFC 6749 §3.3 scope string. Returns `null` on
- * malformed input — callers attach whatever `EmaValidationError` arm fits
- * their context (claim vs. param vs. mapped). No Result here because the
- * error variant would only ever carry a constant reason that downstream
- * discards.
- */
-function parseScopeGrammar(scope: string): string[] | null {
-  if (!scope) return [];
-  const tokens = scope.split(' ').filter(Boolean);
-  for (const token of tokens) {
-    if (!isValidOAuthScopeToken(token)) return null;
-  }
-  return tokens;
 }

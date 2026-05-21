@@ -1,8 +1,10 @@
 /**
- * JWKS provider — fetches IdP signing keys with caching and a force-refresh
- * cool-down to defend against attackers that spam random `kid` values to
- * amplify load on the IdP's JWKS endpoint. Implemented as a closure over
- * an in-memory `Map`.
+ * Default `EmaJwksProvider`: fetches IdP signing keys with caching and a
+ * force-refresh cool-down. The cool-down defends against attackers that
+ * spam random `kid` values to amplify load on the IdP's JWKS endpoint.
+ *
+ * The cache lives inside the returned provider closure, so each
+ * `OAuthProvider` instance has its own cache — no cross-instance bleed.
  */
 
 import {
@@ -11,7 +13,8 @@ import {
   EMA_JWKS_FORCE_REFRESH_COOLDOWN_SECONDS,
   EMA_JWKS_MAX_SIZE_BYTES,
 } from './constants';
-import type { EmaJwksFetchResult, EmaJwksProvider, EmaTrustedIssuer, JsonWebKeySet, OAuthJsonWebKey } from './types';
+import { err, ok } from './result';
+import type { EmaJwksProvider, JsonWebKeySet, OAuthJsonWebKey } from './types';
 
 interface JwksCacheEntry {
   jwks: JsonWebKeySet;
@@ -23,60 +26,50 @@ interface JwksCacheEntry {
 interface DefaultJwksProviderOptions {
   /** Cache TTL in seconds; defaults to `EMA_DEFAULT_JWKS_CACHE_TTL_SECONDS`. */
   cacheTtlSeconds?: number;
-  /** Optional override of the fetch implementation (mainly for tests). */
-  fetchImpl?: typeof fetch;
 }
 
-/**
- * Create the default JWKS provider — a closure with its own private cache.
- */
+/** Create the default JWKS provider — a closure with its own private cache. */
 export function createDefaultJwksProvider(opts: DefaultJwksProviderOptions = {}): EmaJwksProvider {
   const cache = new Map<string, JwksCacheEntry>();
   const cacheTtl = opts.cacheTtlSeconds ?? EMA_DEFAULT_JWKS_CACHE_TTL_SECONDS;
-  const httpFetch = opts.fetchImpl ?? fetch;
 
   return {
     async fetch(issuer, { forceRefresh, now }) {
       const cached = cache.get(issuer.issuer);
 
       if (!forceRefresh && cached && cached.expiresAt > now) {
-        return { ok: true, jwks: cached.jwks };
+        return ok(cached.jwks);
       }
 
       // Anti-DoS: serve the cached JWKS rather than spam the IdP when a
-      // force-refresh is requested too soon after the previous one. The
-      // `force_refresh_throttled` variant is intentionally NOT produced
-      // here — the default provider degrades silently to the cached copy.
-      // The variant exists for callers (or future custom providers) that
-      // want stricter signalling, and the pipeline's defensive handler
-      // collapses it to `jwks_fetch_failed` for safety.
+      // force-refresh is requested too soon after the previous one.
       if (forceRefresh && cached && cached.nextForceRefreshAllowedAt > now) {
-        return { ok: true, jwks: cached.jwks };
+        return ok(cached.jwks);
       }
 
       const abortController = new AbortController();
       const timeoutId = setTimeout(() => abortController.abort(), EMA_JWKS_FETCH_TIMEOUT_MS);
 
       try {
-        const response = await httpFetch(issuer.jwksUri, {
+        const response = await fetch(issuer.jwksUri, {
           headers: { Accept: 'application/json' },
           signal: abortController.signal,
           cf: { cacheEverything: true },
         } as RequestInit);
 
         if (!response.ok) {
-          return { ok: false, reason: 'fetch_failed', status: response.status };
+          return err({ reason: 'jwks_fetch_failed', status: response.status });
         }
 
         const contentLength = response.headers.get('content-length');
         if (contentLength && parseInt(contentLength, 10) > EMA_JWKS_MAX_SIZE_BYTES) {
-          return { ok: false, reason: 'fetch_failed', status: response.status };
+          return err({ reason: 'jwks_fetch_failed', status: response.status });
         }
 
         const rawJwks = await readJsonWithSizeLimit(response, EMA_JWKS_MAX_SIZE_BYTES);
-        if (!rawJwks.ok) return rawJwks;
+        if (!rawJwks.ok) return err({ reason: 'jwks_fetch_failed' });
         if (!Array.isArray(rawJwks.value.keys)) {
-          return { ok: false, reason: 'fetch_failed' };
+          return err({ reason: 'jwks_fetch_failed' });
         }
 
         const jwks: JsonWebKeySet = { keys: rawJwks.value.keys as OAuthJsonWebKey[] };
@@ -85,9 +78,9 @@ export function createDefaultJwksProvider(opts: DefaultJwksProviderOptions = {})
           expiresAt: now + cacheTtl,
           nextForceRefreshAllowedAt: now + EMA_JWKS_FORCE_REFRESH_COOLDOWN_SECONDS,
         });
-        return { ok: true, jwks };
+        return ok(jwks);
       } catch {
-        return { ok: false, reason: 'fetch_failed' };
+        return err({ reason: 'jwks_fetch_failed' });
       } finally {
         clearTimeout(timeoutId);
       }
@@ -99,8 +92,11 @@ export function createDefaultJwksProvider(opts: DefaultJwksProviderOptions = {})
  * Streaming JSON reader that rejects responses exceeding `maxBytes`.
  * Bounds memory consumption before we attempt to JSON-parse the body.
  */
-async function readJsonWithSizeLimit(response: Response, maxBytes: number): Promise<EmaJwksReadResult> {
-  if (!response.body) return { ok: false, reason: 'fetch_failed' };
+async function readJsonWithSizeLimit(
+  response: Response,
+  maxBytes: number
+): Promise<{ ok: true; value: { keys?: unknown } } | { ok: false }> {
+  if (!response.body) return { ok: false };
 
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
@@ -112,7 +108,7 @@ async function readJsonWithSizeLimit(response: Response, maxBytes: number): Prom
       total += value.byteLength;
       if (total > maxBytes) {
         reader.cancel();
-        return { ok: false, reason: 'fetch_failed' };
+        return { ok: false };
       }
       chunks.push(value);
     }
@@ -130,27 +126,10 @@ async function readJsonWithSizeLimit(response: Response, maxBytes: number): Prom
   try {
     const parsed = JSON.parse(new TextDecoder().decode(merged));
     if (typeof parsed !== 'object' || parsed === null) {
-      return { ok: false, reason: 'fetch_failed' };
+      return { ok: false };
     }
     return { ok: true, value: parsed as { keys?: unknown } };
   } catch {
-    return { ok: false, reason: 'fetch_failed' };
+    return { ok: false };
   }
-}
-
-type EmaJwksReadResult = { ok: true; value: { keys?: unknown } } | { ok: false; reason: 'fetch_failed' };
-
-/** Translate an `EmaJwksProvider` fetch result into the in-band Result type used by the EMA pipeline. */
-export function jwksFetchResultToResult(
-  result: EmaJwksFetchResult
-): import('./result').Result<JsonWebKeySet, import('./result').EmaValidationError> {
-  if (result.ok) {
-    return { ok: true, value: result.jwks };
-  }
-  if (result.reason === 'force_refresh_throttled') {
-    // Shouldn't reach the pipeline; treat as cache-hit upstream. If it does,
-    // surface as a fetch failure rather than crash.
-    return { ok: false, error: { reason: 'jwks_fetch_failed' } };
-  }
-  return { ok: false, error: { reason: 'jwks_fetch_failed', status: result.status } };
 }
