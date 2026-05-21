@@ -5,7 +5,8 @@
  * orchestrator chains them with explicit `if (!r.ok) return r` checks — no
  * library, no hidden control flow. The wire-level error string is intentionally
  * generic for security (RFC 6749 §5.2), but the rich tagged `reason` flows to
- * the deployer-supplied `onError` hook so failures are still debuggable.
+ * the deployer-supplied `onError` hook via `error.internal.reason` so failures
+ * are still debuggable.
  */
 
 export type Result<T, E> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: E };
@@ -102,28 +103,3 @@ export function emaErrorToWire(e: EmaValidationError): EmaErrorWireResponse {
   }
 }
 
-/**
- * Payload passed to the `onError` callback when an EMA assertion is rejected.
- * Carries the full tagged reason for logging/alerting/diagnostics; the wire
- * response remains generic.
- *
- * `detail` contains the full tagged error, including raw values from the
- * assertion (e.g. `jti` on replay, `iss` on issuer rejection, `sub`-derived
- * detail on certain claim failures). If your `onError` sink is shared with
- * lower-trust observers, redact or hash these fields before forwarding —
- * an IdP-minted `jti` is typically a random nonce but can encode correlated
- * data depending on the issuer.
- */
-export interface EmaOnErrorPayload {
-  category: 'enterprise-managed-authorization';
-  reason: EmaValidationError['reason'];
-  detail: EmaValidationError;
-}
-
-export function emaErrorToOnErrorPayload(e: EmaValidationError): EmaOnErrorPayload {
-  return {
-    category: 'enterprise-managed-authorization',
-    reason: e.reason,
-    detail: e,
-  };
-}

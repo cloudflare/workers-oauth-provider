@@ -17,7 +17,7 @@ import {
 import { createKvJtiStore, jtiMarkResultToResult } from './ema/jti';
 import { createDefaultJwksProvider, jwksFetchResultToResult } from './ema/jwks';
 import { parseIdJag } from './ema/parser';
-import { emaErrorToOnErrorPayload, emaErrorToWire, err, ok, type EmaValidationError, type Result } from './ema/result';
+import { emaErrorToWire, err, ok, type EmaValidationError, type Result } from './ema/result';
 import { selectJwk, verifyIdJagSignature } from './ema/signature';
 export type {
   EmaClaimsMapper,
@@ -29,7 +29,7 @@ export type {
   EmaTrustedIssuerResolver,
   EmaTrustedIssuerResolverInput,
 } from './ema/types';
-export type { EmaValidationError, EmaOnErrorPayload } from './ema/result';
+export type { EmaValidationError } from './ema/result';
 import type {
   EmaJtiStore,
   EmaJwksProvider,
@@ -414,16 +414,22 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
   resolveExternalToken?: (input: ResolveExternalTokenInput) => Promise<ResolveExternalTokenResult | null>;
 
   /**
-   * Optional callback function that is called whenever the OAuthProvider returns an error response
+   * Optional callback function that is called whenever the OAuthProvider returns an error response.
    * This allows the client to emit notifications or perform other actions when an error occurs.
    *
    * If the function returns a Response, that will be used in place of the OAuthProvider's default one.
+   *
+   * `internal` (when present) carries a tagged, server-side-only reason that the library
+   * deliberately did NOT put on the wire — used for richer diagnostics where the public
+   * response must stay generic (e.g. JWT validation failures on the EMA path). Backwards
+   * compatible: existing callbacks ignoring this field continue to work unchanged.
    */
   onError?: (error: {
     code: string;
     description: string;
     status: number;
     headers: Record<string, string>;
+    internal?: { category: string; reason: string; detail?: unknown };
   }) => Response | void;
 
   /**
@@ -2888,13 +2894,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     if (!result.ok) {
       const wire = emaErrorToWire(result.error);
-      // The standard onError hook fires inside createErrorResponse; the
-      // structured EmaValidationError reason is exposed via the typed
-      // payload helper for deployers who wire up richer diagnostics in
-      // future (the hook's signature is not yet plumbed through, but the
-      // helper gives a stable contract for that work).
-      void emaErrorToOnErrorPayload(result.error);
-      return this.createErrorResponse(wire.code, { description: wire.message });
+      return this.createErrorResponse(
+        wire.code,
+        { description: wire.message },
+        { category: 'enterprise-managed-authorization', reason: result.error.reason, detail: result.error }
+      );
     }
 
     return new Response(JSON.stringify(result.value), {
@@ -3897,12 +3901,18 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   }
 
   /**
-   * Helper function to create OAuth error responses
-   * @param code - OAuth error code (e.g., 'invalid_request', 'invalid_token')
-   * @param options - Error response options
-   * @returns A Response object with the error
+   * Helper function to create OAuth error responses.
+   *
+   * `internal` (optional) carries a tagged, server-side-only reason. It is
+   * forwarded to the deployer's `onError` hook but never placed on the wire,
+   * so the public response stays RFC-compliant and free of information leak
+   * while the deployer can still observe which check failed.
    */
-  private createErrorResponse(code: string, options: OAuthErrorOptions): Response {
+  private createErrorResponse(
+    code: string,
+    options: OAuthErrorOptions,
+    internal?: { category: string; reason: string; detail?: unknown }
+  ): Response {
     const { description } = options;
     const responseStatus = options.statusCode ?? 400;
     const responseHeaders = options.headers ?? {};
@@ -3913,6 +3923,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       description,
       status: responseStatus,
       headers: responseHeaders,
+      ...(internal ? { internal } : {}),
     });
     if (customErrorResponse) return customErrorResponse;
 

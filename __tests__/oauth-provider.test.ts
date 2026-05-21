@@ -3057,6 +3057,67 @@ describe('OAuthProvider', () => {
       expect(await secondResponse.json<any>()).toMatchObject({ error: 'invalid_grant' });
     });
 
+    it('surfaces the typed EMA reason to onError.internal without leaking on the wire', async () => {
+      const captured: Array<Parameters<NonNullable<ConstructorParameters<typeof OAuthProvider>[0]['onError']>>[0]> = [];
+      const observableProvider = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        scopesSupported: ['read', 'write'],
+        accessTokenTTL: 3600,
+        resourceMetadata: { resource },
+        onError: (error) => {
+          captured.push(error);
+        },
+        enterpriseManagedAuthorization: {
+          trustedIssuers: () => ({ issuer, jwksUri: `${issuer}/jwks.json`, algorithms: ['RS256'] }),
+          mapClaims: async () => ({ userId: 'u', scope: [], props: {} }),
+        },
+      });
+
+      // Register a client against the observable provider.
+      const registerResponse = await observableProvider.fetch(
+        createMockRequest('https://example.com/oauth/register', 'POST', { 'Content-Type': 'application/json' }, JSON.stringify({
+          redirect_uris: ['https://client.example.com/callback'],
+          client_name: 'Observable',
+          token_endpoint_auth_method: 'client_secret_basic',
+        })),
+        mockEnv,
+        mockCtx
+      );
+      const obsClient = await registerResponse.json<any>();
+
+      // Send a malformed assertion to trigger a generic invalid_grant.
+      const params = new URLSearchParams();
+      params.append('grant_type', 'urn:ietf:params:oauth:grant-type:jwt-bearer');
+      params.append('assertion', 'this.is.notvalid');
+      const tokenResponse = await observableProvider.fetch(
+        createMockRequest('https://example.com/oauth/token', 'POST', {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${obsClient.client_id}:${obsClient.client_secret}`)}`,
+        }, params.toString()),
+        mockEnv,
+        mockCtx
+      );
+
+      // Wire response stays generic — no internal leak.
+      const wireBody = await tokenResponse.json<any>();
+      expect(wireBody).toEqual({ error: 'invalid_grant', error_description: 'Invalid assertion' });
+      expect(JSON.stringify(wireBody)).not.toContain('assertion_malformed');
+      expect(JSON.stringify(wireBody)).not.toContain('internal');
+
+      // onError receives the typed reason out-of-band.
+      expect(captured).toHaveLength(1);
+      expect(captured[0].internal).toEqual({
+        category: 'enterprise-managed-authorization',
+        reason: 'assertion_malformed',
+        detail: { reason: 'assertion_malformed' },
+      });
+    });
+
     it('should reject assertions signed by an unknown key', async () => {
       const otherKey = await createRsaJwtKey('other-key');
       const now = Math.floor(Date.now() / 1000);
