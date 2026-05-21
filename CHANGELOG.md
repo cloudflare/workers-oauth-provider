@@ -1,5 +1,25 @@
 # @cloudflare/workers-oauth-provider
 
+## 0.7.0
+
+### Minor Changes
+
+- [#208](https://github.com/cloudflare/workers-oauth-provider/pull/208) [`c59c37b`](https://github.com/cloudflare/workers-oauth-provider/commit/c59c37bf1ae35dff274d6110c87a56a531659dad) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Experimentally support MCP Enterprise-Managed Authorization ID-JAG assertions through the JWT bearer grant.
+
+- [#206](https://github.com/cloudflare/workers-oauth-provider/pull/206) [`13ff269`](https://github.com/cloudflare/workers-oauth-provider/commit/13ff2695b8e3d16655cb8ec76f9afedd4978b0a0) Thanks [@itsandy-canva](https://github.com/itsandy-canva)! - Expose `grantId` to `tokenExchangeCallback` via `TokenExchangeCallbackOptions`.
+
+  Implementations of `tokenExchangeCallback` already received `userId` and
+  `clientId`, but had no way to identify which specific grant the library was
+  operating on. This made it impossible to surgically revoke a single grant from
+  the callback (e.g. on a terminal upstream refresh failure) — implementations had
+  to either sweep all grants for a `(userId, clientId)` pair (racy under
+  concurrent refreshes) or maintain their own out-of-band mapping.
+
+  `grantId` is now provided alongside `userId` so callbacks can pass them
+  directly to `OAuthHelpers.revokeGrant`. Populated for all three grant types
+  (`authorization_code`, `refresh_token`, `token_exchange`). Stable across
+  refreshes for the lifetime of the grant.
+
 ## 0.6.0
 
 ### Minor Changes
