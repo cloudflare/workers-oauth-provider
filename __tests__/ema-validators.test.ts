@@ -16,7 +16,7 @@ import { emaErrorToWire } from '../src/ema/result';
 import { selectJwk } from '../src/ema/signature';
 import type { EmaTrustedIssuer, JsonWebKeySet } from '../src/ema/types';
 import {
-  clampEmaAccessTokenTTL,
+  computeEmaAccessTokenTTL,
   parseEmaScopeParam,
   resolveTrustedIssuer,
   validateEmaMapperResult,
@@ -414,9 +414,9 @@ describe('validateEmaMapperResult', () => {
   });
 });
 
-describe('clampEmaAccessTokenTTL', () => {
+describe('computeEmaAccessTokenTTL', () => {
   it('uses the configured default TTL regardless of the assertion remaining lifetime', () => {
-    const r = clampEmaAccessTokenTTL({
+    const r = computeEmaAccessTokenTTL({
       configuredDefaultSeconds: 3600,
       assertionExp: 2_000_000_000,
       mapperTtl: undefined,
@@ -429,7 +429,7 @@ describe('clampEmaAccessTokenTTL', () => {
   });
 
   it('uses the mapper-supplied TTL when provided', () => {
-    const r = clampEmaAccessTokenTTL({
+    const r = computeEmaAccessTokenTTL({
       configuredDefaultSeconds: 3600,
       assertionExp: 2_000_000_000,
       mapperTtl: 86_400,
@@ -439,7 +439,7 @@ describe('clampEmaAccessTokenTTL', () => {
   });
 
   it('rejects with assertion_expired_after_processing when no positive lifetime remains', () => {
-    const r = clampEmaAccessTokenTTL({
+    const r = computeEmaAccessTokenTTL({
       configuredDefaultSeconds: 3600,
       assertionExp: 1_999_999_700,
       mapperTtl: undefined,
