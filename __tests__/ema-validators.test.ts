@@ -415,24 +415,27 @@ describe('validateEmaMapperResult', () => {
 });
 
 describe('clampEmaAccessTokenTTL', () => {
-  it('clamps to the assertion remaining lifetime when shorter than the configured TTL', () => {
+  it('uses the configured default TTL regardless of the assertion remaining lifetime', () => {
     const r = clampEmaAccessTokenTTL({
       configuredDefaultSeconds: 3600,
       assertionExp: 2_000_000_000,
       mapperTtl: undefined,
       now: 1_999_999_700,
     });
-    expect(r).toMatchObject({ ok: true, value: 300 });
+    // Assertion has 300s left but the issued access token follows the AS's
+    // configured TTL (3600s) — the assertion is a one-shot grant, not a
+    // lifetime cap on the token.
+    expect(r).toMatchObject({ ok: true, value: 3600 });
   });
 
-  it('clamps to the mapper-supplied TTL when shorter', () => {
+  it('uses the mapper-supplied TTL when provided', () => {
     const r = clampEmaAccessTokenTTL({
       configuredDefaultSeconds: 3600,
       assertionExp: 2_000_000_000,
-      mapperTtl: 60,
+      mapperTtl: 86_400,
       now: 1_999_999_700,
     });
-    expect(r).toMatchObject({ ok: true, value: 60 });
+    expect(r).toMatchObject({ ok: true, value: 86_400 });
   });
 
   it('rejects with assertion_expired_after_processing when no positive lifetime remains', () => {

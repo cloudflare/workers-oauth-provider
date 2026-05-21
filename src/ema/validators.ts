@@ -377,28 +377,26 @@ interface ClampTtlInput {
 }
 
 /**
- * Compute the access token TTL bounded by:
- *   - the AS's default (`options.accessTokenTTL`)
- *   - the assertion's remaining lifetime (`exp - now`)
- *   - the mapper-supplied override (if present)
+ * Compute the access token TTL.
  *
- * Returns `assertion_expired_after_processing` if no positive lifetime
- * remains (e.g. the assertion crossed `exp` while we were validating it).
+ * The mapper-supplied override wins; otherwise the AS's default applies.
+ * The assertion's `exp` governs how long the ID-JAG is valid as a grant,
+ * not how long the access token issued in exchange lives — RFC 7523 §3
+ * does not bind access-token lifetime to assertion lifetime, and the MCP
+ * EMA spec example issues access tokens far longer than the 300s ID-JAG.
+ *
+ * Returns `assertion_expired_after_processing` if the assertion crossed
+ * `exp` while we were validating it (TOCTOU race between claim check and
+ * here).
  */
 export function clampEmaAccessTokenTTL(input: ClampTtlInput): Result<number, EmaValidationError> {
   const { configuredDefaultSeconds, assertionExp, mapperTtl, now } = input;
-  const remaining = assertionExp - now;
-  let ttl = Math.min(configuredDefaultSeconds, remaining);
 
-  if (mapperTtl !== undefined) {
-    ttl = Math.min(ttl, mapperTtl);
-  }
-
-  if (ttl <= 0) {
+  if (assertionExp - now <= 0) {
     return err({ reason: 'assertion_expired_after_processing' });
   }
 
-  return ok(ttl);
+  return ok(mapperTtl ?? configuredDefaultSeconds);
 }
 
 // ─── Local helpers (not exported) ─────────────────────────────────────────────

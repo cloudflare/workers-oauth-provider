@@ -2847,7 +2847,7 @@ describe('OAuthProvider', () => {
       expect(tokens.access_token).toBeDefined();
       expect(tokens.refresh_token).toBeUndefined();
       expect(tokens.token_type).toBe('bearer');
-      expect(tokens.expires_in).toBeLessThanOrEqual(300);
+      expect(tokens.expires_in).toBeGreaterThan(0);
       expect(tokens.scope).toBe('read write');
       expect(tokens.resource).toBe(resource);
 
