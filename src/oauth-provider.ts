@@ -5,6 +5,7 @@ import {
   EMA_DEFAULT_JWKS_CACHE_TTL_SECONDS,
   EMA_DEFAULT_JWT_ALGORITHM,
   EMA_DEFAULT_MAX_ASSERTION_LIFETIME_SECONDS,
+  EMA_ID_JAG_GRANT_PROFILE,
   EMA_ID_JAG_JWT_TYPE,
   EMA_JWKS_FETCH_TIMEOUT_MS,
   EMA_JWKS_FORCE_REFRESH_COOLDOWN_SECONDS,
@@ -42,7 +43,7 @@ import type {
   OAuthJsonWebKey,
 } from './ema/types';
 import {
-  clampEmaAccessTokenTTL,
+  computeEmaAccessTokenTTL,
   parseEmaScopeParam,
   resolveTrustedIssuer,
   validateEmaMapperResult,
@@ -1890,7 +1891,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const authorizationGrantProfilesSupported: string[] = [];
     if (this.options.enterpriseManagedAuthorization) {
       grantTypesSupported.push(GrantType.JWT_BEARER);
-      authorizationGrantProfilesSupported.push('urn:ietf:params:oauth:grant-profile:id-jag');
+      authorizationGrantProfilesSupported.push(EMA_ID_JAG_GRANT_PROFILE);
     }
 
     const metadata = {
@@ -2992,7 +2993,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const mapped = validateEmaMapperResult(mapperOutput);
     if (!mapped.ok) return mapped;
 
-    const ttl = clampEmaAccessTokenTTL({
+    const ttl = computeEmaAccessTokenTTL({
       configuredDefaultSeconds: this.options.accessTokenTTL ?? DEFAULT_ACCESS_TOKEN_TTL,
       assertionExp: claims.value.claims.exp,
       mapperTtl: mapped.value.accessTokenTTL,

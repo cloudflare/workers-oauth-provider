@@ -9,6 +9,12 @@
 /** JWT `typ` header value required for ID-JAG assertions (RFC 8725 §3.11). */
 export const EMA_ID_JAG_JWT_TYPE = 'oauth-id-jag+jwt';
 
+/**
+ * Grant-profile URN advertised in `authorization_grant_profiles_supported`
+ * when EMA is configured (MCP Enterprise-Managed Authorization spec).
+ */
+export const EMA_ID_JAG_GRANT_PROFILE = 'urn:ietf:params:oauth:grant-profile:id-jag';
+
 /** Maximum compact JWT assertion size accepted at the token endpoint. */
 export const EMA_MAX_JWT_BYTES = 16 * 1024;
 

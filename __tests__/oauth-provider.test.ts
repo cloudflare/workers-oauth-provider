@@ -2821,7 +2821,7 @@ describe('OAuthProvider', () => {
       );
     }
 
-    it('should advertise jwt-bearer grant only when enterprise-managed authorization is enabled', async () => {
+    it('should advertise jwt-bearer grant and id-jag profile only when enterprise-managed authorization is enabled', async () => {
       const enabledResponse = await enterpriseProvider.fetch(
         createMockRequest('https://example.com/.well-known/oauth-authorization-server'),
         mockEnv,
@@ -2829,6 +2829,9 @@ describe('OAuthProvider', () => {
       );
       const enabledMetadata = await enabledResponse.json<any>();
       expect(enabledMetadata.grant_types_supported).toContain('urn:ietf:params:oauth:grant-type:jwt-bearer');
+      expect(enabledMetadata.authorization_grant_profiles_supported).toEqual([
+        'urn:ietf:params:oauth:grant-profile:id-jag',
+      ]);
 
       const defaultResponse = await oauthProvider.fetch(
         createMockRequest('https://example.com/.well-known/oauth-authorization-server'),
@@ -2837,6 +2840,7 @@ describe('OAuthProvider', () => {
       );
       const defaultMetadata = await defaultResponse.json<any>();
       expect(defaultMetadata.grant_types_supported).not.toContain('urn:ietf:params:oauth:grant-type:jwt-bearer');
+      expect(defaultMetadata.authorization_grant_profiles_supported).toBeUndefined();
     });
 
     it('should exchange a valid ID-JAG for an access token with mapped props', async () => {
