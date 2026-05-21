@@ -24,13 +24,12 @@ export function parseIdJag(assertion: string, maxBytes: number): Result<ParsedId
     return err({ reason: 'assertion_missing' });
   }
 
-  // Measure actual UTF-8 bytes — `string.length` is UTF-16 code units, which
-  // disagrees with the byte semantics promised by `maxBytes` for any
-  // non-ASCII input. A well-formed compact JWS is ASCII-only, but rejecting
-  // pre-base64-decode keeps the DoS bound honest.
-  const byteLength = new TextEncoder().encode(assertion).byteLength;
-  if (byteLength > maxBytes) {
-    return err({ reason: 'assertion_too_large', size: byteLength, max: maxBytes });
+  // Compact JWS is ASCII-only (RFC 7515 §3.1), so `string.length` (UTF-16
+  // code units) equals the UTF-8 byte count. Non-ASCII input fails the
+  // base64url decode below, so the byte cap is honored without allocating
+  // the UTF-8 bytes just to measure them.
+  if (assertion.length > maxBytes) {
+    return err({ reason: 'assertion_too_large', size: assertion.length, max: maxBytes });
   }
 
   const parts = assertion.split('.');
