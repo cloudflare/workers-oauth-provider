@@ -146,7 +146,7 @@ describe('resolveTrustedIssuer', () => {
     { issuer: 'https://idp1.example.com', jwksUri: 'https://idp1.example.com/jwks.json', algorithms: ['RS256'] },
     { issuer: 'https://idp2.example.com', jwksUri: 'https://idp2.example.com/jwks.json', algorithms: ['ES256'] },
   ];
-  const resolver = ({ iss }: { iss: string }) => issuers.find((c) => c.issuer === iss) ?? null;
+  const resolver = async ({ iss }: { iss: string }) => issuers.find((c) => c.issuer === iss) ?? null;
   const ctx = {
     env: {} as unknown,
     request: new Request('https://as.example.com/oauth/token'),
@@ -188,7 +188,7 @@ describe('resolveTrustedIssuer', () => {
   });
 
   it('rejects when the resolver returns an issuer whose `issuer` field disagrees with iss', async () => {
-    const lyingResolver = () => ({ ...issuers[0], issuer: 'https://different.example.com' });
+    const lyingResolver = async () => ({ ...issuers[0], issuer: 'https://different.example.com' });
     const r = await resolveTrustedIssuer({
       iss: 'https://idp1.example.com',
       alg: 'RS256',
@@ -199,7 +199,7 @@ describe('resolveTrustedIssuer', () => {
   });
 
   it('rejects when the resolver returns a malformed config (non-HTTPS jwksUri)', async () => {
-    const badResolver = () => ({
+    const badResolver = async () => ({
       issuer: 'https://idp1.example.com',
       jwksUri: 'http://idp1.example.com/jwks.json',
     });
@@ -213,7 +213,7 @@ describe('resolveTrustedIssuer', () => {
   });
 
   it('rejects when the resolver throws', async () => {
-    const throwingResolver = () => {
+    const throwingResolver = async () => {
       throw new Error('database is down');
     };
     const r = await resolveTrustedIssuer({

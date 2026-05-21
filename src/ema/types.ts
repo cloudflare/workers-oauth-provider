@@ -133,10 +133,14 @@ export interface EmaClaimsMapperResult {
 /**
  * Maps validated enterprise ID-JAG claims to this provider's local user, scopes,
  * metadata, and props. Return `null` to deny token issuance.
+ *
+ * Always async — mirrors `EmaTrustedIssuerResolver` so the two enterprise
+ * callbacks have the same shape and downstream lookups (KV, D1, IdP federation)
+ * don't require a later API change to add `Promise<…>` return support.
  */
 export type EmaClaimsMapper<Env = Cloudflare.Env> = (
   input: EmaClaimsMapperInput<Env>
-) => Promise<EmaClaimsMapperResult | null> | EmaClaimsMapperResult | null;
+) => Promise<EmaClaimsMapperResult | null>;
 
 /** Internal adapter for fetching an IdP's JWKS during ID-JAG signature verification. */
 export interface EmaJwksProvider {
@@ -206,7 +210,7 @@ export interface EmaTrustedIssuerResolverInput<Env = Cloudflare.Env> {
  */
 export type EmaTrustedIssuerResolver<Env = Cloudflare.Env> = (
   input: EmaTrustedIssuerResolverInput<Env>
-) => EmaTrustedIssuer | null | Promise<EmaTrustedIssuer | null>;
+) => Promise<EmaTrustedIssuer | null>;
 
 /**
  * MCP Enterprise-Managed Authorization configuration.
@@ -224,7 +228,7 @@ export interface EmaOptions<Env = Cloudflare.Env> {
    *
    * ```ts
    * const issuers = [{ issuer: 'https://idp.example.com', jwksUri: '...' }];
-   * trustedIssuers: ({ iss }) => issuers.find((i) => i.issuer === iss) ?? null,
+   * trustedIssuers: async ({ iss }) => issuers.find((i) => i.issuer === iss) ?? null,
    * ```
    *
    * For B2B / multi-tenant deployments, the resolver can consult `env`,

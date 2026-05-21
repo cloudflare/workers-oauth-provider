@@ -365,7 +365,7 @@ new OAuthProvider({
   // ... other options ...
   resourceMetadata: { resource: 'https://mcp.example.com/mcp' },
   enterpriseManagedAuthorization: {
-    trustedIssuers: ({ iss }) =>
+    trustedIssuers: async ({ iss }) =>
       iss === 'https://idp.example.com'
         ? { issuer: iss, jwksUri: 'https://idp.example.com/.well-known/jwks.json', algorithms: ['RS256'] }
         : null,

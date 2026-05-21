@@ -2749,7 +2749,7 @@ describe('OAuthProvider', () => {
         accessTokenTTL: 3600,
         resourceMetadata: { resource },
         enterpriseManagedAuthorization: {
-          trustedIssuers: () => ({ issuer, jwksUri: `${issuer}/jwks.json`, algorithms: ['RS256'] }),
+          trustedIssuers: async () => ({ issuer, jwksUri: `${issuer}/jwks.json`, algorithms: ['RS256'] }),
           mapClaims: async ({ claims, requestedScope }) => ({
             userId: `enterprise-${claims.sub}`,
             scope: requestedScope,
@@ -2885,7 +2885,7 @@ describe('OAuthProvider', () => {
         clientRegistrationEndpoint: '/oauth/register',
         resourceMetadata: { resource },
         enterpriseManagedAuthorization: {
-          trustedIssuers: () => ({ issuer, jwksUri: `${issuer}/jwks.json`, algorithms: ['ES256'] }),
+          trustedIssuers: async () => ({ issuer, jwksUri: `${issuer}/jwks.json`, algorithms: ['ES256'] }),
           mapClaims: async ({ requestedScope }) => ({
             userId: 'enterprise-employee-123',
             scope: requestedScope,
@@ -3069,8 +3069,8 @@ describe('OAuthProvider', () => {
         accessTokenTTL: 3600,
         resourceMetadata: { resource },
         enterpriseManagedAuthorization: {
-          trustedIssuers: () => ({ issuer, jwksUri: `${issuer}/jwks.json`, algorithms: ['RS256'] }),
-          mapClaims: () => {
+          trustedIssuers: async () => ({ issuer, jwksUri: `${issuer}/jwks.json`, algorithms: ['RS256'] }),
+          mapClaims: async () => {
             throw new Error('mapper exploded');
           },
         },
@@ -3121,7 +3121,7 @@ describe('OAuthProvider', () => {
           captured.push(error);
         },
         enterpriseManagedAuthorization: {
-          trustedIssuers: () => ({ issuer, jwksUri: `${issuer}/jwks.json`, algorithms: ['RS256'] }),
+          trustedIssuers: async () => ({ issuer, jwksUri: `${issuer}/jwks.json`, algorithms: ['RS256'] }),
           mapClaims: async () => ({ userId: 'u', scope: [], props: {} }),
         },
       });
@@ -3200,7 +3200,7 @@ describe('OAuthProvider', () => {
         clientRegistrationEndpoint: '/oauth/register',
         resourceMetadata: { resource },
         enterpriseManagedAuthorization: {
-          trustedIssuers: () => ({ issuer, jwksUri: `${issuer}/jwks.json`, algorithms: ['RS256'] }),
+          trustedIssuers: async () => ({ issuer, jwksUri: `${issuer}/jwks.json`, algorithms: ['RS256'] }),
           mapClaims: async ({ requestedScope }) => ({
             userId: 'employee-123',
             scope: [...requestedScope, 'admin'],
@@ -3259,7 +3259,7 @@ describe('OAuthProvider', () => {
         clientRegistrationEndpoint: '/oauth/register',
         resourceMetadata: { resource },
         enterpriseManagedAuthorization: {
-          trustedIssuers: () => ({ issuer, jwksUri: `${issuer}/jwks.json`, algorithms: ['RS256'] }),
+          trustedIssuers: async () => ({ issuer, jwksUri: `${issuer}/jwks.json`, algorithms: ['RS256'] }),
           mapClaims: async () => ({
             userId: 'employee-123',
             scope: ['read', 'bad scope'],
@@ -3354,7 +3354,7 @@ describe('OAuthProvider', () => {
         clientRegistrationEndpoint: '/oauth/register',
         resourceMetadata: { resource },
         enterpriseManagedAuthorization: {
-          trustedIssuers: () => ({ issuer, jwksUri: `${issuer}/jwks.json`, algorithms: ['RS256'] }),
+          trustedIssuers: async () => ({ issuer, jwksUri: `${issuer}/jwks.json`, algorithms: ['RS256'] }),
           mapClaims: async () => null,
         },
       });
@@ -3432,7 +3432,7 @@ describe('OAuthProvider', () => {
             tokenEndpoint: '/oauth/token',
             clientRegistrationEndpoint: '/oauth/register',
             enterpriseManagedAuthorization: {
-              trustedIssuers: () => ({ issuer, jwksUri: `${issuer}/jwks.json` }),
+              trustedIssuers: async () => ({ issuer, jwksUri: `${issuer}/jwks.json` }),
               mapClaims: async () => ({ userId: 'user', scope: [], props: null }),
             },
           })
@@ -3449,7 +3449,7 @@ describe('OAuthProvider', () => {
         clientRegistrationEndpoint: '/oauth/register',
         resourceMetadata: { resource },
         enterpriseManagedAuthorization: {
-          trustedIssuers: () => ({ issuer, jwksUri: `${issuer}/jwks.json`, algorithms: ['RS256'] }),
+          trustedIssuers: async () => ({ issuer, jwksUri: `${issuer}/jwks.json`, algorithms: ['RS256'] }),
           mapClaims: async ({ claims, requestedScope }) => ({
             userId: `${claims.iss}:${claims.sub}`,
             scope: requestedScope,

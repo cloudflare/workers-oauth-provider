@@ -2982,16 +2982,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     let mapperOutput: unknown;
     try {
-      mapperOutput = await Promise.resolve(
-        enterpriseOptions.mapClaims({
-          claims: claims.value.claims,
-          clientInfo,
-          resource: claims.value.resource,
-          requestedScope: requestedScope.value,
-          request: args.request,
-          env,
-        })
-      );
+      mapperOutput = await enterpriseOptions.mapClaims({
+        claims: claims.value.claims,
+        clientInfo,
+        resource: claims.value.resource,
+        requestedScope: requestedScope.value,
+        request: args.request,
+        env,
+      });
     } catch {
       return err({ reason: 'mapper_threw' });
     }
