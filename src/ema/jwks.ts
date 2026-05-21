@@ -1,0 +1,141 @@
+/**
+ * Default `EmaJwksProvider`: fetches IdP signing keys with caching and a
+ * force-refresh cool-down. The cool-down defends against attackers that
+ * spam random `kid` values to amplify load on the IdP's JWKS endpoint.
+ *
+ * The cache lives inside the returned provider closure, so each
+ * `OAuthProvider` instance has its own cache — no cross-instance bleed.
+ */
+
+import {
+  EMA_DEFAULT_JWKS_CACHE_TTL_SECONDS,
+  EMA_JWKS_FETCH_TIMEOUT_MS,
+  EMA_JWKS_FORCE_REFRESH_COOLDOWN_SECONDS,
+  EMA_JWKS_MAX_SIZE_BYTES,
+} from './constants';
+import { err, ok } from './result';
+import type { EmaJwksProvider, JsonWebKeySet, OAuthJsonWebKey } from './types';
+
+interface JwksCacheEntry {
+  jwks: JsonWebKeySet;
+  expiresAt: number;
+  /** Earliest time at which a force-refresh against the IdP is permitted. */
+  nextForceRefreshAllowedAt: number;
+}
+
+interface DefaultJwksProviderOptions {
+  /** Cache TTL in seconds; defaults to `EMA_DEFAULT_JWKS_CACHE_TTL_SECONDS`. */
+  cacheTtlSeconds?: number;
+}
+
+/** Create the default JWKS provider — a closure with its own private cache. */
+export function createDefaultJwksProvider(opts: DefaultJwksProviderOptions = {}): EmaJwksProvider {
+  const cache = new Map<string, JwksCacheEntry>();
+  const cacheTtl = opts.cacheTtlSeconds ?? EMA_DEFAULT_JWKS_CACHE_TTL_SECONDS;
+
+  return {
+    async fetch(issuer, { forceRefresh, now }) {
+      const cached = cache.get(issuer.issuer);
+
+      if (!forceRefresh && cached && cached.expiresAt > now) {
+        return ok(cached.jwks);
+      }
+
+      // Anti-DoS: serve the cached JWKS rather than spam the IdP when a
+      // force-refresh is requested too soon after the previous one.
+      //
+      // Returning stale keys is safe — signature verification still has to
+      // succeed against them. If the IdP genuinely rotated, the verify step
+      // will reject, the assertion path will fail with `no_matching_key` or
+      // `signature_failed`, and the next force-refresh after the cooldown
+      // window will pick up the new key.
+      if (forceRefresh && cached && cached.nextForceRefreshAllowedAt > now) {
+        return ok(cached.jwks);
+      }
+
+      const abortController = new AbortController();
+      const timeoutId = setTimeout(() => abortController.abort(), EMA_JWKS_FETCH_TIMEOUT_MS);
+
+      try {
+        const response = await fetch(issuer.jwksUri, {
+          headers: { Accept: 'application/json' },
+          signal: abortController.signal,
+          cf: { cacheEverything: true },
+        } as RequestInit);
+
+        if (!response.ok) {
+          return err({ reason: 'jwks_fetch_failed', status: response.status });
+        }
+
+        const contentLength = response.headers.get('content-length');
+        if (contentLength && parseInt(contentLength, 10) > EMA_JWKS_MAX_SIZE_BYTES) {
+          return err({ reason: 'jwks_fetch_failed', status: response.status });
+        }
+
+        const rawJwks = await readJsonWithSizeLimit(response, EMA_JWKS_MAX_SIZE_BYTES);
+        if (!rawJwks.ok) return err({ reason: 'jwks_fetch_failed' });
+        if (!Array.isArray(rawJwks.value.keys)) {
+          return err({ reason: 'jwks_fetch_failed' });
+        }
+
+        const jwks: JsonWebKeySet = { keys: rawJwks.value.keys as OAuthJsonWebKey[] };
+        cache.set(issuer.issuer, {
+          jwks,
+          expiresAt: now + cacheTtl,
+          nextForceRefreshAllowedAt: now + EMA_JWKS_FORCE_REFRESH_COOLDOWN_SECONDS,
+        });
+        return ok(jwks);
+      } catch {
+        return err({ reason: 'jwks_fetch_failed' });
+      } finally {
+        clearTimeout(timeoutId);
+      }
+    },
+  };
+}
+
+/**
+ * Streaming JSON reader that rejects responses exceeding `maxBytes`.
+ * Bounds memory consumption before we attempt to JSON-parse the body.
+ */
+async function readJsonWithSizeLimit(
+  response: Response,
+  maxBytes: number
+): Promise<{ ok: true; value: { keys?: unknown } } | { ok: false }> {
+  if (!response.body) return { ok: false };
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        reader.cancel();
+        return { ok: false };
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+
+  try {
+    const parsed = JSON.parse(new TextDecoder().decode(merged));
+    if (typeof parsed !== 'object' || parsed === null) {
+      return { ok: false };
+    }
+    return { ok: true, value: parsed as { keys?: unknown } };
+  } catch {
+    return { ok: false };
+  }
+}

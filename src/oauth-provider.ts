@@ -1,5 +1,41 @@
 import { WorkerEntrypoint } from 'cloudflare:workers';
 
+import {
+  EMA_DEFAULT_CLOCK_SKEW_SECONDS,
+  EMA_DEFAULT_MAX_ASSERTION_LIFETIME_SECONDS,
+  EMA_ID_JAG_GRANT_PROFILE,
+  EMA_ID_JAG_JWT_TYPE,
+  EMA_MAX_JWT_BYTES,
+  EMA_SUPPORTED_JWT_ALGORITHMS,
+  type EmaSupportedAlg,
+} from './ema/constants';
+import { createKvJtiStore } from './ema/jti';
+import { createDefaultJwksProvider } from './ema/jwks';
+import { parseIdJag } from './ema/parser';
+import { emaErrorToWire, err, ok, type EmaValidationError, type Result } from './ema/result';
+import { selectJwk, verifyIdJagSignature } from './ema/signature';
+import type { EmaJtiStore, EmaJwksProvider, EmaOptions, EmaTrustedIssuer } from './ema/types';
+import {
+  computeEmaAccessTokenTTL,
+  parseEmaScopeParam,
+  resolveTrustedIssuer,
+  validateEmaMapperResult,
+  validateIdJagClaims,
+  validateIdJagHeader,
+} from './ema/validators';
+
+export type {
+  EmaClaimsMapper,
+  EmaClaimsMapperInput,
+  EmaClaimsMapperResult,
+  EmaIdJagClaims,
+  EmaOptions,
+  EmaTrustedIssuer,
+  EmaTrustedIssuerResolver,
+  EmaTrustedIssuerResolverInput,
+} from './ema/types';
+export type { EmaValidationError } from './ema/result';
+
 const PROTECTED_RESOURCE_WELL_KNOWN_PREFIX = '/.well-known/oauth-protected-resource';
 
 // Log CIMD status on module load
@@ -30,6 +66,7 @@ export enum GrantType {
   AUTHORIZATION_CODE = 'authorization_code',
   REFRESH_TOKEN = 'refresh_token',
   TOKEN_EXCHANGE = 'urn:ietf:params:oauth:grant-type:token-exchange',
+  JWT_BEARER = 'urn:ietf:params:oauth:grant-type:jwt-bearer',
 }
 
 /** ExecutionContext with writable props — ctx.props is read-only in types but writable at runtime */
@@ -324,6 +361,16 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
   allowTokenExchangeGrant?: boolean;
 
   /**
+   * Experimental support for the MCP Enterprise-Managed Authorization extension.
+   * When enabled, the token endpoint accepts ID-JAG assertions using the JWT bearer
+   * grant type (`urn:ietf:params:oauth:grant-type:jwt-bearer`).
+   *
+   * This feature is opt-in because the MCP extension and underlying OAuth drafts are
+   * still evolving. Trusted issuers and a claim mapper are required.
+   */
+  enterpriseManagedAuthorization?: EmaOptions<Env>;
+
+  /**
    * Controls whether public clients (clients without a secret, like SPAs) can register via the
    * dynamic client registration endpoint. When true, only confidential clients can register.
    * Note: Creating public clients via the OAuthHelpers.createClient() method is always allowed.
@@ -356,16 +403,22 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
   resolveExternalToken?: (input: ResolveExternalTokenInput) => Promise<ResolveExternalTokenResult | null>;
 
   /**
-   * Optional callback function that is called whenever the OAuthProvider returns an error response
+   * Optional callback function that is called whenever the OAuthProvider returns an error response.
    * This allows the client to emit notifications or perform other actions when an error occurs.
    *
    * If the function returns a Response, that will be used in place of the OAuthProvider's default one.
+   *
+   * `internal` (when present) carries a tagged, server-side-only reason that the library
+   * deliberately did NOT put on the wire — used for richer diagnostics where the public
+   * response must stay generic (e.g. JWT validation failures on the EMA path). Backwards
+   * compatible: existing callbacks ignoring this field continue to work unchanged.
    */
   onError?: (error: {
     code: string;
     description: string;
     status: number;
     headers: Record<string, string>;
+    internal?: { category: string; reason: string; detail?: unknown };
   }) => Response | void;
 
   /**
@@ -1192,6 +1245,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    */
   private typedApiHandlers: Array<[string, TypedHandler<Env>]>;
 
+  /** In-memory cached IdP JWKS fetcher; only constructed when EMA is configured. */
+  private readonly jwksProvider: EmaJwksProvider | undefined;
+
+  /** KV-backed best-effort `jti` replay store; only constructed when EMA is configured. */
+  private readonly jtiStore: EmaJtiStore | undefined;
+
   /**
    * Creates a new OAuth provider instance
    * @param options - Configuration options for the provider
@@ -1258,6 +1317,15 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         console.warn(`OAuth error response: ${status} ${code} - ${description}`),
       ...options,
     };
+
+    this.validateEmaOptions(this.options.enterpriseManagedAuthorization);
+
+    if (this.options.enterpriseManagedAuthorization) {
+      this.jwksProvider = createDefaultJwksProvider({
+        cacheTtlSeconds: this.options.enterpriseManagedAuthorization.jwksCacheTtlSeconds,
+      });
+      this.jtiStore = createKvJtiStore();
+    }
   }
 
   /**
@@ -1303,6 +1371,47 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     throw new TypeError(
       `${name} must be either an ExportedHandler object with a fetch method or a class extending WorkerEntrypoint`
     );
+  }
+
+  /**
+   * Validates MCP Enterprise-Managed Authorization configuration at construction time.
+   *
+   * Presence of `enterpriseManagedAuthorization` on options enables the feature —
+   * there is no separate `enabled` flag (which would silently disable EMA when
+   * forgotten). Configuration is checked structurally; runtime concerns
+   * (JWKS reachability etc.) are checked when assertions arrive.
+   */
+  private validateEmaOptions(options: EmaOptions<Env> | undefined): void {
+    if (!options) {
+      return;
+    }
+
+    if (typeof options.trustedIssuers !== 'function') {
+      throw new TypeError(
+        'enterpriseManagedAuthorization.trustedIssuers must be a resolver function: (input) => EmaTrustedIssuer | null'
+      );
+    }
+
+    if (typeof options.mapClaims !== 'function') {
+      throw new TypeError('enterpriseManagedAuthorization.mapClaims must be a function');
+    }
+
+    // Defense-in-depth: an EMA-configured provider without a declared
+    // resource would accept any RFC-8707-shaped `resource` claim, sidestepping
+    // the AS-side resource pinning. Require it explicitly.
+    if (!this.options.resourceMetadata?.resource) {
+      throw new TypeError('enterpriseManagedAuthorization requires resourceMetadata.resource to be configured');
+    }
+
+    if (options.jwksCacheTtlSeconds !== undefined && options.jwksCacheTtlSeconds <= 0) {
+      throw new TypeError('enterpriseManagedAuthorization.jwksCacheTtlSeconds must be greater than 0');
+    }
+    if (options.clockSkewSeconds !== undefined && options.clockSkewSeconds < 0) {
+      throw new TypeError('enterpriseManagedAuthorization.clockSkewSeconds must be non-negative');
+    }
+    if (options.maxAssertionLifetimeSeconds !== undefined && options.maxAssertionLifetimeSeconds <= 0) {
+      throw new TypeError('enterpriseManagedAuthorization.maxAssertionLifetimeSeconds must be greater than 0');
+    }
   }
 
   /**
@@ -1365,7 +1474,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       if (parsed.isRevocationRequest) {
         response = await this.handleRevocationRequest(parsed.body, env);
       } else {
-        response = await this.handleTokenRequest(parsed.body, parsed.clientInfo, env);
+        response = await this.handleTokenRequest(parsed.body, parsed.clientInfo, env, url, request);
       }
 
       return this.addCorsHeaders(response, request);
@@ -1703,6 +1812,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   }
 
   /**
+   * Gets the authorization server issuer using the same derivation as RFC 8414 metadata.
+   */
+  private getAuthorizationServerIssuer(requestUrl: URL): string {
+    const tokenEndpoint = this.getFullEndpointUrl(this.options.tokenEndpoint, requestUrl);
+    return new URL(tokenEndpoint).origin;
+  }
+
+  /**
    * Adds CORS headers to a response
    * @param response - The response to add CORS headers to
    * @param request - The original request
@@ -1760,6 +1877,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     if (this.options.allowTokenExchangeGrant) {
       grantTypesSupported.push(GrantType.TOKEN_EXCHANGE);
     }
+    const authorizationGrantProfilesSupported: string[] = [];
+    if (this.options.enterpriseManagedAuthorization) {
+      grantTypesSupported.push(GrantType.JWT_BEARER);
+      authorizationGrantProfilesSupported.push(EMA_ID_JAG_GRANT_PROFILE);
+    }
 
     const metadata = {
       issuer: new URL(tokenEndpoint).origin,
@@ -1771,6 +1893,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       response_types_supported: responseTypesSupported,
       response_modes_supported: ['query'],
       grant_types_supported: grantTypesSupported,
+      // MCP Enterprise-Managed Authorization grant profile (only when EMA is configured).
+      ...(authorizationGrantProfilesSupported.length > 0
+        ? { authorization_grant_profiles_supported: authorizationGrantProfilesSupported }
+        : {}),
       // Support "none" auth method for public clients
       token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post', 'none'],
       // not implemented: token_endpoint_auth_signing_alg_values_supported
@@ -1833,7 +1959,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @param env - Cloudflare Worker environment variables
    * @returns Response with token data or error
    */
-  private async handleTokenRequest(body: any, clientInfo: ClientInfo, env: any): Promise<Response> {
+  private async handleTokenRequest(
+    body: any,
+    clientInfo: ClientInfo,
+    env: any,
+    requestUrl: URL,
+    request: Request
+  ): Promise<Response> {
     // Handle different grant types. Any `OAuthError` thrown from below
     // (typically from `tokenExchangeCallback` or any code it calls) is
     // converted into a structured OAuth 2.0 `/token` error response.
@@ -1848,6 +1980,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         return await this.handleRefreshTokenGrant(body, clientInfo, env);
       } else if (grantType === GrantType.TOKEN_EXCHANGE && this.options.allowTokenExchangeGrant) {
         return await this.handleTokenExchangeGrant(body, clientInfo, env);
+      } else if (grantType === GrantType.JWT_BEARER) {
+        return await this.handleJwtBearerGrant(body, clientInfo, env, requestUrl, request);
       } else {
         return this.createErrorResponse('unsupported_grant_type', { description: 'Grant type not supported' });
       }
@@ -2721,6 +2855,282 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   }
 
   /**
+   * Handles the MCP Enterprise-Managed Authorization JWT-bearer grant.
+   *
+   * Acts as a thin shell around `runEmaPipeline`: gate non-EMA traffic, run
+   * the pipeline, translate the typed `EmaValidationError` Result back to a
+   * standard OAuth wire response. All validation logic lives in pure
+   * functions in `src/ema/`.
+   */
+  private async handleJwtBearerGrant(
+    body: any,
+    clientInfo: ClientInfo,
+    env: any,
+    requestUrl: URL,
+    request: Request
+  ): Promise<Response> {
+    const enterpriseOptions = this.options.enterpriseManagedAuthorization;
+    if (!enterpriseOptions) {
+      return this.createErrorResponse('unsupported_grant_type', { description: 'Grant type not supported' });
+    }
+
+    if (clientInfo.tokenEndpointAuthMethod === 'none') {
+      return this.createErrorResponse('invalid_client', {
+        description: 'Enterprise-managed authorization requires client authentication',
+        statusCode: 401,
+      });
+    }
+
+    const result = await this.runEmaPipeline({ body, clientInfo, env, requestUrl, request, enterpriseOptions });
+
+    // RFC 6749 §5.1 — token endpoint responses must not be cached.
+    const noCacheHeaders = { 'Cache-Control': 'no-store', Pragma: 'no-cache' };
+
+    if (!result.ok) {
+      const wire = emaErrorToWire(result.error);
+      return this.createErrorResponse(
+        wire.code,
+        { description: wire.message, headers: noCacheHeaders },
+        { category: 'enterprise-managed-authorization', reason: result.error.reason, detail: result.error }
+      );
+    }
+
+    return new Response(JSON.stringify(result.value), {
+      headers: { 'Content-Type': 'application/json', ...noCacheHeaders },
+    });
+  }
+
+  /**
+   * Runs the full EMA token-request pipeline as a chain of pure validators
+   * and adapter calls. Each step short-circuits on the first failure.
+   *
+   * Sequence:
+   *   parse → validate header → trust issuer → fetch JWKS → select key →
+   *   verify signature → validate claims → record jti → parse scope →
+   *   run mapper → validate mapper result → compute TTL → mint token.
+   */
+  private async runEmaPipeline(args: {
+    body: any;
+    clientInfo: ClientInfo;
+    env: any;
+    requestUrl: URL;
+    request: Request;
+    enterpriseOptions: EmaOptions<Env>;
+  }): Promise<Result<TokenResponse, EmaValidationError>> {
+    const { body, clientInfo, env, requestUrl, request, enterpriseOptions } = args;
+    const { jwksProvider, jtiStore } = this;
+    const configuredResource = this.options.resourceMetadata?.resource;
+    // Unreachable: handleJwtBearerGrant short-circuits when enterpriseOptions is absent,
+    // and validateEmaOptions enforces these invariants at construction time.
+    if (!jwksProvider || !jtiStore || !configuredResource) {
+      throw new Error('EMA pipeline invoked without configured adapters');
+    }
+    const now = Math.floor(Date.now() / 1000);
+
+    const parsed = parseIdJag(body.assertion, EMA_MAX_JWT_BYTES);
+    if (!parsed.ok) return parsed;
+
+    const header = validateIdJagHeader(parsed.value.header, EMA_ID_JAG_JWT_TYPE, EMA_SUPPORTED_JWT_ALGORITHMS);
+    if (!header.ok) return header;
+    const alg = header.value.alg as EmaSupportedAlg;
+
+    const trustedIssuer = await resolveTrustedIssuer({
+      iss: parsed.value.rawClaims.iss,
+      alg,
+      resolver: enterpriseOptions.trustedIssuers,
+      env,
+      request,
+      clientInfo,
+    });
+    if (!trustedIssuer.ok) return trustedIssuer;
+
+    const verified = await this.verifyAssertionSignature({
+      parsed: parsed.value,
+      header: header.value,
+      trustedIssuer: trustedIssuer.value,
+      jwksProvider,
+      now,
+    });
+    if (!verified.ok) return verified;
+
+    const claims = validateIdJagClaims({
+      rawClaims: parsed.value.rawClaims,
+      trustedIssuer: trustedIssuer.value,
+      expectedAudience: trustedIssuer.value.audience ?? this.getAuthorizationServerIssuer(requestUrl),
+      clientId: clientInfo.clientId,
+      configuredResource,
+      matchOriginOnly: !!this.options.resourceMatchOriginOnly,
+      now,
+      clockSkewSeconds: enterpriseOptions.clockSkewSeconds ?? EMA_DEFAULT_CLOCK_SKEW_SECONDS,
+      maxAssertionLifetimeSeconds:
+        enterpriseOptions.maxAssertionLifetimeSeconds ?? EMA_DEFAULT_MAX_ASSERTION_LIFETIME_SECONDS,
+    });
+    if (!claims.ok) return claims;
+
+    // Fresh clock read so the JTI KV TTL reflects the assertion's remaining
+    // lifetime at the moment of write, not at pipeline start (JWKS fetch
+    // already burned several ms; mapper hasn't run yet).
+    const markNow = Math.floor(Date.now() / 1000);
+    const replay = await jtiStore.markUsed({
+      issuer: claims.value.claims.iss,
+      jti: claims.value.claims.jti,
+      exp: claims.value.claims.exp,
+      now: markNow,
+      env,
+    });
+    if (!replay.ok) return replay;
+
+    const requestedScope = parseEmaScopeParam(body.scope, claims.value.assertionScopes);
+    if (!requestedScope.ok) return requestedScope;
+
+    let mapperOutput: unknown;
+    try {
+      mapperOutput = await enterpriseOptions.mapClaims({
+        claims: claims.value.claims,
+        clientInfo,
+        resource: claims.value.resource,
+        requestedScope: requestedScope.value,
+        request: args.request,
+        env,
+      });
+    } catch {
+      return err({ reason: 'mapper_threw' });
+    }
+    const mapped = validateEmaMapperResult(mapperOutput);
+    if (!mapped.ok) return mapped;
+
+    // Fresh clock read so both the TTL TOCTOU guard and the grant `createdAt`
+    // reflect post-mapper time — the pipeline-start `now` is stale by the
+    // time we reach this point (JWKS fetch + mapper invocation may take
+    // hundreds of ms).
+    const issueNow = Math.floor(Date.now() / 1000);
+    const ttl = computeEmaAccessTokenTTL({
+      configuredDefaultSeconds: this.options.accessTokenTTL ?? DEFAULT_ACCESS_TOKEN_TTL,
+      assertionExp: claims.value.claims.exp,
+      mapperTtl: mapped.value.accessTokenTTL,
+      now: issueNow,
+    });
+    if (!ttl.ok) return ttl;
+
+    return ok(
+      await this.issueEmaAccessToken({
+        clientId: clientInfo.clientId,
+        userId: mapped.value.userId,
+        mapperScope: mapped.value.scope,
+        mapperProps: mapped.value.props,
+        mapperMetadata: mapped.value.metadata,
+        assertionScopes: claims.value.assertionScopes,
+        resource: claims.value.resource,
+        accessTokenTTLSeconds: ttl.value,
+        env,
+        now: issueNow,
+      })
+    );
+  }
+
+  /**
+   * Verifies the ID-JAG signature against the trusted issuer's JWKS,
+   * force-refreshing once on a `kid` miss to accommodate IdP key rotation.
+   * Uses the in-memory cached JWKS fetcher with anti-DoS cool-down.
+   */
+  private async verifyAssertionSignature(args: {
+    parsed: { header: Record<string, unknown>; signingInput: Uint8Array; signature: Uint8Array };
+    header: { alg: string; kid?: string };
+    trustedIssuer: EmaTrustedIssuer;
+    jwksProvider: EmaJwksProvider;
+    now: number;
+  }): Promise<Result<void, EmaValidationError>> {
+    const alg = args.header.alg as EmaSupportedAlg;
+    const { jwksProvider } = args;
+
+    const initialJwks = await jwksProvider.fetch(args.trustedIssuer, { forceRefresh: false, now: args.now });
+    if (!initialJwks.ok) return initialJwks;
+
+    let jwk = selectJwk(initialJwks.value, alg, args.header.kid);
+    if (!jwk.ok && args.header.kid) {
+      const refreshed = await jwksProvider.fetch(args.trustedIssuer, { forceRefresh: true, now: args.now });
+      if (!refreshed.ok) return refreshed;
+      jwk = selectJwk(refreshed.value, alg, args.header.kid);
+    }
+    if (!jwk.ok) return jwk;
+
+    const verified = await verifyIdJagSignature({
+      alg,
+      jwk: jwk.value,
+      signingInput: args.parsed.signingInput,
+      signature: args.parsed.signature,
+    });
+    if (!verified) return err({ reason: 'signature_failed' });
+
+    return ok(undefined);
+  }
+
+  /**
+   * Mints the access token for an authorized EMA request.
+   *
+   * Uses the same grant + access-token machinery as the authorization-code
+   * grant: encrypt the props, persist the grant under `grant:userId:grantId`,
+   * and create an opaque access token bound to the resource as audience.
+   */
+  private async issueEmaAccessToken(args: {
+    clientId: string;
+    userId: string;
+    mapperScope: string[];
+    mapperProps: unknown;
+    mapperMetadata: unknown;
+    assertionScopes: string[];
+    resource: string;
+    accessTokenTTLSeconds: number;
+    env: any;
+    now: number;
+  }): Promise<TokenResponse> {
+    // Defense-in-depth downscope: the mapper's output is filtered through the
+    // assertion's scope claim (when present) so that a mapper returning an
+    // out-of-band `admin` scope cannot escalate beyond what the IdP authorized.
+    // `parseEmaScopeParam` already downscoped the *requested* scope before
+    // the mapper saw it; this is the second layer that bounds the *mapper's*
+    // output too. When the assertion carries no scope claim, the mapper has
+    // full discretion (no ceiling to enforce).
+    const tokenScopes =
+      args.assertionScopes.length > 0 ? this.downscope(args.mapperScope, args.assertionScopes) : args.mapperScope;
+
+    const grantId = generateRandomString(16);
+    const { encryptedData, key: encryptionKey } = await encryptProps(args.mapperProps);
+    const grant: Grant = {
+      id: grantId,
+      clientId: args.clientId,
+      userId: args.userId,
+      scope: tokenScopes,
+      metadata: args.mapperMetadata ?? null,
+      encryptedProps: encryptedData,
+      createdAt: args.now,
+      expiresAt: args.now + args.accessTokenTTLSeconds,
+      resource: args.resource,
+    };
+    await this.saveGrantWithTTL(args.env, `grant:${args.userId}:${grantId}`, grant, args.now);
+
+    const accessToken = await this.createAccessToken({
+      userId: args.userId,
+      grantId,
+      clientId: args.clientId,
+      scope: tokenScopes,
+      encryptedProps: encryptedData,
+      encryptionKey,
+      expiresIn: args.accessTokenTTLSeconds,
+      audience: args.resource,
+      env: args.env,
+    });
+
+    return {
+      access_token: accessToken,
+      token_type: 'bearer',
+      expires_in: args.accessTokenTTLSeconds,
+      scope: tokenScopes.join(' '),
+      resource: args.resource,
+    };
+  }
+
+  /**
    * Handles OAuth 2.0 token revocation requests (RFC 7009)
    * @param body - The parsed request body containing revocation parameters
    * @param env - Cloudflare Worker environment variables
@@ -3507,12 +3917,18 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   }
 
   /**
-   * Helper function to create OAuth error responses
-   * @param code - OAuth error code (e.g., 'invalid_request', 'invalid_token')
-   * @param options - Error response options
-   * @returns A Response object with the error
+   * Helper function to create OAuth error responses.
+   *
+   * `internal` (optional) carries a tagged, server-side-only reason. It is
+   * forwarded to the deployer's `onError` hook but never placed on the wire,
+   * so the public response stays RFC-compliant and free of information leak
+   * while the deployer can still observe which check failed.
    */
-  private createErrorResponse(code: string, options: OAuthErrorOptions): Response {
+  private createErrorResponse(
+    code: string,
+    options: OAuthErrorOptions,
+    internal?: { category: string; reason: string; detail?: unknown }
+  ): Response {
     const { description } = options;
     const responseStatus = options.statusCode ?? 400;
     const responseHeaders = options.headers ?? {};
@@ -3523,6 +3939,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       description,
       status: responseStatus,
       headers: responseHeaders,
+      ...(internal ? { internal } : {}),
     });
     if (customErrorResponse) return customErrorResponse;
 
@@ -3660,13 +4077,18 @@ const DEFAULT_PURGE_BATCH_SIZE = 50;
  */
 const TOKEN_LENGTH = 32;
 
+/**
+ * RFC 6749 Section 3.3 scope-token grammar.
+ */
+const OAUTH_SCOPE_TOKEN_PATTERN = /^[\x21\x23-\x5B\x5D-\x7E]+$/;
+
 // Helper Functions
 /**
  * Validates a resource URI per RFC 8707 Section 2
  * @param uri - The URI string to validate
  * @returns true if valid, false otherwise
  */
-function validateResourceUri(uri: string): boolean {
+export function validateResourceUri(uri: string): boolean {
   if (!uri || typeof uri !== 'string') {
     return false;
   }
@@ -3756,7 +4178,7 @@ function parseResourceParameter(value: string | string[] | undefined): string | 
  * When originOnly is true, compares only the origin (scheme + host + port),
  * allowing path-aware resources to match origin-only grants.
  */
-function resourceMatches(requested: string, granted: string, originOnly: boolean): boolean {
+export function resourceMatches(requested: string, granted: string, originOnly: boolean): boolean {
   if (!originOnly) {
     return requested === granted;
   }
@@ -3918,6 +4340,62 @@ function isValidRedirectUri(requestUri: string, registeredUris: string[]): boole
  */
 function base64UrlEncode(str: string): string {
   return btoa(str).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+}
+
+/**
+ * Decodes a base64url-encoded string to bytes.
+ */
+export function base64UrlToBytes(base64Url: string): Uint8Array {
+  const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+  const padded = base64.padEnd(base64.length + ((4 - (base64.length % 4)) % 4), '=');
+  const binaryString = atob(padded);
+  const bytes = new Uint8Array(binaryString.length);
+  for (let i = 0; i < binaryString.length; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return bytes;
+}
+
+/**
+ * Parses a base64url-encoded JWT JSON part into an object.
+ */
+export function parseJwtJsonPart(encoded: string): Record<string, unknown> {
+  try {
+    const json = new TextDecoder().decode(base64UrlToBytes(encoded));
+    const parsed = JSON.parse(json);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      throw new Error('JWT part must be an object');
+    }
+    return parsed as Record<string, unknown>;
+  } catch {
+    throw new Error('Malformed JWT part');
+  }
+}
+
+export function isValidOAuthScopeToken(scopeToken: string): boolean {
+  return OAUTH_SCOPE_TOKEN_PATTERN.test(scopeToken);
+}
+
+/**
+ * Gets WebCrypto import and verify parameters for supported JOSE algorithms.
+ */
+export function getJwtCryptoAlgorithms(alg: string): {
+  importAlgorithm: Parameters<SubtleCrypto['importKey']>[2];
+  verifyAlgorithm: Parameters<SubtleCrypto['verify']>[0];
+} {
+  if (alg === 'RS256') {
+    const algorithm = { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' };
+    return { importAlgorithm: algorithm, verifyAlgorithm: algorithm };
+  }
+
+  if (alg === 'ES256') {
+    return {
+      importAlgorithm: { name: 'ECDSA', namedCurve: 'P-256' },
+      verifyAlgorithm: { name: 'ECDSA', hash: 'SHA-256' },
+    };
+  }
+
+  throw new Error(`Unsupported JWT alg: ${alg}`);
 }
 
 /**
