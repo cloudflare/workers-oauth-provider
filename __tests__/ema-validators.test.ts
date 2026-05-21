@@ -302,12 +302,21 @@ describe('validateIdJagClaims', () => {
     expect(r).toMatchObject({ ok: false, error: { reason: 'resource_mismatch' } });
   });
 
-  it('rejects expired assertions', () => {
+  it('rejects expired assertions beyond clock-skew tolerance', () => {
+    // claimsArgs.clockSkewSeconds = 60, so the assertion must be > 60s past exp.
+    const r = validateIdJagClaims({
+      rawClaims: { ...validClaims, exp: claimsArgs.now - 120 },
+      ...claimsArgs,
+    });
+    expect(r).toMatchObject({ ok: false, error: { reason: 'expired' } });
+  });
+
+  it('accepts assertions within clock-skew tolerance of exp (RFC 7523 §3 rule 4)', () => {
     const r = validateIdJagClaims({
       rawClaims: { ...validClaims, exp: claimsArgs.now - 10 },
       ...claimsArgs,
     });
-    expect(r).toMatchObject({ ok: false, error: { reason: 'expired' } });
+    expect(r.ok).toBe(true);
   });
 
   it('rejects iat too far in the future', () => {
@@ -337,7 +346,7 @@ describe('validateIdJagClaims', () => {
 
   it('rejects malformed scope grammar', () => {
     const r = validateIdJagClaims({
-      rawClaims: { ...validClaims, scope: 'valid badtoken' },
+      rawClaims: { ...validClaims, scope: 'valid bad\x01token' },
       ...claimsArgs,
     });
     expect(r).toMatchObject({ ok: false, error: { reason: 'invalid_claim', claim: 'scope' } });
@@ -361,7 +370,7 @@ describe('parseEmaScopeParam', () => {
   });
 
   it('rejects malformed scope', () => {
-    const r = parseEmaScopeParam('badscope', []);
+    const r = parseEmaScopeParam('bad\x01scope', []);
     expect(r).toMatchObject({ ok: false, error: { reason: 'invalid_scope_param' } });
   });
 
@@ -392,7 +401,7 @@ describe('validateEmaMapperResult', () => {
   });
 
   it('rejects malformed scope tokens', () => {
-    const r = validateEmaMapperResult({ userId: 'u', scope: ['bad'], props: {} });
+    const r = validateEmaMapperResult({ userId: 'u', scope: ['bad\x01'], props: {} });
     expect(r).toMatchObject({ ok: false, error: { reason: 'invalid_mapped_scope' } });
   });
 

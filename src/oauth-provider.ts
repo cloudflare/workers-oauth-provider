@@ -2,14 +2,9 @@ import { WorkerEntrypoint } from 'cloudflare:workers';
 
 import {
   EMA_DEFAULT_CLOCK_SKEW_SECONDS,
-  EMA_DEFAULT_JWKS_CACHE_TTL_SECONDS,
-  EMA_DEFAULT_JWT_ALGORITHM,
   EMA_DEFAULT_MAX_ASSERTION_LIFETIME_SECONDS,
   EMA_ID_JAG_GRANT_PROFILE,
   EMA_ID_JAG_JWT_TYPE,
-  EMA_JWKS_FETCH_TIMEOUT_MS,
-  EMA_JWKS_FORCE_REFRESH_COOLDOWN_SECONDS,
-  EMA_JWKS_MAX_SIZE_BYTES,
   EMA_MAX_JWT_BYTES,
   EMA_SUPPORTED_JWT_ALGORITHMS,
   type EmaSupportedAlg,
@@ -30,14 +25,7 @@ export type {
   EmaTrustedIssuerResolverInput,
 } from './ema/types';
 export type { EmaValidationError } from './ema/result';
-import type {
-  EmaJtiStore,
-  EmaJwksProvider,
-  EmaOptions,
-  EmaTrustedIssuer,
-  JsonWebKeySet,
-  OAuthJsonWebKey,
-} from './ema/types';
+import type { EmaJtiStore, EmaJwksProvider, EmaOptions, EmaTrustedIssuer } from './ema/types';
 import {
   computeEmaAccessTokenTTL,
   parseEmaScopeParam,
@@ -1256,11 +1244,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    */
   private typedApiHandlers: Array<[string, TypedHandler<Env>]>;
 
-  /** In-memory cached IdP JWKS fetcher used during ID-JAG signature verification. */
-  private readonly jwksProvider: EmaJwksProvider;
+  /** In-memory cached IdP JWKS fetcher; only constructed when EMA is configured. */
+  private readonly jwksProvider: EmaJwksProvider | undefined;
 
-  /** KV-backed best-effort store recording ID-JAG `jti` values for replay protection. */
-  private readonly jtiStore: EmaJtiStore;
+  /** KV-backed best-effort `jti` replay store; only constructed when EMA is configured. */
+  private readonly jtiStore: EmaJtiStore | undefined;
 
   /**
    * Creates a new OAuth provider instance
@@ -1331,10 +1319,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     this.validateEmaOptions(this.options.enterpriseManagedAuthorization);
 
-    this.jwksProvider = createDefaultJwksProvider({
-      cacheTtlSeconds: this.options.enterpriseManagedAuthorization?.jwksCacheTtlSeconds,
-    });
-    this.jtiStore = createKvJtiStore();
+    if (this.options.enterpriseManagedAuthorization) {
+      this.jwksProvider = createDefaultJwksProvider({
+        cacheTtlSeconds: this.options.enterpriseManagedAuthorization.jwksCacheTtlSeconds,
+      });
+      this.jtiStore = createKvJtiStore();
+    }
   }
 
   /**
@@ -2892,17 +2882,20 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     const result = await this.runEmaPipeline({ body, clientInfo, env, requestUrl, request, enterpriseOptions });
 
+    // RFC 6749 §5.1 — token endpoint responses must not be cached.
+    const noCacheHeaders = { 'Cache-Control': 'no-store', Pragma: 'no-cache' };
+
     if (!result.ok) {
       const wire = emaErrorToWire(result.error);
       return this.createErrorResponse(
         wire.code,
-        { description: wire.message },
+        { description: wire.message, headers: noCacheHeaders },
         { category: 'enterprise-managed-authorization', reason: result.error.reason, detail: result.error }
       );
     }
 
     return new Response(JSON.stringify(result.value), {
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...noCacheHeaders },
     });
   }
 
@@ -2913,7 +2906,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * Sequence:
    *   parse → validate header → trust issuer → fetch JWKS → select key →
    *   verify signature → validate claims → record jti → parse scope →
-   *   run mapper → validate mapper result → clamp TTL → mint token.
+   *   run mapper → validate mapper result → compute TTL → mint token.
    */
   private async runEmaPipeline(args: {
     body: any;
@@ -2924,6 +2917,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     enterpriseOptions: EmaOptions<Env>;
   }): Promise<Result<TokenResponse, EmaValidationError>> {
     const { body, clientInfo, env, requestUrl, request, enterpriseOptions } = args;
+    const { jwksProvider, jtiStore } = this;
+    // Unreachable: handleJwtBearerGrant short-circuits when enterpriseOptions is absent,
+    // and the constructor instantiates these adapters whenever enterpriseOptions is set.
+    if (!jwksProvider || !jtiStore) {
+      throw new Error('EMA pipeline invoked without configured adapters');
+    }
     const now = Math.floor(Date.now() / 1000);
 
     const parsed = parseIdJag(body.assertion, EMA_MAX_JWT_BYTES);
@@ -2947,6 +2946,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       parsed: parsed.value,
       header: header.value,
       trustedIssuer: trustedIssuer.value,
+      jwksProvider,
       now,
     });
     if (!verified.ok) return verified;
@@ -2966,7 +2966,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     if (!claims.ok) return claims;
 
     const replay = jtiMarkResultToResult(
-      await this.jtiStore.markUsed({
+      await jtiStore.markUsed({
         issuer: claims.value.claims.iss,
         jti: claims.value.claims.jti,
         exp: claims.value.claims.exp,
@@ -2980,15 +2980,21 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const requestedScope = parseEmaScopeParam(body.scope, claims.value.assertionScopes);
     if (!requestedScope.ok) return requestedScope;
 
-    const mapperOutput = await Promise.resolve(
-      enterpriseOptions.mapClaims({
-        claims: claims.value.claims,
-        clientInfo,
-        resource: claims.value.resource,
-        requestedScope: requestedScope.value,
-        env,
-      })
-    );
+    let mapperOutput: unknown;
+    try {
+      mapperOutput = await Promise.resolve(
+        enterpriseOptions.mapClaims({
+          claims: claims.value.claims,
+          clientInfo,
+          resource: claims.value.resource,
+          requestedScope: requestedScope.value,
+          request: args.request,
+          env,
+        })
+      );
+    } catch {
+      return err({ reason: 'mapper_threw' });
+    }
     const mapped = validateEmaMapperResult(mapperOutput);
     if (!mapped.ok) return mapped;
 
@@ -3019,26 +3025,27 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   /**
    * Verifies the ID-JAG signature against the trusted issuer's JWKS,
    * force-refreshing once on a `kid` miss to accommodate IdP key rotation.
-   * Delegates JWKS retrieval to `this.jwksProvider` (default impl is the
-   * in-memory cached fetcher with anti-DoS cool-down).
+   * Uses the in-memory cached JWKS fetcher with anti-DoS cool-down.
    */
   private async verifyAssertionSignature(args: {
     parsed: { header: Record<string, unknown>; signingInput: Uint8Array; signature: Uint8Array };
     header: { alg: string; kid?: string };
     trustedIssuer: EmaTrustedIssuer;
+    jwksProvider: EmaJwksProvider;
     now: number;
   }): Promise<Result<void, EmaValidationError>> {
     const alg = args.header.alg as EmaSupportedAlg;
+    const { jwksProvider } = args;
 
     const initialJwks = jwksFetchResultToResult(
-      await this.jwksProvider.fetch(args.trustedIssuer, { forceRefresh: false, now: args.now })
+      await jwksProvider.fetch(args.trustedIssuer, { forceRefresh: false, now: args.now })
     );
     if (!initialJwks.ok) return initialJwks;
 
     let jwk = selectJwk(initialJwks.value, alg, args.header.kid);
     if (!jwk.ok && args.header.kid) {
       const refreshed = jwksFetchResultToResult(
-        await this.jwksProvider.fetch(args.trustedIssuer, { forceRefresh: true, now: args.now })
+        await jwksProvider.fetch(args.trustedIssuer, { forceRefresh: true, now: args.now })
       );
       if (!refreshed.ok) return refreshed;
       jwk = selectJwk(refreshed.value, alg, args.header.kid);

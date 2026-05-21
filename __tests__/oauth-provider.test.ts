@@ -3057,6 +3057,54 @@ describe('OAuthProvider', () => {
       expect(await secondResponse.json<any>()).toMatchObject({ error: 'invalid_grant' });
     });
 
+    it('catches mapClaims exceptions and emits a graceful invalid_grant', async () => {
+      const throwingProvider = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        scopesSupported: ['read', 'write'],
+        accessTokenTTL: 3600,
+        resourceMetadata: { resource },
+        enterpriseManagedAuthorization: {
+          trustedIssuers: () => ({ issuer, jwksUri: `${issuer}/jwks.json`, algorithms: ['RS256'] }),
+          mapClaims: () => {
+            throw new Error('mapper exploded');
+          },
+        },
+      });
+
+      const reg = await throwingProvider.fetch(
+        createMockRequest('https://example.com/oauth/register', 'POST', { 'Content-Type': 'application/json' }, JSON.stringify({
+          redirect_uris: ['https://client.example.com/callback'],
+          client_name: 'Throwing',
+          token_endpoint_auth_method: 'client_secret_basic',
+        })),
+        mockEnv,
+        mockCtx
+      );
+      const throwClient = await reg.json<any>();
+
+      const assertion = await createAssertion({ client_id: throwClient.client_id });
+      const params = new URLSearchParams();
+      params.append('grant_type', 'urn:ietf:params:oauth:grant-type:jwt-bearer');
+      params.append('assertion', assertion);
+      const response = await throwingProvider.fetch(
+        createMockRequest('https://example.com/oauth/token', 'POST', {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${throwClient.client_id}:${throwClient.client_secret}`)}`,
+        }, params.toString()),
+        mockEnv,
+        mockCtx
+      );
+
+      expect(response.status).toBe(400);
+      expect(response.headers.get('Cache-Control')).toBe('no-store');
+      expect(await response.json<any>()).toMatchObject({ error: 'invalid_grant' });
+    });
+
     it('surfaces the typed EMA reason to onError.internal without leaking on the wire', async () => {
       const captured: Array<Parameters<NonNullable<ConstructorParameters<typeof OAuthProvider>[0]['onError']>>[0]> = [];
       const observableProvider = new OAuthProvider({

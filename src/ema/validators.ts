@@ -5,8 +5,8 @@
  * returns `Result<T, EmaValidationError>`. No `this`. No I/O. No clock —
  * `now` is always passed in so tests stay deterministic.
  *
- * Composed by the orchestrator (`src/ema/orchestrator.ts`) into the full
- * token-request pipeline.
+ * Composed by `OAuthProviderImpl.runEmaPipeline` in `src/oauth-provider.ts`
+ * into the full token-request pipeline.
  */
 
 import type { ClientInfo } from '../oauth-provider';
@@ -232,7 +232,9 @@ export function validateIdJagClaims(input: ValidateClaimsInput): Result<Validate
     return err({ reason: 'resource_mismatch', expected: configuredResource, got: resource.value });
   }
 
-  if (exp.value <= now) {
+  // RFC 7523 §3 rule 4: skew applies to `exp` too, otherwise sub-second
+  // clock drift between IdP and AS rejects assertions right at expiry.
+  if (exp.value + clockSkewSeconds <= now) {
     return err({ reason: 'expired', exp: exp.value, now });
   }
 

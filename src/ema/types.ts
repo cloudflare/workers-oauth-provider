@@ -79,6 +79,9 @@ export interface EmaClaimsMapperInput<Env = Cloudflare.Env> {
   /** Requested scopes after downscoping to the assertion's scope claim, if present. */
   requestedScope: string[];
 
+  /** The original HTTP token request, e.g. for inspecting Host header in multi-tenant routing. */
+  request: Request;
+
   /** Cloudflare Worker environment variables. */
   env: Env;
 }
@@ -118,7 +121,12 @@ export interface EmaClaimsMapperResult {
    */
   props: unknown;
 
-  /** Optional access token TTL override in seconds. Clamped to the assertion lifetime. */
+  /**
+   * Optional access token TTL override in seconds. Overrides the AS's
+   * configured default. Not clamped to the assertion lifetime — the ID-JAG
+   * `exp` governs how long the assertion remains a usable grant, not the
+   * lifetime of the access token it mints (RFC 7523 §3).
+   */
   accessTokenTTL?: number;
 }
 
@@ -272,16 +280,4 @@ export interface ValidatedIdJag {
   claims: EmaIdJagClaims;
   resource: string;
   assertionScopes: string[];
-}
-
-/** Output of the EMA pipeline up to (but not including) token minting. */
-export interface EmaAuthorization {
-  userId: string;
-  scope: string[];
-  props: unknown;
-  metadata: unknown;
-  resource: string;
-  assertionExp: number;
-  assertionScopes: string[];
-  accessTokenTTLSeconds: number;
 }

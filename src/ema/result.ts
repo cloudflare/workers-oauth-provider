@@ -45,6 +45,7 @@ export type EmaValidationError =
   | { reason: 'invalid_mapped_props' }
   | { reason: 'invalid_mapped_ttl' }
   | { reason: 'mapper_denied' }
+  | { reason: 'mapper_threw' }
   | { reason: 'assertion_expired_after_processing' };
 
 /** Wire-level error response that the AS returns to the client. */
@@ -71,6 +72,8 @@ export function emaErrorToWire(e: EmaValidationError): EmaErrorWireResponse {
       return { code: 'invalid_target', message: 'Invalid resource' };
 
     case 'mapper_denied':
+      return { code: 'invalid_grant', message: 'Assertion was not authorized' };
+    case 'mapper_threw':
       return { code: 'invalid_grant', message: 'Assertion was not authorized' };
     case 'invalid_mapped_user':
       return { code: 'invalid_grant', message: 'Invalid mapped user' };
