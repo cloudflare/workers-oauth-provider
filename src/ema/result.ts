@@ -72,7 +72,6 @@ export function emaErrorToWire(e: EmaValidationError): EmaErrorWireResponse {
       return { code: 'invalid_target', message: 'Invalid resource' };
 
     case 'mapper_denied':
-      return { code: 'invalid_grant', message: 'Assertion was not authorized' };
     case 'mapper_threw':
       return { code: 'invalid_grant', message: 'Assertion was not authorized' };
     case 'invalid_mapped_user':

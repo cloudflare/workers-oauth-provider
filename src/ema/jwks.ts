@@ -43,6 +43,12 @@ export function createDefaultJwksProvider(opts: DefaultJwksProviderOptions = {})
 
       // Anti-DoS: serve the cached JWKS rather than spam the IdP when a
       // force-refresh is requested too soon after the previous one.
+      //
+      // Returning stale keys is safe — signature verification still has to
+      // succeed against them. If the IdP genuinely rotated, the verify step
+      // will reject, the assertion path will fail with `no_matching_key` or
+      // `signature_failed`, and the next force-refresh after the cooldown
+      // window will pick up the new key.
       if (forceRefresh && cached && cached.nextForceRefreshAllowedAt > now) {
         return ok(cached.jwks);
       }

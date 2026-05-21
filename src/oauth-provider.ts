@@ -14,6 +14,16 @@ import { createDefaultJwksProvider } from './ema/jwks';
 import { parseIdJag } from './ema/parser';
 import { emaErrorToWire, err, ok, type EmaValidationError, type Result } from './ema/result';
 import { selectJwk, verifyIdJagSignature } from './ema/signature';
+import type { EmaJtiStore, EmaJwksProvider, EmaOptions, EmaTrustedIssuer } from './ema/types';
+import {
+  computeEmaAccessTokenTTL,
+  parseEmaScopeParam,
+  resolveTrustedIssuer,
+  validateEmaMapperResult,
+  validateIdJagClaims,
+  validateIdJagHeader,
+} from './ema/validators';
+
 export type {
   EmaClaimsMapper,
   EmaClaimsMapperInput,
@@ -25,15 +35,6 @@ export type {
   EmaTrustedIssuerResolverInput,
 } from './ema/types';
 export type { EmaValidationError } from './ema/result';
-import type { EmaJtiStore, EmaJwksProvider, EmaOptions, EmaTrustedIssuer } from './ema/types';
-import {
-  computeEmaAccessTokenTTL,
-  parseEmaScopeParam,
-  resolveTrustedIssuer,
-  validateEmaMapperResult,
-  validateIdJagClaims,
-  validateIdJagHeader,
-} from './ema/validators';
 
 const PROTECTED_RESOURCE_WELL_KNOWN_PREFIX = '/.well-known/oauth-protected-resource';
 
@@ -2993,14 +2994,16 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const mapped = validateEmaMapperResult(mapperOutput);
     if (!mapped.ok) return mapped;
 
-    // Fresh clock read so the `exp` check inside `computeEmaAccessTokenTTL`
-    // catches assertions that crossed `exp` during JWKS fetch + mapper execution
-    // — the pipeline-start `now` is too old for this TOCTOU guard.
+    // Fresh clock read so both the TTL TOCTOU guard and the grant `createdAt`
+    // reflect post-mapper time — the pipeline-start `now` is stale by the
+    // time we reach this point (JWKS fetch + mapper invocation may take
+    // hundreds of ms).
+    const issueNow = Math.floor(Date.now() / 1000);
     const ttl = computeEmaAccessTokenTTL({
       configuredDefaultSeconds: this.options.accessTokenTTL ?? DEFAULT_ACCESS_TOKEN_TTL,
       assertionExp: claims.value.claims.exp,
       mapperTtl: mapped.value.accessTokenTTL,
-      now: Math.floor(Date.now() / 1000),
+      now: issueNow,
     });
     if (!ttl.ok) return ttl;
 
@@ -3015,7 +3018,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         resource: claims.value.resource,
         accessTokenTTLSeconds: ttl.value,
         env,
-        now,
+        now: issueNow,
       })
     );
   }
