@@ -3077,11 +3077,16 @@ describe('OAuthProvider', () => {
       });
 
       const reg = await throwingProvider.fetch(
-        createMockRequest('https://example.com/oauth/register', 'POST', { 'Content-Type': 'application/json' }, JSON.stringify({
-          redirect_uris: ['https://client.example.com/callback'],
-          client_name: 'Throwing',
-          token_endpoint_auth_method: 'client_secret_basic',
-        })),
+        createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify({
+            redirect_uris: ['https://client.example.com/callback'],
+            client_name: 'Throwing',
+            token_endpoint_auth_method: 'client_secret_basic',
+          })
+        ),
         mockEnv,
         mockCtx
       );
@@ -3092,10 +3097,15 @@ describe('OAuthProvider', () => {
       params.append('grant_type', 'urn:ietf:params:oauth:grant-type:jwt-bearer');
       params.append('assertion', assertion);
       const response = await throwingProvider.fetch(
-        createMockRequest('https://example.com/oauth/token', 'POST', {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          Authorization: `Basic ${btoa(`${throwClient.client_id}:${throwClient.client_secret}`)}`,
-        }, params.toString()),
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            Authorization: `Basic ${btoa(`${throwClient.client_id}:${throwClient.client_secret}`)}`,
+          },
+          params.toString()
+        ),
         mockEnv,
         mockCtx
       );
@@ -3128,11 +3138,16 @@ describe('OAuthProvider', () => {
 
       // Register a client against the observable provider.
       const registerResponse = await observableProvider.fetch(
-        createMockRequest('https://example.com/oauth/register', 'POST', { 'Content-Type': 'application/json' }, JSON.stringify({
-          redirect_uris: ['https://client.example.com/callback'],
-          client_name: 'Observable',
-          token_endpoint_auth_method: 'client_secret_basic',
-        })),
+        createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify({
+            redirect_uris: ['https://client.example.com/callback'],
+            client_name: 'Observable',
+            token_endpoint_auth_method: 'client_secret_basic',
+          })
+        ),
         mockEnv,
         mockCtx
       );
@@ -3143,10 +3158,15 @@ describe('OAuthProvider', () => {
       params.append('grant_type', 'urn:ietf:params:oauth:grant-type:jwt-bearer');
       params.append('assertion', 'this.is.notvalid');
       const tokenResponse = await observableProvider.fetch(
-        createMockRequest('https://example.com/oauth/token', 'POST', {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          Authorization: `Basic ${btoa(`${obsClient.client_id}:${obsClient.client_secret}`)}`,
-        }, params.toString()),
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            Authorization: `Basic ${btoa(`${obsClient.client_id}:${obsClient.client_secret}`)}`,
+          },
+          params.toString()
+        ),
         mockEnv,
         mockCtx
       );

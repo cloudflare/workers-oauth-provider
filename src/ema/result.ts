@@ -105,4 +105,3 @@ export function emaErrorToWire(e: EmaValidationError): EmaErrorWireResponse {
       return { code: 'invalid_grant', message: 'Invalid assertion' };
   }
 }
-
