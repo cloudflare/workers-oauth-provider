@@ -2116,6 +2116,214 @@ describe('OAuthProvider', () => {
     });
   });
 
+  describe('coalesceRefreshTokenExchange (non-idempotent upstream callback)', () => {
+    // Models an upstream OAuth server whose refresh tokens are single-use and
+    // rotating: each upstream token can be redeemed exactly once, after which
+    // it returns invalid_grant. This is the situation cloudflare-mcp is in.
+    function makeUpstream() {
+      const redeemed = new Set<string>();
+      let nextUpstream = 1;
+      // Seed the first upstream refresh token that the grant starts with.
+      const initialUpstream = `upstream-rt-0`;
+      const callbackCalls: string[] = [];
+
+      const tokenExchangeCallback = async (options: any) => {
+        if (options.grantType !== 'refresh_token') return undefined;
+        const current = options.props.upstreamRefreshToken as string;
+        callbackCalls.push(current);
+        // Single-use: redeeming a token twice fails, like a real provider.
+        if (redeemed.has(current)) {
+          throw new OAuthError('invalid_grant', {
+            description: 'upstream refresh token is invalid',
+          });
+        }
+        redeemed.add(current);
+        const rotated = `upstream-rt-${nextUpstream++}`;
+        return {
+          newProps: { ...options.props, upstreamRefreshToken: rotated },
+        };
+      };
+
+      return { tokenExchangeCallback, callbackCalls, initialUpstream };
+    }
+
+    async function getRefreshTokenFor(provider: OAuthProvider<TestEnv>, initialUpstream: string) {
+      const clientData = {
+        redirect_uris: ['https://client.example.com/callback'],
+        client_name: 'Test Client',
+        token_endpoint_auth_method: 'client_secret_basic',
+      };
+      const registerResponse = await provider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify(clientData)
+        ),
+        mockEnv,
+        mockCtx
+      );
+      const client = await registerResponse.json<any>();
+      const redirectUri = 'https://client.example.com/callback';
+
+      const authResponse = await provider.fetch(
+        createMockRequest(
+          `https://example.com/authorize?response_type=code&client_id=${client.client_id}` +
+            `&redirect_uri=${encodeURIComponent(redirectUri)}&scope=read%20write&state=xyz`
+        ),
+        mockEnv,
+        mockCtx
+      );
+      const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
+
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', client.client_id);
+      params.append('client_secret', client.client_secret);
+      const tokenResponse = await provider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          params.toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+      const tokens = await tokenResponse.json<any>();
+      return { clientId: client.client_id, clientSecret: client.client_secret, refreshToken: tokens.refresh_token };
+    }
+
+    function refreshRequest(clientId: string, clientSecret: string, refreshToken: string) {
+      const params = new URLSearchParams();
+      params.append('grant_type', 'refresh_token');
+      params.append('refresh_token', refreshToken);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+      return createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      );
+    }
+
+    function buildProvider(tokenExchangeCallback: any, coalesce: boolean) {
+      return new OAuthProvider({
+        apiRoute: '/api/',
+        apiHandler: TestApiHandler,
+        defaultHandler: {
+          async fetch(request: Request, env: TestEnv) {
+            const url = new URL(request.url);
+            if (url.pathname === '/authorize') {
+              const info = await env.OAUTH_PROVIDER!.parseAuthRequest(request);
+              const { redirectTo } = await env.OAUTH_PROVIDER!.completeAuthorization({
+                request: info,
+                userId: 'test-user-123',
+                metadata: {},
+                scope: info.scope,
+                // Seed the grant props with the initial upstream refresh token.
+                props: { userId: 'test-user-123', upstreamRefreshToken: 'upstream-rt-0' },
+              });
+              return Response.redirect(redirectTo, 302);
+            }
+            return new Response('Default handler', { status: 200 });
+          },
+        },
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        scopesSupported: ['read', 'write'],
+        accessTokenTTL: 3600,
+        tokenExchangeCallback,
+        coalesceRefreshTokenExchange: coalesce,
+      });
+    }
+
+    it('replays the previous refresh token without re-invoking the upstream callback', async () => {
+      const { tokenExchangeCallback, callbackCalls } = makeUpstream();
+      const provider = buildProvider(tokenExchangeCallback, true);
+      const { clientId, clientSecret, refreshToken } = await getRefreshTokenFor(provider, 'upstream-rt-0');
+
+      // First refresh: redeems upstream-rt-0, rotates downstream + upstream.
+      const first = await provider.fetch(refreshRequest(clientId, clientSecret, refreshToken), mockEnv, mockCtx);
+      expect(first.status).toBe(200);
+      const firstTokens = await first.json<any>();
+      expect(firstTokens.refresh_token).not.toBe(refreshToken);
+      expect(callbackCalls).toEqual(['upstream-rt-0']);
+
+      // Client never received firstTokens (lost response) and retries with the
+      // ORIGINAL (now 'previous') downstream token. Without the replay path
+      // this would re-redeem the already-rotated upstream token and fail.
+      const retry = await provider.fetch(refreshRequest(clientId, clientSecret, refreshToken), mockEnv, mockCtx);
+      expect(retry.status).toBe(200);
+      const retryTokens = await retry.json<any>();
+      // Callback was NOT called again — no second upstream redemption.
+      expect(callbackCalls).toEqual(['upstream-rt-0']);
+      // Replay hands back the same token the client presented (no rotation).
+      expect(retryTokens.refresh_token).toBe(refreshToken);
+      expect(retryTokens.access_token).toBeDefined();
+    });
+
+    it('does not rotate the grant on replay', async () => {
+      const { tokenExchangeCallback } = makeUpstream();
+      const provider = buildProvider(tokenExchangeCallback, true);
+      const { clientId, clientSecret, refreshToken } = await getRefreshTokenFor(provider, 'upstream-rt-0');
+
+      await provider.fetch(refreshRequest(clientId, clientSecret, refreshToken), mockEnv, mockCtx);
+
+      const grantEntries = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      const grantKey = grantEntries.keys[0].name;
+      const before = await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' });
+
+      await provider.fetch(refreshRequest(clientId, clientSecret, refreshToken), mockEnv, mockCtx);
+
+      const after = await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' });
+      // Replay leaves rotation state untouched.
+      expect(after.refreshTokenId).toBe(before.refreshTokenId);
+      expect(after.previousRefreshTokenId).toBe(before.previousRefreshTokenId);
+    });
+
+    it('single-flights concurrent refreshes of the same token (callback runs once)', async () => {
+      const { tokenExchangeCallback, callbackCalls } = makeUpstream();
+      const provider = buildProvider(tokenExchangeCallback, true);
+      const { clientId, clientSecret, refreshToken } = await getRefreshTokenFor(provider, 'upstream-rt-0');
+
+      // Fire two concurrent refreshes with the SAME current token.
+      const [a, b] = await Promise.all([
+        provider.fetch(refreshRequest(clientId, clientSecret, refreshToken), mockEnv, mockCtx),
+        provider.fetch(refreshRequest(clientId, clientSecret, refreshToken), mockEnv, mockCtx),
+      ]);
+
+      expect(a.status).toBe(200);
+      expect(b.status).toBe(200);
+      const aTokens = await a.json<any>();
+      const bTokens = await b.json<any>();
+      // Coalesced: callback ran once, both callers got the same rotated token.
+      expect(callbackCalls).toEqual(['upstream-rt-0']);
+      expect(aTokens.refresh_token).toBe(bTokens.refresh_token);
+      expect(aTokens.access_token).toBe(bTokens.access_token);
+    });
+
+    it('without the flag, retrying with the previous token re-invokes the callback', async () => {
+      const { tokenExchangeCallback, callbackCalls } = makeUpstream();
+      const provider = buildProvider(tokenExchangeCallback, false);
+      const { clientId, clientSecret, refreshToken } = await getRefreshTokenFor(provider, 'upstream-rt-0');
+
+      const first = await provider.fetch(refreshRequest(clientId, clientSecret, refreshToken), mockEnv, mockCtx);
+      expect(first.status).toBe(200);
+      expect(callbackCalls).toEqual(['upstream-rt-0']);
+
+      // Retry with the now-previous token: legacy behaviour re-runs the
+      // callback, which redeems the rotated upstream token (upstream-rt-1).
+      const retry = await provider.fetch(refreshRequest(clientId, clientSecret, refreshToken), mockEnv, mockCtx);
+      expect(retry.status).toBe(200);
+      expect(callbackCalls).toEqual(['upstream-rt-0', 'upstream-rt-1']);
+    });
+  });
+
   describe('Token Exchange Flow', () => {
     let clientId: string;
     let clientSecret: string;

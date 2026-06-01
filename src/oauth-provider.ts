@@ -441,6 +441,37 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
   resourceMatchOriginOnly?: boolean;
 
   /**
+   * Hardening for providers whose `tokenExchangeCallback` performs a
+   * **non-idempotent** upstream operation during the `refresh_token` grant
+   * — most commonly redeeming a *single-use, rotating* upstream refresh
+   * token (e.g. this Worker is itself a client of another OAuth server).
+   *
+   * Without this option, two concurrent refreshes that share the same
+   * downstream refresh token both decrypt the same upstream credentials and
+   * both invoke `tokenExchangeCallback`, so they race to redeem the same
+   * single-use upstream token. One wins; the other gets `invalid_grant`
+   * from upstream. The losing client then retries with its (now *previous*)
+   * refresh token, which re-runs the callback against the freshly-rotated
+   * upstream token, redeeming it again and cascading further rotations.
+   *
+   * When `true`:
+   *  - **Single-flight:** concurrent `refresh_token` requests presenting the
+   *    same refresh token within a single isolate are coalesced — the
+   *    callback runs once and every caller receives a clone of the same
+   *    token response. (KV is eventually-consistent with no compare-and-swap,
+   *    so cross-isolate races cannot be fully serialized; this collapses the
+   *    common same-isolate burst.)
+   *  - **Idempotent replay:** a refresh presented with the grant's *previous*
+   *    refresh token is treated as a retry of the rotation that already
+   *    happened. The callback is skipped and a fresh access token is minted
+   *    from the grant's current props, without rotating the refresh token or
+   *    re-touching upstream. This stops the retry-driven rotation cascade.
+   *
+   * Defaults to false (the callback runs on every refresh, including retries).
+   */
+  coalesceRefreshTokenExchange?: boolean;
+
+  /**
    * Optional metadata for RFC 9728 OAuth 2.0 Protected Resource Metadata.
    * Controls the response served at /.well-known/oauth-protected-resource.
    *
@@ -1250,6 +1281,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
   /** KV-backed best-effort `jti` replay store; only constructed when EMA is configured. */
   private readonly jtiStore: EmaJtiStore | undefined;
+
+  /**
+   * In-flight `refresh_token` exchanges, keyed by a hash that incorporates the
+   * presented refresh token plus the request parameters that can vary the
+   * response (scope/resource). Used to single-flight concurrent refreshes
+   * within one isolate when `coalesceRefreshTokenExchange` is enabled.
+   */
+  private inflightRefreshExchanges = new Map<string, Promise<Response>>();
 
   /**
    * Creates a new OAuth provider instance
@@ -2311,6 +2350,47 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @returns Response with token data or error
    */
   private async handleRefreshTokenGrant(body: any, clientInfo: ClientInfo, env: any): Promise<Response> {
+    // When the callback is non-idempotent (single-use upstream refresh tokens),
+    // single-flight concurrent refreshes that share the same refresh token in
+    // this isolate so the callback runs once and the upstream token is redeemed
+    // once. Each caller gets its own clone of the (single-use) Response body.
+    if (!this.options.coalesceRefreshTokenExchange) {
+      return await this.executeRefreshTokenGrant(body, clientInfo, env);
+    }
+
+    const refreshToken = body.refresh_token;
+    if (!refreshToken || typeof refreshToken !== 'string') {
+      return await this.executeRefreshTokenGrant(body, clientInfo, env);
+    }
+
+    // Key on the parameters that can vary the response so we never hand a
+    // caller a token minted for a different scope/resource request.
+    const coalesceKey = await generateTokenId(
+      `${refreshToken}\n${clientInfo.clientId}\n${JSON.stringify(body.scope ?? null)}\n${JSON.stringify(
+        body.resource ?? null
+      )}`
+    );
+
+    const existing = this.inflightRefreshExchanges.get(coalesceKey);
+    if (existing) {
+      return (await existing).clone();
+    }
+
+    const exchange = this.executeRefreshTokenGrant(body, clientInfo, env);
+    this.inflightRefreshExchanges.set(coalesceKey, exchange);
+    try {
+      const response = await exchange;
+      return response.clone();
+    } finally {
+      this.inflightRefreshExchanges.delete(coalesceKey);
+    }
+  }
+
+  /**
+   * Performs the actual `refresh_token` grant. Wrapped by
+   * {@link handleRefreshTokenGrant}, which may single-flight concurrent calls.
+   */
+  private async executeRefreshTokenGrant(body: any, clientInfo: ClientInfo, env: any): Promise<Response> {
     const refreshToken = body.refresh_token;
 
     if (!refreshToken) {
@@ -2343,6 +2423,15 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     if (!isCurrentToken && !isPreviousToken) {
       return this.createErrorResponse('invalid_grant', { description: 'Invalid refresh token' });
     }
+
+    // Idempotent replay: when the callback is non-idempotent and the client
+    // presents the *previous* refresh token, treat this as a retry of the
+    // rotation that already succeeded. Skip the (single-use) upstream callback
+    // and skip rotation — just mint a fresh access token from the grant's
+    // current props and hand back the same refresh token the client already
+    // holds. This prevents a lost/late response from re-redeeming the upstream
+    // token and cascading further rotations.
+    const replayPreviousRefresh = !!this.options.coalesceRefreshTokenExchange && isPreviousToken && !isCurrentToken;
 
     // Verify client ID matches
     if (grantData.clientId !== clientInfo.clientId) {
@@ -2388,8 +2477,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Track whether grant props changed
     let grantPropsChanged = false;
 
-    // Process token exchange callback if provided
-    if (this.options.tokenExchangeCallback) {
+    // Process token exchange callback if provided.
+    // Skipped on idempotent replay so a non-idempotent (single-use upstream)
+    // callback is not invoked again for a rotation that already happened.
+    if (this.options.tokenExchangeCallback && !replayPreviousRefresh) {
       // Decrypt the existing props to provide them to the callback
       const decryptedProps = await decryptProps(encryptionKey, grantData.encryptedProps);
 
@@ -2488,32 +2579,42 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Wrap the access token key
     const accessTokenWrappedKey = await wrapKeyWithToken(newAccessToken, accessTokenEncryptionKey);
 
-    // Generate new refresh token for rotation
-    const refreshTokenSecret = generateRandomString(TOKEN_LENGTH);
-    const newRefreshToken = `${userId}:${grantId}:${refreshTokenSecret}`;
-    const newRefreshTokenId = await generateTokenId(newRefreshToken);
-    const newRefreshTokenWrappedKey = await wrapKeyWithToken(newRefreshToken, grantEncryptionKey);
+    // The refresh token returned to the client. On idempotent replay we hand
+    // back the same token the client presented (no rotation); otherwise we
+    // rotate to a freshly-generated token below.
+    let responseRefreshToken = refreshToken;
 
-    // Update the grant with the token rotation information
-    // The token which the client used this time becomes the "previous" token, so that the client
-    // can always use the same token again next time. This might technically violate OAuth 2.1's
-    // requirement that refresh tokens be single-use. However, this requirement violates the laws
-    // of distributed systems. It's important that the client can always retry when a transient
-    // failure occurs. Under the strict requirement, if the failure occurred after the server
-    // rotated the token but before the client managed to store the updated token, then the client
-    // no longer has any valid refresh token and has effectively lost its grant. That's bad! So
-    // instead, we don't invalidate the old token until the client successfully uses a newer token.
-    // This provides most of the security benefits (tokens still rotate naturally) but without
-    // being inherently unreliable.
-    grantData.previousRefreshTokenId = providedTokenHash;
-    grantData.previousRefreshTokenWrappedKey = wrappedKeyToUse;
+    if (!replayPreviousRefresh) {
+      // Generate new refresh token for rotation
+      const refreshTokenSecret = generateRandomString(TOKEN_LENGTH);
+      const newRefreshToken = `${userId}:${grantId}:${refreshTokenSecret}`;
+      const newRefreshTokenId = await generateTokenId(newRefreshToken);
+      const newRefreshTokenWrappedKey = await wrapKeyWithToken(newRefreshToken, grantEncryptionKey);
+      responseRefreshToken = newRefreshToken;
 
-    // The newly-generated token becomes the new "current" token.
-    grantData.refreshTokenId = newRefreshTokenId;
-    grantData.refreshTokenWrappedKey = newRefreshTokenWrappedKey;
+      // Update the grant with the token rotation information
+      // The token which the client used this time becomes the "previous" token, so that the client
+      // can always use the same token again next time. This might technically violate OAuth 2.1's
+      // requirement that refresh tokens be single-use. However, this requirement violates the laws
+      // of distributed systems. It's important that the client can always retry when a transient
+      // failure occurs. Under the strict requirement, if the failure occurred after the server
+      // rotated the token but before the client managed to store the updated token, then the client
+      // no longer has any valid refresh token and has effectively lost its grant. That's bad! So
+      // instead, we don't invalidate the old token until the client successfully uses a newer token.
+      // This provides most of the security benefits (tokens still rotate naturally) but without
+      // being inherently unreliable.
+      grantData.previousRefreshTokenId = providedTokenHash;
+      grantData.previousRefreshTokenWrappedKey = wrappedKeyToUse;
 
-    // Save the updated grant with TTL if applicable
-    await this.saveGrantWithTTL(env, grantKey, grantData, now);
+      // The newly-generated token becomes the new "current" token.
+      grantData.refreshTokenId = newRefreshTokenId;
+      grantData.refreshTokenWrappedKey = newRefreshTokenWrappedKey;
+
+      // Save the updated grant with TTL if applicable
+      await this.saveGrantWithTTL(env, grantKey, grantData, now);
+    }
+    // On replay the grant is unchanged (no callback, no rotation), so there is
+    // nothing to persist — skip the write to avoid needless KV contention.
 
     // Parse and validate resource parameter (RFC 8707)
     // Validate downscoping: token request resources must be subset of grant resources
@@ -2573,7 +2674,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       access_token: newAccessToken,
       token_type: 'bearer',
       expires_in: accessTokenTTL,
-      refresh_token: newRefreshToken,
+      refresh_token: responseRefreshToken,
       scope: tokenScopes.join(' '),
     };
 

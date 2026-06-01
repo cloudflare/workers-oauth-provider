@@ -392,6 +392,50 @@ The AS enforces `resolved.issuer === iss` (confused-deputy guard) and validates 
 
 Experimental — the MCP extension is still a draft.
 
+### Non-idempotent callbacks and single-use upstream tokens
+
+If your `tokenExchangeCallback` redeems a **single-use, rotating** upstream
+refresh token (i.e. your Worker is itself a client of another OAuth server),
+the `refresh_token` grant becomes non-idempotent: each upstream token can only
+be redeemed once. This is fragile under two common conditions:
+
+- **Shared tokens / concurrent refresh.** Two sessions (e.g. two chat windows)
+  share one downstream refresh token and refresh at the same time. Both decrypt
+  the same upstream credentials and both call your callback, racing to redeem
+  the same single-use upstream token. One wins; the other gets `invalid_grant`.
+- **Lost responses / retries.** A client never receives a refresh response and
+  retries with its previous refresh token. By default the callback runs again
+  and redeems the already-rotated upstream token, cascading further rotations
+  and a stream of `invalid_grant` errors.
+
+Set `coalesceRefreshTokenExchange: true` to harden this:
+
+```ts
+new OAuthProvider({
+  // …
+  tokenExchangeCallback: async (options) => {
+    /* redeems a single-use upstream refresh token */
+  },
+  coalesceRefreshTokenExchange: true,
+});
+```
+
+When enabled:
+
+- **Single-flight** — concurrent `refresh_token` requests presenting the same
+  refresh token within a single isolate are coalesced. The callback runs once
+  and every caller receives the same token response.
+- **Idempotent replay** — a refresh presented with the grant's _previous_
+  refresh token is treated as a retry of the rotation that already happened.
+  The callback is skipped and a fresh access token is minted from the grant's
+  current props, without rotating the refresh token or re-touching upstream.
+
+Defaults to `false`, so existing behaviour is unchanged unless you opt in. Note
+that KV is eventually-consistent with no compare-and-swap, so simultaneous
+refreshes landing on _different_ isolates before either has persisted cannot be
+fully serialized; this collapses the common same-isolate burst and makes client
+retries safe and upstream-free.
+
 ## Custom Error Responses
 
 By using the `onError` option, you can emit notifications or take other actions when an error response was to be emitted:
