@@ -36,6 +36,12 @@ export type {
 } from './ema/types';
 export type { EmaValidationError } from './ema/result';
 
+import { resolveStorage } from './storage';
+import type { OAuthStorage, StorageConfig } from './storage';
+
+export { OAuthStore } from './storage';
+export type { OAuthStorage, StorageConfig, DurableObjectPartition } from './storage';
+
 const PROTECTED_RESOURCE_WELL_KNOWN_PREFIX = '/.well-known/oauth-protected-resource';
 
 // Log CIMD status on module load
@@ -439,6 +445,23 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
    * Defaults to false (strict exact matching per RFC 8707).
    */
   resourceMatchOriginOnly?: boolean;
+
+  /**
+   * Storage backend for clients, grants, and tokens.
+   *
+   * Defaults to `{ type: 'kv' }` — behaviour-identical to today, backed by the
+   * `OAUTH_KV` namespace.
+   *
+   * `{ type: 'durable_object' }` opts into a partitioned, single-threaded
+   * SQLite Durable Object backend (binding `OAUTH_DURABLE_OBJECT`, class
+   * `OAuthStore`) that serializes the refresh-token read-modify-write and so
+   * eliminates the concurrent-refresh `invalid_grant` race that KV's
+   * lack of compare-and-swap allows. KV is still used as a cross-partition
+   * index for `list`/purge. Partition by `'user'` (default) or `'grant'`.
+   *
+   * See docs/storage-providers.md.
+   */
+  storage?: StorageConfig;
 
   /**
    * Optional metadata for RFC 9728 OAuth 2.0 Protected Resource Metadata.
@@ -1530,7 +1553,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Retrieve the token from KV
     const [userId, grantId] = parts;
     const id = await generateTokenId(token);
-    const tokenData: Token | null = await env.OAUTH_KV.get(`token:${userId}:${grantId}:${id}`, { type: 'json' });
+    const tokenData: Token | null = await this.getStorage(env).get(`token:${userId}:${grantId}:${id}`, {
+      type: 'json',
+    });
 
     // Return null if missing or expired
     if (!tokenData) {
@@ -2034,7 +2059,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Get the grant
     const grantKey = `grant:${userId}:${grantId}`;
-    const grantData: Grant | null = await env.OAUTH_KV.get(grantKey, { type: 'json' });
+    const grantData: Grant | null = await this.getStorage(env).get(grantKey, { type: 'json' });
 
     if (!grantData) {
       return this.createErrorResponse('invalid_grant', {
@@ -2330,7 +2355,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Get the associated grant using userId in the key
     const grantKey = `grant:${userId}:${grantId}`;
-    const grantData: Grant | null = await env.OAUTH_KV.get(grantKey, { type: 'json' });
+    const grantData: Grant | null = await this.getStorage(env).get(grantKey, { type: 'json' });
 
     if (!grantData) {
       return this.createErrorResponse('invalid_grant', { description: 'Grant not found' });
@@ -2560,7 +2585,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Save access token with TTL (using the potentially callback-provided TTL)
     try {
-      await env.OAUTH_KV.put(`token:${userId}:${grantId}:${accessTokenId}`, JSON.stringify(accessTokenData), {
+      await this.getStorage(env).put(`token:${userId}:${grantId}:${accessTokenId}`, JSON.stringify(accessTokenData), {
         expirationTtl: accessTokenTTL,
       });
     } catch (error) {
@@ -2619,7 +2644,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Get the grant to access resource information
     const grantKey = `grant:${tokenSummary.userId}:${tokenSummary.grantId}`;
-    const grantData: Grant | null = await env.OAUTH_KV.get(grantKey, { type: 'json' });
+    const grantData: Grant | null = await this.getStorage(env).get(grantKey, { type: 'json' });
     if (!grantData) {
       throw new OAuthError('invalid_grant', { description: 'Grant not found' });
     }
@@ -2673,7 +2698,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     // Get the subject token data to access encryption key
-    const subjectTokenData: Token | null = await env.OAUTH_KV.get(
+    const subjectTokenData: Token | null = await this.getStorage(env).get(
       `token:${tokenSummary.userId}:${tokenSummary.grantId}:${tokenSummary.id}`,
       { type: 'json' }
     );
@@ -3182,7 +3207,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    */
   private async revokeSpecificAccessToken(tokenId: string, userId: string, grantId: string, env: any): Promise<void> {
     const tokenKey = `token:${userId}:${grantId}:${tokenId}`;
-    await env.OAUTH_KV.delete(tokenKey);
+    await this.getStorage(env).delete(tokenKey);
   }
 
   /**
@@ -3195,7 +3220,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    */
   private async validateAccessToken(tokenId: string, userId: string, grantId: string, env: any): Promise<boolean> {
     const tokenKey = `token:${userId}:${grantId}:${tokenId}`;
-    const tokenData = await env.OAUTH_KV.get(tokenKey, { type: 'json' });
+    const tokenData = await this.getStorage(env).get(tokenKey, { type: 'json' });
 
     if (!tokenData) {
       return false;
@@ -3216,7 +3241,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    */
   private async validateRefreshToken(tokenId: string, userId: string, grantId: string, env: any): Promise<boolean> {
     const grantKey = `grant:${userId}:${grantId}`;
-    const grantData = await env.OAUTH_KV.get(grantKey, { type: 'json' });
+    const grantData = await this.getStorage(env).get(grantKey, { type: 'json' });
 
     if (!grantData) {
       return false;
@@ -3343,7 +3368,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     if (this.options.clientRegistrationTTL !== undefined) {
       clientKvOptions.expirationTtl = this.options.clientRegistrationTTL;
     }
-    await env.OAUTH_KV.put(`client:${clientId}`, JSON.stringify(clientInfo), clientKvOptions);
+    await this.getStorage(env).put(`client:${clientId}`, JSON.stringify(clientInfo), clientKvOptions);
 
     // Return client information with the original unhashed secret
     const response: Record<string, any> = {
@@ -3421,7 +3446,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     if (isPossiblyInternalFormat) {
       [userId, grantId] = parts;
       const id = await generateTokenId(accessToken);
-      tokenData = await env.OAUTH_KV.get(`token:${userId}:${grantId}:${id}`, { type: 'json' });
+      tokenData = await this.getStorage(env).get(`token:${userId}:${grantId}:${id}`, { type: 'json' });
     }
 
     // No internal token found in KV and no external token validator provided
@@ -3562,6 +3587,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   }
 
   /**
+   * Resolve the configured storage backend for this request's `env`.
+   * Defaults to KV; opt into the Durable Object backend via `options.storage`.
+   */
+  public getStorage(env: any): OAuthStorage {
+    return resolveStorage(this.options.storage, env);
+  }
+
+  /**
    * Saves a grant to KV with appropriate TTL based on expiration
    * @param env - The environment bindings
    * @param grantKey - The KV key for the grant
@@ -3572,7 +3605,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Use absolute expiration timestamp if grant has an expiration
     const kvOptions = grantData.expiresAt !== undefined ? { expiration: grantData.expiresAt } : {};
     try {
-      await env.OAUTH_KV.put(grantKey, JSON.stringify(grantData), kvOptions);
+      await this.getStorage(env).put(grantKey, JSON.stringify(grantData), kvOptions);
     } catch (error) {
       this.throwRetryableTokenStorageErrorIfKvRateLimited(error);
       throw error;
@@ -3612,7 +3645,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       if (!this.options.clientIdMetadataDocumentEnabled) {
         // CIMD not enabled — treat as standard KV lookup
         const clientKey = `client:${clientId}`;
-        return env.OAUTH_KV.get(clientKey, { type: 'json' });
+        return this.getStorage(env).get(clientKey, { type: 'json' });
       }
       if (!this.hasGlobalFetchStrictlyPublic()) {
         throw new Error(`CIMD is enabled but 'global_fetch_strictly_public' compatibility flag is not set.`);
@@ -3629,7 +3662,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Standard KV lookup
     const clientKey = `client:${clientId}`;
-    return env.OAUTH_KV.get(clientKey, { type: 'json' });
+    return this.getStorage(env).get(clientKey, { type: 'json' });
   }
 
   /**
@@ -3670,7 +3703,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Save access token with TTL
     try {
-      await env.OAUTH_KV.put(`token:${userId}:${grantId}:${accessTokenId}`, JSON.stringify(accessTokenData), {
+      await this.getStorage(env).put(`token:${userId}:${grantId}:${accessTokenId}`, JSON.stringify(accessTokenData), {
         expirationTtl: expiresIn,
       });
     } catch (error) {
@@ -4752,7 +4785,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
 
       // Store the grant with a key that includes the user ID
       const grantKey = `grant:${options.userId}:${grantId}`;
-      await this.env.OAUTH_KV.put(grantKey, JSON.stringify(grant));
+      await this.provider.getStorage(this.env).put(grantKey, JSON.stringify(grant));
 
       // Store access token with denormalized grant information
       const accessTokenData: Token = {
@@ -4772,11 +4805,11 @@ class OAuthHelpersImpl implements OAuthHelpers {
       };
 
       // Save access token with TTL
-      await this.env.OAUTH_KV.put(
-        `token:${options.userId}:${grantId}:${accessTokenId}`,
-        JSON.stringify(accessTokenData),
-        { expirationTtl: accessTokenTTL }
-      );
+      await this.provider
+        .getStorage(this.env)
+        .put(`token:${options.userId}:${grantId}:${accessTokenId}`, JSON.stringify(accessTokenData), {
+          expirationTtl: accessTokenTTL,
+        });
 
       // Build the redirect URL for implicit flow (token in fragment, not query params)
       const redirectUrl = new URL(options.request.redirectUri);
@@ -4835,7 +4868,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
 
       // Set 10-minute TTL for the grant (will be extended when code is exchanged)
       const codeExpiresIn = 600; // 10 minutes
-      await this.env.OAUTH_KV.put(grantKey, JSON.stringify(grant), { expirationTtl: codeExpiresIn });
+      await this.provider.getStorage(this.env).put(grantKey, JSON.stringify(grant), { expirationTtl: codeExpiresIn });
 
       // Build the redirect URL for authorization code flow
       const redirectUrl = new URL(options.request.redirectUri);
@@ -4901,7 +4934,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
       newClient.clientSecret = await hashSecret(clientSecret);
     }
 
-    await this.env.OAUTH_KV.put(`client:${clientId}`, JSON.stringify(newClient));
+    await this.provider.getStorage(this.env).put(`client:${clientId}`, JSON.stringify(newClient));
 
     // Create the response object
     const clientResponse = { ...newClient };
@@ -4934,7 +4967,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
     }
 
     // Use the KV list() function to get client keys with pagination
-    const response = await this.env.OAUTH_KV.list(listOptions);
+    const response = await this.provider.getStorage(this.env).list(listOptions);
 
     // Fetch all clients in parallel
     const clients: ClientInfo[] = [];
@@ -5003,7 +5036,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
     if (this.provider.options.clientRegistrationTTL !== undefined) {
       clientKvOptions.expirationTtl = this.provider.options.clientRegistrationTTL;
     }
-    await this.env.OAUTH_KV.put(`client:${clientId}`, JSON.stringify(updatedClient), clientKvOptions);
+    await this.provider.getStorage(this.env).put(`client:${clientId}`, JSON.stringify(updatedClient), clientKvOptions);
 
     // Create a response object
     const response = { ...updatedClient };
@@ -5034,10 +5067,10 @@ class OAuthHelpersImpl implements OAuthHelpers {
         listOptions.cursor = cursor;
       }
 
-      const result = await this.env.OAUTH_KV.list(listOptions);
+      const result = await this.provider.getStorage(this.env).list(listOptions);
 
       for (const key of result.keys) {
-        const grantData: Grant | null = await this.env.OAUTH_KV.get(key.name, { type: 'json' });
+        const grantData: Grant | null = await this.provider.getStorage(this.env).get(key.name, { type: 'json' });
         if (grantData && grantData.clientId === clientId) {
           await this.revokeGrant(grantData.id, grantData.userId);
         }
@@ -5051,7 +5084,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
     }
 
     // Delete the client record
-    await this.env.OAUTH_KV.delete(`client:${clientId}`);
+    await this.provider.getStorage(this.env).delete(`client:${clientId}`);
   }
 
   /**
@@ -5076,12 +5109,12 @@ class OAuthHelpersImpl implements OAuthHelpers {
     }
 
     // Use the KV list() function to get grant keys with pagination
-    const response = await this.env.OAUTH_KV.list(listOptions);
+    const response = await this.provider.getStorage(this.env).list(listOptions);
 
     // Fetch all grants in parallel and convert to grant summaries
     const grantSummaries: GrantSummary[] = [];
     const promises = response.keys.map(async (key: { name: string }) => {
-      const grantData: Grant | null = await this.env.OAUTH_KV.get(key.name, { type: 'json' });
+      const grantData: Grant | null = await this.provider.getStorage(this.env).get(key.name, { type: 'json' });
       if (grantData) {
         // Create a summary with only the public fields
         const summary: GrantSummary = {
@@ -5133,13 +5166,13 @@ class OAuthHelpersImpl implements OAuthHelpers {
         listOptions.cursor = cursor;
       }
 
-      const result = await this.env.OAUTH_KV.list(listOptions);
+      const result = await this.provider.getStorage(this.env).list(listOptions);
 
       // Delete each token in this batch
       if (result.keys.length > 0) {
         await Promise.all(
           result.keys.map((key: { name: string }) => {
-            return this.env.OAUTH_KV.delete(key.name);
+            return this.provider.getStorage(this.env).delete(key.name);
           })
         );
       }
@@ -5153,7 +5186,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
     }
 
     // After all tokens are deleted, delete the grant itself
-    await this.env.OAUTH_KV.delete(grantKey);
+    await this.provider.getStorage(this.env).delete(grantKey);
   }
 
   /**
@@ -5226,13 +5259,13 @@ class OAuthHelpersImpl implements OAuthHelpers {
           listOptions.cursor = grantCursor;
         }
 
-        const page = await this.env.OAUTH_KV.list(listOptions);
+        const page = await this.provider.getStorage(this.env).list(listOptions);
 
         for (const key of page.keys) {
           if (result.grantsChecked >= batchSize) break;
           result.grantsChecked++;
 
-          const grantData: Grant | null = await this.env.OAUTH_KV.get(key.name, { type: 'json' });
+          const grantData: Grant | null = await this.provider.getStorage(this.env).get(key.name, { type: 'json' });
           if (!grantData) continue;
 
           let shouldPurge = false;
@@ -5247,7 +5280,9 @@ class OAuthHelpersImpl implements OAuthHelpers {
             if (knownMissingClients.has(grantData.clientId)) {
               shouldPurge = true;
             } else if (!knownGoodClients.has(grantData.clientId)) {
-              const client = await this.env.OAUTH_KV.get(`client:${grantData.clientId}`, { type: 'json' });
+              const client = await this.provider
+                .getStorage(this.env)
+                .get(`client:${grantData.clientId}`, { type: 'json' });
               if (client) {
                 knownGoodClients.add(grantData.clientId);
               } else {
@@ -5292,27 +5327,27 @@ class OAuthHelpersImpl implements OAuthHelpers {
           listOptions.cursor = tokenCursor;
         }
 
-        const page = await this.env.OAUTH_KV.list(listOptions);
+        const page = await this.provider.getStorage(this.env).list(listOptions);
 
         for (const key of page.keys) {
           if (result.tokensChecked >= batchSize) break;
           result.tokensChecked++;
 
-          const tokenData: Token | null = await this.env.OAUTH_KV.get(key.name, { type: 'json' });
+          const tokenData: Token | null = await this.provider.getStorage(this.env).get(key.name, { type: 'json' });
           if (!tokenData) continue;
 
           const grantKey = `grant:${tokenData.userId}:${tokenData.grantId}`;
 
           if (knownMissingGrants.has(grantKey)) {
-            await this.env.OAUTH_KV.delete(key.name);
+            await this.provider.getStorage(this.env).delete(key.name);
             result.tokensPurged++;
           } else if (!knownGoodGrants.has(grantKey)) {
-            const grantExists = await this.env.OAUTH_KV.get(grantKey);
+            const grantExists = await this.provider.getStorage(this.env).get(grantKey);
             if (grantExists) {
               knownGoodGrants.add(grantKey);
             } else {
               knownMissingGrants.add(grantKey);
-              await this.env.OAUTH_KV.delete(key.name);
+              await this.provider.getStorage(this.env).delete(key.name);
               result.tokensPurged++;
             }
           }

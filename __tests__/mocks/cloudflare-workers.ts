@@ -16,3 +16,17 @@ export class WorkerEntrypoint<Env = any> {
     throw new Error('Method not implemented. This should be overridden by subclasses.');
   }
 }
+
+/**
+ * Mock for DurableObject base class.
+ * Subclasses receive `ctx` (DurableObjectState) and `env`.
+ */
+export class DurableObject<Env = any> {
+  ctx: any;
+  env: Env;
+
+  constructor(ctx: any, env: Env) {
+    this.ctx = ctx;
+    this.env = env;
+  }
+}
