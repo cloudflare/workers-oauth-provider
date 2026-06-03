@@ -743,6 +743,76 @@ describe('OAuthProvider', () => {
       expect(savedClient).not.toBeNull();
       expect(savedClient.clientSecret).toBeUndefined(); // No secret stored
     });
+
+    it('should accept http(s) metadata URIs and persist them', async () => {
+      const clientData = {
+        redirect_uris: ['https://client.example.com/callback'],
+        client_name: 'Test Client',
+        client_uri: 'https://client.example.com',
+        logo_uri: 'https://client.example.com/logo.png',
+        policy_uri: 'http://client.example.com/privacy',
+        tos_uri: 'https://client.example.com/terms',
+        jwks_uri: 'https://client.example.com/.well-known/jwks.json',
+        token_endpoint_auth_method: 'none',
+      };
+
+      const request = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify(clientData)
+      );
+
+      const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
+
+      expect(response.status).toBe(201);
+
+      const registeredClient = await response.json<any>();
+      expect(registeredClient.client_uri).toBe('https://client.example.com');
+      expect(registeredClient.logo_uri).toBe('https://client.example.com/logo.png');
+      expect(registeredClient.policy_uri).toBe('http://client.example.com/privacy');
+      expect(registeredClient.tos_uri).toBe('https://client.example.com/terms');
+      expect(registeredClient.jwks_uri).toBe('https://client.example.com/.well-known/jwks.json');
+    });
+
+    describe('should reject metadata URIs with unsafe schemes', () => {
+      const uriFields = ['client_uri', 'logo_uri', 'policy_uri', 'tos_uri', 'jwks_uri'];
+      const unsafeUris = [
+        'javascript:alert(1)',
+        'javascript:1/*poc*/',
+        'data:text/html,<script>alert(1)</script>',
+        'vbscript:msgbox(1)',
+        'file:///etc/passwd',
+        'not-a-url',
+        '/relative/path',
+      ];
+
+      uriFields.forEach((field) => {
+        unsafeUris.forEach((unsafeUri) => {
+          it(`rejects ${field} = ${unsafeUri}`, async () => {
+            const clientData: Record<string, unknown> = {
+              redirect_uris: ['https://client.example.com/callback'],
+              client_name: 'Test Client',
+              token_endpoint_auth_method: 'none',
+              [field]: unsafeUri,
+            };
+
+            const request = createMockRequest(
+              'https://example.com/oauth/register',
+              'POST',
+              { 'Content-Type': 'application/json' },
+              JSON.stringify(clientData)
+            );
+
+            const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
+
+            expect(response.status).toBe(400);
+            const body = await response.json<any>();
+            expect(body.error).toBe('invalid_client_metadata');
+          });
+        });
+      });
+    });
   });
 
   describe('Authorization Code Flow', () => {
