@@ -3375,10 +3375,18 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       token_endpoint_auth_method: clientInfo.tokenEndpointAuthMethod,
       registration_client_uri: `${this.options.clientRegistrationEndpoint}/${clientId}`,
       client_id_issued_at: clientInfo.registrationDate,
-      // RFC 7591 §2.2: echo internationalized variants back as top-level
-      // `field#tag` members alongside their canonical counterparts.
-      ...clientInfo.i18n,
     };
+
+    // RFC 7591 §2.2: echo internationalized variants back as top-level
+    // `field#tag` members alongside their canonical counterparts. Skip any key
+    // already present so a localized variant can never shadow a canonical
+    // response member (i18n keys always contain `#`, but this stays correct
+    // even if a future canonical field name were to include one).
+    if (clientInfo.i18n) {
+      for (const [key, value] of Object.entries(clientInfo.i18n)) {
+        if (!(key in response)) response[key] = value;
+      }
+    }
 
     // Only include client_secret for confidential clients (RFC 7591 §3.2.1)
     if (clientSecret) {
