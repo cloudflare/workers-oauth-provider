@@ -705,6 +705,19 @@ export interface ClientInfo {
   jwksUri?: string;
 
   /**
+   * RFC 7591 §2.2 internationalized variants of the human-readable client
+   * metadata fields, keyed by the raw member name including its BCP 47 language
+   * tag (e.g. `"client_name#ja"`, `"tos_uri#fr"`).
+   *
+   * Only the human-readable fields the RFC names are captured here:
+   * `client_name`, `client_uri`, `logo_uri`, `tos_uri`, and `policy_uri`.
+   * The canonical (un-tagged) values continue to live in their own typed
+   * fields above; this map holds only the locale-specific variants so that
+   * consumers can perform their own locale selection.
+   */
+  i18n?: Record<string, string>;
+
+  /**
    * List of email addresses for contacting the client developers
    */
   contacts?: string[];
@@ -3311,12 +3324,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       clientInfo = {
         clientId,
         redirectUris,
-        clientName: OAuthProviderImpl.validateStringField(clientMetadata.client_name),
+        clientName: OAuthProviderImpl.validateStringField(clientMetadata.client_name, 'client_name'),
         logoUri: OAuthProviderImpl.validateOptionalUriField(clientMetadata.logo_uri, 'logo_uri'),
         clientUri: OAuthProviderImpl.validateOptionalUriField(clientMetadata.client_uri, 'client_uri'),
         policyUri: OAuthProviderImpl.validateOptionalUriField(clientMetadata.policy_uri, 'policy_uri'),
         tosUri: OAuthProviderImpl.validateOptionalUriField(clientMetadata.tos_uri, 'tos_uri'),
         jwksUri: OAuthProviderImpl.validateOptionalUriField(clientMetadata.jwks_uri, 'jwks_uri'),
+        i18n: OAuthProviderImpl.extractI18nFields(clientMetadata),
         contacts: OAuthProviderImpl.validateStringArray(clientMetadata.contacts),
         grantTypes: OAuthProviderImpl.validateStringArray(clientMetadata.grant_types) || [
           GrantType.AUTHORIZATION_CODE,
@@ -3362,6 +3376,17 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       registration_client_uri: `${this.options.clientRegistrationEndpoint}/${clientId}`,
       client_id_issued_at: clientInfo.registrationDate,
     };
+
+    // RFC 7591 §2.2: echo internationalized variants back as top-level
+    // `field#tag` members alongside their canonical counterparts. Skip any key
+    // already present so a localized variant can never shadow a canonical
+    // response member (i18n keys always contain `#`, but this stays correct
+    // even if a future canonical field name were to include one).
+    if (clientInfo.i18n) {
+      for (const [key, value] of Object.entries(clientInfo.i18n)) {
+        if (!(key in response)) response[key] = value;
+      }
+    }
 
     // Only include client_secret for confidential clients (RFC 7591 §3.2.1)
     if (clientSecret) {
@@ -3790,6 +3815,59 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   }
 
   /**
+   * The human-readable client metadata fields that may carry RFC 7591 §2.2
+   * internationalized variants, mapped to whether the value must be a URI.
+   * URI fields are validated with the same scheme rules as their canonical
+   * counterparts; plain fields only need to be strings.
+   */
+  private static readonly I18N_FIELDS: Record<string, 'string' | 'uri'> = {
+    client_name: 'string',
+    client_uri: 'uri',
+    logo_uri: 'uri',
+    tos_uri: 'uri',
+    policy_uri: 'uri',
+  };
+
+  /**
+   * Extracts RFC 7591 §2.2 internationalized metadata variants from a raw
+   * registration payload.
+   *
+   * Localized variants are expressed by appending a `#<BCP 47 language tag>`
+   * suffix to a metadata member name (e.g. `client_name#ja`, `tos_uri#fr`).
+   * Only the human-readable fields the RFC names are considered; each value is
+   * validated with the same rules as its canonical field (URI fields must be
+   * absolute http(s) URLs). The raw `field#tag` keys are preserved verbatim so
+   * that consumers can do their own locale matching.
+   *
+   * @param raw - The parsed client metadata object
+   * @returns A map of `field#tag` to validated value, or undefined if none present
+   * @throws Error if a localized value fails its field's validation
+   */
+  private static extractI18nFields(raw: Record<string, unknown>): Record<string, string> | undefined {
+    const result: Record<string, string> = {};
+
+    for (const key of Object.keys(raw)) {
+      const hashIndex = key.indexOf('#');
+      if (hashIndex <= 0 || hashIndex === key.length - 1) continue;
+
+      const baseField = key.slice(0, hashIndex);
+      const kind = OAuthProviderImpl.I18N_FIELDS[baseField];
+      if (!kind) continue;
+
+      const validated =
+        kind === 'uri'
+          ? OAuthProviderImpl.validateOptionalUriField(raw[key], key)
+          : OAuthProviderImpl.validateStringField(raw[key], key);
+
+      if (validated !== undefined) {
+        result[key] = validated;
+      }
+    }
+
+    return Object.keys(result).length > 0 ? result : undefined;
+  }
+
+  /**
    * Validates that a field is a string array or undefined
    * @param arr - The array to validate
    * @param fieldName - Name of the field for error messages
@@ -3878,6 +3956,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         policyUri: OAuthProviderImpl.validateOptionalUriField(rawMetadata.policy_uri, 'policy_uri'),
         tosUri: OAuthProviderImpl.validateOptionalUriField(rawMetadata.tos_uri, 'tos_uri'),
         jwksUri: OAuthProviderImpl.validateOptionalUriField(rawMetadata.jwks_uri, 'jwks_uri'),
+        i18n: OAuthProviderImpl.extractI18nFields(rawMetadata),
         contacts: OAuthProviderImpl.validateStringArray(rawMetadata.contacts, 'contacts'),
         grantTypes: OAuthProviderImpl.validateStringArray(rawMetadata.grant_types, 'grant_types') || [
           'authorization_code',
@@ -4910,6 +4989,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
       policyUri: clientInfo.policyUri,
       tosUri: clientInfo.tosUri,
       jwksUri: clientInfo.jwksUri,
+      i18n: clientInfo.i18n,
       contacts: clientInfo.contacts,
       grantTypes: clientInfo.grantTypes || [
         GrantType.AUTHORIZATION_CODE,

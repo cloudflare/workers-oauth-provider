@@ -39,6 +39,10 @@ Client records store OAuth client application information.
   "policyUri": "https://app.example.com/privacy",
   "tosUri": "https://app.example.com/terms",
   "jwksUri": null,
+  "i18n": {
+    "client_name#ja": "サンプルアプリ",
+    "tos_uri#ja": "https://app.example.com/ja/terms"
+  },
   "contacts": ["dev@example.com"],
   "grantTypes": ["authorization_code", "refresh_token"],
   "responseTypes": ["code"],
@@ -47,6 +51,8 @@ Client records store OAuth client application information.
 ```
 
 > **Note:** The `clientSecret` is stored as a SHA-256 hash, not in plaintext. The actual secret is only returned to the client when initially created or updated, and never stored.
+
+> **Note:** The optional `i18n` map holds RFC 7591 §2.2 internationalized variants of the human-readable metadata fields (`client_name`, `client_uri`, `logo_uri`, `tos_uri`, `policy_uri`), keyed by the raw `field#<BCP 47 language tag>` member name. Canonical (un-tagged) values remain in their own fields. URI variants are validated as absolute http(s) URLs, the same as their canonical counterparts.
 
 **TTL:** Dynamically registered clients (DCR) default to 90 days. Clients created via `OAuthHelpers.createClient()` have no expiration. Configurable via the `clientRegistrationTTL` option.
 
