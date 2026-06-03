@@ -813,6 +813,166 @@ describe('OAuthProvider', () => {
         });
       });
     });
+
+    describe('RFC 7591 §2.2 internationalized metadata variants', () => {
+      it('persists localized variants and echoes them in the response', async () => {
+        const clientData = {
+          redirect_uris: ['https://client.example.com/callback'],
+          client_name: 'Test Client',
+          'client_name#ja': 'テストクライアント',
+          'client_name#fr': 'Client de test',
+          client_uri: 'https://client.example.com',
+          'client_uri#ja': 'https://client.example.com/ja',
+          'tos_uri#fr': 'https://client.example.com/fr/terms',
+          'policy_uri#de': 'https://client.example.com/de/privacy',
+          'logo_uri#ja': 'https://client.example.com/ja/logo.png',
+          token_endpoint_auth_method: 'none',
+        };
+
+        const request = createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify(clientData)
+        );
+
+        const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
+        expect(response.status).toBe(201);
+
+        const registeredClient = await response.json<any>();
+        // Canonical values still present
+        expect(registeredClient.client_name).toBe('Test Client');
+        expect(registeredClient.client_uri).toBe('https://client.example.com');
+        // Localized variants echoed back as top-level `field#tag` members
+        expect(registeredClient['client_name#ja']).toBe('テストクライアント');
+        expect(registeredClient['client_name#fr']).toBe('Client de test');
+        expect(registeredClient['client_uri#ja']).toBe('https://client.example.com/ja');
+        expect(registeredClient['tos_uri#fr']).toBe('https://client.example.com/fr/terms');
+        expect(registeredClient['policy_uri#de']).toBe('https://client.example.com/de/privacy');
+        expect(registeredClient['logo_uri#ja']).toBe('https://client.example.com/ja/logo.png');
+
+        // Stored under the flat `i18n` map keyed by raw `field#tag`
+        const savedClient = await mockEnv.OAUTH_KV.get(`client:${registeredClient.client_id}`, { type: 'json' });
+        expect(savedClient.i18n).toEqual({
+          'client_name#ja': 'テストクライアント',
+          'client_name#fr': 'Client de test',
+          'client_uri#ja': 'https://client.example.com/ja',
+          'tos_uri#fr': 'https://client.example.com/fr/terms',
+          'policy_uri#de': 'https://client.example.com/de/privacy',
+          'logo_uri#ja': 'https://client.example.com/ja/logo.png',
+        });
+      });
+
+      it('preserves case of BCP 47 language tags', async () => {
+        const clientData = {
+          redirect_uris: ['https://client.example.com/callback'],
+          client_name: 'Test Client',
+          'client_name#ja-Jpan-JP': 'テスト',
+          token_endpoint_auth_method: 'none',
+        };
+
+        const request = createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify(clientData)
+        );
+
+        const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
+        expect(response.status).toBe(201);
+        const registeredClient = await response.json<any>();
+        expect(registeredClient['client_name#ja-Jpan-JP']).toBe('テスト');
+      });
+
+      it('omits the i18n map when no localized variants are present', async () => {
+        const clientData = {
+          redirect_uris: ['https://client.example.com/callback'],
+          client_name: 'Test Client',
+          token_endpoint_auth_method: 'none',
+        };
+
+        const request = createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify(clientData)
+        );
+
+        const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
+        const registeredClient = await response.json<any>();
+        const savedClient = await mockEnv.OAUTH_KV.get(`client:${registeredClient.client_id}`, { type: 'json' });
+        expect(savedClient.i18n).toBeUndefined();
+      });
+
+      it('only captures the RFC §2.2 human-readable fields, ignoring others', async () => {
+        const clientData = {
+          redirect_uris: ['https://client.example.com/callback'],
+          client_name: 'Test Client',
+          'client_name#ja': 'テスト',
+          // Not a §2.2 human-readable field — must be ignored, not stored
+          'jwks_uri#ja': 'https://client.example.com/ja/jwks.json',
+          'contacts#ja': 'ignored',
+          token_endpoint_auth_method: 'none',
+        };
+
+        const request = createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify(clientData)
+        );
+
+        const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
+        expect(response.status).toBe(201);
+        const registeredClient = await response.json<any>();
+        const savedClient = await mockEnv.OAUTH_KV.get(`client:${registeredClient.client_id}`, { type: 'json' });
+        expect(savedClient.i18n).toEqual({ 'client_name#ja': 'テスト' });
+        expect(registeredClient['jwks_uri#ja']).toBeUndefined();
+        expect(registeredClient['contacts#ja']).toBeUndefined();
+      });
+
+      it('applies http(s) scheme validation to localized URI variants', async () => {
+        const clientData = {
+          redirect_uris: ['https://client.example.com/callback'],
+          client_name: 'Test Client',
+          'tos_uri#fr': 'javascript:alert(1)',
+          token_endpoint_auth_method: 'none',
+        };
+
+        const request = createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify(clientData)
+        );
+
+        const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
+        expect(response.status).toBe(400);
+        const body = await response.json<any>();
+        expect(body.error).toBe('invalid_client_metadata');
+      });
+
+      it('rejects non-string localized variant values', async () => {
+        const clientData = {
+          redirect_uris: ['https://client.example.com/callback'],
+          client_name: 'Test Client',
+          'client_name#ja': 123,
+          token_endpoint_auth_method: 'none',
+        };
+
+        const request = createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify(clientData)
+        );
+
+        const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
+        expect(response.status).toBe(400);
+        const body = await response.json<any>();
+        expect(body.error).toBe('invalid_client_metadata');
+      });
+    });
   });
 
   describe('Authorization Code Flow', () => {
@@ -7880,6 +8040,50 @@ describe('OAuthProvider', () => {
         const metadata = await metadataResponse.json<any>();
 
         expect(metadata.client_id_metadata_document_supported).toBe(true);
+      });
+
+      it('should accept a CIMD document with localized metadata variants', async () => {
+        const cimdUrl = 'https://client.example.com/oauth/metadata.json';
+        const validMetadata = {
+          client_id: cimdUrl,
+          client_name: 'CIMD Test Client',
+          'client_name#ja': 'テストクライアント',
+          'tos_uri#fr': 'https://client.example.com/fr/terms',
+          redirect_uris: ['https://client.example.com/callback'],
+          token_endpoint_auth_method: 'none',
+        };
+
+        globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(createMockFetchResponse(validMetadata)));
+
+        const authRequest = createMockRequest(
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          'GET'
+        );
+
+        const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+        expect(authResponse.status).toBe(302);
+      });
+
+      it('should reject a CIMD document whose localized URI variant uses an unsafe scheme', async () => {
+        const cimdUrl = 'https://client.example.com/oauth/metadata.json';
+        const maliciousMetadata = {
+          client_id: cimdUrl,
+          client_name: 'CIMD Test Client',
+          'tos_uri#fr': 'javascript:alert(1)',
+          redirect_uris: ['https://client.example.com/callback'],
+          token_endpoint_auth_method: 'none',
+        };
+
+        globalThis.fetch = vi
+          .fn()
+          .mockImplementation(() => Promise.resolve(createMockFetchResponse(maliciousMetadata)));
+
+        const authRequest = createMockRequest(
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          'GET'
+        );
+
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
       });
     });
 
