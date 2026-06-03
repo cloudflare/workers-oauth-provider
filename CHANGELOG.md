@@ -1,5 +1,38 @@
 # @cloudflare/workers-oauth-provider
 
+## 0.7.1
+
+### Patch Changes
+
+- [#221](https://github.com/cloudflare/workers-oauth-provider/pull/221) [`8e3f08c`](https://github.com/cloudflare/workers-oauth-provider/commit/8e3f08c83e37d5db2bb2a630481408a49006ba10) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Preserve RFC 7591 §2.2 internationalized client metadata variants.
+
+  Localized variants of the human-readable client metadata fields — expressed
+  with a `#<BCP 47 language tag>` suffix on the member name (e.g.
+  `client_name#ja`, `tos_uri#fr`) — were previously dropped during client
+  registration. They are now captured for `client_name`, `client_uri`,
+  `logo_uri`, `tos_uri`, and `policy_uri`, stored on the client record under a
+  new optional `i18n` map (keyed by the raw `field#tag` name), and echoed back in
+  the registration response alongside their canonical fields. The same handling
+  applies to Client ID Metadata Document ingestion.
+
+  Localized values are validated with the same rules as their canonical field:
+  URI variants must be absolute `http:` or `https:` URLs, and all variants must
+  be strings. Fields that are not part of RFC 7591 §2.2 (such as `jwks_uri` and
+  `redirect_uris`) are not collected.
+
+- [#218](https://github.com/cloudflare/workers-oauth-provider/pull/218) [`1f8737d`](https://github.com/cloudflare/workers-oauth-provider/commit/1f8737d93f9b5e907e4f2f346a3649fbb416593b) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Validate the URI scheme of client metadata fields during client registration.
+
+  The `client_uri`, `logo_uri`, `policy_uri`, `tos_uri`, and `jwks_uri` fields
+  were previously only checked to be strings. They are now required to be
+  absolute `http:` or `https:` URLs, consistent with how `redirect_uris` are
+  already validated. Registration (and Client ID Metadata Document ingestion)
+  now rejects values using other schemes with an `invalid_client_metadata`
+  error.
+
+  These fields are commonly surfaced in consent UIs (for example as link or
+  image targets), so restricting them to standard web URLs avoids non-http(s)
+  schemes flowing through to consumers.
+
 ## 0.7.0
 
 ### Minor Changes
