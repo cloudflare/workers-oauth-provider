@@ -3312,11 +3312,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         clientId,
         redirectUris,
         clientName: OAuthProviderImpl.validateStringField(clientMetadata.client_name),
-        logoUri: OAuthProviderImpl.validateStringField(clientMetadata.logo_uri),
-        clientUri: OAuthProviderImpl.validateStringField(clientMetadata.client_uri),
-        policyUri: OAuthProviderImpl.validateStringField(clientMetadata.policy_uri),
-        tosUri: OAuthProviderImpl.validateStringField(clientMetadata.tos_uri),
-        jwksUri: OAuthProviderImpl.validateStringField(clientMetadata.jwks_uri),
+        logoUri: OAuthProviderImpl.validateOptionalUriField(clientMetadata.logo_uri, 'logo_uri'),
+        clientUri: OAuthProviderImpl.validateOptionalUriField(clientMetadata.client_uri, 'client_uri'),
+        policyUri: OAuthProviderImpl.validateOptionalUriField(clientMetadata.policy_uri, 'policy_uri'),
+        tosUri: OAuthProviderImpl.validateOptionalUriField(clientMetadata.tos_uri, 'tos_uri'),
+        jwksUri: OAuthProviderImpl.validateOptionalUriField(clientMetadata.jwks_uri, 'jwks_uri'),
         contacts: OAuthProviderImpl.validateStringArray(clientMetadata.contacts),
         grantTypes: OAuthProviderImpl.validateStringArray(clientMetadata.grant_types) || [
           GrantType.AUTHORIZATION_CODE,
@@ -3757,6 +3757,39 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   }
 
   /**
+   * Validates that a field is an optional URI string using a safe scheme.
+   *
+   * Client metadata URI fields (e.g. logo_uri, client_uri, policy_uri, tos_uri,
+   * jwks_uri) are frequently rendered into HTML attributes such as `<a href>` or
+   * `<img src>` on consent screens. Permitting non-http(s) schemes such as
+   * `javascript:` or `data:` would allow script execution in that context, so we
+   * require an absolute http: or https: URL here, matching how redirect URIs are
+   * already restricted.
+   *
+   * @param field - The field to validate
+   * @param fieldName - Name of the field for error messages
+   * @returns The validated URI string or undefined
+   * @throws Error if the field is not a string or is not an absolute http(s) URL
+   */
+  private static validateOptionalUriField(field: unknown, fieldName: string): string | undefined {
+    const value = OAuthProviderImpl.validateStringField(field, fieldName);
+    if (value === undefined) return undefined;
+
+    let parsed: URL;
+    try {
+      parsed = new URL(value);
+    } catch {
+      throw new Error(`Invalid ${fieldName}: must be an absolute http: or https: URL`);
+    }
+
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      throw new Error(`Invalid ${fieldName}: must be an absolute http: or https: URL`);
+    }
+
+    return value;
+  }
+
+  /**
    * Validates that a field is a string array or undefined
    * @param arr - The array to validate
    * @param fieldName - Name of the field for error messages
@@ -3840,11 +3873,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         clientId,
         redirectUris,
         clientName: OAuthProviderImpl.validateStringField(rawMetadata.client_name, 'client_name'),
-        clientUri: OAuthProviderImpl.validateStringField(rawMetadata.client_uri, 'client_uri'),
-        logoUri: OAuthProviderImpl.validateStringField(rawMetadata.logo_uri, 'logo_uri'),
-        policyUri: OAuthProviderImpl.validateStringField(rawMetadata.policy_uri, 'policy_uri'),
-        tosUri: OAuthProviderImpl.validateStringField(rawMetadata.tos_uri, 'tos_uri'),
-        jwksUri: OAuthProviderImpl.validateStringField(rawMetadata.jwks_uri, 'jwks_uri'),
+        clientUri: OAuthProviderImpl.validateOptionalUriField(rawMetadata.client_uri, 'client_uri'),
+        logoUri: OAuthProviderImpl.validateOptionalUriField(rawMetadata.logo_uri, 'logo_uri'),
+        policyUri: OAuthProviderImpl.validateOptionalUriField(rawMetadata.policy_uri, 'policy_uri'),
+        tosUri: OAuthProviderImpl.validateOptionalUriField(rawMetadata.tos_uri, 'tos_uri'),
+        jwksUri: OAuthProviderImpl.validateOptionalUriField(rawMetadata.jwks_uri, 'jwks_uri'),
         contacts: OAuthProviderImpl.validateStringArray(rawMetadata.contacts, 'contacts'),
         grantTypes: OAuthProviderImpl.validateStringArray(rawMetadata.grant_types, 'grant_types') || [
           'authorization_code',
