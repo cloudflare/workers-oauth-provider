@@ -4048,7 +4048,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   ): Response {
     const { description } = options;
     const responseStatus = options.statusCode ?? 400;
-    const responseHeaders = { ...(options.headers ?? {}), ...NO_CACHE_HEADERS };
+    const responseHeaders = options.headers ?? {};
 
     // Notify the user of the error and allow them to override the response
     const customErrorResponse = this.options.onError?.({
