@@ -147,7 +147,7 @@ const testDefaultHandler = {
       const clientInfo = await env.OAUTH_PROVIDER!.lookupClient(oauthReqInfo.clientId);
 
       // Mock user consent flow - automatically grant consent
-      const { redirectTo, headers } = await env.OAUTH_PROVIDER!.completeAuthorization({
+      const { redirectTo } = await env.OAUTH_PROVIDER!.completeAuthorization({
         request: oauthReqInfo,
         userId: 'test-user-123',
         metadata: { testConsent: true },
@@ -155,13 +155,7 @@ const testDefaultHandler = {
         props: { userId: 'test-user-123', username: 'TestUser' },
       });
 
-      return new Response(null, {
-        status: 302,
-        headers: {
-          Location: redirectTo,
-          ...headers,
-        },
-      });
+      return Response.redirect(redirectTo, 302);
     }
 
     return new Response('Default handler', { status: 200 });
@@ -5538,14 +5532,6 @@ describe('OAuthProvider', () => {
       const { client, response } = await registerClient();
 
       expect(client.client_secret).toBeDefined();
-      expectSensitiveResponseCacheHeaders(response);
-    });
-
-    it('adds no-store and no-cache to authorization redirects containing credentials', async () => {
-      const { client } = await registerClient();
-      const { response } = await authorize(client.client_id);
-
-      expect(response.status).toBe(302);
       expectSensitiveResponseCacheHeaders(response);
     });
 

@@ -502,9 +502,9 @@ export interface OAuthHelpers {
   /**
    * Completes an authorization request by creating a grant and authorization code
    * @param options - Options specifying the grant details
-   * @returns A Promise resolving to the redirect URL and headers to apply to the redirect response
+   * @returns A Promise resolving to an object containing the redirect URL
    */
-  completeAuthorization(options: CompleteAuthorizationOptions): Promise<CompleteAuthorizationResult>;
+  completeAuthorization(options: CompleteAuthorizationOptions): Promise<{ redirectTo: string }>;
 
   /**
    * Creates a new OAuth client
@@ -751,21 +751,8 @@ export interface ClientInfo {
 }
 
 /**
- * Result of completing an authorization request
+ * Options for completing an authorization request
  */
-export interface CompleteAuthorizationResult {
-  /**
-   * URL to redirect the user-agent to after authorization.
-   */
-  redirectTo: string;
-
-  /**
-   * Headers that should be applied to the redirect response because it contains
-   * an authorization code or access token.
-   */
-  headers: Record<string, string>;
-}
-
 export interface CompleteAuthorizationOptions {
   /**
    * The original parsed authorization request
@@ -4804,9 +4791,9 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * - For authorization code flow: generating an authorization code
    * - For implicit flow: generating an access token directly
    * @param options - Options specifying the grant details
-   * @returns A Promise resolving to the redirect URL and headers to apply to the redirect response
+   * @returns A Promise resolving to an object containing the redirect URL
    */
-  async completeAuthorization(options: CompleteAuthorizationOptions): Promise<CompleteAuthorizationResult> {
+  async completeAuthorization(options: CompleteAuthorizationOptions): Promise<{ redirectTo: string }> {
     const { clientId, redirectUri } = options.request;
 
     if (!clientId || !redirectUri) {
@@ -4930,7 +4917,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
         // Best-effort revocation — new grant is already stored, don't fail the authorization
       }
 
-      return { redirectTo: redirectUrl.toString(), headers: { ...NO_CACHE_HEADERS } };
+      return { redirectTo: redirectUrl.toString() };
     } else {
       // Standard authorization code flow
       // Generate an authorization code with embedded user and grant IDs
@@ -4981,7 +4968,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
         // Best-effort revocation — new grant is already stored, don't fail the authorization
       }
 
-      return { redirectTo: redirectUrl.toString(), headers: { ...NO_CACHE_HEADERS } };
+      return { redirectTo: redirectUrl.toString() };
     }
   }
 
