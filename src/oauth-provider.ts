@@ -856,19 +856,15 @@ export interface Grant {
   /**
    * The hash of the authorization code associated with this grant
    * Retained after exchange so that a replay of the same code can be
-   * detected and verified before any action is taken on the grant
+   * verified before any action is taken on the grant. The code is
+   * considered already exchanged once authCodeWrappedKey is removed.
    */
   authCodeId?: string;
 
   /**
-   * Whether the authorization code for this grant has already been exchanged
-   * Used to detect replay of an already-used authorization code
-   */
-  authCodeUsed?: boolean;
-
-  /**
    * Wrapped encryption key for the authorization code
-   * Only present until the authorization code is exchanged
+   * Present only until the authorization code is exchanged; its absence
+   * (with authCodeId still set) marks the code as already used.
    */
   authCodeWrappedKey?: string;
 
@@ -2075,10 +2071,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       return this.createErrorResponse('invalid_grant', { description: 'Client ID mismatch' });
     }
 
-    // If the authorization code has already been exchanged, this is a replay of a
-    // valid code by the legitimate client. Per RFC 6749 Section 10.5, revoke all
-    // tokens issued from the first exchange as a precaution against replay attacks.
-    if (grantData.authCodeUsed) {
+    // If the authorization code has already been exchanged (the wrapped key has
+    // been removed), this is a replay of a valid code by the legitimate client.
+    // Per RFC 6749 Section 10.5, revoke all tokens issued from the first exchange
+    // as a precaution against replay attacks.
+    if (!grantData.authCodeWrappedKey) {
       try {
         await this.createOAuthHelpers(env).revokeGrant(grantId, userId);
       } catch {
@@ -2230,11 +2227,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const useRefreshToken = refreshTokenTTL !== 0;
 
     // Update the grant:
-    // - Mark the auth code as used so a replay can be detected (it's single-use)
     // - Retain the auth code hash so a replayed code can be verified before acting
     // - Remove PKCE-related fields (one-time use)
-    // - Remove auth code wrapped key (no longer needed)
-    grantData.authCodeUsed = true;
+    // - Remove auth code wrapped key (no longer needed); its absence marks the
+    //   code as used so a subsequent replay can be detected
     delete grantData.codeChallenge;
     delete grantData.codeChallengeMethod;
     delete grantData.authCodeWrappedKey;

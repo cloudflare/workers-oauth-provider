@@ -1702,8 +1702,8 @@ describe('OAuthProvider', () => {
       const grantKey = grantEntries.keys[0].name;
       const grant = await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' });
 
-      expect(grant.authCodeUsed).toBe(true); // Auth code should be marked as used
-      expect(grant.authCodeWrappedKey).toBeUndefined(); // Wrapped key should be removed
+      expect(grant.authCodeId).toBeDefined(); // Auth code hash should be retained
+      expect(grant.authCodeWrappedKey).toBeUndefined(); // Wrapped key removed marks code as used
       expect(grant.refreshTokenId).toBeDefined(); // Refresh token should be added
     });
 
