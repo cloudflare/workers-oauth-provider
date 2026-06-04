@@ -2908,7 +2908,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       const wire = emaErrorToWire(result.error);
       return this.createErrorResponse(
         wire.code,
-        { description: wire.message, headers: { ...NO_CACHE_HEADERS } },
+        { description: wire.message, headers: NO_CACHE_HEADERS },
         { category: 'enterprise-managed-authorization', reason: result.error.reason, detail: result.error }
       );
     }
