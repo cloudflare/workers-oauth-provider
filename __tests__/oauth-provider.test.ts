@@ -162,12 +162,13 @@ const testDefaultHandler = {
   },
 };
 
-// Helper function to create mock requests
-function expectSensitiveResponseCacheHeaders(response: Response): void {
+// Asserts a response carries the RFC 6749 §5.1 no-cache headers
+function expectNoCacheHeaders(response: Response): void {
   expect(response.headers.get('Cache-Control')).toBe('no-store');
   expect(response.headers.get('Pragma')).toBe('no-cache');
 }
 
+// Helper function to create mock requests
 function createMockRequest(
   url: string,
   method: string = 'GET',
@@ -3346,7 +3347,7 @@ describe('OAuthProvider', () => {
       );
 
       expect(response.status).toBe(400);
-      expectSensitiveResponseCacheHeaders(response);
+      expectNoCacheHeaders(response);
       expect(await response.json<any>()).toMatchObject({ error: 'invalid_grant' });
     });
 
@@ -5532,7 +5533,7 @@ describe('OAuthProvider', () => {
       const { client, response } = await registerClient();
 
       expect(client.client_secret).toBeDefined();
-      expectSensitiveResponseCacheHeaders(response);
+      expectNoCacheHeaders(response);
     });
 
     it('adds no-store and no-cache to authorization code token responses', async () => {
@@ -5541,7 +5542,7 @@ describe('OAuthProvider', () => {
 
       expect(tokens.access_token).toBeDefined();
       expect(tokens.refresh_token).toBeDefined();
-      expectSensitiveResponseCacheHeaders(response);
+      expectNoCacheHeaders(response);
     });
 
     it('adds no-store and no-cache to refresh token responses', async () => {
@@ -5565,7 +5566,7 @@ describe('OAuthProvider', () => {
       );
 
       expect(response.status).toBe(200);
-      expectSensitiveResponseCacheHeaders(response);
+      expectNoCacheHeaders(response);
     });
 
     it('adds no-store and no-cache to token exchange responses', async () => {
@@ -5591,7 +5592,7 @@ describe('OAuthProvider', () => {
       );
 
       expect(response.status).toBe(200);
-      expectSensitiveResponseCacheHeaders(response);
+      expectNoCacheHeaders(response);
     });
   });
 
