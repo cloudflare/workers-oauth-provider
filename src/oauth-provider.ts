@@ -2903,16 +2903,16 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     const result = await this.runEmaPipeline({ body, clientInfo, env, requestUrl, request, enterpriseOptions });
 
-    // RFC 6749 §5.1 — token endpoint responses must not be cached.
     if (!result.ok) {
       const wire = emaErrorToWire(result.error);
       return this.createErrorResponse(
         wire.code,
-        { description: wire.message, headers: NO_CACHE_HEADERS },
+        { description: wire.message },
         { category: 'enterprise-managed-authorization', reason: result.error.reason, detail: result.error }
       );
     }
 
+    // RFC 6749 §5.1 — responses containing tokens must not be cached.
     return new Response(JSON.stringify(result.value), {
       headers: { 'Content-Type': 'application/json', ...NO_CACHE_HEADERS },
     });
