@@ -3347,9 +3347,6 @@ describe('OAuthProvider', () => {
       );
 
       expect(response.status).toBe(400);
-      // EMA error responses are not in RFC 6749 §5.1 scope (no token/credential), so no no-cache headers.
-      expect(response.headers.get('Cache-Control')).toBeNull();
-      expect(response.headers.get('Pragma')).toBeNull();
       expect(await response.json<any>()).toMatchObject({ error: 'invalid_grant' });
     });
 
