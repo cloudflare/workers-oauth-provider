@@ -5594,6 +5594,22 @@ describe('OAuthProvider', () => {
       expect(response.status).toBe(200);
       expectNoCacheHeaders(response);
     });
+
+    it('adds no-store and no-cache to token endpoint error responses', async () => {
+      const response = await oauthProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          'grant_type=authorization_code&code=invalid'
+        ),
+        mockEnv,
+        mockCtx
+      );
+
+      expect(response.status).toBe(401);
+      expectNoCacheHeaders(response);
+    });
   });
 
   describe('CORS Support', () => {
