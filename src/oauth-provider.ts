@@ -37,6 +37,7 @@ export type {
 export type { EmaValidationError } from './ema/result';
 
 const PROTECTED_RESOURCE_WELL_KNOWN_PREFIX = '/.well-known/oauth-protected-resource';
+const SENSITIVE_RESPONSE_HEADERS = { 'Cache-Control': 'no-store', Pragma: 'no-cache' } as const;
 
 // Log CIMD status on module load
 const hasStrictlyPublicFetch =
@@ -501,9 +502,9 @@ export interface OAuthHelpers {
   /**
    * Completes an authorization request by creating a grant and authorization code
    * @param options - Options specifying the grant details
-   * @returns A Promise resolving to an object containing the redirect URL
+   * @returns A Promise resolving to the redirect URL and headers to apply to the redirect response
    */
-  completeAuthorization(options: CompleteAuthorizationOptions): Promise<{ redirectTo: string }>;
+  completeAuthorization(options: CompleteAuthorizationOptions): Promise<CompleteAuthorizationResult>;
 
   /**
    * Creates a new OAuth client
@@ -750,8 +751,21 @@ export interface ClientInfo {
 }
 
 /**
- * Options for completing an authorization request
+ * Result of completing an authorization request
  */
+export interface CompleteAuthorizationResult {
+  /**
+   * URL to redirect the user-agent to after authorization.
+   */
+  redirectTo: string;
+
+  /**
+   * Headers that should be applied to the redirect response because it contains
+   * an authorization code or access token.
+   */
+  headers: Record<string, string>;
+}
+
 export interface CompleteAuthorizationOptions {
   /**
    * The original parsed authorization request
@@ -2309,9 +2323,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       tokenResponse.resource = audience;
     }
 
-    // Return the tokens
+    // RFC 6749 §5.1 — responses containing tokens must not be cached.
     return new Response(JSON.stringify(tokenResponse), {
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...SENSITIVE_RESPONSE_HEADERS },
     });
   }
 
@@ -2595,9 +2609,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       tokenResponse.resource = audience;
     }
 
-    // Return the tokens
+    // RFC 6749 §5.1 — responses containing tokens must not be cached.
     return new Response(JSON.stringify(tokenResponse), {
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...SENSITIVE_RESPONSE_HEADERS },
     });
   }
 
@@ -2852,9 +2866,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         env
       );
 
-      // Return the token
+      // RFC 6749 §5.1 — responses containing tokens must not be cached.
       return new Response(JSON.stringify(tokenResponse), {
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...SENSITIVE_RESPONSE_HEADERS },
       });
     } catch (error) {
       // Convert OAuth errors into structured `/token` error responses,
@@ -2903,19 +2917,17 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const result = await this.runEmaPipeline({ body, clientInfo, env, requestUrl, request, enterpriseOptions });
 
     // RFC 6749 §5.1 — token endpoint responses must not be cached.
-    const noCacheHeaders = { 'Cache-Control': 'no-store', Pragma: 'no-cache' };
-
     if (!result.ok) {
       const wire = emaErrorToWire(result.error);
       return this.createErrorResponse(
         wire.code,
-        { description: wire.message, headers: noCacheHeaders },
+        { description: wire.message, headers: { ...SENSITIVE_RESPONSE_HEADERS } },
         { category: 'enterprise-managed-authorization', reason: result.error.reason, detail: result.error }
       );
     }
 
     return new Response(JSON.stringify(result.value), {
-      headers: { 'Content-Type': 'application/json', ...noCacheHeaders },
+      headers: { 'Content-Type': 'application/json', ...SENSITIVE_RESPONSE_HEADERS },
     });
   }
 
@@ -3406,7 +3418,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     return new Response(JSON.stringify(response), {
       status: 201,
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...SENSITIVE_RESPONSE_HEADERS },
     });
   }
 
@@ -4049,7 +4061,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   ): Response {
     const { description } = options;
     const responseStatus = options.statusCode ?? 400;
-    const responseHeaders = options.headers ?? {};
+    const responseHeaders = { ...(options.headers ?? {}), ...SENSITIVE_RESPONSE_HEADERS };
 
     // Notify the user of the error and allow them to override the response
     const customErrorResponse = this.options.onError?.({
@@ -4792,9 +4804,9 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * - For authorization code flow: generating an authorization code
    * - For implicit flow: generating an access token directly
    * @param options - Options specifying the grant details
-   * @returns A Promise resolving to an object containing the redirect URL
+   * @returns A Promise resolving to the redirect URL and headers to apply to the redirect response
    */
-  async completeAuthorization(options: CompleteAuthorizationOptions): Promise<{ redirectTo: string }> {
+  async completeAuthorization(options: CompleteAuthorizationOptions): Promise<CompleteAuthorizationResult> {
     const { clientId, redirectUri } = options.request;
 
     if (!clientId || !redirectUri) {
@@ -4918,7 +4930,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
         // Best-effort revocation — new grant is already stored, don't fail the authorization
       }
 
-      return { redirectTo: redirectUrl.toString() };
+      return { redirectTo: redirectUrl.toString(), headers: { ...SENSITIVE_RESPONSE_HEADERS } };
     } else {
       // Standard authorization code flow
       // Generate an authorization code with embedded user and grant IDs
@@ -4969,7 +4981,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
         // Best-effort revocation — new grant is already stored, don't fail the authorization
       }
 
-      return { redirectTo: redirectUrl.toString() };
+      return { redirectTo: redirectUrl.toString(), headers: { ...SENSITIVE_RESPONSE_HEADERS } };
     }
   }
 

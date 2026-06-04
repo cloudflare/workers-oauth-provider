@@ -161,7 +161,7 @@ const defaultHandler = {
 
       // After the user has granted consent, the application calls `env.OAUTH_PROVIDER.completeAuthorization()` to
       // grant the authorization.
-      let { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
+      let { redirectTo, headers } = await env.OAUTH_PROVIDER.completeAuthorization({
         // The application passes back the original OAuth request info that was returned by
         // `parseAuthRequest()` earlier.
         request: oauthReqInfo,
@@ -192,8 +192,15 @@ const defaultHandler = {
       // `completeAuthorization()` will have returned the URL to which the user should be redirected
       // in order to complete the authorization flow. This is the requesting client's OAuth
       // redirect_uri with the appropriate query parameters added to complete the flow and obtain
-      // tokens.
-      return Response.redirect(redirectTo, 302);
+      // tokens. Apply the returned headers so intermediaries do not cache the redirect carrying
+      // authorization credentials.
+      return new Response(null, {
+        status: 302,
+        headers: {
+          Location: redirectTo,
+          ...headers,
+        },
+      });
     }
 
     // ... the application can implement other non-API HTTP endpoints here ...
