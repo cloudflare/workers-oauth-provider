@@ -1,5 +1,13 @@
 # @cloudflare/workers-oauth-provider
 
+## 0.7.2
+
+### Patch Changes
+
+- [#222](https://github.com/cloudflare/workers-oauth-provider/pull/222) [`45397d8`](https://github.com/cloudflare/workers-oauth-provider/commit/45397d8aa57ac0d82c9031e9e0aad588e2e4c1f4) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Add an opt-in `allowPublicClients` flag to `enterpriseManagedAuthorization`.
+
+  By default the enterprise-managed authorization (ID-JAG) grant requires client authentication, so public clients (`token_endpoint_auth_method: 'none'`) are rejected. Setting `allowPublicClients: true` also accepts public clients on this grant — for example clients registered via a Client ID Metadata Document (CIMD), which are always public and cannot present a client secret. The default remains `false`, preserving existing behavior.
+
 ## 0.7.1
 
 ### Patch Changes
