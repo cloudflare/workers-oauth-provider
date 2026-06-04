@@ -37,7 +37,7 @@ export type {
 export type { EmaValidationError } from './ema/result';
 
 const PROTECTED_RESOURCE_WELL_KNOWN_PREFIX = '/.well-known/oauth-protected-resource';
-const SENSITIVE_RESPONSE_HEADERS = { 'Cache-Control': 'no-store', Pragma: 'no-cache' } as const;
+const NO_CACHE_HEADERS = { 'Cache-Control': 'no-store', Pragma: 'no-cache' } as const;
 
 // Log CIMD status on module load
 const hasStrictlyPublicFetch =
@@ -2325,7 +2325,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // RFC 6749 §5.1 — responses containing tokens must not be cached.
     return new Response(JSON.stringify(tokenResponse), {
-      headers: { 'Content-Type': 'application/json', ...SENSITIVE_RESPONSE_HEADERS },
+      headers: { 'Content-Type': 'application/json', ...NO_CACHE_HEADERS },
     });
   }
 
@@ -2611,7 +2611,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // RFC 6749 §5.1 — responses containing tokens must not be cached.
     return new Response(JSON.stringify(tokenResponse), {
-      headers: { 'Content-Type': 'application/json', ...SENSITIVE_RESPONSE_HEADERS },
+      headers: { 'Content-Type': 'application/json', ...NO_CACHE_HEADERS },
     });
   }
 
@@ -2868,7 +2868,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
       // RFC 6749 §5.1 — responses containing tokens must not be cached.
       return new Response(JSON.stringify(tokenResponse), {
-        headers: { 'Content-Type': 'application/json', ...SENSITIVE_RESPONSE_HEADERS },
+        headers: { 'Content-Type': 'application/json', ...NO_CACHE_HEADERS },
       });
     } catch (error) {
       // Convert OAuth errors into structured `/token` error responses,
@@ -2921,13 +2921,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       const wire = emaErrorToWire(result.error);
       return this.createErrorResponse(
         wire.code,
-        { description: wire.message, headers: { ...SENSITIVE_RESPONSE_HEADERS } },
+        { description: wire.message, headers: { ...NO_CACHE_HEADERS } },
         { category: 'enterprise-managed-authorization', reason: result.error.reason, detail: result.error }
       );
     }
 
     return new Response(JSON.stringify(result.value), {
-      headers: { 'Content-Type': 'application/json', ...SENSITIVE_RESPONSE_HEADERS },
+      headers: { 'Content-Type': 'application/json', ...NO_CACHE_HEADERS },
     });
   }
 
@@ -3418,7 +3418,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     return new Response(JSON.stringify(response), {
       status: 201,
-      headers: { 'Content-Type': 'application/json', ...SENSITIVE_RESPONSE_HEADERS },
+      headers: { 'Content-Type': 'application/json', ...NO_CACHE_HEADERS },
     });
   }
 
@@ -4061,7 +4061,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   ): Response {
     const { description } = options;
     const responseStatus = options.statusCode ?? 400;
-    const responseHeaders = { ...(options.headers ?? {}), ...SENSITIVE_RESPONSE_HEADERS };
+    const responseHeaders = { ...(options.headers ?? {}), ...NO_CACHE_HEADERS };
 
     // Notify the user of the error and allow them to override the response
     const customErrorResponse = this.options.onError?.({
@@ -4930,7 +4930,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
         // Best-effort revocation — new grant is already stored, don't fail the authorization
       }
 
-      return { redirectTo: redirectUrl.toString(), headers: { ...SENSITIVE_RESPONSE_HEADERS } };
+      return { redirectTo: redirectUrl.toString(), headers: { ...NO_CACHE_HEADERS } };
     } else {
       // Standard authorization code flow
       // Generate an authorization code with embedded user and grant IDs
@@ -4981,7 +4981,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
         // Best-effort revocation — new grant is already stored, don't fail the authorization
       }
 
-      return { redirectTo: redirectUrl.toString(), headers: { ...SENSITIVE_RESPONSE_HEADERS } };
+      return { redirectTo: redirectUrl.toString(), headers: { ...NO_CACHE_HEADERS } };
     }
   }
 
