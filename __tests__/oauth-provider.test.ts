@@ -3594,6 +3594,69 @@ describe('OAuthProvider', () => {
       expect(await response.json<any>()).toMatchObject({ error: 'invalid_client' });
     });
 
+    it('should allow public clients for enterprise-managed authorization when allowPublicClients is enabled', async () => {
+      const publicClientProvider = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        scopesSupported: ['read', 'write', 'profile'],
+        accessTokenTTL: 3600,
+        resourceMetadata: { resource },
+        enterpriseManagedAuthorization: {
+          allowPublicClients: true,
+          trustedIssuers: async () => ({ issuer, jwksUri: `${issuer}/jwks.json`, algorithms: ['RS256'] }),
+          mapClaims: async ({ claims, requestedScope }) => ({
+            userId: `enterprise-${claims.sub}`,
+            scope: requestedScope,
+            metadata: { enterpriseIssuer: claims.iss, enterpriseSubject: claims.sub },
+            props: { enterprise: true, subject: claims.sub, email: claims.email },
+          }),
+        },
+      });
+
+      const publicRegisterResponse = await publicClientProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify({
+            redirect_uris: ['https://public.example.com/callback'],
+            client_name: 'Public Enterprise Client',
+            token_endpoint_auth_method: 'none',
+          })
+        ),
+        mockEnv,
+        mockCtx
+      );
+      const publicClient = await publicRegisterResponse.json<any>();
+      expect(publicClient.client_secret).toBeUndefined();
+
+      const assertion = await createAssertion({ client_id: publicClient.client_id });
+      const params = new URLSearchParams();
+      params.append('grant_type', 'urn:ietf:params:oauth:grant-type:jwt-bearer');
+      params.append('assertion', assertion);
+      params.append('client_id', publicClient.client_id);
+
+      const response = await publicClientProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          params.toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+
+      expect(response.status).toBe(200);
+      const tokenResponse = await response.json<any>();
+      expect(tokenResponse.access_token).toBeDefined();
+      expect(tokenResponse.token_type).toBe('bearer');
+    });
+
     it('should deny issuance when mapClaims returns null', async () => {
       const denyingProvider = new OAuthProvider({
         apiRoute: ['/api/'],

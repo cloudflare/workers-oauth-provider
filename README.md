@@ -390,6 +390,19 @@ Setup:
 
 The AS enforces `resolved.issuer === iss` (confused-deputy guard) and validates ID-JAG `typ`, signature, audience, client binding, resource, `exp` / `iat` / `nbf`, max lifetime, and `jti` replay. Refresh tokens are not issued for this grant — the ID-JAG itself is the renewable assertion.
 
+### Public clients
+
+By default the EMA grant requires client authentication, so public clients (`token_endpoint_auth_method: 'none'`) are rejected. Set `allowPublicClients: true` to also accept them:
+
+```ts
+enterpriseManagedAuthorization: {
+  allowPublicClients: true,
+  // ... trustedIssuers, mapClaims ...
+}
+```
+
+This is useful for clients registered via a [Client ID Metadata Document (CIMD)](https://modelcontextprotocol.io/), which are always public and therefore cannot present a client secret. With this enabled, trust rests on the IdP-issued, signature-verified, short-lived, single-use ID-JAG assertion (audience-, resource-, and client-bound) rather than on a separately presented client secret. Leave it unset (default `false`) to keep the spec-default behavior of requiring client authentication.
+
 Experimental — the MCP extension is still a draft.
 
 ## Custom Error Responses
