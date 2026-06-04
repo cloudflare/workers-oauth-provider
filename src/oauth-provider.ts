@@ -4048,7 +4048,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   ): Response {
     const { description } = options;
     const responseStatus = options.statusCode ?? 400;
-    const responseHeaders = options.headers ?? {};
+    // RFC 6749 §5.2 / OAuth 2.1 §3.2.4 show `Cache-Control: no-store` on error
+    // responses; mirror that so OAuth state isn't cached by intermediaries.
+    // Caller-supplied headers (e.g. Retry-After, WWW-Authenticate) take precedence.
+    const responseHeaders = { ...NO_CACHE_HEADERS, ...(options.headers ?? {}) };
 
     // Notify the user of the error and allow them to override the response
     const customErrorResponse = this.options.onError?.({
