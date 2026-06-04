@@ -250,6 +250,23 @@ export interface EmaOptions<Env = Cloudflare.Env> {
 
   /** Maximum accepted assertion lifetime in seconds. Defaults to 300 seconds. */
   maxAssertionLifetimeSeconds?: number;
+
+  /**
+   * Allow public clients (`token_endpoint_auth_method: 'none'`) to use the
+   * enterprise-managed authorization (ID-JAG) grant.
+   *
+   * Defaults to `false`. By default the EMA grant requires client
+   * authentication, matching the MCP enterprise-managed-authorization draft.
+   *
+   * Set to `true` to also accept public clients on this grant — for example
+   * clients registered via a Client ID Metadata Document (CIMD), which are
+   * always public (`none`) and therefore cannot present a client secret. The
+   * security trade-off is documented in the README: the trust then rests on
+   * the IdP-issued, signature-verified, short-lived, single-use ID-JAG
+   * assertion (audience-, resource-, and client-bound) rather than on a
+   * separately presented client secret.
+   */
+  allowPublicClients?: boolean;
 }
 
 // ─── Internal types (used inside the EMA pipeline) ────────────────────────────

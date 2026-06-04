@@ -2887,7 +2887,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       return this.createErrorResponse('unsupported_grant_type', { description: 'Grant type not supported' });
     }
 
-    if (clientInfo.tokenEndpointAuthMethod === 'none') {
+    // By default the EMA grant requires client authentication (per the MCP
+    // enterprise-managed-authorization draft). Deployers can opt in to also
+    // accepting public clients (e.g. CIMD clients, which are always
+    // `token_endpoint_auth_method: 'none'`) via `allowPublicClients`. In that
+    // case trust rests on the signature-verified, short-lived, single-use
+    // ID-JAG assertion rather than on a separately presented client secret.
+    if (clientInfo.tokenEndpointAuthMethod === 'none' && !enterpriseOptions.allowPublicClients) {
       return this.createErrorResponse('invalid_client', {
         description: 'Enterprise-managed authorization requires client authentication',
         statusCode: 401,
