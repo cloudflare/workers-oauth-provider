@@ -461,6 +461,69 @@ The method processes records in configurable batches (default: 50) to stay withi
 
 Call it repeatedly via a cron trigger — deleted records disappear from KV, so subsequent invocations naturally process fresh records without needing a persisted cursor. The `result.done` field indicates whether the full key space was scanned in this invocation.
 
+## Storage Backends
+
+By default the provider stores clients, grants, and tokens in the `OAUTH_KV`
+namespace — unchanged, and the right choice for most deployments. You can opt
+into a **Hyperdrive (Postgres)** backend via the `storage` option:
+
+```ts
+new OAuthProvider({
+  // ... options ...
+  storage: { type: 'kv' }, // default — behaviour-identical to today
+});
+
+new OAuthProvider({
+  // ... options ...
+  storage: { type: 'hyperdrive', hyperdrive: env.HYPERDRIVE },
+});
+```
+
+### Why you might need it
+
+KV has **no compare-and-swap** and **eventually-consistent reads**. The
+`refresh_token` grant does a read-modify-write of the grant record (rotate the
+refresh token, persist `tokenExchangeCallback` `newProps`). Two concurrent
+refreshes of the same grant — two clients sharing a refresh token, or a client
+retrying a lost response — can read the same grant, both rotate, and the **last
+write wins**, orphaning the other's token. If your `tokenExchangeCallback` also
+redeems a **single-use, rotating upstream** token, this surfaces as a steady
+stream of `invalid_grant`.
+
+Postgres provides **strongly-consistent reads**, so a refresh always reads the
+latest committed grant rotation — removing the stale-read failure mode that KV
+allows. (Fully serializing two concurrent refreshes is a follow-up that layers a
+transactional `SELECT … FOR UPDATE` path on the same table; see
+[`docs/storage-providers.md`](docs/storage-providers.md).)
+
+### Setup
+
+Add the Hyperdrive binding and Node.js compatibility flag to `wrangler.jsonc`:
+
+```jsonc
+{
+  "compatibility_flags": ["nodejs_compat"],
+  "hyperdrive": [{ "binding": "HYPERDRIVE", "id": "<your-hyperdrive-id>" }],
+}
+```
+
+and install the recommended driver:
+
+```sh
+npm i pg@>8.16.3
+```
+
+`pg` is an **optional peer dependency** — it is only imported when the
+Hyperdrive backend is used. Alternatively, inject your own SQL client to control
+the driver/pool:
+
+```ts
+storage: { type: 'hyperdrive', client: myPgClientOrPool }
+```
+
+The table (`oauth_kv` by default; override with `tableName`) is created on first
+use. This backend is opt-in; existing KV deployments are unaffected.
+
 ## Protected Resource Metadata (RFC 9728)
 
 The library automatically serves a `/.well-known/oauth-protected-resource` endpoint. By default, it uses the request origin as the resource identifier and the token endpoint's origin as the authorization server. You can customize this with the `resourceMetadata` option:
