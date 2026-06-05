@@ -162,6 +162,12 @@ const testDefaultHandler = {
   },
 };
 
+// Asserts a response carries the RFC 6749 §5.1 no-cache headers
+function expectNoCacheHeaders(response: Response): void {
+  expect(response.headers.get('Cache-Control')).toBe('no-store');
+  expect(response.headers.get('Pragma')).toBe('no-cache');
+}
+
 // Helper function to create mock requests
 function createMockRequest(
   url: string,
@@ -3341,7 +3347,6 @@ describe('OAuthProvider', () => {
       );
 
       expect(response.status).toBe(400);
-      expect(response.headers.get('Cache-Control')).toBe('no-store');
       expect(await response.json<any>()).toMatchObject({ error: 'invalid_grant' });
     });
 
@@ -5458,6 +5463,151 @@ describe('OAuthProvider', () => {
       expect(tokenResponse.status).toBe(400);
       const error = await tokenResponse.json<any>();
       expect(error.error).toBe('invalid_target');
+    });
+  });
+
+  describe('Sensitive response cache headers (RFC 6749 §5.1)', () => {
+    async function registerClient(): Promise<{ client: any; response: Response }> {
+      const response = await oauthProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify({
+            redirect_uris: ['https://client.example.com/callback'],
+            client_name: 'Cache Header Test Client',
+            token_endpoint_auth_method: 'client_secret_basic',
+          })
+        ),
+        mockEnv,
+        mockCtx
+      );
+
+      return { client: await response.json<any>(), response };
+    }
+
+    async function authorize(clientId: string): Promise<{ code: string; response: Response; redirectUri: string }> {
+      const redirectUri = 'https://client.example.com/callback';
+      const authUrl = new URL('https://example.com/authorize');
+      authUrl.searchParams.set('response_type', 'code');
+      authUrl.searchParams.set('client_id', clientId);
+      authUrl.searchParams.set('redirect_uri', redirectUri);
+      authUrl.searchParams.set('scope', 'read write');
+      authUrl.searchParams.set('state', 'state-123');
+
+      const response = await oauthProvider.fetch(createMockRequest(authUrl.toString()), mockEnv, mockCtx);
+      const location = response.headers.get('Location');
+      expect(location).toBeTruthy();
+      const code = new URL(location!).searchParams.get('code');
+      expect(code).toBeTruthy();
+
+      return { code: code!, response, redirectUri };
+    }
+
+    async function exchangeAuthorizationCode(client: any): Promise<{ tokens: any; response: Response }> {
+      const { code, redirectUri } = await authorize(client.client_id);
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', client.client_id);
+      params.append('client_secret', client.client_secret);
+
+      const response = await oauthProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          params.toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+
+      expect(response.status).toBe(200);
+      return { tokens: await response.json<any>(), response };
+    }
+
+    it('adds no-store and no-cache to dynamic client registration responses', async () => {
+      const { client, response } = await registerClient();
+
+      expect(client.client_secret).toBeDefined();
+      expectNoCacheHeaders(response);
+    });
+
+    it('adds no-store and no-cache to authorization code token responses', async () => {
+      const { client } = await registerClient();
+      const { tokens, response } = await exchangeAuthorizationCode(client);
+
+      expect(tokens.access_token).toBeDefined();
+      expect(tokens.refresh_token).toBeDefined();
+      expectNoCacheHeaders(response);
+    });
+
+    it('adds no-store and no-cache to refresh token responses', async () => {
+      const { client } = await registerClient();
+      const { tokens } = await exchangeAuthorizationCode(client);
+      const params = new URLSearchParams();
+      params.append('grant_type', 'refresh_token');
+      params.append('refresh_token', tokens.refresh_token);
+      params.append('client_id', client.client_id);
+      params.append('client_secret', client.client_secret);
+
+      const response = await oauthProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          params.toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+
+      expect(response.status).toBe(200);
+      expectNoCacheHeaders(response);
+    });
+
+    it('adds no-store and no-cache to token exchange responses', async () => {
+      const { client } = await registerClient();
+      const { tokens } = await exchangeAuthorizationCode(client);
+      const params = new URLSearchParams();
+      params.append('grant_type', 'urn:ietf:params:oauth:grant-type:token-exchange');
+      params.append('subject_token', tokens.access_token);
+      params.append('subject_token_type', 'urn:ietf:params:oauth:token-type:access_token');
+      params.append('requested_token_type', 'urn:ietf:params:oauth:token-type:access_token');
+      params.append('client_id', client.client_id);
+      params.append('client_secret', client.client_secret);
+
+      const response = await oauthProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          params.toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+
+      expect(response.status).toBe(200);
+      expectNoCacheHeaders(response);
+    });
+
+    it('adds no-store and no-cache to token endpoint error responses', async () => {
+      const response = await oauthProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          'grant_type=authorization_code&code=invalid'
+        ),
+        mockEnv,
+        mockCtx
+      );
+
+      expect(response.status).toBe(401);
+      expectNoCacheHeaders(response);
     });
   });
 
