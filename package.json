@@ -41,13 +41,5 @@
   "bugs": {
     "url": "https://github.com/cloudflare/workers-oauth-provider/issues"
   },
-  "homepage": "https://github.com/cloudflare/workers-oauth-provider#readme",
-  "peerDependencies": {
-    "pg": ">=8.16.3"
-  },
-  "peerDependenciesMeta": {
-    "pg": {
-      "optional": true
-    }
-  }
+  "homepage": "https://github.com/cloudflare/workers-oauth-provider#readme"
 }

@@ -37,10 +37,15 @@ export type {
 export type { EmaValidationError } from './ema/result';
 
 import { resolveStorage } from './storage';
-import type { OAuthStorage, StorageConfig } from './storage';
+import type { OAuthStorage } from './storage';
 
-export { KvStorage, HyperdriveStorage } from './storage';
-export type { OAuthStorage, StorageConfig, SqlClient, HyperdriveLike } from './storage';
+export { KvStorage } from './storage';
+export type {
+  OAuthStorage,
+  StorageListOptions,
+  StorageListResult,
+  StoragePutOptions,
+} from './storage';
 
 const PROTECTED_RESOURCE_WELL_KNOWN_PREFIX = '/.well-known/oauth-protected-resource';
 const NO_CACHE_HEADERS = { 'Cache-Control': 'no-store', Pragma: 'no-cache' } as const;
@@ -450,18 +455,16 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
   /**
    * Storage backend for clients, grants, and tokens.
    *
-   * Defaults to `{ type: 'kv' }` — behaviour-identical to today, backed by the
-   * `OAUTH_KV` namespace.
+   * Defaults to Workers KV (`env.OAUTH_KV`) — behaviour-identical to today.
    *
-   * `{ type: 'hyperdrive', hyperdrive: env.HYPERDRIVE }` opts into a Postgres
-   * backend reached through a Cloudflare Hyperdrive binding. Postgres provides
-   * strongly-consistent reads (which KV does not), so a refresh always reads
-   * the latest committed grant rotation. You may instead inject your own SQL
-   * `client` to control the driver/pool.
+   * To use any other backend (Postgres via Hyperdrive, D1, a test double, …)
+   * implement the small {@link OAuthStorage} interface and pass an instance
+   * here. In module-scope Workers, create it with `env` imported from
+   * `cloudflare:workers`.
    *
-   * See docs/storage-providers.md.
+   * See docs/storage-providers.md for a worked Postgres example.
    */
-  storage?: StorageConfig;
+  storage?: OAuthStorage;
 
   /**
    * Optional metadata for RFC 9728 OAuth 2.0 Protected Resource Metadata.

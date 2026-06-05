@@ -1,53 +1,50 @@
 /**
- * Storage provider factory.
+ * Storage resolution.
  *
- * Resolves the configured backend from `OAuthProviderOptions.storage` and the
- * request `env`. The KV namespace/index binding is `env.OAUTH_KV`.
+ * Resolves the `storage` option into an {@link OAuthStorage} for a request.
+ * Defaults to Workers KV (`env.OAUTH_KV`), behaviour-identical to before.
  */
 
-import { HyperdriveStorage } from './hyperdrive';
 import { KvStorage } from './kv';
-import type { OAuthStorage, StorageConfig } from './types';
+import type { OAuthStorage } from './types';
 
 export { KvStorage } from './kv';
-export { HyperdriveStorage } from './hyperdrive';
 export type {
   OAuthStorage,
-  StorageConfig,
-  SqlClient,
-  SqlQueryResult,
-  HyperdriveLike,
+  StorageListKey,
   StorageListOptions,
   StorageListResult,
   StoragePutOptions,
 } from './types';
 
-/** Hardcoded KV binding name. */
+/** Hardcoded default KV binding name. */
 const KV_BINDING = 'OAUTH_KV';
 
+/** Per-`env` memoization for the default KV wrapper. */
+const defaultKvCache = new WeakMap<object, OAuthStorage>();
+
 /**
- * Build an {@link OAuthStorage} for this request from config + env.
+ * Resolve {@link OAuthStorage} for this request.
  *
- * Defaults to KV (behaviour-identical to today). When `hyperdrive` is selected,
- * uses the provided Hyperdrive binding (or injected `client`) to talk to
- * Postgres.
+ * - `storage` option → use the provided storage instance directly.
+ * - No `storage` option → default KV provider over `env.OAUTH_KV`.
  */
-export function resolveStorage(config: StorageConfig | undefined, env: any): OAuthStorage {
-  if (!config || config.type === 'kv') {
-    const kv = env?.[KV_BINDING] as KVNamespace | undefined;
-    if (!kv) {
-      throw new TypeError(`OAuth storage requires the '${KV_BINDING}' KV namespace binding.`);
-    }
-    return new KvStorage(kv);
+export function resolveStorage(storage: OAuthStorage | undefined, env: any): OAuthStorage {
+  if (storage) return storage;
+
+  const key = (env ?? {}) as object;
+  const cached = defaultKvCache.get(key);
+  if (cached) return cached;
+
+  const kv = env?.[KV_BINDING] as KVNamespace | undefined;
+  if (!kv) {
+    throw new TypeError(
+      `OAuth storage requires the '${KV_BINDING}' KV namespace binding, ` +
+        `or pass a 'storage' provider in the OAuthProvider options.`
+    );
   }
 
-  if (config.type === 'hyperdrive') {
-    return new HyperdriveStorage({
-      hyperdrive: config.hyperdrive,
-      client: config.client,
-      tableName: config.tableName,
-    });
-  }
-
-  throw new TypeError(`Unknown storage.type: ${(config as { type: string }).type}`);
+  const resolved = new KvStorage(kv);
+  defaultKvCache.set(key, resolved);
+  return resolved;
 }

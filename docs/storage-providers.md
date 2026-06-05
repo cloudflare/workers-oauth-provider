@@ -1,41 +1,40 @@
-# Pluggable storage providers (KV default, Hyperdrive/Postgres opt-in)
+# Storage providers
 
-> Status: **draft / RFC**. The KV provider is the default and behaviour-identical
-> to today. The Hyperdrive (Postgres) provider is opt-in and exists to fix a
-> class of correctness bugs that KV cannot.
+The OAuth provider persists clients, grants, and tokens through a small
+`OAuthStorage` interface. By default it uses Workers KV (`env.OAUTH_KV`),
+unchanged. To use another backend — Postgres via Hyperdrive, D1, Durable
+Objects, a test double — implement the interface and pass an instance as
+`storage`.
 
-## Why
+## The blessed setup
 
-The provider stores three kinds of records in `OAUTH_KV`:
+Use the canonical module-scope Worker export, and import bindings with
+`cloudflare:workers` when you need them at construction time:
 
-| Record | Key shape                            | Access pattern                         |
-| ------ | ------------------------------------ | -------------------------------------- |
-| client | `client:{clientId}`                  | read-heavy, rare writes                |
-| grant  | `grant:{userId}:{grantId}`           | **read-modify-write** on every refresh |
-| token  | `token:{userId}:{grantId}:{tokenId}` | write on issue, read on validate       |
+```ts
+import { env } from 'cloudflare:workers';
+import { OAuthProvider } from '@cloudflare/workers-oauth-provider';
+import { PostgresStorage } from './postgres-storage';
 
-The `refresh_token` grant does a **read-modify-write** of the grant record
-(rotate refresh token, persist callback `newProps`). KV has:
+export default new OAuthProvider({
+  apiRoute: '/mcp',
+  apiHandler: MyApiHandler,
+  defaultHandler: MyAuthHandler,
+  authorizeEndpoint: '/authorize',
+  tokenEndpoint: '/token',
 
-- **no compare-and-swap**, and
-- **eventually-consistent reads**.
+  storage: new PostgresStorage(env.HYPERDRIVE),
+});
+```
 
-So two concurrent refreshes of the same grant — two MCP sessions sharing one
-refresh token, or a client retrying a lost response — can read the same grant,
-both rotate, and the **last write wins**, orphaning the other's token. When the
-provider's `tokenExchangeCallback` also redeems a **single-use, rotating
-upstream** refresh token (i.e. the Worker is itself an OAuth client), this
-surfaces as a steady stream of `invalid_grant`.
+If you omit `storage`, the provider keeps using `env.OAUTH_KV`.
 
-## Approach: a pluggable storage interface
-
-We introduce a small `OAuthStorage` interface that mirrors the **subset of the
-KV API** the provider already uses, so existing call sites change only from
-`env.OAUTH_KV` to `getStorage(env)`:
+## The interface
 
 ```ts
 interface OAuthStorage {
-  get(key: string, opts?: { type: 'json' }): Promise<any>;
+  get(key: string): Promise<string | null>;
+  get(key: string, opts: { type: 'json' }): Promise<any | null>;
   put(key: string, value: string, opts?: { expirationTtl?: number; expiration?: number }): Promise<void>;
   delete(key: string): Promise<void>;
   list(opts: { prefix: string; limit?: number; cursor?: string }): Promise<{
@@ -46,112 +45,166 @@ interface OAuthStorage {
 }
 ```
 
-- `KvStorage` — thin pass-through to `env.OAUTH_KV` (default; zero behaviour change).
-- `HyperdriveStorage` — Postgres reached through a Cloudflare Hyperdrive binding.
+Semantics match the subset of Workers KV the provider already used:
 
-## Hyperdrive / Postgres provider
+- `get(key, { type: 'json' })` parses JSON and returns `null` when absent or
+  expired.
+- `put` honours `expirationTtl` (relative seconds) or `expiration` (absolute Unix
+  seconds); expired entries must not be returned by `get`/`list`.
+- `list` is prefix-scoped and cursor-paginated.
 
-Postgres gives **strongly-consistent reads**: a refresh that reads a grant
-always observes the latest committed rotation. That removes the
-eventually-consistent half of the problem outright — the failure mode where a
-refresh reads a _stale_ grant simply cannot happen.
+The provider only uses these key shapes, so one key/value table or namespace is
+enough:
 
-Data model is one KV-shaped table, so the provider's existing key conventions
-work unchanged:
-
-```sql
-CREATE TABLE oauth_kv (
-  key        TEXT PRIMARY KEY,
-  value      TEXT   NOT NULL,
-  expires_at BIGINT          -- Unix seconds, NULL = no expiry
-);
+```
+client:{clientId}
+grant:{userId}:{grantId}
+token:{userId}:{grantId}:{tokenId}
 ```
 
-- `get` — `SELECT … WHERE key = $1`, lazily reaping expired rows.
-- `put` — `INSERT … ON CONFLICT (key) DO UPDATE` (upsert).
-- `delete` — `DELETE … WHERE key = $1`.
-- `list` — `WHERE key LIKE $1 … ORDER BY key LIMIT … OFFSET …`, cursor =
-  numeric offset, matching KV's prefix + pagination semantics.
+## Worked example: Postgres via Hyperdrive
 
-### Driver
-
-`HyperdriveStorage` lazily imports **`node-postgres` (`pg`)** — the
-Hyperdrive-recommended driver — only on this path, so KV-only consumers don't
-pull it in. `pg` is an **optional peer dependency**. Alternatively, inject your
-own `client` (any `{ query(text, params) }`) to control the driver/pool, which
-is also how the tests run without a live database.
-
-### Follow-up: fully serialized rotation
-
-Strong reads remove the stale-read race. To _also_ serialize two refreshes that
-read concurrently, a follow-up can add a transactional path:
-
-```sql
-BEGIN;
-SELECT value FROM oauth_kv WHERE key = $1 FOR UPDATE;  -- row lock
--- rotate in app code …
-UPDATE oauth_kv SET value = $2, expires_at = $3 WHERE key = $1;
-COMMIT;
-```
-
-This needs the provider to expose the grant read-modify-write as a single
-transactional unit (it currently does a separate `get` then `put`). Tracked
-separately; this PR lays the storage seam it builds on.
-
-## Configuration
+This is intentionally just example code. The OAuth provider does not ship a
+Postgres dependency or built-in Hyperdrive backend.
 
 ```ts
-new OAuthProvider({
-  // default — unchanged, behaviour-identical to today:
-  storage: { type: 'kv' },
-});
+import { Client } from 'pg';
+import type { OAuthStorage } from '@cloudflare/workers-oauth-provider';
 
-new OAuthProvider({
-  storage: { type: 'hyperdrive', hyperdrive: env.HYPERDRIVE },
-  // or inject your own driver/pool:
-  // storage: { type: 'hyperdrive', client: myPgClient },
-  // optional: storage: { type: 'hyperdrive', hyperdrive: env.HYPERDRIVE, tableName: 'oauth_kv' },
-});
-```
+// CREATE TABLE oauth_kv (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires_at BIGINT);
 
-`wrangler.jsonc`:
+export class PostgresStorage implements OAuthStorage {
+  #connStr: string;
+  #client?: Promise<Client>;
 
-```jsonc
-{
-  "compatibility_flags": ["nodejs_compat"],
-  "hyperdrive": [{ "binding": "HYPERDRIVE", "id": "<your-hyperdrive-id>" }],
+  constructor(hyperdrive: { connectionString: string }) {
+    this.#connStr = hyperdrive.connectionString;
+  }
+
+  #db() {
+    if (!this.#client) {
+      this.#client = (async () => {
+        const c = new Client({ connectionString: this.#connStr });
+        await c.connect();
+        return c;
+      })();
+    }
+    return this.#client;
+  }
+
+  async get(key: string): Promise<string | null>;
+  async get(key: string, opts: { type: 'json' }): Promise<any | null>;
+  async get(key: string, opts?: { type: 'json' }) {
+    const db = await this.#db();
+    const now = Math.floor(Date.now() / 1000);
+    const { rows } = await db.query(
+      'SELECT value FROM oauth_kv WHERE key = $1 AND (expires_at IS NULL OR expires_at > $2)',
+      [key, now]
+    );
+    if (!rows[0]) return null;
+    return opts?.type === 'json' ? JSON.parse(rows[0].value) : rows[0].value;
+  }
+
+  async put(key: string, value: string, opts?: { expirationTtl?: number; expiration?: number }) {
+    const db = await this.#db();
+    const now = Math.floor(Date.now() / 1000);
+    const expiresAt = opts?.expiration ?? (opts?.expirationTtl != null ? now + opts.expirationTtl : null);
+    await db.query(
+      `INSERT INTO oauth_kv (key, value, expires_at) VALUES ($1, $2, $3)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, expires_at = EXCLUDED.expires_at`,
+      [key, value, expiresAt]
+    );
+  }
+
+  async delete(key: string) {
+    const db = await this.#db();
+    await db.query('DELETE FROM oauth_kv WHERE key = $1', [key]);
+  }
+
+  async list(opts: { prefix: string; limit?: number; cursor?: string }) {
+    const db = await this.#db();
+    const now = Math.floor(Date.now() / 1000);
+    const limit = opts.limit ?? 1000;
+    const offset = opts.cursor ? parseInt(opts.cursor, 10) || 0 : 0;
+    const like = opts.prefix.replace(/([%_\\])/g, '\\$1') + '%';
+    const { rows } = await db.query(
+      `SELECT key FROM oauth_kv
+       WHERE key LIKE $1 ESCAPE '\\' AND (expires_at IS NULL OR expires_at > $2)
+       ORDER BY key LIMIT $3 OFFSET $4`,
+      [like, now, limit + 1, offset]
+    );
+    const hasMore = rows.length > limit;
+    return {
+      keys: rows.slice(0, limit).map((r: { key: string }) => ({ name: r.key })),
+      list_complete: !hasMore,
+      cursor: hasMore ? String(offset + limit) : undefined,
+    };
+  }
 }
 ```
 
-and install the driver: `npm i pg@>8.16.3`.
+Usage:
 
-## Migration / rollout
+```ts
+import { env } from 'cloudflare:workers';
+import { OAuthProvider } from '@cloudflare/workers-oauth-provider';
+import { PostgresStorage } from './postgres-storage';
 
-- Opt-in only. Existing deployments keep `type: 'kv'` and are untouched.
-- New deployments (or those hitting the refresh race) set
-  `type: 'hyperdrive'`, add the binding + `nodejs_compat`, install `pg`.
-- The table is created on first use (`CREATE TABLE IF NOT EXISTS`); a future
-  helper can import existing KV grants on first touch.
+export default new OAuthProvider({
+  // …
+  storage: new PostgresStorage(env.HYPERDRIVE),
+});
+```
 
----
+## Why use a strongly-consistent store?
 
-## Appendix: parked alternative — single-threaded Durable Object
+KV has no compare-and-swap and has eventually-consistent reads. During a
+`refresh_token` exchange, two concurrent refreshes of the same grant can read the
+same old grant, both rotate, and the last write wins. If your callback also
+redeems a single-use upstream refresh token, this can surface as `invalid_grant`.
 
-An earlier draft backed the store with a **partitioned, single-threaded SQLite
-Durable Object** (one instance per user; KV as a cross-partition index). A DO is
-single-threaded per instance, so routing every operation for a grant to one
-instance fully serializes the read-modify-write — fixing the race directly
-rather than only removing stale reads.
+Postgres gives strongly-consistent reads, so a refresh sees the latest committed
+grant rotation and avoids the stale-read class of failures.
 
-It was parked in favour of Hyperdrive because:
+## Migration guide
 
-- Many deployments already have/ want a Postgres system of record; Hyperdrive
-  reuses it rather than introducing a second stateful primitive.
-- No partition-vs-throughput tradeoff to reason about (a single global DO caps
-  at one instance's throughput; partitioning adds a cross-partition index).
-- Simpler operational model: one connection string, standard SQL tooling.
+Existing deployments need no changes — KV remains the default.
 
-The DO design (partitioning by user, KV-as-index for `list`/purge) remains a
-viable path if a Postgres dependency is undesirable, and is preserved in the
-project history. The two share the same `OAuthStorage` seam, so either can be
-added without touching provider logic.
+To move to a custom backend:
+
+1. Implement `OAuthStorage` for your backend.
+2. Import `env` from `cloudflare:workers` in your Worker module.
+3. Pass an instance: `storage: new MyStorage(env.MY_BINDING)`.
+4. Backfill if needed. Key shapes are unchanged, so KV entries can be copied
+   verbatim into a single key/value table, or you can write a temporary dual-read
+   storage wrapper during cutover.
+
+### Migrating from per-request construction
+
+If you currently construct the provider inside `fetch`:
+
+```ts
+export default {
+  fetch(request, env, ctx) {
+    return new OAuthProvider({
+      /* options */
+      storage: new MyStorage(env.MY_BINDING),
+    }).fetch(request, env, ctx);
+  },
+};
+```
+
+prefer the module-scope singleton:
+
+```ts
+import { env } from 'cloudflare:workers';
+
+export default new OAuthProvider({
+  /* options */
+  storage: new MyStorage(env.MY_BINDING),
+});
+```
+
+Handlers still receive the per-request `(request, env, ctx)` arguments. The
+storage object should open connections lazily in its methods, not perform I/O in
+its constructor.
