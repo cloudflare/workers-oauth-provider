@@ -3,16 +3,14 @@
 The OAuth provider persists clients, grants, and tokens through a small
 `OAuthStorage` interface. By default it uses Workers KV (`env.OAUTH_KV`),
 unchanged. To use another backend — Postgres via Hyperdrive, D1, Durable
-Objects, a test double — implement the interface and pass an instance as
-`storage`.
+Objects, a test double — implement the interface and pass a **storage factory**.
 
 ## The blessed setup
 
-Use the canonical module-scope Worker export, and import bindings with
-`cloudflare:workers` when you need them at construction time:
+Use the canonical module-scope Worker export. Custom storage is configured as a
+factory that receives the Worker `env` at request time:
 
 ```ts
-import { env } from 'cloudflare:workers';
 import { OAuthProvider } from '@cloudflare/workers-oauth-provider';
 import { PostgresStorage } from './postgres-storage';
 
@@ -23,11 +21,17 @@ export default new OAuthProvider({
   authorizeEndpoint: '/authorize',
   tokenEndpoint: '/token',
 
-  storage: new PostgresStorage(env.HYPERDRIVE),
+  storage: (env) => new PostgresStorage(env.HYPERDRIVE),
 });
 ```
 
 If you omit `storage`, the provider keeps using `env.OAUTH_KV`.
+
+The factory shape is deliberate: it avoids relying on top-level `env` imports and
+works the same way for module-scope exports, per-request construction, tests, and
+non-Worker-ish environments. The factory is resolved lazily and memoized by
+factory+env. Storage constructors should avoid I/O; open connections lazily in
+methods.
 
 ## The interface
 
@@ -146,13 +150,12 @@ export class PostgresStorage implements OAuthStorage {
 Usage:
 
 ```ts
-import { env } from 'cloudflare:workers';
 import { OAuthProvider } from '@cloudflare/workers-oauth-provider';
 import { PostgresStorage } from './postgres-storage';
 
 export default new OAuthProvider({
   // …
-  storage: new PostgresStorage(env.HYPERDRIVE),
+  storage: (env) => new PostgresStorage(env.HYPERDRIVE),
 });
 ```
 
@@ -173,9 +176,8 @@ Existing deployments need no changes — KV remains the default.
 To move to a custom backend:
 
 1. Implement `OAuthStorage` for your backend.
-2. Import `env` from `cloudflare:workers` in your Worker module.
-3. Pass an instance: `storage: new MyStorage(env.MY_BINDING)`.
-4. Backfill if needed. Key shapes are unchanged, so KV entries can be copied
+2. Pass a factory: `storage: (env) => new MyStorage(env.MY_BINDING)`.
+3. Backfill if needed. Key shapes are unchanged, so KV entries can be copied
    verbatim into a single key/value table, or you can write a temporary dual-read
    storage wrapper during cutover.
 
@@ -188,7 +190,7 @@ export default {
   fetch(request, env, ctx) {
     return new OAuthProvider({
       /* options */
-      storage: new MyStorage(env.MY_BINDING),
+      storage: (env) => new MyStorage(env.MY_BINDING),
     }).fetch(request, env, ctx);
   },
 };
@@ -197,14 +199,11 @@ export default {
 prefer the module-scope singleton:
 
 ```ts
-import { env } from 'cloudflare:workers';
-
 export default new OAuthProvider({
   /* options */
-  storage: new MyStorage(env.MY_BINDING),
+  storage: (env) => new MyStorage(env.MY_BINDING),
 });
 ```
 
 Handlers still receive the per-request `(request, env, ctx)` arguments. The
-storage object should open connections lazily in its methods, not perform I/O in
-its constructor.
+storage factory receives the same `env` when storage is first needed.

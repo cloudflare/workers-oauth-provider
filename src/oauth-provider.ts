@@ -37,11 +37,12 @@ export type {
 export type { EmaValidationError } from './ema/result';
 
 import { resolveStorage } from './storage';
-import type { OAuthStorage } from './storage';
+import type { OAuthStorage, StorageProvider } from './storage';
 
 export { KvStorage } from './storage';
 export type {
   OAuthStorage,
+  StorageProvider,
   StorageListOptions,
   StorageListResult,
   StoragePutOptions,
@@ -458,13 +459,13 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
    * Defaults to Workers KV (`env.OAUTH_KV`) — behaviour-identical to today.
    *
    * To use any other backend (Postgres via Hyperdrive, D1, a test double, …)
-   * implement the small {@link OAuthStorage} interface and pass an instance
-   * here. In module-scope Workers, create it with `env` imported from
-   * `cloudflare:workers`.
+   * implement the small {@link OAuthStorage} interface and pass a factory here.
+   * The factory receives the Worker `env` at request time and its result is
+   * memoized by factory+env.
    *
    * See docs/storage-providers.md for a worked Postgres example.
    */
-  storage?: OAuthStorage;
+  storage?: StorageProvider<Env>;
 
   /**
    * Optional metadata for RFC 9728 OAuth 2.0 Protected Resource Metadata.
@@ -3625,7 +3626,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
   /**
    * Resolve the configured storage backend for this request's `env`.
-   * Defaults to KV; opt into Hyperdrive (Postgres) via `options.storage`.
+   * Defaults to KV; custom backends are provided via `options.storage`.
    */
   public getStorage(env: any): OAuthStorage {
     return resolveStorage(this.options.storage, env);

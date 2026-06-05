@@ -6,14 +6,12 @@ Add a pluggable storage provider interface via the `storage` option.
 
 By default, the provider still uses the `OAUTH_KV` namespace exactly as before.
 Custom backends now implement the small KV-shaped `OAuthStorage` interface and
-are passed as an instance:
+are passed as a factory that receives the Worker `env`:
 
 ```ts
-import { env } from 'cloudflare:workers';
-
 export default new OAuthProvider({
   // ...
-  storage: new MyStorage(env.MY_BINDING),
+  storage: (env) => new MyStorage(env.MY_BINDING),
 });
 ```
 

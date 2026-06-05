@@ -466,17 +466,20 @@ Call it repeatedly via a cron trigger — deleted records disappear from KV, so 
 By default the provider stores clients, grants, and tokens in the `OAUTH_KV`
 namespace — unchanged, and the right choice for most deployments. To use any
 other backend (Postgres via Hyperdrive, D1, Durable Objects, a test double, …)
-implement the small `OAuthStorage` interface and pass an instance as `storage`:
+implement the small `OAuthStorage` interface and pass a factory as `storage`:
 
 ```ts
-import { env } from 'cloudflare:workers';
 import { OAuthProvider } from '@cloudflare/workers-oauth-provider';
 
 export default new OAuthProvider({
   // ... options ...
-  storage: new PostgresStorage(env.HYPERDRIVE),
+  storage: (env) => new PostgresStorage(env.HYPERDRIVE),
 });
 ```
+
+The factory receives the Worker `env` at request time and is memoized by
+factory+env. This works with the canonical module-scope `export default new
+OAuthProvider(...)` pattern without relying on top-level `env` imports.
 
 The interface mirrors the subset of the KV API the provider uses, so a single
 key/value table or namespace is enough:
@@ -509,8 +512,7 @@ Hyperdrive) removes the stale-read failure mode.
 
 See [`docs/storage-providers.md`](docs/storage-providers.md) for a complete
 Postgres/Hyperdrive `OAuthStorage` example and a migration guide, including how
-to move from per-request construction to the module-scope singleton using
-`import { env } from 'cloudflare:workers'`.
+to move from per-request construction to the module-scope singleton.
 
 ## Protected Resource Metadata (RFC 9728)
 

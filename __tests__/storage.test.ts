@@ -125,12 +125,38 @@ describe('resolveStorage', () => {
     expect(() => resolveStorage(undefined, {})).toThrow(/OAUTH_KV/);
   });
 
-  it('accepts a concrete OAuthStorage instance', () => {
-    const mem = new MemoryStorage();
-    expect(resolveStorage(mem, { OAUTH_KV: makeKv() })).toBe(mem);
+  it('accepts a factory and calls it with env', () => {
+    const env = { MY_BINDING: 'x' };
+    let seen: any;
+    const s = resolveStorage((e: any) => {
+      seen = e;
+      return new MemoryStorage();
+    }, env);
+    expect(s).toBeInstanceOf(MemoryStorage);
+    expect(seen).toBe(env);
   });
 
-  it('memoizes only the default KV wrapper per env', () => {
+  it('memoizes custom storage by factory and env', () => {
+    const env = { OAUTH_KV: makeKv() };
+    let calls = 0;
+    const provider = () => {
+      calls++;
+      return new MemoryStorage();
+    };
+    const a = resolveStorage(provider, env);
+    const b = resolveStorage(provider, env);
+    expect(a).toBe(b);
+    expect(calls).toBe(1);
+  });
+
+  it('does not share memoized storage across different factories', () => {
+    const env = { OAUTH_KV: makeKv() };
+    const a = resolveStorage(() => new MemoryStorage(), env);
+    const b = resolveStorage(() => new MemoryStorage(), env);
+    expect(a).not.toBe(b);
+  });
+
+  it('memoizes the default KV wrapper per env', () => {
     const env = { OAUTH_KV: makeKv() };
     const a = resolveStorage(undefined, env);
     const b = resolveStorage(undefined, env);

@@ -4,18 +4,20 @@
  * The provider persists clients, grants, and tokens through this small
  * interface. By default it uses Workers KV (`env.OAUTH_KV`), unchanged. To use
  * any other backend (Postgres via Hyperdrive, D1, Durable Objects, a test
- * double, …) you implement `OAuthStorage` and pass it as `storage`.
+ * double, …) implement `OAuthStorage` and pass a storage factory.
  *
- * You pass an `OAuthStorage` **instance**. Build it with the Worker `env`
- * imported from `cloudflare:workers`, which is available at module scope:
+ * The factory receives the Worker `env` at request time:
  *
  * ```ts
- * import { env } from 'cloudflare:workers';
- *
  * export default new OAuthProvider({
- *   storage: new MyStorage(env.MY_BINDING),
+ *   storage: (env) => new MyStorage(env.MY_BINDING),
  * });
  * ```
+ *
+ * This is the single supported custom-storage shape. It works for the
+ * module-scope `export default new OAuthProvider(...)` pattern, per-request
+ * construction, tests, and non-Worker-ish environments without relying on a
+ * top-level `env` import.
  *
  * The interface intentionally mirrors the *subset* of the Workers KV API the
  * provider already used, so implementations are small and the semantics are
@@ -71,4 +73,11 @@ export interface OAuthStorage {
   list(options: StorageListOptions): Promise<StorageListResult>;
 }
 
-
+/**
+ * Builds a storage backend from the Worker `env`.
+ *
+ * The provider calls this lazily when storage is first needed and memoizes the
+ * result by factory+env. Constructors should avoid I/O; open connections lazily
+ * inside storage methods.
+ */
+export type StorageProvider<Env = any> = (env: Env) => OAuthStorage;
