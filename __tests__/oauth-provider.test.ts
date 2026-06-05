@@ -1708,7 +1708,8 @@ describe('OAuthProvider', () => {
       const grantKey = grantEntries.keys[0].name;
       const grant = await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' });
 
-      expect(grant.authCodeId).toBeUndefined(); // Auth code should be removed
+      expect(grant.authCodeId).toBeDefined(); // Auth code hash should be retained
+      expect(grant.authCodeWrappedKey).toBeUndefined(); // Wrapped key removed marks code as used
       expect(grant.refreshTokenId).toBeDefined(); // Refresh token should be added
     });
 
@@ -1779,6 +1780,90 @@ describe('OAuthProvider', () => {
       // Verify the grant itself was also revoked
       const grantsAfter = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
       expect(grantsAfter.keys.length).toBe(0);
+    });
+
+    it('should not act on a grant when an unmatched code is submitted by another client', async () => {
+      // Legitimate client obtains an auth code and exchanges it for tokens
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123`
+      );
+
+      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const location = authResponse.headers.get('Location')!;
+      const url = new URL(location);
+      const code = url.searchParams.get('code')!;
+
+      const params1 = new URLSearchParams();
+      params1.append('grant_type', 'authorization_code');
+      params1.append('code', code);
+      params1.append('redirect_uri', redirectUri);
+      params1.append('client_id', clientId);
+      params1.append('client_secret', clientSecret);
+
+      const tokenRequest1 = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params1.toString()
+      );
+
+      const tokenResponse1 = await oauthProvider.fetch(tokenRequest1, mockEnv, mockCtx);
+      expect(tokenResponse1.status).toBe(200);
+
+      // Tokens and grant exist after the legitimate exchange
+      const tokensBefore = await mockEnv.OAUTH_KV.list({ prefix: 'token:' });
+      expect(tokensBefore.keys.length).toBe(1);
+      const grantsBefore = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      expect(grantsBefore.keys.length).toBe(1);
+
+      // Derive the userId:grantId prefix the way it is exposed in any issued token
+      const [userId, grantId] = code.split(':');
+
+      // Register a second, unrelated client
+      const otherClientData = {
+        redirect_uris: ['https://other.example.com/callback'],
+        client_name: 'Other Client',
+        token_endpoint_auth_method: 'client_secret_basic',
+      };
+      const otherRegisterRequest = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify(otherClientData)
+      );
+      const otherRegisterResponse = await oauthProvider.fetch(otherRegisterRequest, mockEnv, mockCtx);
+      const otherClient = await otherRegisterResponse.json<any>();
+
+      // The other client submits a fabricated code that only shares the
+      // userId:grantId prefix; the secret part does not match the real code
+      const forgedCode = `${userId}:${grantId}:not-the-real-secret`;
+      const params2 = new URLSearchParams();
+      params2.append('grant_type', 'authorization_code');
+      params2.append('code', forgedCode);
+      params2.append('redirect_uri', 'https://other.example.com/callback');
+      params2.append('client_id', otherClient.client_id);
+      params2.append('client_secret', otherClient.client_secret);
+
+      const tokenRequest2 = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params2.toString()
+      );
+
+      const tokenResponse2 = await oauthProvider.fetch(tokenRequest2, mockEnv, mockCtx);
+      expect(tokenResponse2.status).toBe(400);
+      const error = await tokenResponse2.json<any>();
+      expect(error.error).toBe('invalid_grant');
+      expect(error.error_description).toBe('Invalid authorization code');
+
+      // The legitimate grant and tokens must be untouched
+      const tokensAfter = await mockEnv.OAUTH_KV.list({ prefix: 'token:' });
+      expect(tokensAfter.keys.length).toBe(1);
+      const grantsAfter = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      expect(grantsAfter.keys.length).toBe(1);
     });
 
     it('should reject token exchange without redirect_uri when not using PKCE', async () => {

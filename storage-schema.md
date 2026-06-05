@@ -97,6 +97,7 @@ Grant records store information about permissions a user has granted to an appli
   },
   "encryptedProps": "AES-GCM encrypted base64-encoded string",
   "createdAt": 1644256123,
+  "authCodeId": "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8",
   "refreshTokenId": "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8",
   "refreshTokenWrappedKey": "base64-encoded wrapped encryption key"
 }
@@ -219,10 +220,14 @@ Token records store metadata about issued access tokens, including denormalized 
 
 3. The client exchanges the authorization code for tokens:
    - The code is validated by comparing its hash to the one stored in the grant
+   - The requesting client is validated against the grant's `clientId`
    - If PKCE was used, the code_verifier is validated against the stored code_challenge
    - The encryption key is unwrapped using the authorization code
    - The key is re-wrapped for both the access token and refresh token
-   - The `authCodeId`, `authCodeWrappedKey`, and PKCE fields are removed from the grant
+   - The `authCodeId` hash is retained so a replay of the same code can be verified
+     before any action is taken; the `authCodeWrappedKey` and PKCE fields are removed
+     from the grant. The absence of `authCodeWrappedKey` (with `authCodeId` still set)
+     marks the code as already used
    - A refresh token is generated and its hash is stored in the grant's `refreshTokenId` field
    - The wrapped key for the refresh token is stored in `refreshTokenWrappedKey`
    - The grant's TTL is removed, making it permanent

@@ -856,13 +856,16 @@ export interface Grant {
 
   /**
    * The hash of the authorization code associated with this grant
-   * Only present during the authorization code exchange process
+   * Retained after exchange so that a replay of the same code can be
+   * verified before any action is taken on the grant. The code is
+   * considered already exchanged once authCodeWrappedKey is removed.
    */
   authCodeId?: string;
 
   /**
    * Wrapped encryption key for the authorization code
-   * Only present during the authorization code exchange process
+   * Present only until the authorization code is exchanged; its absence
+   * (with authCodeId still set) marks the code as already used.
    */
   authCodeWrappedKey?: string;
 
@@ -2056,28 +2059,30 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       });
     }
 
-    // Verify that the grant contains an auth code hash
-    // If absent, the authorization code has been previously exchanged.
-    // Per RFC 6749 Section 10.5, revoke all tokens issued from the first
-    // exchange as a precaution against authorization code replay attacks.
-    if (!grantData.authCodeId) {
+    // Verify the authorization code by comparing its hash to the one in the grant.
+    // This is checked before any other action so that a submitted code that does
+    // not match the one issued for this grant has no effect on the grant.
+    const codeHash = await hashSecret(code);
+    if (!grantData.authCodeId || codeHash !== grantData.authCodeId) {
+      return this.createErrorResponse('invalid_grant', { description: 'Invalid authorization code' });
+    }
+
+    // Verify client ID matches before taking any action on the grant
+    if (grantData.clientId !== clientInfo.clientId) {
+      return this.createErrorResponse('invalid_grant', { description: 'Client ID mismatch' });
+    }
+
+    // If the authorization code has already been exchanged (the wrapped key has
+    // been removed), this is a replay of a valid code by the legitimate client.
+    // Per RFC 6749 Section 10.5, revoke all tokens issued from the first exchange
+    // as a precaution against replay attacks.
+    if (!grantData.authCodeWrappedKey) {
       try {
         await this.createOAuthHelpers(env).revokeGrant(grantId, userId);
       } catch {
         // Best-effort revocation — always return invalid_grant per RFC 6749 §10.5
       }
       return this.createErrorResponse('invalid_grant', { description: 'Authorization code already used' });
-    }
-
-    // Verify the authorization code by comparing its hash to the one in the grant
-    const codeHash = await hashSecret(code);
-    if (codeHash !== grantData.authCodeId) {
-      return this.createErrorResponse('invalid_grant', { description: 'Invalid authorization code' });
-    }
-
-    // Verify client ID matches
-    if (grantData.clientId !== clientInfo.clientId) {
-      return this.createErrorResponse('invalid_grant', { description: 'Client ID mismatch' });
     }
 
     // Check if PKCE is being used
@@ -2223,10 +2228,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const useRefreshToken = refreshTokenTTL !== 0;
 
     // Update the grant:
-    // - Remove the auth code hash (it's single-use)
+    // - Retain the auth code hash so a replayed code can be verified before acting
     // - Remove PKCE-related fields (one-time use)
-    // - Remove auth code wrapped key (no longer needed)
-    delete grantData.authCodeId;
+    // - Remove auth code wrapped key (no longer needed); its absence marks the
+    //   code as used so a subsequent replay can be detected
     delete grantData.codeChallenge;
     delete grantData.codeChallengeMethod;
     delete grantData.authCodeWrappedKey;
