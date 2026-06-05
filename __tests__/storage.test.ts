@@ -29,14 +29,9 @@ class MemoryStorage implements OAuthStorage {
     return options?.type === 'json' ? JSON.parse(row.value) : row.value;
   }
 
-  async put(
-    key: string,
-    value: string,
-    options?: { expirationTtl?: number; expiration?: number }
-  ): Promise<void> {
+  async put(key: string, value: string, options?: { expirationTtl?: number; expiration?: number }): Promise<void> {
     const now = Math.floor(Date.now() / 1000);
-    const expiresAt =
-      options?.expiration ?? (options?.expirationTtl != null ? now + options.expirationTtl : null);
+    const expiresAt = options?.expiration ?? (options?.expirationTtl != null ? now + options.expirationTtl : null);
     this.rows.set(key, { value, expiresAt });
   }
 
@@ -79,9 +74,7 @@ function makeKv() {
       store.delete(key);
     },
     async list({ prefix }: { prefix: string }) {
-      const keys = [...store.keys()]
-        .filter((k: string) => k.startsWith(prefix))
-        .map((name: string) => ({ name }));
+      const keys = [...store.keys()].filter((k: string) => k.startsWith(prefix)).map((name: string) => ({ name }));
       return { keys, list_complete: true };
     },
   };
