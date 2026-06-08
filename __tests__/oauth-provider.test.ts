@@ -1161,6 +1161,45 @@ describe('OAuthProvider', () => {
       expect(savedClient.contacts).toEqual(['admin@example.com']);
     });
 
+    it('should reject invalid URI overrides before storing', async () => {
+      const provider = new OAuthProvider({
+        apiRoute: '/api/',
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        clientRegistrationCallback: () => ({
+          clientMetadataOverrides: {
+            logoUri: 'javascript:alert(1)',
+          },
+        }),
+      });
+
+      const clientData = {
+        redirect_uris: ['https://client.example.com/callback'],
+        client_name: 'Original Name',
+        token_endpoint_auth_method: 'client_secret_basic',
+      };
+
+      const request = createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify(clientData)
+      );
+
+      const response = await provider.fetch(request, mockEnv, mockCtx);
+
+      expect(response.status).toBe(400);
+      const body = await response.json<any>();
+      expect(body.error).toBe('invalid_client_metadata');
+      expect(body.error_description).toBe('Invalid logoUri: must be an absolute http: or https: URL');
+
+      const keys = await mockEnv.OAUTH_KV.list({ prefix: 'client:' });
+      expect(keys.keys.length).toBe(0);
+    });
+
     it('should return 500 server_error when callback throws', async () => {
       const provider = new OAuthProvider({
         apiRoute: '/api/',

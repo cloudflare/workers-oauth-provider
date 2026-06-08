@@ -235,7 +235,8 @@ export interface ClientRegistrationCallbackResult {
   /**
    * Override non-security-critical client metadata fields (allowlist).
    * Security fields (clientId, clientSecret, redirectUris, tokenEndpointAuthMethod,
-   * registrationDate, grantTypes, responseTypes) cannot be overridden.
+   * registrationDate, grantTypes, responseTypes) cannot be overridden. Override
+   * values are revalidated before storage.
    */
   clientMetadataOverrides?: Partial<
     Pick<ClientInfo, 'clientName' | 'logoUri' | 'clientUri' | 'policyUri' | 'tosUri' | 'jwksUri' | 'contacts'>
@@ -3464,40 +3465,51 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
           this.options.clientRegistrationCallback({ clientMetadata, request: callbackRequest })
         );
       } catch (error) {
-        return this.createErrorResponse(
-          'server_error',
-          error instanceof Error ? error.message : 'Client registration callback failed',
-          500
-        );
+        return this.createErrorResponse('server_error', {
+          description: error instanceof Error ? error.message : 'Client registration callback failed',
+          statusCode: 500,
+        });
       }
 
       if (callbackResult?.reject) {
         // Default to RFC 7591 §3.2.2 — `invalid_client_metadata` / 400. Callbacks
         // rejecting for non-metadata reasons (missing IAT, policy denial) should
         // override `rejectCode` / `rejectStatus` explicitly.
-        return this.createErrorResponse(
-          callbackResult.rejectCode || 'invalid_client_metadata',
-          callbackResult.rejectDescription || 'Client registration denied',
-          callbackResult.rejectStatus ?? 400
-        );
+        return this.createErrorResponse(callbackResult.rejectCode || 'invalid_client_metadata', {
+          description: callbackResult.rejectDescription || 'Client registration denied',
+          statusCode: callbackResult.rejectStatus ?? 400,
+        });
       }
 
       if (callbackResult?.clientMetadataOverrides) {
-        // Runtime allowlist (defense in depth — matches the Pick<> type constraint)
-        const ALLOWED_OVERRIDE_KEYS = [
-          'clientName',
-          'logoUri',
-          'clientUri',
-          'policyUri',
-          'tosUri',
-          'jwksUri',
-          'contacts',
-        ] as const;
         const overrides = callbackResult.clientMetadataOverrides;
-        for (const key of ALLOWED_OVERRIDE_KEYS) {
-          if (key in overrides) {
-            (clientInfo as any)[key] = (overrides as any)[key];
+        try {
+          // Runtime allowlist and validation (defense in depth — matches the Pick<> type constraint).
+          if ('clientName' in overrides) {
+            clientInfo.clientName = OAuthProviderImpl.validateStringField(overrides.clientName, 'clientName');
           }
+          if ('logoUri' in overrides) {
+            clientInfo.logoUri = OAuthProviderImpl.validateOptionalUriField(overrides.logoUri, 'logoUri');
+          }
+          if ('clientUri' in overrides) {
+            clientInfo.clientUri = OAuthProviderImpl.validateOptionalUriField(overrides.clientUri, 'clientUri');
+          }
+          if ('policyUri' in overrides) {
+            clientInfo.policyUri = OAuthProviderImpl.validateOptionalUriField(overrides.policyUri, 'policyUri');
+          }
+          if ('tosUri' in overrides) {
+            clientInfo.tosUri = OAuthProviderImpl.validateOptionalUriField(overrides.tosUri, 'tosUri');
+          }
+          if ('jwksUri' in overrides) {
+            clientInfo.jwksUri = OAuthProviderImpl.validateOptionalUriField(overrides.jwksUri, 'jwksUri');
+          }
+          if ('contacts' in overrides) {
+            clientInfo.contacts = OAuthProviderImpl.validateStringArray(overrides.contacts, 'contacts');
+          }
+        } catch (error) {
+          return this.createErrorResponse('invalid_client_metadata', {
+            description: error instanceof Error ? error.message : 'Invalid client metadata override',
+          });
         }
       }
     }
