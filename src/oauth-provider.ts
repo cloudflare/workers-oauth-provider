@@ -230,33 +230,26 @@ export interface ClientRegistrationCallbackOptions {
 
 /**
  * Result of the client registration callback.
+ *
+ * Return `undefined`/nothing to allow registration. Return an object to reject
+ * registration. By default, rejection follows RFC 7591 §3.2.2:
+ * `invalid_client_metadata` with HTTP 400.
  */
 export interface ClientRegistrationCallbackResult {
   /**
-   * Override non-security-critical client metadata fields (allowlist).
-   * Security fields (clientId, clientSecret, redirectUris, tokenEndpointAuthMethod,
-   * registrationDate, grantTypes, responseTypes) cannot be overridden. Override
-   * values are revalidated before storage.
+   * OAuth error code when rejecting. Defaults to `invalid_client_metadata`.
+   * For non-metadata rejections (e.g. missing initial access token, untrusted
+   * origin), set this to a more specific code such as `access_denied` or
+   * `invalid_token`.
    */
-  clientMetadataOverrides?: Partial<
-    Pick<ClientInfo, 'clientName' | 'logoUri' | 'clientUri' | 'policyUri' | 'tosUri' | 'jwksUri' | 'contacts'>
-  >;
-  /** Set true to reject the registration. */
-  reject?: boolean;
-  /**
-   * OAuth error code when rejecting. Defaults to `invalid_client_metadata`
-   * (RFC 7591 §3.2.2). For non-metadata rejections (e.g. missing initial access
-   * token, untrusted origin), set this to a more specific code such as
-   * `access_denied` or `invalid_token`.
-   */
-  rejectCode?: string;
+  code?: string;
   /** Error description when rejecting. */
-  rejectDescription?: string;
+  description?: string;
   /**
-   * HTTP status code when rejecting. Defaults to 400 (RFC 7591 §3.2.2). Override
-   * for auth-style failures (e.g. 401 for missing IAT, 403 for policy denial).
+   * HTTP status code when rejecting. Defaults to 400. Override for auth-style
+   * failures (e.g. 401 for missing IAT, 403 for policy denial).
    */
-  rejectStatus?: number;
+  status?: number;
 }
 
 /**
@@ -431,8 +424,8 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
   disallowPublicClientRegistration?: boolean;
 
   /**
-   * Called during DCR (RFC 7591) before the client is stored. Return `{ reject: true }` to
-   * deny, `{ clientMetadataOverrides }` to modify, or void to allow.
+   * Called during DCR (RFC 7591) before the client is stored. Return void/undefined
+   * to allow registration, or return an object to reject it.
    */
   clientRegistrationCallback?: (
     options: ClientRegistrationCallbackOptions
@@ -3471,46 +3464,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         });
       }
 
-      if (callbackResult?.reject) {
+      if (callbackResult !== undefined) {
         // Default to RFC 7591 §3.2.2 — `invalid_client_metadata` / 400. Callbacks
         // rejecting for non-metadata reasons (missing IAT, policy denial) should
-        // override `rejectCode` / `rejectStatus` explicitly.
-        return this.createErrorResponse(callbackResult.rejectCode || 'invalid_client_metadata', {
-          description: callbackResult.rejectDescription || 'Client registration denied',
-          statusCode: callbackResult.rejectStatus ?? 400,
+        // override `code` / `status` explicitly.
+        return this.createErrorResponse(callbackResult.code || 'invalid_client_metadata', {
+          description: callbackResult.description || 'Client registration denied',
+          statusCode: callbackResult.status ?? 400,
         });
-      }
-
-      if (callbackResult?.clientMetadataOverrides) {
-        const overrides = callbackResult.clientMetadataOverrides;
-        try {
-          // Runtime allowlist and validation (defense in depth — matches the Pick<> type constraint).
-          if ('clientName' in overrides) {
-            clientInfo.clientName = OAuthProviderImpl.validateStringField(overrides.clientName, 'clientName');
-          }
-          if ('logoUri' in overrides) {
-            clientInfo.logoUri = OAuthProviderImpl.validateOptionalUriField(overrides.logoUri, 'logoUri');
-          }
-          if ('clientUri' in overrides) {
-            clientInfo.clientUri = OAuthProviderImpl.validateOptionalUriField(overrides.clientUri, 'clientUri');
-          }
-          if ('policyUri' in overrides) {
-            clientInfo.policyUri = OAuthProviderImpl.validateOptionalUriField(overrides.policyUri, 'policyUri');
-          }
-          if ('tosUri' in overrides) {
-            clientInfo.tosUri = OAuthProviderImpl.validateOptionalUriField(overrides.tosUri, 'tosUri');
-          }
-          if ('jwksUri' in overrides) {
-            clientInfo.jwksUri = OAuthProviderImpl.validateOptionalUriField(overrides.jwksUri, 'jwksUri');
-          }
-          if ('contacts' in overrides) {
-            clientInfo.contacts = OAuthProviderImpl.validateStringArray(overrides.contacts, 'contacts');
-          }
-        } catch (error) {
-          return this.createErrorResponse('invalid_client_metadata', {
-            description: error instanceof Error ? error.message : 'Invalid client metadata override',
-          });
-        }
       }
     }
 
