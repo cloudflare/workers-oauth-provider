@@ -1908,7 +1908,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       registration_endpoint: registrationEndpoint,
       scopes_supported: this.options.scopesSupported,
       response_types_supported: responseTypesSupported,
-      response_modes_supported: ['query'],
+      response_modes_supported: this.options.allowImplicitFlow ? ['query', 'fragment'] : ['query'],
       grant_types_supported: grantTypesSupported,
       // MCP Enterprise-Managed Authorization grant profile (only when EMA is configured).
       ...(authorizationGrantProfilesSupported.length > 0
