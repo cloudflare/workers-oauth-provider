@@ -461,6 +461,59 @@ The method processes records in configurable batches (default: 50) to stay withi
 
 Call it repeatedly via a cron trigger — deleted records disappear from KV, so subsequent invocations naturally process fresh records without needing a persisted cursor. The `result.done` field indicates whether the full key space was scanned in this invocation.
 
+## Storage Backends
+
+By default the provider stores clients, grants, and tokens in the `OAUTH_KV`
+namespace — unchanged, and the right choice for most deployments. To use any
+other backend (Postgres via Hyperdrive, D1, Durable Objects, a test double, …)
+implement the small `OAuthStorage` interface and pass a factory as `storage`:
+
+```ts
+import { OAuthProvider } from '@cloudflare/workers-oauth-provider';
+
+export default new OAuthProvider({
+  // ... options ...
+  storage: (env) => new PostgresStorage(env.HYPERDRIVE),
+});
+```
+
+The factory receives the Worker `env` at request time and is memoized by
+factory+env. This works with the canonical module-scope `export default new
+OAuthProvider(...)` pattern without relying on top-level `env` imports.
+
+The interface mirrors the subset of the KV API the provider uses, so a single
+key/value table or namespace is enough:
+
+```ts
+interface OAuthStorage {
+  get(key: string): Promise<string | null>;
+  get(key: string, opts: { type: 'json' }): Promise<any | null>;
+  put(key: string, value: string, opts?: { expirationTtl?: number; expiration?: number }): Promise<void>;
+  delete(key: string): Promise<void>;
+  list(opts: { prefix: string; limit?: number; cursor?: string }): Promise<{
+    keys: { name: string }[];
+    list_complete: boolean;
+    cursor?: string;
+  }>;
+}
+```
+
+### Why you might need it
+
+KV has **no compare-and-swap** and **eventually-consistent reads**. The
+`refresh_token` grant does a read-modify-write of the grant record (rotate the
+refresh token, persist `tokenExchangeCallback` `newProps`). Two concurrent
+refreshes of the same grant — two clients sharing a refresh token, or a client
+retrying a lost response — can read the same grant, both rotate, and the **last
+write wins**, orphaning the other's token. If your `tokenExchangeCallback` also
+redeems a **single-use, rotating upstream** token, this surfaces as a steady
+stream of `invalid_grant`. A strongly-consistent store (e.g. Postgres via
+Hyperdrive) removes the stale-read failure mode.
+
+See [`docs/storage-providers.md`](docs/storage-providers.md) for a complete
+Postgres/Hyperdrive `OAuthStorage` example and a migration guide, including how
+to move from per-request construction to the module-scope singleton.
+
 ## Protected Resource Metadata (RFC 9728)
 
 The library automatically serves a `/.well-known/oauth-protected-resource` endpoint. By default, it uses the request origin as the resource identifier and the token endpoint's origin as the authorization server. You can customize this with the `resourceMetadata` option:
