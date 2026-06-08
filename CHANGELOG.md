@@ -1,5 +1,66 @@
 # @cloudflare/workers-oauth-provider
 
+## 0.7.2
+
+### Patch Changes
+
+- [#222](https://github.com/cloudflare/workers-oauth-provider/pull/222) [`45397d8`](https://github.com/cloudflare/workers-oauth-provider/commit/45397d8aa57ac0d82c9031e9e0aad588e2e4c1f4) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Add an opt-in `allowPublicClients` flag to `enterpriseManagedAuthorization`.
+
+  By default the enterprise-managed authorization (ID-JAG) grant requires client authentication, so public clients (`token_endpoint_auth_method: 'none'`) are rejected. Setting `allowPublicClients: true` also accepts public clients on this grant — for example clients registered via a Client ID Metadata Document (CIMD), which are always public and cannot present a client secret. The default remains `false`, preserving existing behavior.
+
+## 0.7.1
+
+### Patch Changes
+
+- [#221](https://github.com/cloudflare/workers-oauth-provider/pull/221) [`8e3f08c`](https://github.com/cloudflare/workers-oauth-provider/commit/8e3f08c83e37d5db2bb2a630481408a49006ba10) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Preserve RFC 7591 §2.2 internationalized client metadata variants.
+
+  Localized variants of the human-readable client metadata fields — expressed
+  with a `#<BCP 47 language tag>` suffix on the member name (e.g.
+  `client_name#ja`, `tos_uri#fr`) — were previously dropped during client
+  registration. They are now captured for `client_name`, `client_uri`,
+  `logo_uri`, `tos_uri`, and `policy_uri`, stored on the client record under a
+  new optional `i18n` map (keyed by the raw `field#tag` name), and echoed back in
+  the registration response alongside their canonical fields. The same handling
+  applies to Client ID Metadata Document ingestion.
+
+  Localized values are validated with the same rules as their canonical field:
+  URI variants must be absolute `http:` or `https:` URLs, and all variants must
+  be strings. Fields that are not part of RFC 7591 §2.2 (such as `jwks_uri` and
+  `redirect_uris`) are not collected.
+
+- [#218](https://github.com/cloudflare/workers-oauth-provider/pull/218) [`1f8737d`](https://github.com/cloudflare/workers-oauth-provider/commit/1f8737d93f9b5e907e4f2f346a3649fbb416593b) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Validate the URI scheme of client metadata fields during client registration.
+
+  The `client_uri`, `logo_uri`, `policy_uri`, `tos_uri`, and `jwks_uri` fields
+  were previously only checked to be strings. They are now required to be
+  absolute `http:` or `https:` URLs, consistent with how `redirect_uris` are
+  already validated. Registration (and Client ID Metadata Document ingestion)
+  now rejects values using other schemes with an `invalid_client_metadata`
+  error.
+
+  These fields are commonly surfaced in consent UIs (for example as link or
+  image targets), so restricting them to standard web URLs avoids non-http(s)
+  schemes flowing through to consumers.
+
+## 0.7.0
+
+### Minor Changes
+
+- [#208](https://github.com/cloudflare/workers-oauth-provider/pull/208) [`c59c37b`](https://github.com/cloudflare/workers-oauth-provider/commit/c59c37bf1ae35dff274d6110c87a56a531659dad) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Experimentally support MCP Enterprise-Managed Authorization ID-JAG assertions through the JWT bearer grant.
+
+- [#206](https://github.com/cloudflare/workers-oauth-provider/pull/206) [`13ff269`](https://github.com/cloudflare/workers-oauth-provider/commit/13ff2695b8e3d16655cb8ec76f9afedd4978b0a0) Thanks [@itsandy-canva](https://github.com/itsandy-canva)! - Expose `grantId` to `tokenExchangeCallback` via `TokenExchangeCallbackOptions`.
+
+  Implementations of `tokenExchangeCallback` already received `userId` and
+  `clientId`, but had no way to identify which specific grant the library was
+  operating on. This made it impossible to surgically revoke a single grant from
+  the callback (e.g. on a terminal upstream refresh failure) — implementations had
+  to either sweep all grants for a `(userId, clientId)` pair (racy under
+  concurrent refreshes) or maintain their own out-of-band mapping.
+
+  `grantId` is now provided alongside `userId` so callbacks can pass them
+  directly to `OAuthHelpers.revokeGrant`. Populated for all three grant types
+  (`authorization_code`, `refresh_token`, `token_exchange`). Stable across
+  refreshes for the lifetime of the grant.
+
 ## 0.6.0
 
 ### Minor Changes
