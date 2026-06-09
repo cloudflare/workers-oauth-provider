@@ -32,7 +32,7 @@
     "prettier": "^3.7.4",
     "tsdown": "^0.18.1",
     "typescript": "^5.9.3",
-    "vitest": "^3.2.4"
+    "vitest": "^4.1.8"
   },
   "repository": {
     "type": "git",
