@@ -244,18 +244,25 @@ See the `OAuthHelpers` interface definition for full API details.
 
 ## Permission attenuation during authorization
 
-Authorization UIs can add application-specific steps before calling `completeAuthorization()`. This is useful when the
-user should narrow a grant to a workspace, account, project, or other resource subset before the provider stores the
-grant's `scope` and encrypted `props`.
+Authorization UIs can add their own steps before calling `completeAuthorization()`. This helps when the user needs to
+narrow a grant to a specific workspace, account, or project before the provider stores the grant's `scope` and encrypted
+`props`.
 
-The safe pattern is to parse the original OAuth request once, keep that parsed request server-side while the additional
-UI runs, and then call `completeAuthorization()` with the narrowed grant. Do not rebuild the OAuth request from form
-fields supplied by the client.
+Parse the original OAuth request once and carry it across the extra UI step so it cannot be tampered with, then call
+`completeAuthorization()` with the narrowed grant. Carry it in a short-lived server-side store keyed by an opaque id
+(KV, as below), or in a signed or encrypted `state` value. Do not put it in plain form fields the client can edit. Bind
+the carried value to the user's session and check it when the form comes back (for example, a CSRF double-submit cookie
+plus a session-bound id), so one user cannot complete another user's authorization.
 
 ```ts
-import type { AuthRequest } from '@cloudflare/workers-oauth-provider';
+import { env } from 'cloudflare:workers';
+import type { AuthRequest, OAuthHelpers } from '@cloudflare/workers-oauth-provider';
 
-async function storePendingAuthorization(env, oauthReqInfo: AuthRequest) {
+interface HandlerEnv extends Cloudflare.Env {
+  OAUTH_PROVIDER: OAuthHelpers;
+}
+
+async function storePendingAuthorization(oauthReqInfo: AuthRequest) {
   let authorizationId = crypto.randomUUID();
   await env.AUTHORIZATION_SESSIONS.put(authorizationId, JSON.stringify(oauthReqInfo), {
     expirationTtl: 300,
@@ -263,7 +270,7 @@ async function storePendingAuthorization(env, oauthReqInfo: AuthRequest) {
   return authorizationId;
 }
 
-async function takePendingAuthorization(env, authorizationId: string) {
+async function takePendingAuthorization(authorizationId: string) {
   let value = await env.AUTHORIZATION_SESSIONS.get(authorizationId);
   if (!value) return null;
   await env.AUTHORIZATION_SESSIONS.delete(authorizationId);
@@ -271,16 +278,16 @@ async function takePendingAuthorization(env, authorizationId: string) {
 }
 
 const defaultHandler = {
-  async fetch(request: Request, env) {
+  async fetch(request: Request, handlerEnv: HandlerEnv) {
     let url = new URL(request.url);
 
     if (url.pathname == '/authorize') {
-      let oauthReqInfo = await env.OAUTH_PROVIDER.parseAuthRequest(request);
-      let clientInfo = await env.OAUTH_PROVIDER.lookupClient(oauthReqInfo.clientId);
+      let oauthReqInfo = await handlerEnv.OAUTH_PROVIDER.parseAuthRequest(request);
+      let clientInfo = await handlerEnv.OAUTH_PROVIDER.lookupClient(oauthReqInfo.clientId);
 
       // Render a consent screen that lets the user choose the resource boundary
       // for this client, such as a workspace, account, or project.
-      let authorizationId = await storePendingAuthorization(env, oauthReqInfo);
+      let authorizationId = await storePendingAuthorization(oauthReqInfo);
 
       return renderWorkspacePicker({ authorizationId, clientInfo });
     }
@@ -294,12 +301,12 @@ const defaultHandler = {
         return new Response('Bad request', { status: 400 });
       }
 
-      let oauthReqInfo = await takePendingAuthorization(env, authorizationId);
+      let oauthReqInfo = await takePendingAuthorization(authorizationId);
       if (!oauthReqInfo) {
         return new Response('Authorization expired', { status: 400 });
       }
 
-      let { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
+      let { redirectTo } = await handlerEnv.OAUTH_PROVIDER.completeAuthorization({
         request: oauthReqInfo,
         userId: '1234',
         metadata: { workspaceId },
@@ -323,10 +330,9 @@ const defaultHandler = {
 };
 ```
 
-For production, store pending authorizations in a server-side session or durable store with a short TTL, bind the
-additional UI submission to the authenticated user/session, and validate that the selected resource belongs to that
-user before completing the authorization. The OAuth provider persists only the final attenuated `scope`, `metadata`, and
-`props` supplied to `completeAuthorization()`.
+Session binding is the control that matters most here; the short TTL and opaque id only limit the damage if something
+leaks. Also check that the selected resource belongs to the signed-in user before you complete the authorization. The
+provider stores only the final attenuated `scope`, `metadata`, and `props` you pass to `completeAuthorization()`.
 
 ## Token Exchange Callback
 
