@@ -242,6 +242,98 @@ Note that `deleteClient()` cascades: it revokes all grants (and their associated
 
 See the `OAuthHelpers` interface definition for full API details.
 
+## Permission attenuation during authorization
+
+Authorization UIs can add their own steps before calling `completeAuthorization()`. This helps when the user needs to
+narrow a grant to a specific workspace, account, or project before the provider stores the grant's `scope` and encrypted
+`props`.
+
+Parse the original OAuth request once and carry it across the extra UI step so it cannot be tampered with, then call
+`completeAuthorization()` with the narrowed grant. Carry it in a short-lived server-side store keyed by an opaque id
+(KV, as below), or in a signed or encrypted `state` value. Do not put it in plain form fields the client can edit. Bind
+the carried value to the user's session and check it when the form comes back (for example, a CSRF double-submit cookie
+plus a session-bound id), so one user cannot complete another user's authorization.
+
+```ts
+import { env } from 'cloudflare:workers';
+import type { AuthRequest, OAuthHelpers } from '@cloudflare/workers-oauth-provider';
+
+interface HandlerEnv extends Cloudflare.Env {
+  OAUTH_PROVIDER: OAuthHelpers;
+}
+
+async function storePendingAuthorization(oauthReqInfo: AuthRequest) {
+  let authorizationId = crypto.randomUUID();
+  await env.AUTHORIZATION_SESSIONS.put(authorizationId, JSON.stringify(oauthReqInfo), {
+    expirationTtl: 300,
+  });
+  return authorizationId;
+}
+
+async function takePendingAuthorization(authorizationId: string) {
+  let value = await env.AUTHORIZATION_SESSIONS.get(authorizationId);
+  if (!value) return null;
+  await env.AUTHORIZATION_SESSIONS.delete(authorizationId);
+  return JSON.parse(value) as AuthRequest;
+}
+
+const defaultHandler = {
+  async fetch(request: Request, handlerEnv: HandlerEnv) {
+    let url = new URL(request.url);
+
+    if (url.pathname == '/authorize') {
+      let oauthReqInfo = await handlerEnv.OAUTH_PROVIDER.parseAuthRequest(request);
+      let clientInfo = await handlerEnv.OAUTH_PROVIDER.lookupClient(oauthReqInfo.clientId);
+
+      // Render a consent screen that lets the user choose the resource boundary
+      // for this client, such as a workspace, account, or project.
+      let authorizationId = await storePendingAuthorization(oauthReqInfo);
+
+      return renderWorkspacePicker({ authorizationId, clientInfo });
+    }
+
+    if (url.pathname == '/authorize/workspace' && request.method == 'POST') {
+      let form = await request.formData();
+      let authorizationId = form.get('authorizationId');
+      let workspaceId = form.get('workspaceId');
+
+      if (typeof authorizationId != 'string' || typeof workspaceId != 'string') {
+        return new Response('Bad request', { status: 400 });
+      }
+
+      let oauthReqInfo = await takePendingAuthorization(authorizationId);
+      if (!oauthReqInfo) {
+        return new Response('Authorization expired', { status: 400 });
+      }
+
+      let { redirectTo } = await handlerEnv.OAUTH_PROVIDER.completeAuthorization({
+        request: oauthReqInfo,
+        userId: '1234',
+        metadata: { workspaceId },
+
+        // Grant only the scopes that are valid for the selected resource.
+        scope: ['document.read'],
+
+        // API handlers receive these narrowed props as ctx.props.
+        props: {
+          userId: '1234',
+          workspaceId,
+          permissions: ['document.read'],
+        },
+      });
+
+      return Response.redirect(redirectTo, 302);
+    }
+
+    return new Response('Not found', { status: 404 });
+  },
+};
+```
+
+Session binding is the control that matters most here; the short TTL and opaque id only limit the damage if something
+leaks. Also check that the selected resource belongs to the signed-in user before you complete the authorization. The
+provider stores only the final attenuated `scope`, `metadata`, and `props` you pass to `completeAuthorization()`.
+
 ## Token Exchange Callback
 
 This library allows you to update the `props` value during token exchanges by configuring a callback function. This is useful for scenarios where the application needs to perform additional processing when tokens are issued or refreshed.
