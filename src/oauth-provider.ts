@@ -839,6 +839,13 @@ export interface CompleteAuthorizationOptions {
    * Set to false to allow multiple concurrent grants per user+client.
    */
   revokeExistingGrants?: boolean;
+
+  /**
+   * Maximum number of grants to fetch per page when revoking existing
+   * grants. Only used when revokeExistingGrants is not false.
+   * Defaults to 50.
+   */
+  revokeExistingGrantsBatchSize?: number;
 }
 
 /**
@@ -4325,6 +4332,12 @@ const DEFAULT_CLIENT_REGISTRATION_TTL = 90 * 24 * 60 * 60;
 const DEFAULT_PURGE_BATCH_SIZE = 50;
 
 /**
+ * Default batch size for paginating existing grants when revoking them
+ * during completeAuthorization. Conservative to avoid throttling KV.
+ */
+const DEFAULT_REVOKE_EXISTING_GRANTS_BATCH_SIZE = 50;
+
+/**
  * Length of generated token strings
  */
 const TOKEN_LENGTH = 32;
@@ -4956,9 +4969,10 @@ class OAuthHelpersImpl implements OAuthHelpers {
     // This avoids a data-loss window where the user has no grants if creation fails.
     let grantsToRevoke: string[] = [];
     if (options.revokeExistingGrants !== false) {
+      const batchSize = options.revokeExistingGrantsBatchSize ?? DEFAULT_REVOKE_EXISTING_GRANTS_BATCH_SIZE;
       let cursor: string | undefined;
       do {
-        const page = await this.listUserGrants(options.userId, { cursor });
+        const page = await this.listUserGrants(options.userId, { cursor, limit: batchSize });
         for (const grant of page.items) {
           if (grant.clientId === clientId) {
             grantsToRevoke.push(grant.id);

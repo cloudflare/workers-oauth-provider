@@ -10474,6 +10474,148 @@ describe('OAuthProvider', () => {
         const api2 = await callApi(provider, reAuthEnv, reAuthCtx, tokens2.access_token);
         expect(api2.status).toBe(200);
       });
+
+      it('paginates the existing-grant listing with the default batch size of 50', async () => {
+        const provider = new OAuthProvider({
+          apiRoute: ['/api/'],
+          apiHandler: TestApiHandler,
+          defaultHandler: createDefaultHandlerWithRevoke(() => propsFromAuthorize),
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: '/oauth/token',
+          clientRegistrationEndpoint: '/oauth/register',
+          scopesSupported: ['read', 'write'],
+        });
+
+        const { clientId, clientSecret } = await registerClient(provider, reAuthEnv, reAuthCtx);
+
+        // Seed an initial grant so the next re-auth exercises the listing loop.
+        const code1 = await authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, clientId);
+        await exchangeCodeForTokens(provider, reAuthEnv, reAuthCtx, code1, clientId, clientSecret);
+
+        const listSpy = vi.spyOn(reAuthEnv.OAUTH_KV, 'list');
+
+        // Re-authorize: this is what triggers the grant-listing loop.
+        const code2 = await authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, clientId);
+        await exchangeCodeForTokens(provider, reAuthEnv, reAuthCtx, code2, clientId, clientSecret);
+
+        const grantListCalls = listSpy.mock.calls.filter(
+          (call: any[]) => call[0]?.prefix === 'grant:user-1:'
+        );
+        expect(grantListCalls.length).toBeGreaterThan(0);
+        for (const [args] of grantListCalls) {
+          expect(args.limit).toBe(50);
+        }
+      });
+
+      it('honors a custom revokeExistingGrantsBatchSize', async () => {
+        const customHandler = {
+          async fetch(request: Request, env: any, _ctx: ExecutionContext) {
+            const url = new URL(request.url);
+            if (url.pathname === '/authorize') {
+              const oauthReqInfo = await env.OAUTH_PROVIDER.parseAuthRequest(request);
+              const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
+                request: oauthReqInfo,
+                userId: 'user-1',
+                metadata: {},
+                scope: oauthReqInfo.scope,
+                props: propsFromAuthorize,
+                revokeExistingGrantsBatchSize: 2,
+              });
+              return Response.redirect(redirectTo, 302);
+            }
+            return new Response('OK', { status: 200 });
+          },
+        };
+
+        const provider = new OAuthProvider({
+          apiRoute: ['/api/'],
+          apiHandler: TestApiHandler,
+          defaultHandler: customHandler,
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: '/oauth/token',
+          clientRegistrationEndpoint: '/oauth/register',
+          scopesSupported: ['read', 'write'],
+        });
+
+        const { clientId, clientSecret } = await registerClient(provider, reAuthEnv, reAuthCtx);
+
+        // Seed an initial grant.
+        const code1 = await authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, clientId);
+        await exchangeCodeForTokens(provider, reAuthEnv, reAuthCtx, code1, clientId, clientSecret);
+
+        const listSpy = vi.spyOn(reAuthEnv.OAUTH_KV, 'list');
+
+        const code2 = await authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, clientId);
+        await exchangeCodeForTokens(provider, reAuthEnv, reAuthCtx, code2, clientId, clientSecret);
+
+        const grantListCalls = listSpy.mock.calls.filter(
+          (call: any[]) => call[0]?.prefix === 'grant:user-1:'
+        );
+        expect(grantListCalls.length).toBeGreaterThan(0);
+        for (const [args] of grantListCalls) {
+          expect(args.limit).toBe(2);
+        }
+      });
+
+      it('revokes every old grant across multiple pages when batch size is smaller than total', async () => {
+        // Phase 1: create 5 grants for the same user+client without revoking.
+        const noRevokeProvider = new OAuthProvider({
+          apiRoute: ['/api/'],
+          apiHandler: TestApiHandler,
+          defaultHandler: createDefaultHandlerNoRevoke(() => propsFromAuthorize),
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: '/oauth/token',
+          clientRegistrationEndpoint: '/oauth/register',
+          scopesSupported: ['read', 'write'],
+        });
+
+        const { clientId, clientSecret } = await registerClient(noRevokeProvider, reAuthEnv, reAuthCtx);
+
+        for (let i = 0; i < 5; i++) {
+          const code = await authorizeAndGetCode(noRevokeProvider, reAuthEnv, reAuthCtx, clientId);
+          await exchangeCodeForTokens(noRevokeProvider, reAuthEnv, reAuthCtx, code, clientId, clientSecret);
+        }
+
+        const before = await reAuthEnv.OAUTH_PROVIDER!.listUserGrants('user-1');
+        expect(before.items.length).toBe(5);
+
+        // Phase 2: re-authorize with a small batch size forcing multiple pages.
+        const smallBatchHandler = {
+          async fetch(request: Request, env: any, _ctx: ExecutionContext) {
+            const url = new URL(request.url);
+            if (url.pathname === '/authorize') {
+              const oauthReqInfo = await env.OAUTH_PROVIDER.parseAuthRequest(request);
+              const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
+                request: oauthReqInfo,
+                userId: 'user-1',
+                metadata: {},
+                scope: oauthReqInfo.scope,
+                props: propsFromAuthorize,
+                revokeExistingGrantsBatchSize: 2,
+              });
+              return Response.redirect(redirectTo, 302);
+            }
+            return new Response('OK', { status: 200 });
+          },
+        };
+        const revokeProvider = new OAuthProvider({
+          apiRoute: ['/api/'],
+          apiHandler: TestApiHandler,
+          defaultHandler: smallBatchHandler,
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: '/oauth/token',
+          clientRegistrationEndpoint: '/oauth/register',
+          scopesSupported: ['read', 'write'],
+        });
+
+        const code = await authorizeAndGetCode(revokeProvider, reAuthEnv, reAuthCtx, clientId);
+        await exchangeCodeForTokens(revokeProvider, reAuthEnv, reAuthCtx, code, clientId, clientSecret);
+
+        // Pagination walked every page — only the new grant remains.
+        const after = await reAuthEnv.OAUTH_PROVIDER!.listUserGrants('user-1');
+        expect(after.items.length).toBe(1);
+        expect(after.items[0].clientId).toBe(clientId);
+      });
     });
   });
 
