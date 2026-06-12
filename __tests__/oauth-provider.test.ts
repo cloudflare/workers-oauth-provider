@@ -10125,7 +10125,10 @@ describe('OAuthProvider', () => {
       };
     }
 
-    function createDefaultHandlerWithRevoke(getProps: () => Record<string, any>) {
+    function createDefaultHandlerWithRevoke(
+      getProps: () => Record<string, any>,
+      extraOptions: Record<string, any> = {}
+    ) {
       return {
         async fetch(request: Request, env: any, _ctx: ExecutionContext) {
           const url = new URL(request.url);
@@ -10137,6 +10140,7 @@ describe('OAuthProvider', () => {
               metadata: {},
               scope: oauthReqInfo.scope,
               props: getProps(),
+              ...extraOptions,
             });
             return Response.redirect(redirectTo, 302);
           }
@@ -10498,9 +10502,7 @@ describe('OAuthProvider', () => {
         const code2 = await authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, clientId);
         await exchangeCodeForTokens(provider, reAuthEnv, reAuthCtx, code2, clientId, clientSecret);
 
-        const grantListCalls = listSpy.mock.calls.filter(
-          (call: any[]) => call[0]?.prefix === 'grant:user-1:'
-        );
+        const grantListCalls = listSpy.mock.calls.filter((call: any[]) => call[0]?.prefix === 'grant:user-1:');
         expect(grantListCalls.length).toBeGreaterThan(0);
         for (const [args] of grantListCalls) {
           expect(args.limit).toBe(50);
@@ -10548,12 +10550,64 @@ describe('OAuthProvider', () => {
         const code2 = await authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, clientId);
         await exchangeCodeForTokens(provider, reAuthEnv, reAuthCtx, code2, clientId, clientSecret);
 
-        const grantListCalls = listSpy.mock.calls.filter(
-          (call: any[]) => call[0]?.prefix === 'grant:user-1:'
-        );
+        const grantListCalls = listSpy.mock.calls.filter((call: any[]) => call[0]?.prefix === 'grant:user-1:');
         expect(grantListCalls.length).toBeGreaterThan(0);
         for (const [args] of grantListCalls) {
           expect(args.limit).toBe(2);
+        }
+      });
+
+      it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])(
+        'rejects invalid revokeExistingGrantsBatchSize value %s',
+        async (revokeExistingGrantsBatchSize) => {
+          const provider = new OAuthProvider({
+            apiRoute: ['/api/'],
+            apiHandler: TestApiHandler,
+            defaultHandler: createDefaultHandlerWithRevoke(() => propsFromAuthorize, {
+              revokeExistingGrantsBatchSize,
+            }),
+            authorizeEndpoint: '/authorize',
+            tokenEndpoint: '/oauth/token',
+            clientRegistrationEndpoint: '/oauth/register',
+            scopesSupported: ['read', 'write'],
+          });
+
+          const { clientId } = await registerClient(provider, reAuthEnv, reAuthCtx);
+
+          await expect(authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, clientId)).rejects.toThrow(
+            'revokeExistingGrantsBatchSize must be a positive integer.'
+          );
+        }
+      );
+
+      it('clamps revokeExistingGrantsBatchSize to the Cloudflare KV maximum', async () => {
+        const provider = new OAuthProvider({
+          apiRoute: ['/api/'],
+          apiHandler: TestApiHandler,
+          defaultHandler: createDefaultHandlerWithRevoke(() => propsFromAuthorize, {
+            revokeExistingGrantsBatchSize: 5000,
+          }),
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: '/oauth/token',
+          clientRegistrationEndpoint: '/oauth/register',
+          scopesSupported: ['read', 'write'],
+        });
+
+        const { clientId, clientSecret } = await registerClient(provider, reAuthEnv, reAuthCtx);
+
+        // Seed an initial grant so the next re-auth exercises the listing loop.
+        const code1 = await authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, clientId);
+        await exchangeCodeForTokens(provider, reAuthEnv, reAuthCtx, code1, clientId, clientSecret);
+
+        const listSpy = vi.spyOn(reAuthEnv.OAUTH_KV, 'list');
+
+        const code2 = await authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, clientId);
+        await exchangeCodeForTokens(provider, reAuthEnv, reAuthCtx, code2, clientId, clientSecret);
+
+        const grantListCalls = listSpy.mock.calls.filter((call: any[]) => call[0]?.prefix === 'grant:user-1:');
+        expect(grantListCalls.length).toBeGreaterThan(0);
+        for (const [args] of grantListCalls) {
+          expect(args.limit).toBe(1000);
         }
       });
 
