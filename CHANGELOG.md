@@ -1,5 +1,33 @@
 # @cloudflare/workers-oauth-provider
 
+## 0.8.0
+
+### Minor Changes
+
+- [#228](https://github.com/cloudflare/workers-oauth-provider/pull/228) [`d3d1c10`](https://github.com/cloudflare/workers-oauth-provider/commit/d3d1c104440192a4d7f72c8bb6b9f39e0bcb2a9d) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Simplify `clientRegistrationCallback` to be an allow-or-reject policy hook. Returning `undefined` allows registration; returning an object rejects registration with optional `code`, `description`, and `status`. Metadata override behavior has been removed.
+
+- [#184](https://github.com/cloudflare/workers-oauth-provider/pull/184) [`917fe92`](https://github.com/cloudflare/workers-oauth-provider/commit/917fe92d0c21906ba34a2b805925ee13ff54b7a5) Thanks [@Talador12](https://github.com/Talador12)! - Add `clientRegistrationCallback` for validating or rejecting dynamic client registrations before storage. Return `undefined`/nothing to allow registration, or return an object to reject it. Closes #162.
+  - Default rejection error follows RFC 7591 §3.2.2 (`invalid_client_metadata` / 400). Callbacks rejecting for non-metadata reasons (missing IAT, untrusted origin) should override `code` and `status` explicitly.
+  - The `request` passed to the callback is cloned before the library reads the body, so callbacks may consume the body (e.g. to verify a signature over the raw bytes).
+  - Callback exceptions are caught and surfaced as `500 server_error`.
+  - `software_statement` (RFC 7591 §3.1.1) JWTs are not processed by the library; callbacks wishing to honor them must verify the JWT and apply its claims themselves.
+
+### Patch Changes
+
+- [#231](https://github.com/cloudflare/workers-oauth-provider/pull/231) [`624fc56`](https://github.com/cloudflare/workers-oauth-provider/commit/624fc56e184c86d5e70f89763458e3ab95c40f41) Thanks [@william-canva](https://github.com/william-canva)! - Bound the KV page size used when revoking existing grants during authorization.
+
+- [#224](https://github.com/cloudflare/workers-oauth-provider/pull/224) [`46cf9b6`](https://github.com/cloudflare/workers-oauth-provider/commit/46cf9b6a5c2656782a6ba36f433a8435171cae01) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Add `Cache-Control: no-store` and `Pragma: no-cache` to OAuth responses that carry tokens, credentials, or OAuth state, matching the response examples in RFC 6749 §5.1/§5.2: token endpoint responses (success and error), dynamic client registration responses carrying `client_secret`, and EMA JWT-bearer token responses.
+
+- [#207](https://github.com/cloudflare/workers-oauth-provider/pull/207) [`fd6e40b`](https://github.com/cloudflare/workers-oauth-provider/commit/fd6e40b41cc9dbb448a346ef72414aa6824828e5) Thanks [@EfeDurmaz16](https://github.com/EfeDurmaz16)! - Tighten token endpoint client authentication parsing for RFC 6749 compliance.
+
+- [#187](https://github.com/cloudflare/workers-oauth-provider/pull/187) [`a1534c4`](https://github.com/cloudflare/workers-oauth-provider/commit/a1534c4baf67364ebd3b481cf075b32e5a523c8d) Thanks [@Talador12](https://github.com/Talador12)! - Advertise `fragment` in `response_modes_supported` when `allowImplicitFlow` enables the implicit `token` response type. RFC 8414 §2 requires authorization server metadata to list supported response modes; RFC 6749 §4.2.2 delivers implicit-flow access tokens through the redirect URI fragment.
+
+- [#188](https://github.com/cloudflare/workers-oauth-provider/pull/188) [`64aa241`](https://github.com/cloudflare/workers-oauth-provider/commit/64aa241a8959012c5de0cafe8546788b858469e7) Thanks [@Talador12](https://github.com/Talador12)! - Verify client ownership on token revocation (RFC 7009 §2.1) and honor `token_type_hint` for lookup ordering. Previously any client could revoke any other client's tokens.
+
+- [#225](https://github.com/cloudflare/workers-oauth-provider/pull/225) [`601f042`](https://github.com/cloudflare/workers-oauth-provider/commit/601f0426367c63b50602443d8721719dd36673aa) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Validate the authorization code and requesting client before acting on a grant during the authorization code exchange.
+
+  The `/token` authorization code grant now verifies the submitted code against the stored code hash and confirms the requesting client matches the grant's client before any single-use replay handling runs. The auth code hash is retained after exchange so that a replayed code can be verified rather than acted upon based on its `userId:grantId` prefix alone. This ensures a code that does not match the one issued for a grant has no effect on that grant.
+
 ## 0.7.2
 
 ### Patch Changes
