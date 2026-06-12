@@ -229,6 +229,15 @@ class ApiHandler extends WorkerEntrypoint {
 }
 ```
 
+By default, `completeAuthorization()` revokes existing grants for the same user and client after storing the new
+grant. This prevents stale tokens from continuing to use old `props` after a user re-authorizes. Set
+`revokeExistingGrants: false` only if your application intentionally allows multiple concurrent grants for the same
+user and client.
+
+For users with many grants, `revokeExistingGrantsBatchSize` controls the KV page size used while scanning existing
+grants for revocation. It defaults to `50`, must be a positive integer, and is capped at Cloudflare KV's maximum page
+size of `1000`.
+
 This implementation requires that your worker is configured with a Workers KV namespace binding called `OAUTH_KV`, which is used to store token information. See the file `storage-schema.md` for details on the schema of this namespace.
 
 The `env.OAUTH_PROVIDER` object available to the fetch handlers provides some methods to query the storage, including:

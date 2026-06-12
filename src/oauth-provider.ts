@@ -839,6 +839,14 @@ export interface CompleteAuthorizationOptions {
    * Set to false to allow multiple concurrent grants per user+client.
    */
   revokeExistingGrants?: boolean;
+
+  /**
+   * Maximum number of grants to fetch per page when revoking existing
+   * grants. Only used when revokeExistingGrants is not false.
+   * Must be a positive integer. Values above Cloudflare KV's 1000-key page
+   * limit are clamped to 1000. Defaults to 50.
+   */
+  revokeExistingGrantsBatchSize?: number;
 }
 
 /**
@@ -4325,6 +4333,29 @@ const DEFAULT_CLIENT_REGISTRATION_TTL = 90 * 24 * 60 * 60;
 const DEFAULT_PURGE_BATCH_SIZE = 50;
 
 /**
+ * Maximum supported Cloudflare KV list page size.
+ */
+const MAX_KV_LIST_LIMIT = 1000;
+
+/**
+ * Default batch size for paginating existing grants when revoking them
+ * during completeAuthorization. Conservative for each KV list page.
+ */
+const DEFAULT_REVOKE_EXISTING_GRANTS_BATCH_SIZE = 50;
+
+function getRevokeExistingGrantsBatchSize(batchSize: number | undefined): number {
+  if (batchSize === undefined) {
+    return DEFAULT_REVOKE_EXISTING_GRANTS_BATCH_SIZE;
+  }
+
+  if (!Number.isFinite(batchSize) || !Number.isInteger(batchSize) || batchSize < 1) {
+    throw new Error('revokeExistingGrantsBatchSize must be a positive integer.');
+  }
+
+  return Math.min(batchSize, MAX_KV_LIST_LIMIT);
+}
+
+/**
  * Length of generated token strings
  */
 const TOKEN_LENGTH = 32;
@@ -4956,9 +4987,10 @@ class OAuthHelpersImpl implements OAuthHelpers {
     // This avoids a data-loss window where the user has no grants if creation fails.
     let grantsToRevoke: string[] = [];
     if (options.revokeExistingGrants !== false) {
+      const batchSize = getRevokeExistingGrantsBatchSize(options.revokeExistingGrantsBatchSize);
       let cursor: string | undefined;
       do {
-        const page = await this.listUserGrants(options.userId, { cursor });
+        const page = await this.listUserGrants(options.userId, { cursor, limit: batchSize });
         for (const grant of page.items) {
           if (grant.clientId === clientId) {
             grantsToRevoke.push(grant.id);
