@@ -3118,6 +3118,67 @@ describe('OAuthProvider', () => {
       expect(newTokens.expires_in).toBe(1800);
     });
 
+    it('should reject (not crash) exchanging a subject token with less than 60s remaining', async () => {
+      // Same root cause as the refresh near-expiry bug (#233): the issued token's TTL is
+      // clamped to the subject token's remaining lifetime, so a subject token in its final
+      // <60s would produce an access token whose expiration KV rejects with a 400.
+      const tokenEntries = await mockEnv.OAUTH_KV.list({ prefix: 'token:' });
+      const subjectTokenKey = tokenEntries.keys[0].name;
+      const subjectTokenData = await mockEnv.OAUTH_KV.get(subjectTokenKey, { type: 'json' });
+      // Still valid (not yet expired) but inside the 60s window.
+      subjectTokenData.expiresAt = Math.floor(Date.now() / 1000) + 30;
+      await mockEnv.OAUTH_KV.put(subjectTokenKey, JSON.stringify(subjectTokenData));
+
+      const params = new URLSearchParams();
+      params.append('grant_type', 'urn:ietf:params:oauth:grant-type:token-exchange');
+      params.append('subject_token', accessToken);
+      params.append('subject_token_type', 'urn:ietf:params:oauth:token-type:access_token');
+      params.append('requested_token_type', 'urn:ietf:params:oauth:token-type:access_token');
+
+      const exchangeRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+        },
+        params.toString()
+      );
+
+      const exchangeResponse = await oauthProvider.fetch(exchangeRequest, mockEnv, mockCtx);
+
+      expect(exchangeResponse.status).toBe(400);
+      const error = await exchangeResponse.json<any>();
+      expect(error.error).toBe('invalid_grant');
+      expect(error.error_description).toBe('Subject token is too close to expiry to exchange');
+    });
+
+    it('should reject (not crash) a token exchange requesting expires_in below 60s', async () => {
+      const params = new URLSearchParams();
+      params.append('grant_type', 'urn:ietf:params:oauth:grant-type:token-exchange');
+      params.append('subject_token', accessToken);
+      params.append('subject_token_type', 'urn:ietf:params:oauth:token-type:access_token');
+      params.append('requested_token_type', 'urn:ietf:params:oauth:token-type:access_token');
+      params.append('expires_in', '30'); // below KV's 60s minimum
+
+      const exchangeRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+        },
+        params.toString()
+      );
+
+      const exchangeResponse = await oauthProvider.fetch(exchangeRequest, mockEnv, mockCtx);
+
+      expect(exchangeResponse.status).toBe(400);
+      const error = await exchangeResponse.json<any>();
+      expect(error.error).toBe('invalid_request');
+      expect(error.error_description).toBe('Requested token lifetime must be at least 60 seconds');
+    });
+
     it('should reject token exchange with invalid subject token', async () => {
       const params = new URLSearchParams();
       params.append('grant_type', 'urn:ietf:params:oauth:grant-type:token-exchange');

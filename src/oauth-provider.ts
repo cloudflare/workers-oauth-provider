@@ -2783,6 +2783,17 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Determine TTL for new token
     const now = Math.floor(Date.now() / 1000);
     const subjectTokenRemainingLifetime = tokenSummary.expiresAt - now;
+
+    // The issued token's TTL is clamped to the subject token's remaining lifetime below.
+    // Cloudflare KV rejects writes whose expiration is less than 60 seconds away, so a
+    // subject token in its final <60s would produce an unstorable access token and an
+    // uncaught 500. Treat such a near-expiry subject token as not exchangeable instead.
+    if (subjectTokenRemainingLifetime < KV_MIN_EXPIRATION_TTL_SECONDS) {
+      throw new OAuthError('invalid_grant', {
+        description: 'Subject token is too close to expiry to exchange',
+      });
+    }
+
     let accessTokenTTL = this.options.accessTokenTTL ?? DEFAULT_ACCESS_TOKEN_TTL;
 
     // If expiresIn is provided, use it but clamp to subject token's remaining lifetime
@@ -2860,6 +2871,15 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
           tokenScopes = this.downscope(callbackResult.accessTokenScope, grantData.scope);
         }
       }
+    }
+
+    // A client-requested `expires_in` (or a callback-supplied `accessTokenTTL`) may be
+    // below KV's 60-second minimum even when the subject token has ample life remaining.
+    // Reject rather than attempting an unstorable write that KV would reject with a 400.
+    if (accessTokenTTL < KV_MIN_EXPIRATION_TTL_SECONDS) {
+      throw new OAuthError('invalid_request', {
+        description: 'Requested token lifetime must be at least 60 seconds',
+      });
     }
 
     // Create and store access token

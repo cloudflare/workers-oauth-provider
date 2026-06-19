@@ -14,3 +14,9 @@ threshold mid-request is rejected cleanly instead of crashing when writing the r
 grant or the new access token (whose TTL is clamped to the grant's remaining lifetime).
 As defense-in-depth, `saveGrantWithTTL` also clamps the absolute expiration to KV's
 60-second minimum.
+
+The token exchange grant (RFC 8693) shared the same root cause: the issued token's TTL is
+clamped to the subject token's remaining lifetime, so a subject token in its final <60s (or
+a `expires_in`/`accessTokenTTL` below 60) produced an unstorable token. The exchange now
+rejects a subject token with under 60s remaining (`invalid_grant`) and a requested lifetime
+below 60s (`invalid_request`) instead of crashing.
