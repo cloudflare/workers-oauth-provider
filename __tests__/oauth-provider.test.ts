@@ -21,6 +21,14 @@ class MockKV {
     if (options?.expirationTtl) {
       expirationTime = Date.now() + options.expirationTtl * 1000;
     } else if (options?.expiration) {
+      // Mirror Cloudflare KV's validation for absolute expirations: they must be at
+      // least 60 seconds in the future, otherwise the PUT is rejected with a 400.
+      const minExpiration = Math.floor(Date.now() / 1000) + 60;
+      if (options.expiration < minExpiration) {
+        throw new Error(
+          `KV PUT failed: 400 Invalid expiration of ${options.expiration}. Expiration times must be at least 60 seconds in the future.`
+        );
+      }
       expirationTime = options.expiration * 1000;
     }
 
@@ -4521,8 +4529,80 @@ describe('OAuthProvider', () => {
       expect(refreshResponse.status).toBe(400);
       const error = await refreshResponse.json<any>();
       expect(error.error).toBe('invalid_grant');
-      // KV auto-deletes expired entries, so the grant is gone before the expiry check runs
-      expect(error.error_description).toBe('Grant not found');
+      // The grant's KV expiration is clamped to a 60s minimum (Cloudflare KV rejects
+      // shorter expirations), so the record outlives its logical expiresAt. The refresh
+      // handler's expiry check therefore runs and reports the expired refresh token.
+      expect(error.error_description).toBe('Refresh token has expired');
+    });
+
+    it('should reject a refresh when the grant has less than 60s remaining instead of throwing a KV 400', async () => {
+      // Regression test for https://github.com/cloudflare/workers-oauth-provider/issues/233
+      // Cloudflare KV rejects absolute expirations less than 60s in the future. A refresh
+      // arriving in the final <60s of a grant's life used to pass the expiry check and then
+      // crash with an uncaught "KV PUT failed: 400 Invalid expiration" when re-saving the
+      // rotated grant. It should instead be treated as an expired refresh token.
+      const providerWithTTL = new OAuthProvider({
+        apiRoute: ['/api/', 'https://api.example.com/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        accessTokenTTL: 3600,
+        refreshTokenTTL: 7200,
+      });
+
+      // Get an auth code and exchange it for tokens
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123`
+      );
+      const authResponse = await providerWithTTL.fetch(authRequest, mockEnv, mockCtx);
+      const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
+
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      );
+      const tokens = await (await providerWithTTL.fetch(tokenRequest, mockEnv, mockCtx)).json<any>();
+      const refreshToken = tokens.refresh_token;
+
+      // Move the grant's expiration into the final <60s window. Write it back without a KV
+      // expiration so the record itself persists and the refresh handler's expiry check runs.
+      const grantEntries = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      const grantKey = grantEntries.keys[0].name;
+      const grantData = await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' });
+      grantData.expiresAt = Math.floor(Date.now() / 1000) + 30;
+      await mockEnv.OAUTH_KV.put(grantKey, JSON.stringify(grantData));
+
+      const refreshParams = new URLSearchParams();
+      refreshParams.append('grant_type', 'refresh_token');
+      refreshParams.append('refresh_token', refreshToken);
+      refreshParams.append('client_id', clientId);
+      refreshParams.append('client_secret', clientSecret);
+      const refreshRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        refreshParams.toString()
+      );
+
+      const refreshResponse = await providerWithTTL.fetch(refreshRequest, mockEnv, mockCtx);
+
+      // Should be a clean invalid_grant, not a 500 from the KV PUT failure
+      expect(refreshResponse.status).toBe(400);
+      const error = await refreshResponse.json<any>();
+      expect(error.error).toBe('invalid_grant');
+      expect(error.error_description).toBe('Refresh token has expired');
     });
 
     it('should allow overriding refresh token TTL via callback', async () => {

@@ -2457,10 +2457,15 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       return this.createErrorResponse('invalid_grant', { description: 'Client ID mismatch' });
     }
 
-    // Check if the refresh token has expired
+    // Check if the refresh token has expired.
+    // Cloudflare KV requires absolute expirations to be at least 60 seconds in the
+    // future. Rotating the grant re-saves it with `{ expiration: grantData.expiresAt }`,
+    // so a grant with less than 60 seconds of life remaining cannot be written back to
+    // KV and would otherwise surface as an uncaught "KV PUT failed: 400 Invalid
+    // expiration" error. Treat such near-expiry grants as already expired instead.
     if (grantData.expiresAt !== undefined) {
       const now = Math.floor(Date.now() / 1000);
-      if (now >= grantData.expiresAt) {
+      if (grantData.expiresAt - now < KV_MIN_EXPIRATION_TTL_SECONDS) {
         return this.createErrorResponse('invalid_grant', { description: 'Refresh token has expired' });
       }
     }
@@ -3739,8 +3744,15 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @param now - Current timestamp in seconds
    */
   private async saveGrantWithTTL(env: any, grantKey: string, grantData: Grant, now: number): Promise<void> {
-    // Use absolute expiration timestamp if grant has an expiration
-    const kvOptions = grantData.expiresAt !== undefined ? { expiration: grantData.expiresAt } : {};
+    // Use absolute expiration timestamp if grant has an expiration.
+    // Cloudflare KV rejects expirations less than 60 seconds in the future, so clamp
+    // the absolute expiration to that minimum. This is defense-in-depth: callers that
+    // refresh near-expiry grants already treat them as expired, but clamping here also
+    // protects freshly-issued grants configured with a very short refreshTokenTTL.
+    const kvOptions =
+      grantData.expiresAt !== undefined
+        ? { expiration: Math.max(grantData.expiresAt, now + KV_MIN_EXPIRATION_TTL_SECONDS) }
+        : {};
     try {
       await env.OAUTH_KV.put(grantKey, JSON.stringify(grantData), kvOptions);
     } catch (error) {
@@ -4325,6 +4337,15 @@ const DEFAULT_REFRESH_TOKEN_TTL = 30 * 24 * 60 * 60;
  * Default expiration time for dynamically registered clients (90 days in seconds)
  */
 const DEFAULT_CLIENT_REGISTRATION_TTL = 90 * 24 * 60 * 60;
+
+/**
+ * Minimum number of seconds an absolute KV expiration must be in the future.
+ * Cloudflare KV rejects `put` calls whose `expiration` is less than 60 seconds
+ * away with "400 Invalid expiration ... Expiration times must be at least 60
+ * seconds in the future." We use this to treat near-expiry grants as expired and
+ * to clamp absolute expirations when writing grants back to KV.
+ */
+const KV_MIN_EXPIRATION_TTL_SECONDS = 60;
 
 /**
  * Default batch size for purgeExpiredData. Conservative to stay within
