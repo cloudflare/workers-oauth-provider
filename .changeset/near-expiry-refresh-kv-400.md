@@ -13,7 +13,7 @@ slow callback (e.g. an upstream network refresh) that pushes the grant under the
 threshold mid-request is rejected cleanly instead of crashing when writing the rotated
 grant or the new access token (whose TTL is clamped to the grant's remaining lifetime).
 As defense-in-depth, `saveGrantWithTTL` also clamps the absolute expiration to KV's
-60-second minimum.
+60-second minimum (plus a small margin so writes stay storable under clock skew / write latency).
 
 The token exchange grant (RFC 8693) shared the same root cause: the issued token's TTL is
 clamped to the subject token's remaining lifetime, so a subject token in its final <60s (or

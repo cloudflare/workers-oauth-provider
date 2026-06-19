@@ -11,6 +11,22 @@ import { WorkerEntrypoint } from 'cloudflare:workers';
 class MockKV {
   private storage: Map<string, { value: any; expiration?: number }> = new Map();
 
+  // Offset (ms) added to the wall clock. Lets tests deterministically advance time to
+  // exercise TTL expiry without real `setTimeout` sleeps. Defaults to 0 (real time).
+  private timeOffsetMs = 0;
+
+  private now(): number {
+    return Date.now() + this.timeOffsetMs;
+  }
+
+  /**
+   * Advance the mock clock by `ms` so TTL'd entries expire deterministically.
+   * Mirrors how real KV would drop an entry once its expiration passes.
+   */
+  advanceTime(ms: number): void {
+    this.timeOffsetMs += ms;
+  }
+
   async put(
     key: string,
     value: string | ArrayBuffer,
@@ -18,12 +34,19 @@ class MockKV {
   ): Promise<void> {
     let expirationTime: number | undefined = undefined;
 
+    // Mirror Cloudflare KV's validation: both relative (`expirationTtl`) and absolute
+    // (`expiration`) expirations must be at least 60 seconds in the future, otherwise the
+    // PUT is rejected with a 400. This is what makes near-expiry/sub-60s token writes
+    // reproduce as failures here exactly as they would in production.
     if (options?.expirationTtl) {
-      expirationTime = Date.now() + options.expirationTtl * 1000;
+      if (options.expirationTtl < 60) {
+        throw new Error(
+          `KV PUT failed: 400 Invalid expiration_ttl of ${options.expirationTtl}. Expiration TTL's must be at least 60 seconds.`
+        );
+      }
+      expirationTime = this.now() + options.expirationTtl * 1000;
     } else if (options?.expiration) {
-      // Mirror Cloudflare KV's validation for absolute expirations: they must be at
-      // least 60 seconds in the future, otherwise the PUT is rejected with a 400.
-      const minExpiration = Math.floor(Date.now() / 1000) + 60;
+      const minExpiration = Math.floor(this.now() / 1000) + 60;
       if (options.expiration < minExpiration) {
         throw new Error(
           `KV PUT failed: 400 Invalid expiration of ${options.expiration}. Expiration times must be at least 60 seconds in the future.`
@@ -42,7 +65,7 @@ class MockKV {
       return null;
     }
 
-    if (item.expiration && item.expiration < Date.now()) {
+    if (item.expiration && item.expiration < this.now()) {
       this.storage.delete(key);
       return null;
     }
@@ -70,7 +93,7 @@ class MockKV {
     for (const key of this.storage.keys()) {
       if (key.startsWith(prefix)) {
         const item = this.storage.get(key);
-        if (item && (!item.expiration || item.expiration >= Date.now())) {
+        if (item && (!item.expiration || item.expiration >= this.now())) {
           allKeys.push(key);
         }
       }
@@ -91,6 +114,7 @@ class MockKV {
 
   clear() {
     this.storage.clear();
+    this.timeOffsetMs = 0;
   }
 }
 
@@ -11619,7 +11643,9 @@ describe('OAuthProvider', () => {
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
         clientRegistrationEndpoint: '/oauth/register',
-        clientRegistrationTTL: 1, // 1 second
+        // Cloudflare KV (and MockKV) reject TTLs under 60s, so use the minimum and advance
+        // the mock clock past it to deterministically exercise auto-expiry without sleeping.
+        clientRegistrationTTL: 60,
       });
 
       const request = createMockRequest(
@@ -11638,8 +11664,8 @@ describe('OAuthProvider', () => {
       // Client should exist immediately
       expect(await mockEnv.OAUTH_KV.get(`client:${client.client_id}`, { type: 'json' })).not.toBeNull();
 
-      // Wait for expiry
-      await new Promise((resolve) => setTimeout(resolve, 1500));
+      // Advance past the TTL
+      mockEnv.OAUTH_KV.advanceTime(61_000);
 
       // Client should be auto-deleted by KV TTL
       expect(await mockEnv.OAUTH_KV.get(`client:${client.client_id}`, { type: 'json' })).toBeNull();
@@ -11737,7 +11763,8 @@ describe('OAuthProvider', () => {
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
         clientRegistrationEndpoint: '/oauth/register',
-        clientRegistrationTTL: 1, // 1 second
+        // KV's minimum storable TTL; advance the mock clock past it below.
+        clientRegistrationTTL: 60,
       });
 
       // Register a DCR client
@@ -11768,8 +11795,8 @@ describe('OAuthProvider', () => {
       expect(stored).not.toBeNull();
       expect(stored.clientName).toBe('Updated Name');
 
-      // Wait for TTL to expire
-      await new Promise((resolve) => setTimeout(resolve, 1500));
+      // Advance past the TTL
+      mockEnv.OAUTH_KV.advanceTime(61_000);
 
       // Client should have expired (TTL was preserved on update)
       const expired = await mockEnv.OAUTH_KV.get(`client:${client.client_id}`, { type: 'json' });

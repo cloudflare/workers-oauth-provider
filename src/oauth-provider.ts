@@ -3799,14 +3799,15 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    */
   private async saveGrantWithTTL(env: any, grantKey: string, grantData: Grant, now: number): Promise<void> {
     // Use absolute expiration timestamp if grant has an expiration.
-    // Cloudflare KV rejects expirations less than 60 seconds in the future, so clamp
-    // the absolute expiration to that minimum. This is defense-in-depth: callers that
-    // refresh near-expiry grants already treat them as expired, but clamping here also
-    // protects freshly-issued grants configured with a very short refreshTokenTTL.
+    // Cloudflare KV rejects expirations less than 60 seconds in the future, so clamp the
+    // absolute expiration to that minimum plus a small margin (KV validates against its own
+    // clock at write time, so an exact `now + 60` can be rejected under latency/skew). This
+    // is defense-in-depth: callers that refresh near-expiry grants already treat them as
+    // expired, but clamping here also protects freshly-issued grants configured with a very
+    // short refreshTokenTTL.
+    const minExpiration = now + KV_MIN_EXPIRATION_TTL_SECONDS + KV_EXPIRATION_CLAMP_MARGIN_SECONDS;
     const kvOptions =
-      grantData.expiresAt !== undefined
-        ? { expiration: Math.max(grantData.expiresAt, now + KV_MIN_EXPIRATION_TTL_SECONDS) }
-        : {};
+      grantData.expiresAt !== undefined ? { expiration: Math.max(grantData.expiresAt, minExpiration) } : {};
     try {
       await env.OAUTH_KV.put(grantKey, JSON.stringify(grantData), kvOptions);
     } catch (error) {
@@ -4410,6 +4411,15 @@ const DEFAULT_CLIENT_REGISTRATION_TTL = 90 * 24 * 60 * 60;
  * to clamp absolute expirations when writing grants back to KV.
  */
 const KV_MIN_EXPIRATION_TTL_SECONDS = 60;
+
+/**
+ * Safety margin (seconds) added on top of `KV_MIN_EXPIRATION_TTL_SECONDS` when clamping an
+ * absolute KV expiration. Absolute expirations are validated against KV's clock at the
+ * moment the write is processed, so writing exactly `now + 60` can be rejected once
+ * worker→KV latency or minor clock skew is accounted for. The margin keeps clamped writes
+ * comfortably above KV's hard minimum without meaningfully extending a grant's lifetime.
+ */
+const KV_EXPIRATION_CLAMP_MARGIN_SECONDS = 5;
 
 /**
  * Default batch size for purgeExpiredData. Conservative to stay within
