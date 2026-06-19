@@ -2588,6 +2588,17 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Calculate the access token expiration time (after callback might have updated TTL)
     const now = Math.floor(Date.now() / 1000);
 
+    // Re-check expiry against the post-callback clock. The expiry check above runs before
+    // the tokenExchangeCallback, which may take long enough (e.g. an upstream network
+    // refresh) that the grant now has less than KV's 60-second minimum remaining. Both the
+    // grant write below and the access token write (whose TTL is clamped to the grant's
+    // remaining lifetime) would then be rejected by KV with a 400. Treat the grant as
+    // expired here so we return a clean invalid_grant rather than an uncaught 500. No grant
+    // mutation or token write has happened yet, so returning now leaves no partial state.
+    if (grantData.expiresAt !== undefined && grantData.expiresAt - now < KV_MIN_EXPIRATION_TTL_SECONDS) {
+      return this.createErrorResponse('invalid_grant', { description: 'Refresh token has expired' });
+    }
+
     // Clamp access token TTL to not exceed refresh token's remaining lifetime
     if (grantData.expiresAt !== undefined) {
       const remainingRefreshTokenLifetime = grantData.expiresAt - now;

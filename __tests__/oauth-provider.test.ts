@@ -4605,6 +4605,83 @@ describe('OAuthProvider', () => {
       expect(error.error_description).toBe('Refresh token has expired');
     });
 
+    it('should reject (not crash) when a slow tokenExchangeCallback pushes the grant under 60s remaining', async () => {
+      // Companion to the near-expiry regression test: the expiry check runs before the
+      // tokenExchangeCallback, but the access token (and grant) are written after it. A
+      // slow callback (e.g. an upstream network refresh) can drop the grant under KV's
+      // 60s minimum while the callback runs, which would otherwise produce a KV 400 on
+      // the write. It should resolve to a clean invalid_grant instead.
+      const providerWithSlowCallback = new OAuthProvider({
+        apiRoute: ['/api/', 'https://api.example.com/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        accessTokenTTL: 3600,
+        refreshTokenTTL: 7200,
+        tokenExchangeCallback: async (options) => {
+          if (options.grantType === 'refresh_token') {
+            // Simulate a slow upstream refresh that elapses real time.
+            await new Promise((resolve) => setTimeout(resolve, 2000));
+          }
+          return {};
+        },
+      });
+
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123`
+      );
+      const authResponse = await providerWithSlowCallback.fetch(authRequest, mockEnv, mockCtx);
+      const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
+
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      );
+      const tokens = await (await providerWithSlowCallback.fetch(tokenRequest, mockEnv, mockCtx)).json<any>();
+      const refreshToken = tokens.refresh_token;
+
+      // Place the grant just past the 60s threshold so it passes the pre-callback check,
+      // then the 2s callback pushes it under 60s before the writes happen.
+      const grantEntries = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      const grantKey = grantEntries.keys[0].name;
+      const grantData = await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' });
+      grantData.expiresAt = Math.floor(Date.now() / 1000) + 61;
+      await mockEnv.OAUTH_KV.put(grantKey, JSON.stringify(grantData));
+
+      const refreshParams = new URLSearchParams();
+      refreshParams.append('grant_type', 'refresh_token');
+      refreshParams.append('refresh_token', refreshToken);
+      refreshParams.append('client_id', clientId);
+      refreshParams.append('client_secret', clientSecret);
+      const refreshRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        refreshParams.toString()
+      );
+
+      const refreshResponse = await providerWithSlowCallback.fetch(refreshRequest, mockEnv, mockCtx);
+
+      // Either the pre- or post-callback check may fire depending on timing; both must
+      // produce a clean 400 invalid_grant rather than a 500 from a rejected KV write.
+      expect(refreshResponse.status).toBe(400);
+      const error = await refreshResponse.json<any>();
+      expect(error.error).toBe('invalid_grant');
+      expect(error.error_description).toBe('Refresh token has expired');
+    });
+
     it('should allow overriding refresh token TTL via callback', async () => {
       // Create provider with callback that sets custom TTL
       const providerWithCallback = new OAuthProvider({
