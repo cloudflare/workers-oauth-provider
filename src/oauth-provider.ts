@@ -1395,6 +1395,18 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       ...options,
     };
 
+    // Cloudflare KV rejects token writes whose expiration is less than 60 seconds in the
+    // future, so an access token TTL below that would make every token issuance fail with
+    // an opaque KV 400 at runtime. Reject it at construction with a clear, actionable error.
+    if (
+      !Number.isInteger(this.options.accessTokenTTL) ||
+      this.options.accessTokenTTL! < KV_MIN_EXPIRATION_TTL_SECONDS
+    ) {
+      throw new TypeError(
+        `accessTokenTTL must be an integer of at least ${KV_MIN_EXPIRATION_TTL_SECONDS} seconds (Cloudflare KV's minimum expiration window).`
+      );
+    }
+
     this.validateEmaOptions(this.options.enterpriseManagedAuthorization);
 
     if (this.options.enterpriseManagedAuthorization) {
@@ -2607,6 +2619,16 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       }
     }
 
+    // The access token below is written with a relative `expirationTtl`, which KV rejects
+    // when under 60 seconds. With the re-check above the grant has >=60s remaining, so the
+    // only way to land here is a tokenExchangeCallback returning an `accessTokenTTL` below
+    // the minimum. Reject before rotating/saving the grant rather than crashing on the write.
+    if (accessTokenTTL < KV_MIN_EXPIRATION_TTL_SECONDS) {
+      return this.createErrorResponse('invalid_request', {
+        description: 'Requested token lifetime must be at least 60 seconds',
+      });
+    }
+
     const accessTokenExpiresAt = now + accessTokenTTL;
 
     // Wrap the access token key
@@ -3157,6 +3179,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       assertionExp: claims.value.claims.exp,
       mapperTtl: mapped.value.accessTokenTTL,
       now: issueNow,
+      minTtlSeconds: KV_MIN_EXPIRATION_TTL_SECONDS,
     });
     if (!ttl.ok) return ttl;
 
@@ -3852,6 +3875,16 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    */
   private async createAccessToken(params: CreateAccessTokenOptions): Promise<string> {
     const { userId, grantId, clientId, scope, encryptedProps, encryptionKey, expiresIn, audience, env } = params;
+
+    // Central guard for all access-token writes: Cloudflare KV rejects an `expirationTtl`
+    // below 60 seconds, so a TTL derived from a callback override or a near-expiry source
+    // must not reach the write. Callers that clamp to a source's remaining lifetime should
+    // already have rejected this case with a more specific error; this is the backstop.
+    if (expiresIn < KV_MIN_EXPIRATION_TTL_SECONDS) {
+      throw new OAuthError('invalid_request', {
+        description: 'Requested token lifetime must be at least 60 seconds',
+      });
+    }
 
     // Generate access token
     const accessTokenSecret = generateRandomString(TOKEN_LENGTH);

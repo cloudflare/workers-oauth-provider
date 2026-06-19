@@ -20,3 +20,13 @@ clamped to the subject token's remaining lifetime, so a subject token in its fin
 a `expires_in`/`accessTokenTTL` below 60) produced an unstorable token. The exchange now
 rejects a subject token with under 60s remaining (`invalid_grant`) and a requested lifetime
 below 60s (`invalid_request`) instead of crashing.
+
+More broadly, any access token lifetime below KV's 60-second minimum is now caught instead of
+crashing with an opaque KV 400:
+
+- `accessTokenTTL` is validated at `OAuthProvider` construction (must be an integer of at
+  least 60 seconds).
+- A `tokenExchangeCallback` returning an `accessTokenTTL` below 60 on the authorization code
+  or refresh grant is rejected with `invalid_request`.
+- The enterprise-managed authorization (ID-JAG) grant rejects a mapper-supplied access token
+  TTL below 60 (`invalid_grant`, "Invalid access token TTL").

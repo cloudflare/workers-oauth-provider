@@ -383,6 +383,13 @@ interface ComputeTtlInput {
   assertionExp: number;
   mapperTtl: number | undefined;
   now: number;
+  /**
+   * Minimum storable token lifetime. Cloudflare KV rejects token writes whose
+   * expiration is less than 60 seconds away, so a resolved TTL below this would
+   * make the mint fail with an opaque KV 400. The caller passes the shared
+   * `KV_MIN_EXPIRATION_TTL_SECONDS` constant.
+   */
+  minTtlSeconds: number;
 }
 
 /**
@@ -392,13 +399,21 @@ interface ComputeTtlInput {
  * TOCTOU window between claim validation and token mint.
  */
 export function computeEmaAccessTokenTTL(input: ComputeTtlInput): Result<number, EmaValidationError> {
-  const { configuredDefaultSeconds, assertionExp, mapperTtl, now } = input;
+  const { configuredDefaultSeconds, assertionExp, mapperTtl, now, minTtlSeconds } = input;
 
   if (assertionExp - now <= 0) {
     return err({ reason: 'assertion_expired_after_processing' });
   }
 
-  return ok(mapperTtl ?? configuredDefaultSeconds);
+  const ttl = mapperTtl ?? configuredDefaultSeconds;
+
+  // A mapper-supplied TTL below KV's minimum would produce an unstorable token.
+  // (The configured default is validated to be storable at OAuthProvider construction.)
+  if (ttl < minTtlSeconds) {
+    return err({ reason: 'invalid_mapped_ttl' });
+  }
+
+  return ok(ttl);
 }
 
 // ─── Local helpers (not exported) ─────────────────────────────────────────────

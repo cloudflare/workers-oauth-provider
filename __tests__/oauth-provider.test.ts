@@ -437,6 +437,32 @@ describe('OAuthProvider', () => {
         });
       }).toThrow('Must provide either apiRoute + apiHandler OR apiHandlers');
     });
+
+    it('should throw when accessTokenTTL is below the 60-second KV minimum', () => {
+      expect(() => {
+        new OAuthProvider({
+          apiRoute: '/api/',
+          apiHandler: { fetch: () => Promise.resolve(new Response()) },
+          defaultHandler: testDefaultHandler,
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: '/oauth/token',
+          accessTokenTTL: 30,
+        });
+      }).toThrow('accessTokenTTL must be an integer of at least 60 seconds');
+    });
+
+    it('should allow accessTokenTTL exactly at the 60-second minimum', () => {
+      expect(() => {
+        new OAuthProvider({
+          apiRoute: '/api/',
+          apiHandler: { fetch: () => Promise.resolve(new Response()) },
+          defaultHandler: testDefaultHandler,
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: '/oauth/token',
+          accessTokenTTL: 60,
+        });
+      }).not.toThrow();
+    });
   });
 
   describe('OAuth Metadata Discovery', () => {
@@ -4741,6 +4767,113 @@ describe('OAuthProvider', () => {
       const error = await refreshResponse.json<any>();
       expect(error.error).toBe('invalid_grant');
       expect(error.error_description).toBe('Refresh token has expired');
+    });
+
+    it('should reject (not crash) when a callback sets accessTokenTTL below 60s on the authorization_code grant', async () => {
+      const providerWithTinyTTL = new OAuthProvider({
+        apiRoute: ['/api/', 'https://api.example.com/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        accessTokenTTL: 3600,
+        tokenExchangeCallback: async (options) => {
+          if (options.grantType === 'authorization_code') {
+            return { accessTokenTTL: 30 }; // below KV's 60s minimum
+          }
+          return {};
+        },
+      });
+
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123`
+      );
+      const authResponse = await providerWithTinyTTL.fetch(authRequest, mockEnv, mockCtx);
+      const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
+
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      );
+
+      const tokenResponse = await providerWithTinyTTL.fetch(tokenRequest, mockEnv, mockCtx);
+
+      expect(tokenResponse.status).toBe(400);
+      const error = await tokenResponse.json<any>();
+      expect(error.error).toBe('invalid_request');
+      expect(error.error_description).toBe('Requested token lifetime must be at least 60 seconds');
+    });
+
+    it('should reject (not crash) when a callback sets accessTokenTTL below 60s on the refresh_token grant', async () => {
+      const providerWithTinyTTL = new OAuthProvider({
+        apiRoute: ['/api/', 'https://api.example.com/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        accessTokenTTL: 3600,
+        refreshTokenTTL: 7200,
+        tokenExchangeCallback: async (options) => {
+          // Only shorten on refresh, so the initial code exchange succeeds.
+          if (options.grantType === 'refresh_token') {
+            return { accessTokenTTL: 30 }; // below KV's 60s minimum
+          }
+          return {};
+        },
+      });
+
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123`
+      );
+      const authResponse = await providerWithTinyTTL.fetch(authRequest, mockEnv, mockCtx);
+      const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
+
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      );
+      const tokens = await (await providerWithTinyTTL.fetch(tokenRequest, mockEnv, mockCtx)).json<any>();
+
+      const refreshParams = new URLSearchParams();
+      refreshParams.append('grant_type', 'refresh_token');
+      refreshParams.append('refresh_token', tokens.refresh_token);
+      refreshParams.append('client_id', clientId);
+      refreshParams.append('client_secret', clientSecret);
+      const refreshRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        refreshParams.toString()
+      );
+
+      const refreshResponse = await providerWithTinyTTL.fetch(refreshRequest, mockEnv, mockCtx);
+
+      expect(refreshResponse.status).toBe(400);
+      const error = await refreshResponse.json<any>();
+      expect(error.error).toBe('invalid_request');
+      expect(error.error_description).toBe('Requested token lifetime must be at least 60 seconds');
     });
 
     it('should allow overriding refresh token TTL via callback', async () => {
