@@ -1395,6 +1395,18 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       ...options,
     };
 
+    // Cloudflare KV rejects token writes whose expiration is less than 60 seconds in the
+    // future, so an access token TTL below that would make every token issuance fail with
+    // an opaque KV 400 at runtime. Reject it at construction with a clear, actionable error.
+    if (
+      !Number.isInteger(this.options.accessTokenTTL) ||
+      this.options.accessTokenTTL! < KV_MIN_EXPIRATION_TTL_SECONDS
+    ) {
+      throw new TypeError(
+        `accessTokenTTL must be an integer of at least ${KV_MIN_EXPIRATION_TTL_SECONDS} seconds (Cloudflare KV's minimum expiration window).`
+      );
+    }
+
     this.validateEmaOptions(this.options.enterpriseManagedAuthorization);
 
     if (this.options.enterpriseManagedAuthorization) {
@@ -2457,10 +2469,15 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       return this.createErrorResponse('invalid_grant', { description: 'Client ID mismatch' });
     }
 
-    // Check if the refresh token has expired
+    // Check if the refresh token has expired.
+    // Cloudflare KV requires absolute expirations to be at least 60 seconds in the
+    // future. Rotating the grant re-saves it with `{ expiration: grantData.expiresAt }`,
+    // so a grant with less than 60 seconds of life remaining cannot be written back to
+    // KV and would otherwise surface as an uncaught "KV PUT failed: 400 Invalid
+    // expiration" error. Treat such near-expiry grants as already expired instead.
     if (grantData.expiresAt !== undefined) {
       const now = Math.floor(Date.now() / 1000);
-      if (now >= grantData.expiresAt) {
+      if (grantData.expiresAt - now < KV_MIN_EXPIRATION_TTL_SECONDS) {
         return this.createErrorResponse('invalid_grant', { description: 'Refresh token has expired' });
       }
     }
@@ -2583,12 +2600,33 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Calculate the access token expiration time (after callback might have updated TTL)
     const now = Math.floor(Date.now() / 1000);
 
+    // Re-check expiry against the post-callback clock. The expiry check above runs before
+    // the tokenExchangeCallback, which may take long enough (e.g. an upstream network
+    // refresh) that the grant now has less than KV's 60-second minimum remaining. Both the
+    // grant write below and the access token write (whose TTL is clamped to the grant's
+    // remaining lifetime) would then be rejected by KV with a 400. Treat the grant as
+    // expired here so we return a clean invalid_grant rather than an uncaught 500. No grant
+    // mutation or token write has happened yet, so returning now leaves no partial state.
+    if (grantData.expiresAt !== undefined && grantData.expiresAt - now < KV_MIN_EXPIRATION_TTL_SECONDS) {
+      return this.createErrorResponse('invalid_grant', { description: 'Refresh token has expired' });
+    }
+
     // Clamp access token TTL to not exceed refresh token's remaining lifetime
     if (grantData.expiresAt !== undefined) {
       const remainingRefreshTokenLifetime = grantData.expiresAt - now;
       if (remainingRefreshTokenLifetime > 0) {
         accessTokenTTL = Math.min(accessTokenTTL, remainingRefreshTokenLifetime);
       }
+    }
+
+    // The access token below is written with a relative `expirationTtl`, which KV rejects
+    // when under 60 seconds. With the re-check above the grant has >=60s remaining, so the
+    // only way to land here is a tokenExchangeCallback returning an `accessTokenTTL` below
+    // the minimum. Reject before rotating/saving the grant rather than crashing on the write.
+    if (accessTokenTTL < KV_MIN_EXPIRATION_TTL_SECONDS) {
+      return this.createErrorResponse('invalid_request', {
+        description: 'Requested token lifetime must be at least 60 seconds',
+      });
     }
 
     const accessTokenExpiresAt = now + accessTokenTTL;
@@ -2767,6 +2805,17 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Determine TTL for new token
     const now = Math.floor(Date.now() / 1000);
     const subjectTokenRemainingLifetime = tokenSummary.expiresAt - now;
+
+    // The issued token's TTL is clamped to the subject token's remaining lifetime below.
+    // Cloudflare KV rejects writes whose expiration is less than 60 seconds away, so a
+    // subject token in its final <60s would produce an unstorable access token and an
+    // uncaught 500. Treat such a near-expiry subject token as not exchangeable instead.
+    if (subjectTokenRemainingLifetime < KV_MIN_EXPIRATION_TTL_SECONDS) {
+      throw new OAuthError('invalid_grant', {
+        description: 'Subject token is too close to expiry to exchange',
+      });
+    }
+
     let accessTokenTTL = this.options.accessTokenTTL ?? DEFAULT_ACCESS_TOKEN_TTL;
 
     // If expiresIn is provided, use it but clamp to subject token's remaining lifetime
@@ -2844,6 +2893,15 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
           tokenScopes = this.downscope(callbackResult.accessTokenScope, grantData.scope);
         }
       }
+    }
+
+    // A client-requested `expires_in` (or a callback-supplied `accessTokenTTL`) may be
+    // below KV's 60-second minimum even when the subject token has ample life remaining.
+    // Reject rather than attempting an unstorable write that KV would reject with a 400.
+    if (accessTokenTTL < KV_MIN_EXPIRATION_TTL_SECONDS) {
+      throw new OAuthError('invalid_request', {
+        description: 'Requested token lifetime must be at least 60 seconds',
+      });
     }
 
     // Create and store access token
@@ -3121,6 +3179,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       assertionExp: claims.value.claims.exp,
       mapperTtl: mapped.value.accessTokenTTL,
       now: issueNow,
+      minTtlSeconds: KV_MIN_EXPIRATION_TTL_SECONDS,
     });
     if (!ttl.ok) return ttl;
 
@@ -3739,8 +3798,16 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @param now - Current timestamp in seconds
    */
   private async saveGrantWithTTL(env: any, grantKey: string, grantData: Grant, now: number): Promise<void> {
-    // Use absolute expiration timestamp if grant has an expiration
-    const kvOptions = grantData.expiresAt !== undefined ? { expiration: grantData.expiresAt } : {};
+    // Use absolute expiration timestamp if grant has an expiration.
+    // Cloudflare KV rejects expirations less than 60 seconds in the future, so clamp the
+    // absolute expiration to that minimum plus a small margin (KV validates against its own
+    // clock at write time, so an exact `now + 60` can be rejected under latency/skew). This
+    // is defense-in-depth: callers that refresh near-expiry grants already treat them as
+    // expired, but clamping here also protects freshly-issued grants configured with a very
+    // short refreshTokenTTL.
+    const minExpiration = now + KV_MIN_EXPIRATION_TTL_SECONDS + KV_EXPIRATION_CLAMP_MARGIN_SECONDS;
+    const kvOptions =
+      grantData.expiresAt !== undefined ? { expiration: Math.max(grantData.expiresAt, minExpiration) } : {};
     try {
       await env.OAUTH_KV.put(grantKey, JSON.stringify(grantData), kvOptions);
     } catch (error) {
@@ -3809,6 +3876,16 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    */
   private async createAccessToken(params: CreateAccessTokenOptions): Promise<string> {
     const { userId, grantId, clientId, scope, encryptedProps, encryptionKey, expiresIn, audience, env } = params;
+
+    // Central guard for all access-token writes: Cloudflare KV rejects an `expirationTtl`
+    // below 60 seconds, so a TTL derived from a callback override or a near-expiry source
+    // must not reach the write. Callers that clamp to a source's remaining lifetime should
+    // already have rejected this case with a more specific error; this is the backstop.
+    if (expiresIn < KV_MIN_EXPIRATION_TTL_SECONDS) {
+      throw new OAuthError('invalid_request', {
+        description: 'Requested token lifetime must be at least 60 seconds',
+      });
+    }
 
     // Generate access token
     const accessTokenSecret = generateRandomString(TOKEN_LENGTH);
@@ -4325,6 +4402,24 @@ const DEFAULT_REFRESH_TOKEN_TTL = 30 * 24 * 60 * 60;
  * Default expiration time for dynamically registered clients (90 days in seconds)
  */
 const DEFAULT_CLIENT_REGISTRATION_TTL = 90 * 24 * 60 * 60;
+
+/**
+ * Minimum number of seconds an absolute KV expiration must be in the future.
+ * Cloudflare KV rejects `put` calls whose `expiration` is less than 60 seconds
+ * away with "400 Invalid expiration ... Expiration times must be at least 60
+ * seconds in the future." We use this to treat near-expiry grants as expired and
+ * to clamp absolute expirations when writing grants back to KV.
+ */
+const KV_MIN_EXPIRATION_TTL_SECONDS = 60;
+
+/**
+ * Safety margin (seconds) added on top of `KV_MIN_EXPIRATION_TTL_SECONDS` when clamping an
+ * absolute KV expiration. Absolute expirations are validated against KV's clock at the
+ * moment the write is processed, so writing exactly `now + 60` can be rejected once
+ * worker→KV latency or minor clock skew is accounted for. The margin keeps clamped writes
+ * comfortably above KV's hard minimum without meaningfully extending a grant's lifetime.
+ */
+const KV_EXPIRATION_CLAMP_MARGIN_SECONDS = 5;
 
 /**
  * Default batch size for purgeExpiredData. Conservative to stay within

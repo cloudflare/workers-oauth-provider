@@ -11,6 +11,22 @@ import { WorkerEntrypoint } from 'cloudflare:workers';
 class MockKV {
   private storage: Map<string, { value: any; expiration?: number }> = new Map();
 
+  // Offset (ms) added to the wall clock. Lets tests deterministically advance time to
+  // exercise TTL expiry without real `setTimeout` sleeps. Defaults to 0 (real time).
+  private timeOffsetMs = 0;
+
+  private now(): number {
+    return Date.now() + this.timeOffsetMs;
+  }
+
+  /**
+   * Advance the mock clock by `ms` so TTL'd entries expire deterministically.
+   * Mirrors how real KV would drop an entry once its expiration passes.
+   */
+  advanceTime(ms: number): void {
+    this.timeOffsetMs += ms;
+  }
+
   async put(
     key: string,
     value: string | ArrayBuffer,
@@ -18,9 +34,24 @@ class MockKV {
   ): Promise<void> {
     let expirationTime: number | undefined = undefined;
 
+    // Mirror Cloudflare KV's validation: both relative (`expirationTtl`) and absolute
+    // (`expiration`) expirations must be at least 60 seconds in the future, otherwise the
+    // PUT is rejected with a 400. This is what makes near-expiry/sub-60s token writes
+    // reproduce as failures here exactly as they would in production.
     if (options?.expirationTtl) {
-      expirationTime = Date.now() + options.expirationTtl * 1000;
+      if (options.expirationTtl < 60) {
+        throw new Error(
+          `KV PUT failed: 400 Invalid expiration_ttl of ${options.expirationTtl}. Expiration TTL's must be at least 60 seconds.`
+        );
+      }
+      expirationTime = this.now() + options.expirationTtl * 1000;
     } else if (options?.expiration) {
+      const minExpiration = Math.floor(this.now() / 1000) + 60;
+      if (options.expiration < minExpiration) {
+        throw new Error(
+          `KV PUT failed: 400 Invalid expiration of ${options.expiration}. Expiration times must be at least 60 seconds in the future.`
+        );
+      }
       expirationTime = options.expiration * 1000;
     }
 
@@ -34,7 +65,7 @@ class MockKV {
       return null;
     }
 
-    if (item.expiration && item.expiration < Date.now()) {
+    if (item.expiration && item.expiration < this.now()) {
       this.storage.delete(key);
       return null;
     }
@@ -62,7 +93,7 @@ class MockKV {
     for (const key of this.storage.keys()) {
       if (key.startsWith(prefix)) {
         const item = this.storage.get(key);
-        if (item && (!item.expiration || item.expiration >= Date.now())) {
+        if (item && (!item.expiration || item.expiration >= this.now())) {
           allKeys.push(key);
         }
       }
@@ -83,6 +114,7 @@ class MockKV {
 
   clear() {
     this.storage.clear();
+    this.timeOffsetMs = 0;
   }
 }
 
@@ -428,6 +460,32 @@ describe('OAuthProvider', () => {
           tokenEndpoint: '/oauth/token',
         });
       }).toThrow('Must provide either apiRoute + apiHandler OR apiHandlers');
+    });
+
+    it('should throw when accessTokenTTL is below the 60-second KV minimum', () => {
+      expect(() => {
+        new OAuthProvider({
+          apiRoute: '/api/',
+          apiHandler: { fetch: () => Promise.resolve(new Response()) },
+          defaultHandler: testDefaultHandler,
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: '/oauth/token',
+          accessTokenTTL: 30,
+        });
+      }).toThrow('accessTokenTTL must be an integer of at least 60 seconds');
+    });
+
+    it('should allow accessTokenTTL exactly at the 60-second minimum', () => {
+      expect(() => {
+        new OAuthProvider({
+          apiRoute: '/api/',
+          apiHandler: { fetch: () => Promise.resolve(new Response()) },
+          defaultHandler: testDefaultHandler,
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: '/oauth/token',
+          accessTokenTTL: 60,
+        });
+      }).not.toThrow();
     });
   });
 
@@ -3110,6 +3168,67 @@ describe('OAuthProvider', () => {
       expect(newTokens.expires_in).toBe(1800);
     });
 
+    it('should reject (not crash) exchanging a subject token with less than 60s remaining', async () => {
+      // Same root cause as the refresh near-expiry bug (#233): the issued token's TTL is
+      // clamped to the subject token's remaining lifetime, so a subject token in its final
+      // <60s would produce an access token whose expiration KV rejects with a 400.
+      const tokenEntries = await mockEnv.OAUTH_KV.list({ prefix: 'token:' });
+      const subjectTokenKey = tokenEntries.keys[0].name;
+      const subjectTokenData = await mockEnv.OAUTH_KV.get(subjectTokenKey, { type: 'json' });
+      // Still valid (not yet expired) but inside the 60s window.
+      subjectTokenData.expiresAt = Math.floor(Date.now() / 1000) + 30;
+      await mockEnv.OAUTH_KV.put(subjectTokenKey, JSON.stringify(subjectTokenData));
+
+      const params = new URLSearchParams();
+      params.append('grant_type', 'urn:ietf:params:oauth:grant-type:token-exchange');
+      params.append('subject_token', accessToken);
+      params.append('subject_token_type', 'urn:ietf:params:oauth:token-type:access_token');
+      params.append('requested_token_type', 'urn:ietf:params:oauth:token-type:access_token');
+
+      const exchangeRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+        },
+        params.toString()
+      );
+
+      const exchangeResponse = await oauthProvider.fetch(exchangeRequest, mockEnv, mockCtx);
+
+      expect(exchangeResponse.status).toBe(400);
+      const error = await exchangeResponse.json<any>();
+      expect(error.error).toBe('invalid_grant');
+      expect(error.error_description).toBe('Subject token is too close to expiry to exchange');
+    });
+
+    it('should reject (not crash) a token exchange requesting expires_in below 60s', async () => {
+      const params = new URLSearchParams();
+      params.append('grant_type', 'urn:ietf:params:oauth:grant-type:token-exchange');
+      params.append('subject_token', accessToken);
+      params.append('subject_token_type', 'urn:ietf:params:oauth:token-type:access_token');
+      params.append('requested_token_type', 'urn:ietf:params:oauth:token-type:access_token');
+      params.append('expires_in', '30'); // below KV's 60s minimum
+
+      const exchangeRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+        },
+        params.toString()
+      );
+
+      const exchangeResponse = await oauthProvider.fetch(exchangeRequest, mockEnv, mockCtx);
+
+      expect(exchangeResponse.status).toBe(400);
+      const error = await exchangeResponse.json<any>();
+      expect(error.error).toBe('invalid_request');
+      expect(error.error_description).toBe('Requested token lifetime must be at least 60 seconds');
+    });
+
     it('should reject token exchange with invalid subject token', async () => {
       const params = new URLSearchParams();
       params.append('grant_type', 'urn:ietf:params:oauth:grant-type:token-exchange');
@@ -4521,8 +4640,264 @@ describe('OAuthProvider', () => {
       expect(refreshResponse.status).toBe(400);
       const error = await refreshResponse.json<any>();
       expect(error.error).toBe('invalid_grant');
-      // KV auto-deletes expired entries, so the grant is gone before the expiry check runs
-      expect(error.error_description).toBe('Grant not found');
+      // The grant's KV expiration is clamped to a 60s minimum (Cloudflare KV rejects
+      // shorter expirations), so the record outlives its logical expiresAt. The refresh
+      // handler's expiry check therefore runs and reports the expired refresh token.
+      expect(error.error_description).toBe('Refresh token has expired');
+    });
+
+    it('should reject a refresh when the grant has less than 60s remaining instead of throwing a KV 400', async () => {
+      // Regression test for https://github.com/cloudflare/workers-oauth-provider/issues/233
+      // Cloudflare KV rejects absolute expirations less than 60s in the future. A refresh
+      // arriving in the final <60s of a grant's life used to pass the expiry check and then
+      // crash with an uncaught "KV PUT failed: 400 Invalid expiration" when re-saving the
+      // rotated grant. It should instead be treated as an expired refresh token.
+      const providerWithTTL = new OAuthProvider({
+        apiRoute: ['/api/', 'https://api.example.com/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        accessTokenTTL: 3600,
+        refreshTokenTTL: 7200,
+      });
+
+      // Get an auth code and exchange it for tokens
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123`
+      );
+      const authResponse = await providerWithTTL.fetch(authRequest, mockEnv, mockCtx);
+      const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
+
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      );
+      const tokens = await (await providerWithTTL.fetch(tokenRequest, mockEnv, mockCtx)).json<any>();
+      const refreshToken = tokens.refresh_token;
+
+      // Move the grant's expiration into the final <60s window. Write it back without a KV
+      // expiration so the record itself persists and the refresh handler's expiry check runs.
+      const grantEntries = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      const grantKey = grantEntries.keys[0].name;
+      const grantData = await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' });
+      grantData.expiresAt = Math.floor(Date.now() / 1000) + 30;
+      await mockEnv.OAUTH_KV.put(grantKey, JSON.stringify(grantData));
+
+      const refreshParams = new URLSearchParams();
+      refreshParams.append('grant_type', 'refresh_token');
+      refreshParams.append('refresh_token', refreshToken);
+      refreshParams.append('client_id', clientId);
+      refreshParams.append('client_secret', clientSecret);
+      const refreshRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        refreshParams.toString()
+      );
+
+      const refreshResponse = await providerWithTTL.fetch(refreshRequest, mockEnv, mockCtx);
+
+      // Should be a clean invalid_grant, not a 500 from the KV PUT failure
+      expect(refreshResponse.status).toBe(400);
+      const error = await refreshResponse.json<any>();
+      expect(error.error).toBe('invalid_grant');
+      expect(error.error_description).toBe('Refresh token has expired');
+    });
+
+    it('should reject (not crash) when a slow tokenExchangeCallback pushes the grant under 60s remaining', async () => {
+      // Companion to the near-expiry regression test: the expiry check runs before the
+      // tokenExchangeCallback, but the access token (and grant) are written after it. A
+      // slow callback (e.g. an upstream network refresh) can drop the grant under KV's
+      // 60s minimum while the callback runs, which would otherwise produce a KV 400 on
+      // the write. It should resolve to a clean invalid_grant instead.
+      const providerWithSlowCallback = new OAuthProvider({
+        apiRoute: ['/api/', 'https://api.example.com/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        accessTokenTTL: 3600,
+        refreshTokenTTL: 7200,
+        tokenExchangeCallback: async (options) => {
+          if (options.grantType === 'refresh_token') {
+            // Simulate a slow upstream refresh that elapses real time.
+            await new Promise((resolve) => setTimeout(resolve, 2000));
+          }
+          return {};
+        },
+      });
+
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123`
+      );
+      const authResponse = await providerWithSlowCallback.fetch(authRequest, mockEnv, mockCtx);
+      const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
+
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      );
+      const tokens = await (await providerWithSlowCallback.fetch(tokenRequest, mockEnv, mockCtx)).json<any>();
+      const refreshToken = tokens.refresh_token;
+
+      // Place the grant just past the 60s threshold so it passes the pre-callback check,
+      // then the 2s callback pushes it under 60s before the writes happen.
+      const grantEntries = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      const grantKey = grantEntries.keys[0].name;
+      const grantData = await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' });
+      grantData.expiresAt = Math.floor(Date.now() / 1000) + 61;
+      await mockEnv.OAUTH_KV.put(grantKey, JSON.stringify(grantData));
+
+      const refreshParams = new URLSearchParams();
+      refreshParams.append('grant_type', 'refresh_token');
+      refreshParams.append('refresh_token', refreshToken);
+      refreshParams.append('client_id', clientId);
+      refreshParams.append('client_secret', clientSecret);
+      const refreshRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        refreshParams.toString()
+      );
+
+      const refreshResponse = await providerWithSlowCallback.fetch(refreshRequest, mockEnv, mockCtx);
+
+      // Either the pre- or post-callback check may fire depending on timing; both must
+      // produce a clean 400 invalid_grant rather than a 500 from a rejected KV write.
+      expect(refreshResponse.status).toBe(400);
+      const error = await refreshResponse.json<any>();
+      expect(error.error).toBe('invalid_grant');
+      expect(error.error_description).toBe('Refresh token has expired');
+    });
+
+    it('should reject (not crash) when a callback sets accessTokenTTL below 60s on the authorization_code grant', async () => {
+      const providerWithTinyTTL = new OAuthProvider({
+        apiRoute: ['/api/', 'https://api.example.com/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        accessTokenTTL: 3600,
+        tokenExchangeCallback: async (options) => {
+          if (options.grantType === 'authorization_code') {
+            return { accessTokenTTL: 30 }; // below KV's 60s minimum
+          }
+          return {};
+        },
+      });
+
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123`
+      );
+      const authResponse = await providerWithTinyTTL.fetch(authRequest, mockEnv, mockCtx);
+      const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
+
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      );
+
+      const tokenResponse = await providerWithTinyTTL.fetch(tokenRequest, mockEnv, mockCtx);
+
+      expect(tokenResponse.status).toBe(400);
+      const error = await tokenResponse.json<any>();
+      expect(error.error).toBe('invalid_request');
+      expect(error.error_description).toBe('Requested token lifetime must be at least 60 seconds');
+    });
+
+    it('should reject (not crash) when a callback sets accessTokenTTL below 60s on the refresh_token grant', async () => {
+      const providerWithTinyTTL = new OAuthProvider({
+        apiRoute: ['/api/', 'https://api.example.com/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        accessTokenTTL: 3600,
+        refreshTokenTTL: 7200,
+        tokenExchangeCallback: async (options) => {
+          // Only shorten on refresh, so the initial code exchange succeeds.
+          if (options.grantType === 'refresh_token') {
+            return { accessTokenTTL: 30 }; // below KV's 60s minimum
+          }
+          return {};
+        },
+      });
+
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123`
+      );
+      const authResponse = await providerWithTinyTTL.fetch(authRequest, mockEnv, mockCtx);
+      const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
+
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      );
+      const tokens = await (await providerWithTinyTTL.fetch(tokenRequest, mockEnv, mockCtx)).json<any>();
+
+      const refreshParams = new URLSearchParams();
+      refreshParams.append('grant_type', 'refresh_token');
+      refreshParams.append('refresh_token', tokens.refresh_token);
+      refreshParams.append('client_id', clientId);
+      refreshParams.append('client_secret', clientSecret);
+      const refreshRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        refreshParams.toString()
+      );
+
+      const refreshResponse = await providerWithTinyTTL.fetch(refreshRequest, mockEnv, mockCtx);
+
+      expect(refreshResponse.status).toBe(400);
+      const error = await refreshResponse.json<any>();
+      expect(error.error).toBe('invalid_request');
+      expect(error.error_description).toBe('Requested token lifetime must be at least 60 seconds');
     });
 
     it('should allow overriding refresh token TTL via callback', async () => {
@@ -11268,7 +11643,9 @@ describe('OAuthProvider', () => {
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
         clientRegistrationEndpoint: '/oauth/register',
-        clientRegistrationTTL: 1, // 1 second
+        // Cloudflare KV (and MockKV) reject TTLs under 60s, so use the minimum and advance
+        // the mock clock past it to deterministically exercise auto-expiry without sleeping.
+        clientRegistrationTTL: 60,
       });
 
       const request = createMockRequest(
@@ -11287,8 +11664,8 @@ describe('OAuthProvider', () => {
       // Client should exist immediately
       expect(await mockEnv.OAUTH_KV.get(`client:${client.client_id}`, { type: 'json' })).not.toBeNull();
 
-      // Wait for expiry
-      await new Promise((resolve) => setTimeout(resolve, 1500));
+      // Advance past the TTL
+      mockEnv.OAUTH_KV.advanceTime(61_000);
 
       // Client should be auto-deleted by KV TTL
       expect(await mockEnv.OAUTH_KV.get(`client:${client.client_id}`, { type: 'json' })).toBeNull();
@@ -11386,7 +11763,8 @@ describe('OAuthProvider', () => {
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
         clientRegistrationEndpoint: '/oauth/register',
-        clientRegistrationTTL: 1, // 1 second
+        // KV's minimum storable TTL; advance the mock clock past it below.
+        clientRegistrationTTL: 60,
       });
 
       // Register a DCR client
@@ -11417,8 +11795,8 @@ describe('OAuthProvider', () => {
       expect(stored).not.toBeNull();
       expect(stored.clientName).toBe('Updated Name');
 
-      // Wait for TTL to expire
-      await new Promise((resolve) => setTimeout(resolve, 1500));
+      // Advance past the TTL
+      mockEnv.OAUTH_KV.advanceTime(61_000);
 
       // Client should have expired (TTL was preserved on update)
       const expired = await mockEnv.OAUTH_KV.get(`client:${client.client_id}`, { type: 'json' });

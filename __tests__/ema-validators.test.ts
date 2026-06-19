@@ -430,6 +430,7 @@ describe('computeEmaAccessTokenTTL', () => {
       assertionExp: 2_000_000_000,
       mapperTtl: undefined,
       now: 1_999_999_700,
+      minTtlSeconds: 60,
     });
     // Assertion has 300s left but the issued access token follows the AS's
     // configured TTL (3600s) — the assertion is a one-shot grant, not a
@@ -443,6 +444,7 @@ describe('computeEmaAccessTokenTTL', () => {
       assertionExp: 2_000_000_000,
       mapperTtl: 86_400,
       now: 1_999_999_700,
+      minTtlSeconds: 60,
     });
     expect(r).toMatchObject({ ok: true, value: 86_400 });
   });
@@ -453,8 +455,20 @@ describe('computeEmaAccessTokenTTL', () => {
       assertionExp: 1_999_999_700,
       mapperTtl: undefined,
       now: 1_999_999_800,
+      minTtlSeconds: 60,
     });
     expect(r).toMatchObject({ ok: false, error: { reason: 'assertion_expired_after_processing' } });
+  });
+
+  it('rejects a mapper-supplied TTL below the storable minimum', () => {
+    const r = computeEmaAccessTokenTTL({
+      configuredDefaultSeconds: 3600,
+      assertionExp: 2_000_000_000,
+      mapperTtl: 30, // below KV's 60s minimum
+      now: 1_999_999_700,
+      minTtlSeconds: 60,
+    });
+    expect(r).toMatchObject({ ok: false, error: { reason: 'invalid_mapped_ttl' } });
   });
 });
 
