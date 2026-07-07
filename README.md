@@ -229,6 +229,17 @@ class ApiHandler extends WorkerEntrypoint {
 }
 ```
 
+### MCP SDK v2 authentication context
+
+For access tokens issued by this provider, compatible MCP SDK v2 integrations can also receive the already-verified
+token, client ID, token scopes, expiry, resource, and application props through standard MCP `AuthInfo`. This is an
+additive, request-local integration: `ctx.props` retains exactly the same object and behavior shown above, and no
+configuration or package dependency is required. Treat both `AuthInfo.token` and `AuthInfo.extra.props` as sensitive
+and do not log or return them.
+
+Tokens accepted through `resolveExternalToken` continue to populate `ctx.props`, but do not automatically produce
+standard `AuthInfo` because that callback does not yet return the complete client and scope metadata required by MCP.
+
 By default, `completeAuthorization()` revokes existing grants for the same user and client after storing the new
 grant. This prevents stale tokens from continuing to use old `props` after a user re-authorizes. Set
 `revokeExistingGrants: false` only if your application intentionally allows multiple concurrent grants for the same

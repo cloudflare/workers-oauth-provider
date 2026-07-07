@@ -135,7 +135,10 @@ npm run test          # Single run
 npm run test:watch    # Watch mode
 ```
 
-**Test file:** `__tests__/oauth-provider.test.ts`
+**Test files:**
+
+- `__tests__/oauth-provider.test.ts` — comprehensive Node suite with Worker API mocks
+- `__tests__/workers/` — focused tests running in real workerd through `@cloudflare/vitest-pool-workers`
 
 **Mock implementations:**
 
