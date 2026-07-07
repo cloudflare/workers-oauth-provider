@@ -135,7 +135,6 @@ interface TestVerifiedOAuthContext {
 
 class MockExecutionContext implements ExecutionContext {
   props: any = {};
-  tracing = {} as Tracing;
 
   waitUntil(promise: Promise<any>): void {
     // In tests, we can just ignore waitUntil
