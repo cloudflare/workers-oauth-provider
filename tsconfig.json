@@ -12,5 +12,5 @@
     "noEmit": true
   },
   "include": ["src/**/*.ts", "__tests__/**/*.ts"],
-  "exclude": ["node_modules", "dist", "__tests__/workers/vitest.config.ts"]
+  "exclude": ["node_modules", "dist"]
 }
