@@ -123,6 +123,15 @@ type Row = {
   expires_at: number | string | null;
 };
 type CountRow = { count: number | string };
+type GrantTransitionRow = Row & {
+  transition_lease_id: string | null;
+  transition_owner_id: string | null;
+  transition_kind: string | null;
+  transition_credential_id: string | null;
+  transition_callback_key: string | null;
+  transition_lease_expires_at: number | string | null;
+  transition_fence: number | string;
+};
 const TABLE = {
   clients: 'oauth_clients',
   grants: 'oauth_grants',
@@ -331,12 +340,13 @@ class Connection implements OAuthStorageConnection {
         if (c.rows[0].revision !== i.client.expectedRevision) return { status: 'client_conflict' };
       }
       const g = await this.db.query(
-        `INSERT INTO ${TABLE.grants}(namespace,user_id,grant_id,client_id,value,schema_version,revision,created_at,expires_at,transition_fence) VALUES($1,$2,$3,$4,$5::jsonb,$6,$7,$8,$9,0) ON CONFLICT DO NOTHING`,
+        `INSERT INTO ${TABLE.grants}(namespace,user_id,grant_id,client_id,registered_client_id,value,schema_version,revision,created_at,expires_at,transition_fence) VALUES($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9,$10,0) ON CONFLICT DO NOTHING`,
         [
           this.namespace,
           i.grant.value.userId,
           i.grant.value.id,
           i.grant.value.clientId,
+          i.client.kind === 'registered' ? i.grant.value.clientId : null,
           JSON.stringify(i.grant.value),
           i.grant.metadata.schemaVersion,
           i.grant.metadata.revision,
@@ -360,14 +370,8 @@ class Connection implements OAuthStorageConnection {
   private async begin(i: BeginGrantTransitionInput): Promise<BeginGrantTransitionResult> {
     assertBeginGrantTransitionInput(i);
     return this.tx(async () => {
-      const q = await this.db.query<
-        Row & {
-          transition_lease_id: string | null;
-          transition_lease_expires_at: number | null;
-          transition_fence: number;
-        }
-      >(
-        `SELECT value,schema_version,revision,created_at,expires_at,transition_lease_id,transition_lease_expires_at,transition_fence FROM ${TABLE.grants} WHERE namespace=$1 AND user_id=$2 AND grant_id=$3 FOR UPDATE`,
+      const q = await this.db.query<GrantTransitionRow>(
+        `SELECT value,schema_version,revision,created_at,expires_at,transition_lease_id,transition_owner_id,transition_kind,transition_credential_id,transition_callback_key,transition_lease_expires_at,transition_fence FROM ${TABLE.grants} WHERE namespace=$1 AND user_id=$2 AND grant_id=$3 FOR UPDATE`,
         [this.namespace, i.grant.userId, i.grant.grantId]
       );
       if (!q.rows[0]) return { status: 'not_found' };
@@ -428,28 +432,27 @@ class Connection implements OAuthStorageConnection {
   private async commit(i: ValidatedCommitGrantTransitionInput): Promise<CommitGrantTransitionResult> {
     assertCommitGrantTransitionInput(i);
     return this.tx(async () => {
-      const q = await this.db.query<
-        Row & {
-          transition_lease_id: string | null;
-          transition_fence: number;
-          transition_lease_expires_at: number | null;
-        }
-      >(
-        `SELECT value,schema_version,revision,created_at,expires_at,transition_lease_id,transition_fence,transition_lease_expires_at FROM ${TABLE.grants} WHERE namespace=$1 AND user_id=$2 AND grant_id=$3 FOR UPDATE`,
+      const q = await this.db.query<GrantTransitionRow>(
+        `SELECT value,schema_version,revision,created_at,expires_at,transition_lease_id,transition_owner_id,transition_kind,transition_credential_id,transition_callback_key,transition_lease_expires_at,transition_fence FROM ${TABLE.grants} WHERE namespace=$1 AND user_id=$2 AND grant_id=$3 FOR UPDATE`,
         [this.namespace, i.lease.grant.userId, i.lease.grant.grantId]
       );
       if (!q.rows[0]) return { status: 'not_found' };
       const r = q.rows[0];
-      if (Number(r.expires_at) <= i.now) return { status: 'expired' };
+      if (r.expires_at !== null && Number(r.expires_at) <= i.now) return { status: 'expired' };
       if (
         r.transition_lease_id !== i.lease.id ||
+        r.transition_owner_id !== i.lease.ownerId ||
+        r.transition_kind !== i.lease.kind ||
+        r.transition_credential_id !== i.lease.credentialId ||
+        r.transition_callback_key !== i.lease.callbackIdempotencyKey ||
         Number(r.transition_fence) !== i.lease.fence ||
+        Number(r.transition_lease_expires_at) !== i.lease.expiresAt ||
         Number(r.transition_lease_expires_at) <= i.now
       )
         return { status: 'lease_lost' };
       if (r.revision !== i.lease.expectedRevision) return { status: 'conflict' };
-      await this.db.query(
-        `UPDATE ${TABLE.grants} SET client_id=$4,value=$5::jsonb,schema_version=$6,revision=$7,created_at=$8,expires_at=$9,transition_lease_id=NULL,transition_owner_id=NULL,transition_kind=NULL,transition_credential_id=NULL,transition_callback_key=NULL,transition_lease_expires_at=NULL WHERE namespace=$1 AND user_id=$2 AND grant_id=$3`,
+      const updated = await this.db.query(
+        `UPDATE ${TABLE.grants} SET client_id=$4,value=$5::jsonb,schema_version=$6,revision=$7,created_at=$8,expires_at=$9,transition_lease_id=NULL,transition_owner_id=NULL,transition_kind=NULL,transition_credential_id=NULL,transition_callback_key=NULL,transition_lease_expires_at=NULL WHERE namespace=$1 AND user_id=$2 AND grant_id=$3 AND revision=$10 AND transition_lease_id=$11 AND transition_owner_id=$12 AND transition_kind=$13 AND transition_credential_id=$14 AND transition_callback_key=$15 AND transition_lease_expires_at=$16 AND transition_fence=$17`,
         [
           this.namespace,
           i.grant.value.userId,
@@ -460,8 +463,17 @@ class Connection implements OAuthStorageConnection {
           i.grant.metadata.revision,
           i.grant.metadata.createdAt,
           i.grant.metadata.expiresAt ?? null,
+          i.lease.expectedRevision,
+          i.lease.id,
+          i.lease.ownerId,
+          i.lease.kind,
+          i.lease.credentialId,
+          i.lease.callbackIdempotencyKey,
+          i.lease.expiresAt,
+          i.lease.fence,
         ]
       );
+      if (!updated.rowCount) return { status: 'lease_lost' };
       await this.insertToken(i.accessToken);
       return { status: 'committed' };
     });
