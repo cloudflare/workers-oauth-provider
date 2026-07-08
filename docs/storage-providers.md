@@ -2,7 +2,7 @@
 
 - **Status:** accepted implementation direction; implementation in progress
 - **Scope:** storage contract, capability negotiation, adapter boundaries, and compatibility policy
-- **Current implementation:** backend-neutral contract and legacy-compatible Workers KV adapter under `src/storage/`; provider-core migration and strong adapters remain pending
+- **Current implementation:** backend-neutral contract, request-scoped provider-core integration, and legacy-compatible Workers KV adapter; strong adapters remain pending
 - **Research baselines:** `workers-oauth-provider@0.8.1` (`f8e3ddd`), `better-auth@1.6.23` plus main (`fd6b8c1`), and `pi-mono` (`9a0a8d7c`)
 
 ## Goal
@@ -218,7 +218,7 @@ import { workersKvStorage } from '@cloudflare/workers-oauth-provider/storage/kv'
 new OAuthProvider({
   // ...
   storage: workersKvStorage<Env>({
-    namespace: (env) => env.OAUTH_KV,
+    binding: (env) => env.OAUTH_KV,
   }),
 });
 ```
@@ -375,7 +375,7 @@ The contract covers every current storage access without exposing current KV key
 | List a user's grants                                                                            | `grants.listByUser`                                                           |
 | Enumerate a grant's access tokens                                                               | `accessTokens.listByGrant`                                                    |
 | Reserve an EMA JTI                                                                              | `replay.reserve`                                                              |
-| Purge expired or orphaned state                                                                 | `maintenance.purgeExpired` plus indexed domain queries                        |
+| Purge expired or orphaned state                                                                 | `maintenance.purge`                                                           |
 
 Future persistent consent uses `consents`; it is included in contract version 1 because it is part of the Better Auth coverage roadmap. Device authorization and signing-key storage are not forced into this contract. Device state can add a versioned domain store later. OIDC signing keys use a separate signing-key provider because key custody and rotation are not ordinary OAuth record storage.
 
@@ -534,9 +534,17 @@ export interface OAuthReplayStore {
 
 ```ts
 export interface OAuthMaintenanceStore {
-  purgeExpired(input: { limit: number; cursor?: string }): Promise<{
-    deleted: number;
-    cursor?: string;
+  purge(input: {
+    now: number;
+    limit: number;
+    purgeOrphanedGrants: boolean;
+    purgeExpiredGrants: boolean;
+    purgeOrphanedTokens: boolean;
+  }): Promise<{
+    grantsChecked: number;
+    grantsPurged: number;
+    tokensChecked: number;
+    tokensPurged: number;
     done: boolean;
   }>;
 }

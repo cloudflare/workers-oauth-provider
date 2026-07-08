@@ -58,6 +58,14 @@ export function decodeKvGrant(value: unknown): StoredGrant {
   });
 }
 
+/** Decodes the parent identity needed for best-effort legacy cleanup. */
+export function decodeKvAccessTokenParent(value: unknown): { readonly userId: string; readonly grantId: string } {
+  const token = assertRecord(value, 'access token');
+  assertString(token.userId, 'token.userId');
+  assertString(token.grantId, 'token.grantId');
+  return { userId: token.userId, grantId: token.grantId };
+}
+
 /** Decodes and validates a legacy Workers KV access-token JSON value. */
 export function decodeKvAccessToken(value: unknown): StoredAccessToken {
   const token = assertRecord(value, 'access token') as unknown as Token;
@@ -173,12 +181,14 @@ function validateAccessToken(token: Token): void {
   assertStringArray(token.scope, 'token.scope');
   assertString(token.wrappedEncryptionKey, 'token.wrappedEncryptionKey');
   assertStringOrStringArray(token.audience, 'token.audience');
-  if (typeof token.grant !== 'object' || token.grant === null || Array.isArray(token.grant)) {
-    throw new TypeError('Invalid Workers KV token.grant');
+  if (token.grant !== undefined) {
+    if (typeof token.grant !== 'object' || token.grant === null || Array.isArray(token.grant)) {
+      throw new TypeError('Invalid Workers KV token.grant');
+    }
+    assertString(token.grant.clientId, 'token.grant.clientId');
+    assertStringArray(token.grant.scope, 'token.grant.scope');
+    assertString(token.grant.encryptedProps, 'token.grant.encryptedProps');
   }
-  assertString(token.grant.clientId, 'token.grant.clientId');
-  assertStringArray(token.grant.scope, 'token.grant.scope');
-  assertString(token.grant.encryptedProps, 'token.grant.encryptedProps');
 }
 
 function assertString(value: unknown, name: string): asserts value is string {

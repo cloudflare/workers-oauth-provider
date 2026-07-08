@@ -1,14 +1,33 @@
 import { WorkerEntrypoint } from 'cloudflare:workers';
 
 import {
+  assertStorageOperationSupported,
+  assertStorageQuerySupported,
+  beginGrantTransitionInput,
+  commitGrantTransitionInput,
+  createClientInput,
   createOAuthStorageOpenContext,
+  createStoredAccessToken,
+  createStoredClient,
+  createStoredGrant,
+  credentialIdFromSha256,
+  issueAccessTokenInput,
+  issueGrantInput,
+  isOAuthStorageError,
+  OAuthStorageError,
+  replaceClientInput,
+  transitionOwnerId,
   resolveOAuthStorageCompatibility,
   validateOAuthStorageProvider,
   type MutationCapabilityPath,
+  type OAuthStorageCapabilities,
   type OAuthStorageCompatibilityReport,
   type OAuthStorageConnection,
   type OAuthStorageProvider,
+  type StorageAccessToken,
+  type StorageClient,
   type StorageFeatureRequirement,
+  type StorageGrant,
   type StorageRequirement,
 } from './storage';
 import { workersKvStorage } from './storage/kv';
@@ -22,12 +41,12 @@ import {
   EMA_SUPPORTED_JWT_ALGORITHMS,
   type EmaSupportedAlg,
 } from './ema/constants';
-import { createKvJtiStore } from './ema/jti';
 import { createDefaultJwksProvider } from './ema/jwks';
 import { parseIdJag } from './ema/parser';
 import { emaErrorToWire, err, ok, type EmaValidationError, type Result } from './ema/result';
 import { selectJwk, verifyIdJagSignature } from './ema/signature';
-import type { EmaJtiStore, EmaJwksProvider, EmaOptions, EmaTrustedIssuer } from './ema/types';
+import type { EmaJwksProvider, EmaOptions, EmaTrustedIssuer } from './ema/types';
+import { sha256Hex } from './ema/util';
 import {
   computeEmaAccessTokenTTL,
   parseEmaScopeParam,
@@ -52,9 +71,15 @@ export type { EmaValidationError } from './ema/result';
 const PROTECTED_RESOURCE_WELL_KNOWN_PREFIX = '/.well-known/oauth-protected-resource';
 const NO_CACHE_HEADERS = { 'Cache-Control': 'no-store', Pragma: 'no-cache' } as const;
 const OAUTH_STORAGE_CONNECTION: unique symbol = Symbol('OAuthStorageConnection');
+const OAUTH_STORAGE_LIFETIME: unique symbol = Symbol('OAuthStorageLifetime');
+
+interface StorageOperationLifetime {
+  active: boolean;
+}
 
 type StorageBoundEnv<Env> = Env & {
   readonly [OAUTH_STORAGE_CONNECTION]: OAuthStorageConnection;
+  readonly [OAUTH_STORAGE_LIFETIME]: StorageOperationLifetime;
 };
 
 // Log CIMD status on module load
@@ -208,6 +233,12 @@ export interface TokenExchangeCallbackOptions {
    * terminal error code).
    */
   grantId: string;
+
+  /**
+   * Stable key for retries of the same grant and presented credential. External
+   * services may use it to make callback side effects idempotent.
+   */
+  idempotencyKey?: string;
 
   /**
    * List of scopes that were granted
@@ -651,13 +682,13 @@ export interface OAuthHelpers {
   exchangeToken(options: ExchangeTokenOptions): Promise<TokenResponse>;
 
   /**
-   * Purges expired and orphaned data from the KV namespace.
+   * Purges expired and orphaned data through the configured storage provider.
    * Designed to be called from a scheduled handler (Cron Trigger) for periodic cleanup.
    * Processes records in configurable batches to stay within Cloudflare's subrequest limits.
    *
    * Performs two sweep phases:
-   * 1. Grant sweep: removes orphaned grants (client deleted) and expired grants (defense-in-depth for KV TTL)
-   * 2. Token sweep: removes orphaned tokens (grant deleted) as defense-in-depth
+   * 1. Grant sweep: removes orphaned grants and expired grants
+   * 2. Token sweep: removes orphaned tokens whose grant was deleted
    *
    * Safe to call repeatedly — deleted records disappear from KV, so subsequent invocations
    * naturally process fresh records without needing a persisted cursor.
@@ -1244,6 +1275,9 @@ interface CreateAccessTokenOptions {
    */
   clientId: string;
 
+  /** Grant revision whose state was used to construct this token. */
+  expectedGrantRevision?: number;
+
   /**
    * Token scopes
    */
@@ -1304,10 +1338,10 @@ export class OAuthProvider<Env = Cloudflare.Env> {
   }
 
   /**
-   * Purges expired and orphaned data from the KV namespace.
+   * Purges expired and orphaned data through the configured storage provider.
    * Can be called directly from a scheduled handler without needing a request context.
    *
-   * @param env - Cloudflare Worker environment variables (must include OAUTH_KV binding)
+   * @param env - Cloudflare Worker environment variables used to open storage
    * @param options - Optional configuration for batch size and which purge types to enable
    * @returns Statistics about what was checked and purged
    */
@@ -1360,9 +1394,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
   /** In-memory cached IdP JWKS fetcher; only constructed when EMA is configured. */
   private readonly jwksProvider: EmaJwksProvider | undefined;
-
-  /** KV-backed best-effort `jti` replay store; only constructed when EMA is configured. */
-  private readonly jtiStore: EmaJtiStore | undefined;
 
   /** Authoritative configured storage provider. */
   private readonly storageProvider: OAuthStorageProvider<Env>;
@@ -1475,13 +1506,16 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       this.jwksProvider = createDefaultJwksProvider({
         cacheTtlSeconds: this.options.enterpriseManagedAuthorization.jwksCacheTtlSeconds,
       });
-      this.jtiStore = createKvJtiStore();
     }
   }
 
   /** Returns the constructor-time static storage compatibility report. */
   getStorageCompatibility(): OAuthStorageCompatibilityReport {
     return this.storageCompatibility;
+  }
+
+  getStorageCapabilities(): OAuthStorageCapabilities {
+    return this.storageProvider.capabilities;
   }
 
   private getEnabledStorageRequirements(): readonly StorageFeatureRequirement[] {
@@ -1756,10 +1790,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       return null;
     }
 
-    // Retrieve the token from KV
     const [userId, grantId] = parts;
-    const id = await generateTokenId(token);
-    const tokenData: Token | null = await env.OAUTH_KV.get(`token:${userId}:${grantId}:${id}`, { type: 'json' });
+    const id = credentialIdFromSha256(await generateTokenId(token));
+    const storedToken = await this.requireStorage(env).accessTokens.get({ userId, grantId, tokenId: id });
+    const tokenData = storedToken?.value;
 
     // Return null if missing or expired
     if (!tokenData) {
@@ -1770,12 +1804,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       return null;
     }
 
+    const { grant } = tokenData;
+    if (!grant) return null;
+
     // Decrypt the props
     const encryptionKey = await unwrapKeyWithToken(token, tokenData.wrappedEncryptionKey);
-    const decryptedProps = await decryptProps(encryptionKey, tokenData.grant.encryptedProps);
+    const decryptedProps = await decryptProps(encryptionKey, grant.encryptedProps);
 
     // Return the token data with decrypted instead of encrypted props
-    const { grant } = tokenData;
     return {
       id: tokenData.id,
       grantId: tokenData.grantId,
@@ -2261,8 +2297,16 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * HTTP-date is allowed).
    */
   private createOAuthErrorResponse(error: unknown): Response | undefined {
-    if (!(error instanceof OAuthError)) return undefined;
-    return this.createErrorResponse(error.code, error.options);
+    if (error instanceof OAuthError) return this.createErrorResponse(error.code, error.options);
+    if (isOAuthStorageError(error) && error.retryable) {
+      const rateLimited = error.code === 'rate_limited';
+      return this.createErrorResponse('temporarily_unavailable', {
+        description: 'Token issuance is temporarily unavailable; retry shortly',
+        statusCode: rateLimited ? 429 : 503,
+        ...(rateLimited ? { headers: { 'Retry-After': '30' } } : {}),
+      });
+    }
+    return undefined;
   }
 
   /**
@@ -2290,9 +2334,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     const [userId, grantId, _] = codeParts;
 
-    // Get the grant
-    const grantKey = `grant:${userId}:${grantId}`;
-    const grantData: Grant | null = await env.OAUTH_KV.get(grantKey, { type: 'json' });
+    const storage = this.requireStorage(env);
+    const grantKey = { userId, grantId };
+    const initialGrant = await storage.grants.get(grantKey);
+    let grantData = initialGrant ? this.cloneGrant(initialGrant.value) : null;
 
     if (!grantData) {
       return this.createErrorResponse('invalid_grant', {
@@ -2374,192 +2419,255 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       }
     }
 
-    // Define the access token TTL, may be updated by callback if provided
-    let accessTokenTTL = this.options.accessTokenTTL!;
-    // Define the refresh token TTL, may be updated by callback if provided
-    let refreshTokenTTL = this.options.refreshTokenTTL;
+    const transition = await storage.grants.beginTransition(
+      await beginGrantTransitionInput({
+        namespace: storage.namespace,
+        grant: grantKey,
+        kind: 'authorization_code',
+        credentialId: credentialIdFromSha256(codeHash),
+        ownerId: transitionOwnerId(generateRandomString(24)),
+        leaseTtlSeconds: 300,
+        now: Math.floor(Date.now() / 1000),
+      })
+    );
+    if (transition.status === 'already_consumed') {
+      try {
+        await storage.grants.revoke({ grant: grantKey });
+      } catch {
+        // Best-effort replay revocation.
+      }
+      return this.createErrorResponse('invalid_grant', { description: 'Authorization code already used' });
+    }
+    if (transition.status === 'not_found' || transition.status === 'expired') {
+      return this.createErrorResponse('invalid_grant', {
+        description: 'Grant not found or authorization code expired',
+      });
+    }
+    if (transition.status === 'invalid_credential') {
+      return this.createErrorResponse('invalid_grant', { description: 'Invalid authorization code' });
+    }
+    if (transition.status === 'busy') {
+      return this.createErrorResponse('temporarily_unavailable', {
+        description: 'Authorization code exchange is already in progress',
+        statusCode: 429,
+        headers: { 'Retry-After': String(transition.retryAfterSeconds) },
+      });
+    }
+    if (transition.status !== 'acquired') {
+      return this.createErrorResponse('invalid_grant', { description: 'Invalid authorization code' });
+    }
+    grantData = this.cloneGrant(transition.grant.value);
+    let transitionCommitted = false;
+    try {
+      // Define the access token TTL, may be updated by callback if provided
+      let accessTokenTTL = this.options.accessTokenTTL!;
+      // Define the refresh token TTL, may be updated by callback if provided
+      let refreshTokenTTL = this.options.refreshTokenTTL;
 
-    // Get the encryption key for props by unwrapping it using the auth code
-    const encryptionKey = await unwrapKeyWithToken(code, grantData.authCodeWrappedKey!);
+      // Get the encryption key for props by unwrapping it using the auth code
+      const encryptionKey = await unwrapKeyWithToken(code, grantData.authCodeWrappedKey!);
 
-    // Default to using the same encryption key and props for both grant and access token
-    let grantEncryptionKey = encryptionKey;
-    let accessTokenEncryptionKey = encryptionKey;
-    let encryptedAccessTokenProps = grantData.encryptedProps;
+      // Default to using the same encryption key and props for both grant and access token
+      let grantEncryptionKey = encryptionKey;
+      let accessTokenEncryptionKey = encryptionKey;
+      let encryptedAccessTokenProps = grantData.encryptedProps;
 
-    // Parse and validate scope parameter for downscoping (RFC 6749 Section 3.3)
-    // The token request can include a scope parameter to request a subset of the granted scopes
-    let tokenScopes: string[] = this.downscope(body.scope, grantData.scope);
+      // Parse and validate scope parameter for downscoping (RFC 6749 Section 3.3)
+      // The token request can include a scope parameter to request a subset of the granted scopes
+      let tokenScopes: string[] = this.downscope(body.scope, grantData.scope);
 
-    // Process token exchange callback if provided
-    if (this.options.tokenExchangeCallback) {
-      // Decrypt the existing props to provide them to the callback
-      const decryptedProps = await decryptProps(encryptionKey, grantData.encryptedProps);
+      // Process token exchange callback if provided
+      if (this.options.tokenExchangeCallback) {
+        // Decrypt the existing props to provide them to the callback
+        const decryptedProps = await decryptProps(encryptionKey, grantData.encryptedProps);
 
-      // Default to using the original props for both grant and token
-      let grantProps = decryptedProps;
-      let accessTokenProps = decryptedProps;
+        // Default to using the original props for both grant and token
+        let grantProps = decryptedProps;
+        let accessTokenProps = decryptedProps;
 
-      const callbackOptions: TokenExchangeCallbackOptions = {
-        grantType: GrantType.AUTHORIZATION_CODE,
-        clientId: clientInfo.clientId,
-        userId: userId,
-        grantId: grantId,
-        scope: grantData.scope,
-        requestedScope: tokenScopes,
-        props: decryptedProps,
-      };
+        const callbackOptions: TokenExchangeCallbackOptions = {
+          grantType: GrantType.AUTHORIZATION_CODE,
+          clientId: clientInfo.clientId,
+          userId: userId,
+          grantId: grantId,
+          idempotencyKey: transition.lease.callbackIdempotencyKey,
+          scope: grantData.scope,
+          requestedScope: tokenScopes,
+          props: decryptedProps,
+        };
 
-      const callbackResult = await Promise.resolve(this.options.tokenExchangeCallback(callbackOptions));
+        const callbackResult = await Promise.resolve(this.options.tokenExchangeCallback(callbackOptions));
 
-      if (callbackResult) {
-        // Use the returned props if provided, otherwise keep the original props
-        if (callbackResult.newProps) {
-          grantProps = callbackResult.newProps;
+        if (callbackResult) {
+          // Use the returned props if provided, otherwise keep the original props
+          if (callbackResult.newProps) {
+            grantProps = callbackResult.newProps;
 
-          // If accessTokenProps wasn't explicitly specified, use the updated newProps for the token too
-          // This ensures token props are updated when only newProps are specified
-          if (!callbackResult.accessTokenProps) {
-            accessTokenProps = callbackResult.newProps;
+            // If accessTokenProps wasn't explicitly specified, use the updated newProps for the token too
+            // This ensures token props are updated when only newProps are specified
+            if (!callbackResult.accessTokenProps) {
+              accessTokenProps = callbackResult.newProps;
+            }
+          }
+
+          // If accessTokenProps was explicitly specified, use those
+          if (callbackResult.accessTokenProps) {
+            accessTokenProps = callbackResult.accessTokenProps;
+          }
+
+          // If accessTokenTTL was specified, use that for this token
+          if (callbackResult.accessTokenTTL !== undefined) {
+            accessTokenTTL = callbackResult.accessTokenTTL;
+          }
+
+          // If refreshTokenTTL was specified, use that for this grant
+          if ('refreshTokenTTL' in callbackResult) {
+            refreshTokenTTL = callbackResult.refreshTokenTTL;
+          }
+
+          // If accessTokenScope was specified, use it for this token
+          if (callbackResult.accessTokenScope) {
+            tokenScopes = this.downscope(callbackResult.accessTokenScope, grantData.scope);
           }
         }
 
-        // If accessTokenProps was explicitly specified, use those
-        if (callbackResult.accessTokenProps) {
-          accessTokenProps = callbackResult.accessTokenProps;
-        }
+        // Re-encrypt the potentially updated grant props
+        const grantResult = await encryptProps(grantProps);
+        grantData.encryptedProps = grantResult.encryptedData;
+        grantEncryptionKey = grantResult.key;
 
-        // If accessTokenTTL was specified, use that for this token
-        if (callbackResult.accessTokenTTL !== undefined) {
-          accessTokenTTL = callbackResult.accessTokenTTL;
-        }
-
-        // If refreshTokenTTL was specified, use that for this grant
-        if ('refreshTokenTTL' in callbackResult) {
-          refreshTokenTTL = callbackResult.refreshTokenTTL;
-        }
-
-        // If accessTokenScope was specified, use it for this token
-        if (callbackResult.accessTokenScope) {
-          tokenScopes = this.downscope(callbackResult.accessTokenScope, grantData.scope);
+        // Re-encrypt the access token props if they're different from grant props
+        if (accessTokenProps !== grantProps) {
+          const tokenResult = await encryptProps(accessTokenProps);
+          encryptedAccessTokenProps = tokenResult.encryptedData;
+          accessTokenEncryptionKey = tokenResult.key;
+        } else {
+          // If they're the same, use the grant's encrypted data and key
+          encryptedAccessTokenProps = grantData.encryptedProps;
+          accessTokenEncryptionKey = grantEncryptionKey;
         }
       }
 
-      // Re-encrypt the potentially updated grant props
-      const grantResult = await encryptProps(grantProps);
-      grantData.encryptedProps = grantResult.encryptedData;
-      grantEncryptionKey = grantResult.key;
+      // Calculate the access token expiration time (after callback might have updated TTL)
+      const now = Math.floor(Date.now() / 1000);
 
-      // Re-encrypt the access token props if they're different from grant props
-      if (accessTokenProps !== grantProps) {
-        const tokenResult = await encryptProps(accessTokenProps);
-        encryptedAccessTokenProps = tokenResult.encryptedData;
-        accessTokenEncryptionKey = tokenResult.key;
-      } else {
-        // If they're the same, use the grant's encrypted data and key
-        encryptedAccessTokenProps = grantData.encryptedProps;
-        accessTokenEncryptionKey = grantEncryptionKey;
+      // Determine if we should issue a refresh token
+      const useRefreshToken = refreshTokenTTL !== 0;
+
+      // Update the grant:
+      // - Retain the auth code hash so a replayed code can be verified before acting
+      // - Remove PKCE-related fields (one-time use)
+      // - Remove auth code wrapped key (no longer needed); its absence marks the
+      //   code as used so a subsequent replay can be detected
+      delete grantData.codeChallenge;
+      delete grantData.codeChallengeMethod;
+      delete grantData.authCodeWrappedKey;
+
+      // Only generate refresh token if issuing one
+      let refreshToken: string | undefined;
+
+      if (useRefreshToken) {
+        const refreshTokenSecret = generateRandomString(TOKEN_LENGTH);
+        refreshToken = `${userId}:${grantId}:${refreshTokenSecret}`;
+        const refreshTokenId = await generateTokenId(refreshToken);
+        const refreshTokenWrappedKey = await wrapKeyWithToken(refreshToken, grantEncryptionKey);
+
+        // Calculate expiration if TTL is defined
+        const expiresAt = refreshTokenTTL !== undefined ? now + refreshTokenTTL : undefined;
+
+        // Add refresh token data to grant
+        grantData.refreshTokenId = refreshTokenId;
+        grantData.refreshTokenWrappedKey = refreshTokenWrappedKey;
+        grantData.previousRefreshTokenId = undefined; // No previous token for first use
+        grantData.previousRefreshTokenWrappedKey = undefined; // No previous token for first use
+        grantData.expiresAt = expiresAt;
       }
-    }
 
-    // Calculate the access token expiration time (after callback might have updated TTL)
-    const now = Math.floor(Date.now() / 1000);
+      // Parse and validate resource parameter (RFC 8707)
+      // Validate downscoping: token request resources must be subset of grant resources
+      const originOnly = !!this.options.resourceMatchOriginOnly;
+      if (body.resource && grantData.resource) {
+        const requestedResources = Array.isArray(body.resource) ? body.resource : [body.resource];
+        const grantedResources = Array.isArray(grantData.resource) ? grantData.resource : [grantData.resource];
 
-    // Determine if we should issue a refresh token
-    const useRefreshToken = refreshTokenTTL !== 0;
-
-    // Update the grant:
-    // - Retain the auth code hash so a replayed code can be verified before acting
-    // - Remove PKCE-related fields (one-time use)
-    // - Remove auth code wrapped key (no longer needed); its absence marks the
-    //   code as used so a subsequent replay can be detected
-    delete grantData.codeChallenge;
-    delete grantData.codeChallengeMethod;
-    delete grantData.authCodeWrappedKey;
-
-    // Only generate refresh token if issuing one
-    let refreshToken: string | undefined;
-
-    if (useRefreshToken) {
-      const refreshTokenSecret = generateRandomString(TOKEN_LENGTH);
-      refreshToken = `${userId}:${grantId}:${refreshTokenSecret}`;
-      const refreshTokenId = await generateTokenId(refreshToken);
-      const refreshTokenWrappedKey = await wrapKeyWithToken(refreshToken, grantEncryptionKey);
-
-      // Calculate expiration if TTL is defined
-      const expiresAt = refreshTokenTTL !== undefined ? now + refreshTokenTTL : undefined;
-
-      // Add refresh token data to grant
-      grantData.refreshTokenId = refreshTokenId;
-      grantData.refreshTokenWrappedKey = refreshTokenWrappedKey;
-      grantData.previousRefreshTokenId = undefined; // No previous token for first use
-      grantData.previousRefreshTokenWrappedKey = undefined; // No previous token for first use
-      grantData.expiresAt = expiresAt;
-    }
-
-    // Save the updated grant with TTL matching refresh token expiration (if any)
-    await this.saveGrantWithTTL(env, grantKey, grantData, now);
-
-    // Parse and validate resource parameter (RFC 8707)
-    // Validate downscoping: token request resources must be subset of grant resources
-    const originOnly = !!this.options.resourceMatchOriginOnly;
-    if (body.resource && grantData.resource) {
-      const requestedResources = Array.isArray(body.resource) ? body.resource : [body.resource];
-      const grantedResources = Array.isArray(grantData.resource) ? grantData.resource : [grantData.resource];
-
-      // Check that all requested resources are in the granted resources
-      for (const requested of requestedResources) {
-        if (!grantedResources.some((granted) => resourceMatches(requested, granted, originOnly))) {
-          return this.createErrorResponse('invalid_target', {
-            description: 'Requested resource was not included in the authorization request',
-          });
+        // Check that all requested resources are in the granted resources
+        for (const requested of requestedResources) {
+          if (!grantedResources.some((granted) => resourceMatches(requested, granted, originOnly))) {
+            return this.createErrorResponse('invalid_target', {
+              description: 'Requested resource was not included in the authorization request',
+            });
+          }
         }
       }
-    }
 
-    // Use resource from token request if provided, otherwise use resource from grant
-    const audience = parseResourceParameter(body.resource || grantData.resource);
-    if ((body.resource || grantData.resource) && !audience) {
-      // RFC 8707 Section 2.1: invalid or unacceptable resource
-      return this.createErrorResponse('invalid_target', {
-        description: 'The resource parameter must be a valid absolute URI without a fragment',
+      // Use resource from token request if provided, otherwise use resource from grant
+      const audience = parseResourceParameter(body.resource || grantData.resource);
+      if ((body.resource || grantData.resource) && !audience) {
+        // RFC 8707 Section 2.1: invalid or unacceptable resource
+        return this.createErrorResponse('invalid_target', {
+          description: 'The resource parameter must be a valid absolute URI without a fragment',
+        });
+      }
+
+      const builtAccessToken = await this.buildAccessToken({
+        userId,
+        grantId,
+        clientId: grantData.clientId,
+        scope: tokenScopes,
+        encryptedProps: encryptedAccessTokenProps,
+        encryptionKey: accessTokenEncryptionKey,
+        expiresIn: accessTokenTTL,
+        audience,
+        env,
       });
+      const committed = await storage.grants.commitTransition(
+        commitGrantTransitionInput({
+          lease: transition.lease,
+          now,
+          grant: this.toStoredGrant(grantData, transition.grant.metadata.revision + 1),
+          accessToken: this.toStoredAccessToken(builtAccessToken.record),
+        })
+      );
+      if (committed.status !== 'committed') {
+        return this.createErrorResponse('invalid_grant', {
+          description: 'Authorization grant changed during exchange',
+        });
+      }
+      transitionCommitted = true;
+
+      // Build the response
+      const tokenResponse: TokenResponse = {
+        access_token: builtAccessToken.token,
+        token_type: 'bearer',
+        expires_in: accessTokenTTL,
+        scope: tokenScopes.join(' '),
+      };
+
+      if (refreshToken) {
+        tokenResponse.refresh_token = refreshToken;
+      }
+
+      // RFC 8707 Section 2.2: SHOULD return resource parameter in response
+      if (audience) {
+        tokenResponse.resource = audience;
+      }
+
+      // RFC 6749 §5.1 — responses containing tokens must not be cached.
+      return new Response(JSON.stringify(tokenResponse), {
+        headers: { 'Content-Type': 'application/json', ...NO_CACHE_HEADERS },
+      });
+    } finally {
+      if (!transitionCommitted) {
+        try {
+          await storage.grants.abortTransition({
+            lease: transition.lease,
+            now: Math.floor(Date.now() / 1000),
+          });
+        } catch {
+          // Preserve the original OAuth response or callback error.
+        }
+      }
     }
-
-    // Create and store access token with potentially narrowed scopes
-    const accessToken = await this.createAccessToken({
-      userId,
-      grantId,
-      clientId: grantData.clientId,
-      scope: tokenScopes,
-      encryptedProps: encryptedAccessTokenProps,
-      encryptionKey: accessTokenEncryptionKey,
-      expiresIn: accessTokenTTL,
-      audience,
-      env,
-    });
-
-    // Build the response
-    const tokenResponse: TokenResponse = {
-      access_token: accessToken,
-      token_type: 'bearer',
-      expires_in: accessTokenTTL,
-      scope: tokenScopes.join(' '),
-    };
-
-    if (refreshToken) {
-      tokenResponse.refresh_token = refreshToken;
-    }
-
-    // RFC 8707 Section 2.2: SHOULD return resource parameter in response
-    if (audience) {
-      tokenResponse.resource = audience;
-    }
-
-    // RFC 6749 §5.1 — responses containing tokens must not be cached.
-    return new Response(JSON.stringify(tokenResponse), {
-      headers: { 'Content-Type': 'application/json', ...NO_CACHE_HEADERS },
-    });
   }
 
   /**
@@ -2588,290 +2696,319 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Calculate the token hash
     const providedTokenHash = await generateTokenId(refreshToken);
 
-    // Get the associated grant using userId in the key
-    const grantKey = `grant:${userId}:${grantId}`;
-    const grantData: Grant | null = await env.OAUTH_KV.get(grantKey, { type: 'json' });
-
-    if (!grantData) {
+    const storage = this.requireStorage(env);
+    const grantKey = { userId, grantId };
+    const transition = await storage.grants.beginTransition(
+      await beginGrantTransitionInput({
+        namespace: storage.namespace,
+        grant: grantKey,
+        kind: 'refresh_token',
+        credentialId: credentialIdFromSha256(providedTokenHash),
+        ownerId: transitionOwnerId(generateRandomString(24)),
+        leaseTtlSeconds: 300,
+        now: Math.floor(Date.now() / 1000),
+      })
+    );
+    if (transition.status === 'expired') {
+      return this.createErrorResponse('invalid_grant', { description: 'Refresh token has expired' });
+    }
+    if (transition.status === 'not_found') {
       return this.createErrorResponse('invalid_grant', { description: 'Grant not found' });
     }
-
-    // Check if the provided token matches either the current or previous refresh token
-    const isCurrentToken = grantData.refreshTokenId === providedTokenHash;
-    const isPreviousToken = grantData.previousRefreshTokenId === providedTokenHash;
-
-    if (!isCurrentToken && !isPreviousToken) {
+    if (transition.status === 'invalid_credential' || transition.status === 'already_consumed') {
       return this.createErrorResponse('invalid_grant', { description: 'Invalid refresh token' });
     }
-
-    // Verify client ID matches
+    if (transition.status === 'busy') {
+      return this.createErrorResponse('temporarily_unavailable', {
+        description: 'Refresh token exchange is already in progress',
+        statusCode: 429,
+        headers: { 'Retry-After': String(transition.retryAfterSeconds) },
+      });
+    }
+    if (transition.status !== 'acquired') {
+      return this.createErrorResponse('invalid_grant', { description: 'Invalid refresh token' });
+    }
+    const grantData = this.cloneGrant(transition.grant.value);
+    const acquiredCurrentToken = grantData.refreshTokenId === providedTokenHash;
+    const acquiredPreviousToken = grantData.previousRefreshTokenId === providedTokenHash;
+    if (!acquiredCurrentToken && !acquiredPreviousToken) {
+      await storage.grants.abortTransition({ lease: transition.lease, now: Math.floor(Date.now() / 1000) });
+      return this.createErrorResponse('invalid_grant', { description: 'Invalid refresh token' });
+    }
     if (grantData.clientId !== clientInfo.clientId) {
+      await storage.grants.abortTransition({ lease: transition.lease, now: Math.floor(Date.now() / 1000) });
       return this.createErrorResponse('invalid_grant', { description: 'Client ID mismatch' });
     }
+    const minimumStorageTtl = this.storageProvider.capabilities.expiration.minimumTtlSeconds;
+    if (grantData.expiresAt !== undefined && grantData.expiresAt - Math.floor(Date.now() / 1000) < minimumStorageTtl) {
+      await storage.grants.abortTransition({ lease: transition.lease, now: Math.floor(Date.now() / 1000) });
+      return this.createErrorResponse('invalid_grant', { description: 'Refresh token has expired' });
+    }
+    let transitionCommitted = false;
+    try {
+      // Generate new access token with embedded user and grant IDs
+      const accessTokenSecret = generateRandomString(TOKEN_LENGTH);
+      const newAccessToken = `${userId}:${grantId}:${accessTokenSecret}`;
+      const accessTokenId = await generateTokenId(newAccessToken);
 
-    // Check if the refresh token has expired.
-    // Cloudflare KV requires absolute expirations to be at least 60 seconds in the
-    // future. Rotating the grant re-saves it with `{ expiration: grantData.expiresAt }`,
-    // so a grant with less than 60 seconds of life remaining cannot be written back to
-    // KV and would otherwise surface as an uncaught "KV PUT failed: 400 Invalid
-    // expiration" error. Treat such near-expiry grants as already expired instead.
-    if (grantData.expiresAt !== undefined) {
-      const now = Math.floor(Date.now() / 1000);
-      if (grantData.expiresAt - now < KV_MIN_EXPIRATION_TTL_SECONDS) {
-        return this.createErrorResponse('invalid_grant', { description: 'Refresh token has expired' });
+      // Define the access token TTL, may be updated by callback if provided
+      let accessTokenTTL = this.options.accessTokenTTL!;
+
+      // Determine which wrapped key to use for unwrapping
+      let wrappedKeyToUse: string;
+      if (acquiredCurrentToken) {
+        wrappedKeyToUse = grantData.refreshTokenWrappedKey!;
+      } else {
+        wrappedKeyToUse = grantData.previousRefreshTokenWrappedKey!;
       }
-    }
 
-    // Generate new access token with embedded user and grant IDs
-    const accessTokenSecret = generateRandomString(TOKEN_LENGTH);
-    const newAccessToken = `${userId}:${grantId}:${accessTokenSecret}`;
-    const accessTokenId = await generateTokenId(newAccessToken);
+      // Unwrap the encryption key using the refresh token
+      const encryptionKey = await unwrapKeyWithToken(refreshToken, wrappedKeyToUse);
 
-    // Define the access token TTL, may be updated by callback if provided
-    let accessTokenTTL = this.options.accessTokenTTL!;
+      // Default to using the same encryption key and props for both grant and access token
+      let grantEncryptionKey = encryptionKey;
+      let accessTokenEncryptionKey = encryptionKey;
+      let encryptedAccessTokenProps = grantData.encryptedProps;
 
-    // Determine which wrapped key to use for unwrapping
-    let wrappedKeyToUse: string;
-    if (isCurrentToken) {
-      wrappedKeyToUse = grantData.refreshTokenWrappedKey!;
-    } else {
-      wrappedKeyToUse = grantData.previousRefreshTokenWrappedKey!;
-    }
+      // Parse and validate scope parameter for downscoping (RFC 6749 Section 3.3)
+      // The token request can include a scope parameter to request a subset of the granted scopes
+      let tokenScopes = this.downscope(body.scope, grantData.scope);
 
-    // Unwrap the encryption key using the refresh token
-    const encryptionKey = await unwrapKeyWithToken(refreshToken, wrappedKeyToUse);
+      // Track whether grant props changed
+      let grantPropsChanged = false;
 
-    // Default to using the same encryption key and props for both grant and access token
-    let grantEncryptionKey = encryptionKey;
-    let accessTokenEncryptionKey = encryptionKey;
-    let encryptedAccessTokenProps = grantData.encryptedProps;
+      // Process token exchange callback if provided
+      if (this.options.tokenExchangeCallback) {
+        // Decrypt the existing props to provide them to the callback
+        const decryptedProps = await decryptProps(encryptionKey, grantData.encryptedProps);
 
-    // Parse and validate scope parameter for downscoping (RFC 6749 Section 3.3)
-    // The token request can include a scope parameter to request a subset of the granted scopes
-    let tokenScopes = this.downscope(body.scope, grantData.scope);
+        // Default to using the original props for both grant and token
+        let grantProps = decryptedProps;
+        let accessTokenProps = decryptedProps;
 
-    // Track whether grant props changed
-    let grantPropsChanged = false;
+        const callbackOptions: TokenExchangeCallbackOptions = {
+          grantType: GrantType.REFRESH_TOKEN,
+          clientId: clientInfo.clientId,
+          userId: userId,
+          grantId: grantId,
+          idempotencyKey: transition.lease.callbackIdempotencyKey,
+          scope: grantData.scope,
+          requestedScope: tokenScopes,
+          props: decryptedProps,
+        };
 
-    // Process token exchange callback if provided
-    if (this.options.tokenExchangeCallback) {
-      // Decrypt the existing props to provide them to the callback
-      const decryptedProps = await decryptProps(encryptionKey, grantData.encryptedProps);
+        const callbackResult = await Promise.resolve(this.options.tokenExchangeCallback(callbackOptions));
 
-      // Default to using the original props for both grant and token
-      let grantProps = decryptedProps;
-      let accessTokenProps = decryptedProps;
+        if (callbackResult) {
+          // Use the returned props if provided, otherwise keep the original props
+          if (callbackResult.newProps) {
+            grantProps = callbackResult.newProps;
+            grantPropsChanged = true;
 
-      const callbackOptions: TokenExchangeCallbackOptions = {
-        grantType: GrantType.REFRESH_TOKEN,
-        clientId: clientInfo.clientId,
-        userId: userId,
-        grantId: grantId,
-        scope: grantData.scope,
-        requestedScope: tokenScopes,
-        props: decryptedProps,
-      };
+            // If accessTokenProps wasn't explicitly specified, use the updated newProps for the token too
+            // This ensures token props are updated when only newProps are specified
+            if (!callbackResult.accessTokenProps) {
+              accessTokenProps = callbackResult.newProps;
+            }
+          }
 
-      const callbackResult = await Promise.resolve(this.options.tokenExchangeCallback(callbackOptions));
+          // If accessTokenProps was explicitly specified, use those
+          if (callbackResult.accessTokenProps) {
+            accessTokenProps = callbackResult.accessTokenProps;
+          }
 
-      if (callbackResult) {
-        // Use the returned props if provided, otherwise keep the original props
-        if (callbackResult.newProps) {
-          grantProps = callbackResult.newProps;
-          grantPropsChanged = true;
+          // If accessTokenTTL was specified, use that for this token
+          if (callbackResult.accessTokenTTL !== undefined) {
+            accessTokenTTL = callbackResult.accessTokenTTL;
+          }
 
-          // If accessTokenProps wasn't explicitly specified, use the updated newProps for the token too
-          // This ensures token props are updated when only newProps are specified
-          if (!callbackResult.accessTokenProps) {
-            accessTokenProps = callbackResult.newProps;
+          // refreshTokenTTL changes are not supported during refresh token exchange
+          if ('refreshTokenTTL' in callbackResult) {
+            return this.createErrorResponse('invalid_request', {
+              description: 'refreshTokenTTL cannot be changed during refresh token exchange',
+            });
+          }
+
+          // If accessTokenScope was specified, use it for this token
+          if (callbackResult.accessTokenScope) {
+            tokenScopes = this.downscope(callbackResult.accessTokenScope, grantData.scope);
           }
         }
 
-        // If accessTokenProps was explicitly specified, use those
-        if (callbackResult.accessTokenProps) {
-          accessTokenProps = callbackResult.accessTokenProps;
+        // Only re-encrypt the grant props if they've changed
+        if (grantPropsChanged) {
+          // Re-encrypt the updated grant props
+          const grantResult = await encryptProps(grantProps);
+          grantData.encryptedProps = grantResult.encryptedData;
+
+          // If the encryption key changed, we need to re-wrap the previous token key
+          if (grantResult.key !== encryptionKey) {
+            grantEncryptionKey = grantResult.key;
+            wrappedKeyToUse = await wrapKeyWithToken(refreshToken, grantEncryptionKey);
+          } else {
+            grantEncryptionKey = grantResult.key;
+          }
         }
 
-        // If accessTokenTTL was specified, use that for this token
-        if (callbackResult.accessTokenTTL !== undefined) {
-          accessTokenTTL = callbackResult.accessTokenTTL;
-        }
-
-        // refreshTokenTTL changes are not supported during refresh token exchange
-        if ('refreshTokenTTL' in callbackResult) {
-          return this.createErrorResponse('invalid_request', {
-            description: 'refreshTokenTTL cannot be changed during refresh token exchange',
-          });
-        }
-
-        // If accessTokenScope was specified, use it for this token
-        if (callbackResult.accessTokenScope) {
-          tokenScopes = this.downscope(callbackResult.accessTokenScope, grantData.scope);
-        }
-      }
-
-      // Only re-encrypt the grant props if they've changed
-      if (grantPropsChanged) {
-        // Re-encrypt the updated grant props
-        const grantResult = await encryptProps(grantProps);
-        grantData.encryptedProps = grantResult.encryptedData;
-
-        // If the encryption key changed, we need to re-wrap the previous token key
-        if (grantResult.key !== encryptionKey) {
-          grantEncryptionKey = grantResult.key;
-          wrappedKeyToUse = await wrapKeyWithToken(refreshToken, grantEncryptionKey);
+        // Re-encrypt the access token props if they're different from grant props
+        if (accessTokenProps !== grantProps) {
+          const tokenResult = await encryptProps(accessTokenProps);
+          encryptedAccessTokenProps = tokenResult.encryptedData;
+          accessTokenEncryptionKey = tokenResult.key;
         } else {
-          grantEncryptionKey = grantResult.key;
+          // If they're the same, use the grant's encrypted data and key
+          encryptedAccessTokenProps = grantData.encryptedProps;
+          accessTokenEncryptionKey = grantEncryptionKey;
         }
       }
 
-      // Re-encrypt the access token props if they're different from grant props
-      if (accessTokenProps !== grantProps) {
-        const tokenResult = await encryptProps(accessTokenProps);
-        encryptedAccessTokenProps = tokenResult.encryptedData;
-        accessTokenEncryptionKey = tokenResult.key;
-      } else {
-        // If they're the same, use the grant's encrypted data and key
-        encryptedAccessTokenProps = grantData.encryptedProps;
-        accessTokenEncryptionKey = grantEncryptionKey;
+      // Calculate the access token expiration time (after callback might have updated TTL)
+      const now = Math.floor(Date.now() / 1000);
+
+      // Re-check expiry against the post-callback clock. The expiry check above runs before
+      // the tokenExchangeCallback, which may take long enough (e.g. an upstream network
+      // refresh) that the grant now has less than KV's 60-second minimum remaining. Both the
+      // grant write below and the access token write (whose TTL is clamped to the grant's
+      // remaining lifetime) would then be rejected by KV with a 400. Treat the grant as
+      // expired here so we return a clean invalid_grant rather than an uncaught 500. No grant
+      // mutation or token write has happened yet, so returning now leaves no partial state.
+      if (grantData.expiresAt !== undefined && grantData.expiresAt - now < minimumStorageTtl) {
+        return this.createErrorResponse('invalid_grant', { description: 'Refresh token has expired' });
       }
-    }
 
-    // Calculate the access token expiration time (after callback might have updated TTL)
-    const now = Math.floor(Date.now() / 1000);
-
-    // Re-check expiry against the post-callback clock. The expiry check above runs before
-    // the tokenExchangeCallback, which may take long enough (e.g. an upstream network
-    // refresh) that the grant now has less than KV's 60-second minimum remaining. Both the
-    // grant write below and the access token write (whose TTL is clamped to the grant's
-    // remaining lifetime) would then be rejected by KV with a 400. Treat the grant as
-    // expired here so we return a clean invalid_grant rather than an uncaught 500. No grant
-    // mutation or token write has happened yet, so returning now leaves no partial state.
-    if (grantData.expiresAt !== undefined && grantData.expiresAt - now < KV_MIN_EXPIRATION_TTL_SECONDS) {
-      return this.createErrorResponse('invalid_grant', { description: 'Refresh token has expired' });
-    }
-
-    // Clamp access token TTL to not exceed refresh token's remaining lifetime
-    if (grantData.expiresAt !== undefined) {
-      const remainingRefreshTokenLifetime = grantData.expiresAt - now;
-      if (remainingRefreshTokenLifetime > 0) {
-        accessTokenTTL = Math.min(accessTokenTTL, remainingRefreshTokenLifetime);
+      // Clamp access token TTL to not exceed refresh token's remaining lifetime
+      if (grantData.expiresAt !== undefined) {
+        const remainingRefreshTokenLifetime = grantData.expiresAt - now;
+        if (remainingRefreshTokenLifetime > 0) {
+          accessTokenTTL = Math.min(accessTokenTTL, remainingRefreshTokenLifetime);
+        }
       }
-    }
 
-    // The access token below is written with a relative `expirationTtl`, which KV rejects
-    // when under 60 seconds. With the re-check above the grant has >=60s remaining, so the
-    // only way to land here is a tokenExchangeCallback returning an `accessTokenTTL` below
-    // the minimum. Reject before rotating/saving the grant rather than crashing on the write.
-    if (accessTokenTTL < KV_MIN_EXPIRATION_TTL_SECONDS) {
-      return this.createErrorResponse('invalid_request', {
-        description: 'Requested token lifetime must be at least 60 seconds',
+      // The access token below is written with a relative `expirationTtl`, which KV rejects
+      // when under 60 seconds. With the re-check above the grant has >=60s remaining, so the
+      // only way to land here is a tokenExchangeCallback returning an `accessTokenTTL` below
+      // the minimum. Reject before rotating/saving the grant rather than crashing on the write.
+      if (accessTokenTTL < minimumStorageTtl) {
+        return this.createErrorResponse('invalid_request', {
+          description: `Requested token lifetime must be at least ${minimumStorageTtl} seconds`,
+        });
+      }
+
+      const accessTokenExpiresAt = now + accessTokenTTL;
+
+      // Wrap the access token key
+      const accessTokenWrappedKey = await wrapKeyWithToken(newAccessToken, accessTokenEncryptionKey);
+
+      // Generate new refresh token for rotation
+      const refreshTokenSecret = generateRandomString(TOKEN_LENGTH);
+      const newRefreshToken = `${userId}:${grantId}:${refreshTokenSecret}`;
+      const newRefreshTokenId = await generateTokenId(newRefreshToken);
+      const newRefreshTokenWrappedKey = await wrapKeyWithToken(newRefreshToken, grantEncryptionKey);
+
+      // Update the grant with the token rotation information
+      // The token which the client used this time becomes the "previous" token, so that the client
+      // can always use the same token again next time. This might technically violate OAuth 2.1's
+      // requirement that refresh tokens be single-use. However, this requirement violates the laws
+      // of distributed systems. It's important that the client can always retry when a transient
+      // failure occurs. Under the strict requirement, if the failure occurred after the server
+      // rotated the token but before the client managed to store the updated token, then the client
+      // no longer has any valid refresh token and has effectively lost its grant. That's bad! So
+      // instead, we don't invalidate the old token until the client successfully uses a newer token.
+      // This provides most of the security benefits (tokens still rotate naturally) but without
+      // being inherently unreliable.
+      grantData.previousRefreshTokenId = providedTokenHash;
+      grantData.previousRefreshTokenWrappedKey = wrappedKeyToUse;
+
+      // The newly-generated token becomes the new "current" token.
+      grantData.refreshTokenId = newRefreshTokenId;
+      grantData.refreshTokenWrappedKey = newRefreshTokenWrappedKey;
+
+      // Parse and validate resource parameter (RFC 8707)
+      // Validate downscoping: token request resources must be subset of grant resources
+      const originOnly = !!this.options.resourceMatchOriginOnly;
+      if (body.resource && grantData.resource) {
+        const requestedResources = Array.isArray(body.resource) ? body.resource : [body.resource];
+        const grantedResources = Array.isArray(grantData.resource) ? grantData.resource : [grantData.resource];
+
+        // Check that all requested resources are in the granted resources
+        for (const requested of requestedResources) {
+          if (!grantedResources.some((granted) => resourceMatches(requested, granted, originOnly))) {
+            return this.createErrorResponse('invalid_target', {
+              description: 'Requested resource was not included in the authorization request',
+            });
+          }
+        }
+      }
+
+      // Use resource from token request if provided, otherwise use resource from grant
+      const audience = parseResourceParameter(body.resource || grantData.resource);
+      if ((body.resource || grantData.resource) && !audience) {
+        // RFC 8707 Section 2.1: invalid or unacceptable resource
+        return this.createErrorResponse('invalid_target', {
+          description: 'The resource parameter must be a valid absolute URI without a fragment',
+        });
+      }
+
+      // Store new access token with denormalized grant information
+      const accessTokenData: Token = {
+        id: accessTokenId,
+        grantId: grantId,
+        userId: userId,
+        createdAt: now,
+        expiresAt: accessTokenExpiresAt,
+        audience: audience,
+        scope: tokenScopes,
+        wrappedEncryptionKey: accessTokenWrappedKey,
+        grant: {
+          clientId: grantData.clientId,
+          scope: grantData.scope,
+          encryptedProps: encryptedAccessTokenProps,
+        },
+      };
+
+      const committed = await storage.grants.commitTransition(
+        commitGrantTransitionInput({
+          lease: transition.lease,
+          now,
+          grant: this.toStoredGrant(grantData, transition.grant.metadata.revision + 1),
+          accessToken: this.toStoredAccessToken(accessTokenData),
+        })
+      );
+      if (committed.status !== 'committed') {
+        return this.createErrorResponse('invalid_grant', { description: 'Refresh grant changed during exchange' });
+      }
+      transitionCommitted = true;
+
+      // Build the response
+      const tokenResponse: TokenResponse = {
+        access_token: newAccessToken,
+        token_type: 'bearer',
+        expires_in: accessTokenTTL,
+        refresh_token: newRefreshToken,
+        scope: tokenScopes.join(' '),
+      };
+
+      // RFC 8707 Section 2.2: SHOULD return resource parameter in response
+      if (audience) {
+        tokenResponse.resource = audience;
+      }
+
+      // RFC 6749 §5.1 — responses containing tokens must not be cached.
+      return new Response(JSON.stringify(tokenResponse), {
+        headers: { 'Content-Type': 'application/json', ...NO_CACHE_HEADERS },
       });
-    }
-
-    const accessTokenExpiresAt = now + accessTokenTTL;
-
-    // Wrap the access token key
-    const accessTokenWrappedKey = await wrapKeyWithToken(newAccessToken, accessTokenEncryptionKey);
-
-    // Generate new refresh token for rotation
-    const refreshTokenSecret = generateRandomString(TOKEN_LENGTH);
-    const newRefreshToken = `${userId}:${grantId}:${refreshTokenSecret}`;
-    const newRefreshTokenId = await generateTokenId(newRefreshToken);
-    const newRefreshTokenWrappedKey = await wrapKeyWithToken(newRefreshToken, grantEncryptionKey);
-
-    // Update the grant with the token rotation information
-    // The token which the client used this time becomes the "previous" token, so that the client
-    // can always use the same token again next time. This might technically violate OAuth 2.1's
-    // requirement that refresh tokens be single-use. However, this requirement violates the laws
-    // of distributed systems. It's important that the client can always retry when a transient
-    // failure occurs. Under the strict requirement, if the failure occurred after the server
-    // rotated the token but before the client managed to store the updated token, then the client
-    // no longer has any valid refresh token and has effectively lost its grant. That's bad! So
-    // instead, we don't invalidate the old token until the client successfully uses a newer token.
-    // This provides most of the security benefits (tokens still rotate naturally) but without
-    // being inherently unreliable.
-    grantData.previousRefreshTokenId = providedTokenHash;
-    grantData.previousRefreshTokenWrappedKey = wrappedKeyToUse;
-
-    // The newly-generated token becomes the new "current" token.
-    grantData.refreshTokenId = newRefreshTokenId;
-    grantData.refreshTokenWrappedKey = newRefreshTokenWrappedKey;
-
-    // Save the updated grant with TTL if applicable
-    await this.saveGrantWithTTL(env, grantKey, grantData, now);
-
-    // Parse and validate resource parameter (RFC 8707)
-    // Validate downscoping: token request resources must be subset of grant resources
-    const originOnly = !!this.options.resourceMatchOriginOnly;
-    if (body.resource && grantData.resource) {
-      const requestedResources = Array.isArray(body.resource) ? body.resource : [body.resource];
-      const grantedResources = Array.isArray(grantData.resource) ? grantData.resource : [grantData.resource];
-
-      // Check that all requested resources are in the granted resources
-      for (const requested of requestedResources) {
-        if (!grantedResources.some((granted) => resourceMatches(requested, granted, originOnly))) {
-          return this.createErrorResponse('invalid_target', {
-            description: 'Requested resource was not included in the authorization request',
+    } finally {
+      if (!transitionCommitted) {
+        try {
+          await storage.grants.abortTransition({
+            lease: transition.lease,
+            now: Math.floor(Date.now() / 1000),
           });
+        } catch {
+          // Preserve the original OAuth response or callback error.
         }
       }
     }
-
-    // Use resource from token request if provided, otherwise use resource from grant
-    const audience = parseResourceParameter(body.resource || grantData.resource);
-    if ((body.resource || grantData.resource) && !audience) {
-      // RFC 8707 Section 2.1: invalid or unacceptable resource
-      return this.createErrorResponse('invalid_target', {
-        description: 'The resource parameter must be a valid absolute URI without a fragment',
-      });
-    }
-
-    // Store new access token with denormalized grant information
-    const accessTokenData: Token = {
-      id: accessTokenId,
-      grantId: grantId,
-      userId: userId,
-      createdAt: now,
-      expiresAt: accessTokenExpiresAt,
-      audience: audience,
-      scope: tokenScopes,
-      wrappedEncryptionKey: accessTokenWrappedKey,
-      grant: {
-        clientId: grantData.clientId,
-        scope: grantData.scope,
-        encryptedProps: encryptedAccessTokenProps,
-      },
-    };
-
-    // Save access token with TTL (using the potentially callback-provided TTL)
-    try {
-      await env.OAUTH_KV.put(`token:${userId}:${grantId}:${accessTokenId}`, JSON.stringify(accessTokenData), {
-        expirationTtl: accessTokenTTL,
-      });
-    } catch (error) {
-      this.throwRetryableTokenStorageErrorIfKvRateLimited(error);
-      throw error;
-    }
-
-    // Build the response
-    const tokenResponse: TokenResponse = {
-      access_token: newAccessToken,
-      token_type: 'bearer',
-      expires_in: accessTokenTTL,
-      refresh_token: newRefreshToken,
-      scope: tokenScopes.join(' '),
-    };
-
-    // RFC 8707 Section 2.2: SHOULD return resource parameter in response
-    if (audience) {
-      tokenResponse.resource = audience;
-    }
-
-    // RFC 6749 §5.1 — responses containing tokens must not be cached.
-    return new Response(JSON.stringify(tokenResponse), {
-      headers: { 'Content-Type': 'application/json', ...NO_CACHE_HEADERS },
-    });
   }
 
   /**
@@ -2904,11 +3041,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     // Get the grant to access resource information
-    const grantKey = `grant:${tokenSummary.userId}:${tokenSummary.grantId}`;
-    const grantData: Grant | null = await env.OAUTH_KV.get(grantKey, { type: 'json' });
-    if (!grantData) {
+    const storedGrant = await this.requireStorage(env).grants.get({
+      userId: tokenSummary.userId,
+      grantId: tokenSummary.grantId,
+    });
+    if (!storedGrant) {
       throw new OAuthError('invalid_grant', { description: 'Grant not found' });
     }
+    const grantData = this.cloneGrant(storedGrant.value);
 
     // If scopes are requested, validate they are a subset of the original grant scopes
     let tokenScopes: string[] = this.downscope(requestedScopes, grantData.scope);
@@ -2950,7 +3090,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Cloudflare KV rejects writes whose expiration is less than 60 seconds away, so a
     // subject token in its final <60s would produce an unstorable access token and an
     // uncaught 500. Treat such a near-expiry subject token as not exchangeable instead.
-    if (subjectTokenRemainingLifetime < KV_MIN_EXPIRATION_TTL_SECONDS) {
+    const minimumStorageTtl = this.storageProvider.capabilities.expiration.minimumTtlSeconds;
+    if (subjectTokenRemainingLifetime < minimumStorageTtl) {
       throw new OAuthError('invalid_grant', {
         description: 'Subject token is too close to expiry to exchange',
       });
@@ -2970,10 +3111,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     // Get the subject token data to access encryption key
-    const subjectTokenData: Token | null = await env.OAUTH_KV.get(
-      `token:${tokenSummary.userId}:${tokenSummary.grantId}:${tokenSummary.id}`,
-      { type: 'json' }
-    );
+    const storedSubjectToken = await this.requireStorage(env).accessTokens.get({
+      userId: tokenSummary.userId,
+      grantId: tokenSummary.grantId,
+      tokenId: credentialIdFromSha256(tokenSummary.id),
+    });
+    const subjectTokenData = storedSubjectToken ? this.cloneToken(storedSubjectToken.value) : null;
 
     if (!subjectTokenData) {
       throw new OAuthError('invalid_grant', { description: 'Subject token data not found' });
@@ -3038,9 +3181,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // A client-requested `expires_in` (or a callback-supplied `accessTokenTTL`) may be
     // below KV's 60-second minimum even when the subject token has ample life remaining.
     // Reject rather than attempting an unstorable write that KV would reject with a 400.
-    if (accessTokenTTL < KV_MIN_EXPIRATION_TTL_SECONDS) {
+    if (accessTokenTTL < minimumStorageTtl) {
       throw new OAuthError('invalid_request', {
-        description: 'Requested token lifetime must be at least 60 seconds',
+        description: `Requested token lifetime must be at least ${minimumStorageTtl} seconds`,
       });
     }
 
@@ -3049,6 +3192,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       userId: tokenSummary.userId,
       grantId: tokenSummary.grantId,
       clientId: tokenSummary.grant.clientId,
+      expectedGrantRevision: storedGrant.metadata.revision,
       scope: tokenScopes,
       encryptedProps: encryptedAccessTokenProps,
       encryptionKey: accessTokenEncryptionKey,
@@ -3216,8 +3360,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    *
    * Sequence:
    *   parse → validate header → trust issuer → fetch JWKS → select key →
-   *   verify signature → validate claims → record jti → parse scope →
-   *   run mapper → validate mapper result → compute TTL → mint token.
+   *   verify signature → validate claims → parse scope → run mapper →
+   *   validate mapper result → compute TTL → reserve jti → mint token.
    */
   private async runEmaPipeline(args: {
     body: any;
@@ -3228,11 +3372,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     enterpriseOptions: EmaOptions<Env>;
   }): Promise<Result<TokenResponse, EmaValidationError>> {
     const { body, clientInfo, env, requestUrl, request, enterpriseOptions } = args;
-    const { jwksProvider, jtiStore } = this;
+    const { jwksProvider } = this;
     const configuredResource = this.options.resourceMetadata?.resource;
     // Unreachable: handleJwtBearerGrant short-circuits when enterpriseOptions is absent,
     // and validateEmaOptions enforces these invariants at construction time.
-    if (!jwksProvider || !jtiStore || !configuredResource) {
+    if (!jwksProvider || !configuredResource) {
       throw new Error('EMA pipeline invoked without configured adapters');
     }
     const now = Math.floor(Date.now() / 1000);
@@ -3277,19 +3421,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     });
     if (!claims.ok) return claims;
 
-    // Fresh clock read so the JTI KV TTL reflects the assertion's remaining
-    // lifetime at the moment of write, not at pipeline start (JWKS fetch
-    // already burned several ms; mapper hasn't run yet).
-    const markNow = Math.floor(Date.now() / 1000);
-    const replay = await jtiStore.markUsed({
-      issuer: claims.value.claims.iss,
-      jti: claims.value.claims.jti,
-      exp: claims.value.claims.exp,
-      now: markNow,
-      env,
-    });
-    if (!replay.ok) return replay;
-
     const requestedScope = parseEmaScopeParam(body.scope, claims.value.assertionScopes);
     if (!requestedScope.ok) return requestedScope;
 
@@ -3319,9 +3450,17 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       assertionExp: claims.value.claims.exp,
       mapperTtl: mapped.value.accessTokenTTL,
       now: issueNow,
-      minTtlSeconds: KV_MIN_EXPIRATION_TTL_SECONDS,
+      minTtlSeconds: this.storageProvider.capabilities.expiration.minimumTtlSeconds,
     });
     if (!ttl.ok) return ttl;
+
+    const jtiHash = credentialIdFromSha256(await sha256Hex(`${claims.value.claims.iss}\n${claims.value.claims.jti}`));
+    const replay = await this.requireStorage(env).replay.reserve({
+      reservationNamespace: 'ema-jti',
+      keyHash: jtiHash,
+      expiresAt: claims.value.claims.exp,
+    });
+    if (replay.status === 'exists') return err({ reason: 'replayed', jti: claims.value.claims.jti });
 
     return ok(
       await this.issueEmaAccessToken({
@@ -3418,9 +3557,16 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       expiresAt: args.now + args.accessTokenTTLSeconds,
       resource: args.resource,
     };
-    await this.saveGrantWithTTL(args.env, `grant:${args.userId}:${grantId}`, grant, args.now);
-
-    const accessToken = await this.createAccessToken({
+    const storage = this.requireStorage(args.env);
+    const storedClient = await storage.clients.get(args.clientId);
+    const clientReference = storedClient
+      ? {
+          kind: 'registered' as const,
+          clientId: args.clientId,
+          expectedRevision: storedClient.metadata.revision,
+        }
+      : { kind: 'external' as const, clientId: args.clientId };
+    const builtAccessToken = await this.buildAccessToken({
       userId: args.userId,
       grantId,
       clientId: args.clientId,
@@ -3431,9 +3577,19 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       audience: args.resource,
       env: args.env,
     });
+    const issued = await storage.grants.issue(
+      issueGrantInput({
+        client: clientReference,
+        grant: this.toStoredGrant(grant),
+        accessToken: this.toStoredAccessToken(builtAccessToken.record),
+      })
+    );
+    if (issued.status !== 'created') {
+      throw new OAuthError('invalid_grant', { description: 'EMA grant issuance failed' });
+    }
 
     return {
-      access_token: accessToken,
+      access_token: builtAccessToken.token,
       token_type: 'bearer',
       expires_in: args.accessTokenTTLSeconds,
       scope: tokenScopes.join(' '),
@@ -3505,8 +3661,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     clientInfo: ClientInfo,
     env: any
   ): Promise<boolean> {
-    const tokenData: Token | null = await env.OAUTH_KV.get(`token:${userId}:${grantId}:${tokenId}`, { type: 'json' });
-    if (!tokenData) return false;
+    const tokenKey = { userId, grantId, tokenId: credentialIdFromSha256(tokenId) };
+    const storedToken = await this.requireStorage(env).accessTokens.get(tokenKey);
+    if (!storedToken) return false;
+    const tokenData = storedToken.value;
 
     const tokenClientId = tokenData.grant?.clientId;
     if (tokenClientId !== undefined) {
@@ -3514,8 +3672,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     } else {
       // Backward compatibility for token records written before access tokens
       // denormalized grant.clientId. Verify ownership from the backing grant.
-      const grantData: Grant | null = await env.OAUTH_KV.get(`grant:${userId}:${grantId}`, { type: 'json' });
-      if (grantData?.clientId !== clientInfo.clientId) return false;
+      const storedGrant = await this.requireStorage(env).grants.get({ userId, grantId });
+      if (storedGrant?.value.clientId !== clientInfo.clientId) return false;
     }
 
     await this.revokeSpecificAccessToken(tokenId, userId, grantId, env);
@@ -3530,11 +3688,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     clientInfo: ClientInfo,
     env: any
   ): Promise<boolean> {
-    const grantData: Grant | null = await env.OAUTH_KV.get(`grant:${userId}:${grantId}`, { type: 'json' });
-    if (!grantData) return false;
-    const isRefreshToken = grantData.refreshTokenId === tokenId || grantData.previousRefreshTokenId === tokenId;
+    const storedGrant = await this.requireStorage(env).grants.get({ userId, grantId });
+    if (!storedGrant) return false;
+    const isRefreshToken =
+      storedGrant.value.refreshTokenId === tokenId || storedGrant.value.previousRefreshTokenId === tokenId;
     if (!isRefreshToken) return false;
-    if (grantData.clientId !== clientInfo.clientId) return false;
+    if (storedGrant.value.clientId !== clientInfo.clientId) return false;
     await this.createOAuthHelpers(env).revokeGrant(grantId, userId);
     return true;
   }
@@ -3547,8 +3706,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @param env - Cloudflare Worker environment variables
    */
   private async revokeSpecificAccessToken(tokenId: string, userId: string, grantId: string, env: any): Promise<void> {
-    const tokenKey = `token:${userId}:${grantId}:${tokenId}`;
-    await env.OAUTH_KV.delete(tokenKey);
+    await this.requireStorage(env).accessTokens.delete({
+      key: { userId, grantId, tokenId: credentialIdFromSha256(tokenId) },
+    });
   }
 
   /**
@@ -3696,12 +3856,18 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       }
     }
 
-    // Store client info with optional TTL for DCR clients
-    const clientKvOptions: { expirationTtl?: number } = {};
-    if (this.options.clientRegistrationTTL !== undefined) {
-      clientKvOptions.expirationTtl = this.options.clientRegistrationTTL;
+    const now = Math.floor(Date.now() / 1000);
+    const expiresAt =
+      this.options.clientRegistrationTTL === undefined ? undefined : now + this.options.clientRegistrationTTL;
+    const created = await this.requireStorage(env).clients.create(
+      createClientInput(this.toStoredClient(clientInfo, 0, expiresAt))
+    );
+    if (created.status !== 'created') {
+      return this.createErrorResponse('server_error', {
+        description: 'Generated client identifier already exists',
+        statusCode: 500,
+      });
     }
-    await env.OAUTH_KV.put(`client:${clientId}`, JSON.stringify(clientInfo), clientKvOptions);
 
     // Return client information with the original unhashed secret
     const response: Record<string, any> = {
@@ -3789,8 +3955,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // It's a token generated by workers-oauth-provider
     if (isPossiblyInternalFormat) {
       [userId, grantId] = parts;
-      const id = await generateTokenId(accessToken);
-      tokenData = await env.OAUTH_KV.get(`token:${userId}:${grantId}:${id}`, { type: 'json' });
+      const id = credentialIdFromSha256(await generateTokenId(accessToken));
+      const storedToken = await this.requireStorage(env).accessTokens.get({ userId, grantId, tokenId: id });
+      tokenData = storedToken ? this.cloneToken(storedToken.value) : null;
     }
 
     // No internal token found in KV and no external token validator provided
@@ -3925,7 +4092,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * detached facade that opens one connection around each public operation.
    */
   public createOAuthHelpers(env: any): OAuthHelpers {
-    return new OAuthHelpersImpl(env, this, this.getStorageConnection(env));
+    return new OAuthHelpersImpl(env, this, this.getStorageConnection(env), this.getStorageLifetime(env));
   }
 
   /** Runs one detached helper operation on one request-scoped connection. */
@@ -3951,6 +4118,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       ...(signal === undefined ? {} : { signal }),
     });
     const connection = await this.storageProvider.open(context);
+    const lifetime: StorageOperationLifetime = { active: true };
     const boundEnv = Object.create(env as object) as StorageBoundEnv<Env> & Record<string, unknown>;
     Object.defineProperty(boundEnv, OAUTH_STORAGE_CONNECTION, {
       value: connection,
@@ -3958,17 +4126,53 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       configurable: false,
       writable: false,
     });
+    Object.defineProperty(boundEnv, OAUTH_STORAGE_LIFETIME, {
+      value: lifetime,
+      enumerable: false,
+      configurable: false,
+      writable: false,
+    });
     Object.defineProperty(boundEnv, 'OAUTH_PROVIDER', {
-      value: new OAuthHelpersImpl(boundEnv, this, connection),
+      value: new OAuthHelpersImpl(boundEnv, this, connection, lifetime),
       enumerable: true,
       configurable: true,
       writable: false,
     });
+
+    let result: T | undefined;
+    let callbackError: unknown;
+    let callbackFailed = false;
     try {
-      return await callback(boundEnv);
-    } finally {
-      await connection.close();
+      result = await callback(boundEnv);
+    } catch (error) {
+      callbackFailed = true;
+      callbackError = error;
     }
+
+    lifetime.active = false;
+    let closeError: unknown;
+    try {
+      await connection.close();
+    } catch (error) {
+      closeError = error;
+    }
+
+    if (callbackFailed) {
+      if (closeError !== undefined && typeof callbackError === 'object' && callbackError !== null) {
+        try {
+          Object.defineProperty(callbackError, 'storageCloseError', {
+            value: closeError,
+            enumerable: false,
+            configurable: true,
+          });
+        } catch {
+          // A frozen primary error still takes precedence over close failure.
+        }
+      }
+      throw callbackError;
+    }
+    if (closeError !== undefined) throw closeError;
+    return result as T;
   }
 
   private getStorageConnection(env: any): OAuthStorageConnection | undefined {
@@ -3976,54 +4180,91 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     return (env as Partial<StorageBoundEnv<Env>>)[OAUTH_STORAGE_CONNECTION];
   }
 
-  /**
-   * Saves a grant to KV with appropriate TTL based on expiration
-   * @param env - The environment bindings
-   * @param grantKey - The KV key for the grant
-   * @param grantData - The grant data to save
-   * @param now - Current timestamp in seconds
-   */
-  private async saveGrantWithTTL(env: any, grantKey: string, grantData: Grant, now: number): Promise<void> {
-    // Use absolute expiration timestamp if grant has an expiration.
-    // Cloudflare KV rejects expirations less than 60 seconds in the future, so clamp the
-    // absolute expiration to that minimum plus a small margin (KV validates against its own
-    // clock at write time, so an exact `now + 60` can be rejected under latency/skew). This
-    // is defense-in-depth: callers that refresh near-expiry grants already treat them as
-    // expired, but clamping here also protects freshly-issued grants configured with a very
-    // short refreshTokenTTL.
-    const minExpiration = now + KV_MIN_EXPIRATION_TTL_SECONDS + KV_EXPIRATION_CLAMP_MARGIN_SECONDS;
-    const kvOptions =
-      grantData.expiresAt !== undefined ? { expiration: Math.max(grantData.expiresAt, minExpiration) } : {};
-    try {
-      await env.OAUTH_KV.put(grantKey, JSON.stringify(grantData), kvOptions);
-    } catch (error) {
-      this.throwRetryableTokenStorageErrorIfKvRateLimited(error);
-      throw error;
-    }
+  private getStorageLifetime(env: any): StorageOperationLifetime | undefined {
+    if ((typeof env !== 'object' && typeof env !== 'function') || env === null) return undefined;
+    return (env as Partial<StorageBoundEnv<Env>>)[OAUTH_STORAGE_LIFETIME];
   }
 
-  private throwRetryableTokenStorageErrorIfKvRateLimited(error: unknown): never | void {
-    if (!this.isKvRateLimitError(error)) return;
-    throw new OAuthError('temporarily_unavailable', {
-      description: 'Token issuance is temporarily unavailable; retry shortly',
-      statusCode: 429,
-      headers: { 'Retry-After': '30' },
+  private requireStorage(env: any): OAuthStorageConnection {
+    const storage = this.getStorageConnection(env);
+    if (!storage) throw new Error('OAuth storage connection is not bound to this operation');
+    return storage;
+  }
+
+  toStoredClient(client: ClientInfo, revision = 0, expiresAt?: number) {
+    if (client.clientSecret !== undefined) credentialIdFromSha256(client.clientSecret);
+    return createStoredClient(client as StorageClient, {
+      schemaVersion: 1,
+      revision,
+      createdAt: client.registrationDate ?? 0,
+      ...(expiresAt === undefined ? {} : { expiresAt }),
     });
   }
 
-  private isKvRateLimitError(error: unknown): boolean {
-    if (!(error instanceof Error)) return false;
-    return /KV .*failed: 429 Too Many Requests/i.test(error.message) || /429 Too Many Requests/i.test(error.message);
+  toStoredGrant(grant: Grant, revision = 0, physicalExpiresAt?: number) {
+    for (const credential of [grant.authCodeId, grant.refreshTokenId, grant.previousRefreshTokenId]) {
+      if (credential !== undefined) credentialIdFromSha256(credential);
+    }
+    return createStoredGrant(grant as StorageGrant, {
+      schemaVersion: 1,
+      revision,
+      createdAt: grant.createdAt,
+      ...((physicalExpiresAt ?? grant.expiresAt) === undefined
+        ? {}
+        : { expiresAt: physicalExpiresAt ?? grant.expiresAt }),
+    });
+  }
+
+  toStoredAccessToken(token: Token, revision = 0) {
+    credentialIdFromSha256(token.id);
+    return createStoredAccessToken(token as StorageAccessToken, {
+      schemaVersion: 1,
+      revision,
+      createdAt: token.createdAt,
+      expiresAt: token.expiresAt,
+    });
+  }
+
+  cloneClient(client: Readonly<StorageClient>): ClientInfo {
+    return {
+      ...client,
+      redirectUris: [...client.redirectUris],
+      ...(client.i18n === undefined ? {} : { i18n: { ...client.i18n } }),
+      ...(client.contacts === undefined ? {} : { contacts: [...client.contacts] }),
+      ...(client.grantTypes === undefined ? {} : { grantTypes: [...client.grantTypes] }),
+      ...(client.responseTypes === undefined ? {} : { responseTypes: [...client.responseTypes] }),
+    };
+  }
+
+  cloneGrant(grant: Readonly<StorageGrant>): Grant {
+    return {
+      ...grant,
+      scope: [...grant.scope],
+      ...(Array.isArray(grant.resource) ? { resource: [...grant.resource] } : {}),
+    };
+  }
+
+  cloneToken(token: Readonly<StorageAccessToken>): Token {
+    if (!token.grant) throw new Error('Access-token record is missing grant metadata');
+    return {
+      ...token,
+      scope: [...token.scope],
+      ...(Array.isArray(token.audience) ? { audience: [...token.audience] } : {}),
+      grant: {
+        ...token.grant,
+        scope: [...token.grant.scope],
+      },
+    };
   }
 
   /**
-   * Fetches client information from KV storage or via CIMD (Client ID Metadata Document)
+   * Fetches registered client information from storage or resolves it via CIMD
    * This method is not private because `OAuthHelpers` needs to call it. Note that since
    * `OAuthProviderImpl` is not exposed outside this module, this is still effectively
    * module-private.
    *
    * Supports CIMD: If clientId is an HTTPS URL with a non-root path, the metadata
-   * document will be fetched from that URL instead of looking up in KV storage.
+   * document will be fetched from that URL instead of looking up registered-client storage.
    *
    * @param env - Cloudflare Worker environment variables
    * @param clientId - The client ID to look up (can be a regular ID or an HTTPS URL for CIMD)
@@ -4034,8 +4275,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     if (this.isClientMetadataUrl(clientId)) {
       if (!this.options.clientIdMetadataDocumentEnabled) {
         // CIMD not enabled — treat as standard KV lookup
-        const clientKey = `client:${clientId}`;
-        return env.OAUTH_KV.get(clientKey, { type: 'json' });
+        const stored = await this.requireStorage(env).clients.get(clientId);
+        return stored ? this.cloneClient(stored.value) : null;
       }
       if (!this.hasGlobalFetchStrictlyPublic()) {
         throw new Error(`CIMD is enabled but 'global_fetch_strictly_public' compatibility flag is not set.`);
@@ -4050,68 +4291,55 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       }
     }
 
-    // Standard KV lookup
-    const clientKey = `client:${clientId}`;
-    return env.OAUTH_KV.get(clientKey, { type: 'json' });
+    const stored = await this.requireStorage(env).clients.get(clientId);
+    return stored ? this.cloneClient(stored.value) : null;
   }
 
-  /**
-   * Creates and stores an access token
-   * @param params - Options for creating the access token
-   * @returns The access token string
-   */
-  private async createAccessToken(params: CreateAccessTokenOptions): Promise<string> {
-    const { userId, grantId, clientId, scope, encryptedProps, encryptionKey, expiresIn, audience, env } = params;
-
-    // Central guard for all access-token writes: Cloudflare KV rejects an `expirationTtl`
-    // below 60 seconds, so a TTL derived from a callback override or a near-expiry source
-    // must not reach the write. Callers that clamp to a source's remaining lifetime should
-    // already have rejected this case with a more specific error; this is the backstop.
-    if (expiresIn < KV_MIN_EXPIRATION_TTL_SECONDS) {
+  private async buildAccessToken(params: CreateAccessTokenOptions): Promise<{
+    readonly token: string;
+    readonly record: Token;
+  }> {
+    const { userId, grantId, clientId, scope, encryptedProps, encryptionKey, expiresIn, audience } = params;
+    const minimumTtl = this.storageProvider.capabilities.expiration.minimumTtlSeconds;
+    if (expiresIn < minimumTtl) {
       throw new OAuthError('invalid_request', {
-        description: 'Requested token lifetime must be at least 60 seconds',
+        description: `Requested token lifetime must be at least ${minimumTtl} seconds`,
       });
     }
-
-    // Generate access token
-    const accessTokenSecret = generateRandomString(TOKEN_LENGTH);
-    const accessToken = `${userId}:${grantId}:${accessTokenSecret}`;
-
+    const token = `${userId}:${grantId}:${generateRandomString(TOKEN_LENGTH)}`;
     const now = Math.floor(Date.now() / 1000);
-    const accessTokenId = await generateTokenId(accessToken);
-    const accessTokenExpiresAt = now + expiresIn;
-
-    // Wrap the key for the access token
-    const accessTokenWrappedKey = await wrapKeyWithToken(accessToken, encryptionKey);
-
-    // Store access token with denormalized grant information
-    const accessTokenData: Token = {
-      id: accessTokenId,
-      grantId: grantId,
-      userId: userId,
+    const record: Token = {
+      id: await generateTokenId(token),
+      grantId,
+      userId,
       createdAt: now,
-      expiresAt: accessTokenExpiresAt,
-      audience: audience,
-      scope: scope,
-      wrappedEncryptionKey: accessTokenWrappedKey,
-      grant: {
-        clientId: clientId,
-        scope: scope,
-        encryptedProps: encryptedProps,
-      },
+      expiresAt: now + expiresIn,
+      audience,
+      scope,
+      wrappedEncryptionKey: await wrapKeyWithToken(token, encryptionKey),
+      grant: { clientId, scope, encryptedProps },
     };
+    return { token, record };
+  }
 
-    // Save access token with TTL
-    try {
-      await env.OAUTH_KV.put(`token:${userId}:${grantId}:${accessTokenId}`, JSON.stringify(accessTokenData), {
-        expirationTtl: expiresIn,
-      });
-    } catch (error) {
-      this.throwRetryableTokenStorageErrorIfKvRateLimited(error);
-      throw error;
+  /** Creates and stores a guarded access token on an existing grant. */
+  private async createAccessToken(params: CreateAccessTokenOptions): Promise<string> {
+    const built = await this.buildAccessToken(params);
+    if (params.expectedGrantRevision === undefined) {
+      throw new Error('Guarded access-token issuance requires an expected grant revision');
     }
-
-    return accessToken;
+    const storage = this.requireStorage(params.env);
+    const created = await storage.accessTokens.createForGrant(
+      issueAccessTokenInput({
+        grant: { userId: params.userId, grantId: params.grantId },
+        expectedGrantRevision: params.expectedGrantRevision,
+        token: this.toStoredAccessToken(built.record),
+      })
+    );
+    if (created.status !== 'created') {
+      throw new OAuthError('invalid_grant', { description: 'Grant changed during token issuance' });
+    }
+    return built.token;
   }
 
   /**
@@ -4142,11 +4370,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     return !!compatFlags?.global_fetch_strictly_public;
   }
 
-  /**
-   * Checks if a client_id is a CIMD URL (HTTPS with non-root path).
-   * Not private because OAuthHelpersImpl needs access for purgeExpiredData.
-   */
-  isClientMetadataUrl(clientId: string): boolean {
+  /** Checks if a client_id is a CIMD URL (HTTPS with non-root path). */
+  private isClientMetadataUrl(clientId: string): boolean {
     try {
       const url = new URL(clientId);
       return url.protocol === 'https:' && url.pathname !== '/';
@@ -4588,24 +4813,6 @@ const DEFAULT_REFRESH_TOKEN_TTL = 30 * 24 * 60 * 60;
  * Default expiration time for dynamically registered clients (90 days in seconds)
  */
 const DEFAULT_CLIENT_REGISTRATION_TTL = 90 * 24 * 60 * 60;
-
-/**
- * Minimum number of seconds an absolute KV expiration must be in the future.
- * Cloudflare KV rejects `put` calls whose `expiration` is less than 60 seconds
- * away with "400 Invalid expiration ... Expiration times must be at least 60
- * seconds in the future." We use this to treat near-expiry grants as expired and
- * to clamp absolute expirations when writing grants back to KV.
- */
-const KV_MIN_EXPIRATION_TTL_SECONDS = 60;
-
-/**
- * Safety margin (seconds) added on top of `KV_MIN_EXPIRATION_TTL_SECONDS` when clamping an
- * absolute KV expiration. Absolute expirations are validated against KV's clock at the
- * moment the write is processed, so writing exactly `now + 60` can be rejected once
- * worker→KV latency or minor clock skew is accounted for. The margin keeps clamped writes
- * comfortably above KV's hard minimum without meaningfully extending a grant's lifetime.
- */
-const KV_EXPIRATION_CLAMP_MARGIN_SECONDS = 5;
 
 /**
  * Default batch size for purgeExpiredData. Conservative to stay within
@@ -5155,17 +5362,31 @@ class OAuthHelpersImpl implements OAuthHelpers {
   private env: any;
   private provider: OAuthProviderImpl<any>;
   private readonly storage: OAuthStorageConnection | undefined;
+  private readonly lifetime: StorageOperationLifetime | undefined;
 
   /**
    * Creates a new OAuthHelpers instance
    * @param env - Cloudflare Worker environment variables
    * @param provider - Reference to the parent provider instance
    * @param storage - Request-scoped connection, omitted for detached helpers
+   * @param lifetime - Lifetime shared by helpers bound to one operation
    */
-  constructor(env: any, provider: OAuthProviderImpl<any>, storage?: OAuthStorageConnection) {
+  constructor(
+    env: any,
+    provider: OAuthProviderImpl<any>,
+    storage?: OAuthStorageConnection,
+    lifetime?: StorageOperationLifetime
+  ) {
     this.env = env;
     this.provider = provider;
     this.storage = storage;
+    this.lifetime = lifetime;
+  }
+
+  private assertActive(): void {
+    if (this.lifetime && !this.lifetime.active) {
+      throw new OAuthStorageError('unavailable', { operation: 'helpers.operation' });
+    }
   }
 
   /**
@@ -5174,6 +5395,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * @returns The parsed authorization request parameters
    */
   async parseAuthRequest(request: Request): Promise<AuthRequest> {
+    this.assertActive();
     if (!this.storage) {
       return this.provider.withStorageHelpers(this.env, (helpers) => helpers.parseAuthRequest(request));
     }
@@ -5245,6 +5467,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * @returns A Promise resolving to the client info, or null if not found
    */
   async lookupClient(clientId: string): Promise<ClientInfo | null> {
+    this.assertActive();
     if (!this.storage) {
       return this.provider.withStorageHelpers(this.env, (helpers) => helpers.lookupClient(clientId));
     }
@@ -5259,6 +5482,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * @returns A Promise resolving to an object containing the redirect URL
    */
   async completeAuthorization(options: CompleteAuthorizationOptions): Promise<{ redirectTo: string }> {
+    this.assertActive();
     if (!this.storage) {
       return this.provider.withStorageHelpers(this.env, (helpers) => helpers.completeAuthorization(options));
     }
@@ -5276,22 +5500,14 @@ class OAuthHelpersImpl implements OAuthHelpers {
       );
     }
 
-    // If requested, collect existing grants for this user+client to revoke AFTER the new grant is created.
-    // This avoids a data-loss window where the user has no grants if creation fails.
-    let grantsToRevoke: string[] = [];
-    if (options.revokeExistingGrants !== false) {
-      const batchSize = getRevokeExistingGrantsBatchSize(options.revokeExistingGrantsBatchSize);
-      let cursor: string | undefined;
-      do {
-        const page = await this.listUserGrants(options.userId, { cursor, limit: batchSize });
-        for (const grant of page.items) {
-          if (grant.clientId === clientId) {
-            grantsToRevoke.push(grant.id);
-          }
+    const storedClient = await this.storage.clients.get(clientId);
+    const clientReference = storedClient
+      ? {
+          kind: 'registered' as const,
+          clientId,
+          expectedRevision: storedClient.metadata.revision,
         }
-        cursor = page.cursor;
-      } while (cursor);
-    }
+      : { kind: 'external' as const, clientId };
 
     // Generate a unique grant ID
     const grantId = generateRandomString(16);
@@ -5336,10 +5552,6 @@ class OAuthHelpersImpl implements OAuthHelpers {
         resource: options.request.resource,
       };
 
-      // Store the grant with a key that includes the user ID
-      const grantKey = `grant:${options.userId}:${grantId}`;
-      await this.env.OAUTH_KV.put(grantKey, JSON.stringify(grant));
-
       // Store access token with denormalized grant information
       const accessTokenData: Token = {
         id: accessTokenId,
@@ -5357,12 +5569,16 @@ class OAuthHelpersImpl implements OAuthHelpers {
         },
       };
 
-      // Save access token with TTL
-      await this.env.OAUTH_KV.put(
-        `token:${options.userId}:${grantId}:${accessTokenId}`,
-        JSON.stringify(accessTokenData),
-        { expirationTtl: accessTokenTTL }
+      const issued = await this.storage.grants.issue(
+        issueGrantInput({
+          client: clientReference,
+          grant: this.provider.toStoredGrant(grant),
+          accessToken: this.provider.toStoredAccessToken(accessTokenData),
+          replaceExistingUserClientGrants: options.revokeExistingGrants !== false,
+          replacementPageSize: getRevokeExistingGrantsBatchSize(options.revokeExistingGrantsBatchSize),
+        })
       );
+      if (issued.status !== 'created') throw new Error(`Grant issuance failed: ${issued.status}`);
 
       // Build the redirect URL for implicit flow (token in fragment, not query params)
       const redirectUrl = new URL(options.request.redirectUri);
@@ -5378,13 +5594,6 @@ class OAuthHelpersImpl implements OAuthHelpers {
 
       // Set the fragment (hash) part of the URL
       redirectUrl.hash = fragment.toString();
-
-      // Revoke old grants AFTER the new grant is successfully stored
-      try {
-        await Promise.allSettled(grantsToRevoke.map((oldGrantId) => this.revokeGrant(oldGrantId, options.userId)));
-      } catch {
-        // Best-effort revocation — new grant is already stored, don't fail the authorization
-      }
 
       return { redirectTo: redirectUrl.toString() };
     } else {
@@ -5416,25 +5625,21 @@ class OAuthHelpersImpl implements OAuthHelpers {
         resource: options.request.resource,
       };
 
-      // Store the grant with a key that includes the user ID
-      const grantKey = `grant:${options.userId}:${grantId}`;
-
-      // Set 10-minute TTL for the grant (will be extended when code is exchanged)
-      const codeExpiresIn = 600; // 10 minutes
-      await this.env.OAUTH_KV.put(grantKey, JSON.stringify(grant), { expirationTtl: codeExpiresIn });
+      const issued = await this.storage.grants.issue(
+        issueGrantInput({
+          client: clientReference,
+          grant: this.provider.toStoredGrant(grant, 0, now + 600),
+          replaceExistingUserClientGrants: options.revokeExistingGrants !== false,
+          replacementPageSize: getRevokeExistingGrantsBatchSize(options.revokeExistingGrantsBatchSize),
+        })
+      );
+      if (issued.status !== 'created') throw new Error(`Grant issuance failed: ${issued.status}`);
 
       // Build the redirect URL for authorization code flow
       const redirectUrl = new URL(options.request.redirectUri);
       redirectUrl.searchParams.set('code', authCode);
       if (options.request.state) {
         redirectUrl.searchParams.set('state', options.request.state);
-      }
-
-      // Revoke old grants AFTER the new grant is successfully stored
-      try {
-        await Promise.allSettled(grantsToRevoke.map((oldGrantId) => this.revokeGrant(oldGrantId, options.userId)));
-      } catch {
-        // Best-effort revocation — new grant is already stored, don't fail the authorization
       }
 
       return { redirectTo: redirectUrl.toString() };
@@ -5447,9 +5652,11 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * @returns A Promise resolving to the created client info
    */
   async createClient(clientInfo: Partial<ClientInfo>): Promise<ClientInfo> {
+    this.assertActive();
     if (!this.storage) {
       return this.provider.withStorageHelpers(this.env, (helpers) => helpers.createClient(clientInfo));
     }
+    assertStorageOperationSupported(this.provider.getStorageCapabilities().clients.create, 'clients.create');
     const clientId = generateRandomString(16);
 
     // Determine token endpoint auth method
@@ -5491,7 +5698,8 @@ class OAuthHelpersImpl implements OAuthHelpers {
       newClient.clientSecret = await hashSecret(clientSecret);
     }
 
-    await this.env.OAUTH_KV.put(`client:${clientId}`, JSON.stringify(newClient));
+    const created = await this.storage.clients.create(createClientInput(this.provider.toStoredClient(newClient)));
+    if (created.status !== 'created') throw new Error('Generated client ID already exists');
 
     // Create the response object
     const clientResponse = { ...newClient };
@@ -5510,41 +5718,15 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * @returns A Promise resolving to the list result with items and optional cursor
    */
   async listClients(options?: ListOptions): Promise<ListResult<ClientInfo>> {
+    this.assertActive();
     if (!this.storage) {
       return this.provider.withStorageHelpers(this.env, (helpers) => helpers.listClients(options));
     }
-    // Prepare list options for KV
-    const listOptions: { limit?: number; cursor?: string; prefix: string } = {
-      prefix: 'client:',
-    };
-
-    if (options?.limit !== undefined) {
-      listOptions.limit = options.limit;
-    }
-
-    if (options?.cursor !== undefined) {
-      listOptions.cursor = options.cursor;
-    }
-
-    // Use the KV list() function to get client keys with pagination
-    const response = await this.env.OAUTH_KV.list(listOptions);
-
-    // Fetch all clients in parallel
-    const clients: ClientInfo[] = [];
-    const promises = response.keys.map(async (key: { name: string }) => {
-      const clientId = key.name.substring('client:'.length);
-      const client = await this.provider.getClient(this.env, clientId);
-      if (client) {
-        clients.push(client);
-      }
-    });
-
-    await Promise.all(promises);
-
-    // Return result with cursor if there are more results
+    assertStorageQuerySupported(this.provider.getStorageCapabilities().queries.listClients, 'clients.list');
+    const response = await this.storage.clients.list(options);
     return {
-      items: clients,
-      cursor: response.list_complete ? undefined : response.cursor,
+      items: response.items.map((client) => this.provider.cloneClient(client.value)),
+      cursor: response.cursor,
     };
   }
 
@@ -5555,13 +5737,14 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * @returns A Promise resolving to the updated client info, or null if not found
    */
   async updateClient(clientId: string, updates: Partial<ClientInfo>): Promise<ClientInfo | null> {
+    this.assertActive();
     if (!this.storage) {
       return this.provider.withStorageHelpers(this.env, (helpers) => helpers.updateClient(clientId, updates));
     }
-    const client = await this.provider.getClient(this.env, clientId);
-    if (!client) {
-      return null;
-    }
+    assertStorageOperationSupported(this.provider.getStorageCapabilities().clients.replace, 'clients.replace');
+    const storedClient = await this.storage.clients.get(clientId);
+    if (!storedClient) return null;
+    const client = this.provider.cloneClient(storedClient.value);
 
     // Determine token endpoint auth method
     let authMethod = updates.tokenEndpointAuthMethod || client.tokenEndpointAuthMethod || 'client_secret_basic';
@@ -5594,12 +5777,20 @@ class OAuthHelpersImpl implements OAuthHelpers {
       delete updatedClient.clientSecret;
     }
 
-    // Preserve TTL for DCR clients: re-apply clientRegistrationTTL if configured
-    const clientKvOptions: { expirationTtl?: number } = {};
-    if (this.provider.options.clientRegistrationTTL !== undefined) {
-      clientKvOptions.expirationTtl = this.provider.options.clientRegistrationTTL;
-    }
-    await this.env.OAUTH_KV.put(`client:${clientId}`, JSON.stringify(updatedClient), clientKvOptions);
+    const now = Math.floor(Date.now() / 1000);
+    const expiresAt =
+      this.provider.options.clientRegistrationTTL === undefined
+        ? undefined
+        : now + this.provider.options.clientRegistrationTTL;
+    const replaced = await this.storage.clients.replace(
+      replaceClientInput(
+        clientId,
+        storedClient.metadata.revision,
+        this.provider.toStoredClient(updatedClient, storedClient.metadata.revision + 1, expiresAt)
+      )
+    );
+    if (replaced.status === 'not_found') return null;
+    if (replaced.status === 'conflict') throw new Error('Client was modified concurrently');
 
     // Create a response object
     const response = { ...updatedClient };
@@ -5618,39 +5809,15 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * @returns A Promise resolving when the deletion is confirmed.
    */
   async deleteClient(clientId: string): Promise<void> {
+    this.assertActive();
     if (!this.storage) {
       return this.provider.withStorageHelpers(this.env, (helpers) => helpers.deleteClient(clientId));
     }
-    // Revoke all grants associated with this client across all users.
-    // Grants are keyed as grant:{userId}:{grantId}, so we scan all grants
-    // and check the clientId stored in each one.
-    let cursor: string | undefined;
-    let allProcessed = false;
-
-    while (!allProcessed) {
-      const listOptions: { prefix: string; cursor?: string } = { prefix: 'grant:' };
-      if (cursor) {
-        listOptions.cursor = cursor;
-      }
-
-      const result = await this.env.OAUTH_KV.list(listOptions);
-
-      for (const key of result.keys) {
-        const grantData: Grant | null = await this.env.OAUTH_KV.get(key.name, { type: 'json' });
-        if (grantData && grantData.clientId === clientId) {
-          await this.revokeGrant(grantData.id, grantData.userId);
-        }
-      }
-
-      if (result.list_complete) {
-        allProcessed = true;
-      } else {
-        cursor = result.cursor;
-      }
-    }
-
-    // Delete the client record
-    await this.env.OAUTH_KV.delete(`client:${clientId}`);
+    assertStorageOperationSupported(
+      this.provider.getStorageCapabilities().revocation.clientCascade,
+      'clients.deleteWithGrants'
+    );
+    await this.storage.clients.deleteWithGrants({ clientId });
   }
 
   /**
@@ -5661,50 +5828,23 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * @returns A Promise resolving to the list result with grant summaries and optional cursor
    */
   async listUserGrants(userId: string, options?: ListOptions): Promise<ListResult<GrantSummary>> {
+    this.assertActive();
     if (!this.storage) {
       return this.provider.withStorageHelpers(this.env, (helpers) => helpers.listUserGrants(userId, options));
     }
-    // Prepare list options for KV
-    const listOptions: { limit?: number; cursor?: string; prefix: string } = {
-      prefix: `grant:${userId}:`,
-    };
-
-    if (options?.limit !== undefined) {
-      listOptions.limit = options.limit;
-    }
-
-    if (options?.cursor !== undefined) {
-      listOptions.cursor = options.cursor;
-    }
-
-    // Use the KV list() function to get grant keys with pagination
-    const response = await this.env.OAUTH_KV.list(listOptions);
-
-    // Fetch all grants in parallel and convert to grant summaries
-    const grantSummaries: GrantSummary[] = [];
-    const promises = response.keys.map(async (key: { name: string }) => {
-      const grantData: Grant | null = await this.env.OAUTH_KV.get(key.name, { type: 'json' });
-      if (grantData) {
-        // Create a summary with only the public fields
-        const summary: GrantSummary = {
-          id: grantData.id,
-          clientId: grantData.clientId,
-          userId: grantData.userId,
-          scope: grantData.scope,
-          metadata: grantData.metadata,
-          createdAt: grantData.createdAt,
-          expiresAt: grantData.expiresAt,
-        };
-        grantSummaries.push(summary);
-      }
-    });
-
-    await Promise.all(promises);
-
-    // Return result with cursor if there are more results
+    assertStorageQuerySupported(this.provider.getStorageCapabilities().queries.grantsByUser, 'grants.listByUser');
+    const response = await this.storage.grants.listByUser({ userId, page: options });
     return {
-      items: grantSummaries,
-      cursor: response.list_complete ? undefined : response.cursor,
+      items: response.items.map(({ value: grantData }) => ({
+        id: grantData.id,
+        clientId: grantData.clientId,
+        userId: grantData.userId,
+        scope: [...grantData.scope],
+        metadata: grantData.metadata,
+        createdAt: grantData.createdAt,
+        expiresAt: grantData.expiresAt,
+      })),
+      cursor: response.cursor,
     };
   }
 
@@ -5715,50 +5855,12 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * @returns A Promise resolving when the revocation is confirmed.
    */
   async revokeGrant(grantId: string, userId: string): Promise<void> {
+    this.assertActive();
     if (!this.storage) {
       return this.provider.withStorageHelpers(this.env, (helpers) => helpers.revokeGrant(grantId, userId));
     }
-    // Construct the full grant key with user ID
-    const grantKey = `grant:${userId}:${grantId}`;
-
-    // Delete all access tokens associated with this grant
-    const tokenPrefix = `token:${userId}:${grantId}:`;
-
-    // Handle pagination to ensure we delete all tokens even if there are more than 1000
-    let cursor: string | undefined;
-    let allTokensDeleted = false;
-
-    // Continue fetching and deleting tokens until we've processed all of them
-    while (!allTokensDeleted) {
-      const listOptions: { prefix: string; cursor?: string } = {
-        prefix: tokenPrefix,
-      };
-
-      if (cursor) {
-        listOptions.cursor = cursor;
-      }
-
-      const result = await this.env.OAUTH_KV.list(listOptions);
-
-      // Delete each token in this batch
-      if (result.keys.length > 0) {
-        await Promise.all(
-          result.keys.map((key: { name: string }) => {
-            return this.env.OAUTH_KV.delete(key.name);
-          })
-        );
-      }
-
-      // Check if we need to fetch more tokens
-      if (result.list_complete) {
-        allTokensDeleted = true;
-      } else {
-        cursor = result.cursor;
-      }
-    }
-
-    // After all tokens are deleted, delete the grant itself
-    await this.env.OAUTH_KV.delete(grantKey);
+    assertStorageOperationSupported(this.provider.getStorageCapabilities().revocation.grantCascade, 'grants.revoke');
+    await this.storage.grants.revoke({ grant: { userId, grantId } });
   }
 
   /**
@@ -5767,6 +5869,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * @returns Promise resolving to token data with decrypted props, or null if token is invalid
    */
   async unwrapToken<T = any>(token: string): Promise<TokenSummary<T> | null> {
+    this.assertActive();
     if (!this.storage) {
       return this.provider.withStorageHelpers(this.env, (helpers) => helpers.unwrapToken<T>(token));
     }
@@ -5780,9 +5883,14 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * @returns Promise resolving to token response with new access token
    */
   async exchangeToken(options: ExchangeTokenOptions): Promise<TokenResponse> {
+    this.assertActive();
     if (!this.storage) {
       return this.provider.withStorageHelpers(this.env, (helpers) => helpers.exchangeToken(options));
     }
+    assertStorageOperationSupported(
+      this.provider.getStorageCapabilities().issuance.existingGrantAccessToken,
+      'accessTokens.createForGrant'
+    );
     // Validate subject token first to get client info
     const tokenSummary = await this.unwrapToken(options.subjectToken);
     if (!tokenSummary) {
@@ -5807,145 +5915,18 @@ class OAuthHelpersImpl implements OAuthHelpers {
   }
 
   async purgeExpiredData(options?: PurgeOptions): Promise<PurgeResult> {
+    this.assertActive();
     if (!this.storage) {
       return this.provider.withStorageHelpers(this.env, (helpers) => helpers.purgeExpiredData(options));
     }
-    const batchSize = options?.batchSize ?? DEFAULT_PURGE_BATCH_SIZE;
-    const purgeOrphanedGrants = options?.purgeOrphanedGrants !== false;
-    const purgeExpiredGrants = options?.purgeExpiredGrants !== false;
-    const purgeOrphanedTokens = options?.purgeOrphanedTokens !== false;
-    const now = Math.floor(Date.now() / 1000);
-
-    const result: PurgeResult = {
-      grantsChecked: 0,
-      grantsPurged: 0,
-      tokensChecked: 0,
-      tokensPurged: 0,
-      done: false,
-    };
-
-    // Phase 1: Grant sweep
-    if (purgeOrphanedGrants || purgeExpiredGrants) {
-      const knownGoodClients = new Set<string>();
-      const knownMissingClients = new Set<string>();
-      let grantCursor: string | undefined;
-      let grantsDone = false;
-
-      while (!grantsDone && result.grantsChecked < batchSize) {
-        const listOptions: { prefix: string; cursor?: string; limit?: number } = {
-          prefix: 'grant:',
-          limit: Math.min(1000, batchSize - result.grantsChecked),
-        };
-        if (grantCursor) {
-          listOptions.cursor = grantCursor;
-        }
-
-        const page = await this.env.OAUTH_KV.list(listOptions);
-
-        for (const key of page.keys) {
-          if (result.grantsChecked >= batchSize) break;
-          result.grantsChecked++;
-
-          const grantData: Grant | null = await this.env.OAUTH_KV.get(key.name, { type: 'json' });
-          if (!grantData) continue;
-
-          let shouldPurge = false;
-
-          // Expiry check (defense-in-depth for KV TTL)
-          if (purgeExpiredGrants && grantData.expiresAt !== undefined && now >= grantData.expiresAt) {
-            shouldPurge = true;
-          }
-
-          // Orphan check: skip CIMD clients (URL-based client IDs not stored in KV)
-          if (!shouldPurge && purgeOrphanedGrants && !this.provider.isClientMetadataUrl(grantData.clientId)) {
-            if (knownMissingClients.has(grantData.clientId)) {
-              shouldPurge = true;
-            } else if (!knownGoodClients.has(grantData.clientId)) {
-              const client = await this.env.OAUTH_KV.get(`client:${grantData.clientId}`, { type: 'json' });
-              if (client) {
-                knownGoodClients.add(grantData.clientId);
-              } else {
-                knownMissingClients.add(grantData.clientId);
-                shouldPurge = true;
-              }
-            }
-          }
-
-          if (shouldPurge) {
-            await this.revokeGrant(grantData.id, grantData.userId);
-            result.grantsPurged++;
-          }
-        }
-
-        if (page.list_complete) {
-          grantsDone = true;
-        } else {
-          grantCursor = page.cursor;
-        }
-      }
-
-      // If grant sweep didn't finish, skip token sweep
-      if (!grantsDone) {
-        return result;
-      }
-    }
-
-    // Phase 2: Token sweep
-    if (purgeOrphanedTokens) {
-      const knownGoodGrants = new Set<string>();
-      const knownMissingGrants = new Set<string>();
-      let tokenCursor: string | undefined;
-      let tokensDone = false;
-
-      while (!tokensDone && result.tokensChecked < batchSize) {
-        const listOptions: { prefix: string; cursor?: string; limit?: number } = {
-          prefix: 'token:',
-          limit: Math.min(1000, batchSize - result.tokensChecked),
-        };
-        if (tokenCursor) {
-          listOptions.cursor = tokenCursor;
-        }
-
-        const page = await this.env.OAUTH_KV.list(listOptions);
-
-        for (const key of page.keys) {
-          if (result.tokensChecked >= batchSize) break;
-          result.tokensChecked++;
-
-          const tokenData: Token | null = await this.env.OAUTH_KV.get(key.name, { type: 'json' });
-          if (!tokenData) continue;
-
-          const grantKey = `grant:${tokenData.userId}:${tokenData.grantId}`;
-
-          if (knownMissingGrants.has(grantKey)) {
-            await this.env.OAUTH_KV.delete(key.name);
-            result.tokensPurged++;
-          } else if (!knownGoodGrants.has(grantKey)) {
-            const grantExists = await this.env.OAUTH_KV.get(grantKey);
-            if (grantExists) {
-              knownGoodGrants.add(grantKey);
-            } else {
-              knownMissingGrants.add(grantKey);
-              await this.env.OAUTH_KV.delete(key.name);
-              result.tokensPurged++;
-            }
-          }
-        }
-
-        if (page.list_complete) {
-          tokensDone = true;
-        } else {
-          tokenCursor = page.cursor;
-        }
-      }
-
-      if (!tokensDone) {
-        return result;
-      }
-    }
-
-    result.done = true;
-    return result;
+    assertStorageQuerySupported(this.provider.getStorageCapabilities().queries.globalMaintenance, 'maintenance.purge');
+    return this.storage.maintenance.purge({
+      now: Math.floor(Date.now() / 1000),
+      limit: options?.batchSize ?? DEFAULT_PURGE_BATCH_SIZE,
+      purgeOrphanedGrants: options?.purgeOrphanedGrants !== false,
+      purgeExpiredGrants: options?.purgeExpiredGrants !== false,
+      purgeOrphanedTokens: options?.purgeOrphanedTokens !== false,
+    });
   }
 }
 

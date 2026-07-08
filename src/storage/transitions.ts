@@ -255,6 +255,9 @@ export function commitGrantTransitionInput(input: {
   if (input.now >= input.lease.expiresAt) throw new TypeError('Transition lease has expired');
   assertNextStorageRevision(input.lease.expectedRevision, input.grant);
   assertInitialStorageRevision(input.accessToken);
+  if (!input.accessToken.value.grant) {
+    throw new TypeError('Transition access token must include grant metadata');
+  }
   if (
     input.grant.value.userId !== input.lease.grant.userId ||
     input.grant.value.id !== input.lease.grant.grantId ||

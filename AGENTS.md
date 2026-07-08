@@ -63,14 +63,15 @@ Node 24+ required.
 
 ## Commands
 
-| Command              | What it does                              |
-| -------------------- | ----------------------------------------- |
-| `npm run build`      | Builds single-file ESM bundle with tsdown |
-| `npm run check`      | Runs typecheck + tests                    |
-| `npm run typecheck`  | TypeScript type checking (no emit)        |
-| `npm run test`       | Runs vitest test suite                    |
-| `npm run test:watch` | Runs vitest in watch mode                 |
-| `npm run prettier`   | Formats all files with Prettier           |
+| Command                 | What it does                                        |
+| ----------------------- | --------------------------------------------------- |
+| `npm run build`         | Builds root and storage ESM entrypoints with tsdown |
+| `npm run check`         | Runs typecheck + tests                              |
+| `npm run check:package` | Verifies package export and pack targets            |
+| `npm run typecheck`     | TypeScript type checking (no emit)                  |
+| `npm run test`          | Runs vitest test suite                              |
+| `npm run test:watch`    | Runs vitest in watch mode                           |
+| `npm run prettier`      | Formats all files with Prettier                     |
 
 ## Code standards
 

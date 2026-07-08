@@ -48,7 +48,8 @@ import {
   type OAuthGrantStore,
   type OAuthMaintenanceStore,
   type OAuthReplayStore,
-  type PurgeExpiredResult,
+  type PurgeStorageInput,
+  type PurgeStorageResult,
   type ReplaceClientInput,
 } from '../stores';
 import {
@@ -66,6 +67,7 @@ import {
 } from '../transitions';
 import {
   decodeKvAccessToken,
+  decodeKvAccessTokenParent,
   decodeKvClient,
   decodeKvGrant,
   encodeKvRecord,
@@ -257,7 +259,7 @@ class WorkersKvStorageConnection implements OAuthStorageConnection {
 
   private createMaintenanceStore(): OAuthMaintenanceStore {
     const store: OAuthMaintenanceStore = {
-      purgeExpired: (input) => this.run('maintenance.purgeExpired', async () => this.purgeExpired(input)),
+      purge: (input) => this.run('maintenance.purge', async () => this.purge(input)),
     };
     return Object.freeze(store);
   }
@@ -370,16 +372,19 @@ class WorkersKvStorageConnection implements OAuthStorageConnection {
       priorGrants = await this.collectUserClientGrants(
         input.grant.value.userId,
         input.grant.value.clientId,
-        input.grant.value.id
+        input.grant.value.id,
+        input.replacementPageSize
       );
     }
 
     await this.putGrant(input.grant);
     if (input.accessToken !== undefined) await this.putAccessToken(input.accessToken);
     for (const prior of priorGrants) {
-      const result = await this.revokeGrant({ userId: prior.value.userId, grantId: prior.value.id }, undefined);
-      if (result.status !== 'revoked' && result.status !== 'not_found') {
-        throw new OAuthStorageError('conflict', { operation: 'grants.issue' });
+      try {
+        await this.revokeGrant({ userId: prior.value.userId, grantId: prior.value.id }, undefined);
+      } catch {
+        // Preserve legacy semantics: once new issuance succeeds, replacement
+        // cleanup is best-effort and must not fail authorization.
       }
     }
     return { status: 'created' };
@@ -414,7 +419,7 @@ class WorkersKvStorageConnection implements OAuthStorageConnection {
         ? WORKERS_KV_STORAGE_CAPABILITIES.transitions.authorizationCode
         : WORKERS_KV_STORAGE_CAPABILITIES.transitions.refreshToken;
     assertStorageOperationSupported(guarantee, 'grants.beginTransition');
-    const grant = await this.getGrant(input.grant);
+    const grant = await this.getGrantRaw(input.grant);
     if (grant === null) return { status: 'not_found' };
     if (grant.metadata.expiresAt !== undefined && grant.metadata.expiresAt <= input.now) {
       return { status: 'expired' };
@@ -560,34 +565,85 @@ class WorkersKvStorageConnection implements OAuthStorageConnection {
     return { status: 'reserved' };
   }
 
-  private async purgeExpired(input: {
-    readonly now: number;
-    readonly limit: number;
-    readonly cursor?: string;
-  }): Promise<PurgeExpiredResult> {
-    if (!Number.isSafeInteger(input.limit) || input.limit < 1) {
-      throw new OAuthStorageError('invalid_configuration', { operation: 'maintenance.purgeExpired' });
+  private async purge(input: PurgeStorageInput): Promise<PurgeStorageResult> {
+    if (!Number.isSafeInteger(input.limit) || input.limit < 1 || !Number.isSafeInteger(input.now)) {
+      throw new OAuthStorageError('invalid_configuration', { operation: 'maintenance.purge' });
     }
-    const page = await this.list(kvGrantPrefix(this.namespace), {
-      limit: input.limit,
-      cursor: input.cursor,
-    });
-    let deleted = 0;
-    for (const key of page.keys) {
-      const value = await this.kv.get(key.name, { type: 'json' });
-      if (value === null) continue;
-      const grant = decodeKvGrant(value);
-      if (grant.metadata.expiresAt !== undefined && grant.metadata.expiresAt <= input.now) {
-        const result = await this.revokeGrant({ userId: grant.value.userId, grantId: grant.value.id }, undefined);
-        if (result.status === 'revoked') deleted += 1 + result.deletedAccessTokens;
+    const result: PurgeStorageResult = {
+      grantsChecked: 0,
+      grantsPurged: 0,
+      tokensChecked: 0,
+      tokensPurged: 0,
+      done: false,
+    };
+
+    let grantsDone = !(input.purgeExpiredGrants || input.purgeOrphanedGrants);
+    let grantCursor: string | undefined;
+    const knownClients = new Map<string, boolean>();
+    while (!grantsDone && result.grantsChecked < input.limit) {
+      const page = await this.list(kvGrantPrefix(this.namespace), {
+        limit: Math.min(1000, input.limit - result.grantsChecked),
+        ...(grantCursor === undefined ? {} : { cursor: grantCursor }),
+      });
+      let deletedFromPage = false;
+      for (const key of page.keys) {
+        (result as { grantsChecked: number }).grantsChecked++;
+        const value = await this.kv.get(key.name, { type: 'json' });
+        if (value === null) continue;
+        const grant = decodeKvGrant(value);
+        let shouldPurge =
+          input.purgeExpiredGrants && grant.metadata.expiresAt !== undefined && grant.metadata.expiresAt <= input.now;
+        if (!shouldPurge && input.purgeOrphanedGrants && !isClientMetadataUrl(grant.value.clientId)) {
+          let exists = knownClients.get(grant.value.clientId);
+          if (exists === undefined) {
+            exists = (await this.kv.get(kvClientKey(this.namespace, grant.value.clientId))) !== null;
+            knownClients.set(grant.value.clientId, exists);
+          }
+          shouldPurge = !exists;
+        }
+        if (shouldPurge) {
+          const revoked = await this.revokeGrant({ userId: grant.value.userId, grantId: grant.value.id }, undefined);
+          if (revoked.status === 'revoked') {
+            (result as { grantsPurged: number }).grantsPurged++;
+            deletedFromPage = true;
+          }
+        }
       }
+      grantsDone = page.cursor === undefined;
+      grantCursor = deletedFromPage ? undefined : page.cursor;
     }
-    if (deleted > 0 && page.cursor !== undefined) {
-      // Deletion invalidates offset-style cursors used by test doubles and some
-      // KV-compatible services. Restart the next bounded pass from the prefix.
-      return { deleted, done: false };
+    if (!grantsDone) return result;
+
+    let tokensDone = !input.purgeOrphanedTokens;
+    let tokenCursor: string | undefined;
+    const knownGrants = new Map<string, boolean>();
+    while (!tokensDone && result.tokensChecked < input.limit) {
+      const page = await this.list(kvAccessTokenPrefix(this.namespace), {
+        limit: Math.min(1000, input.limit - result.tokensChecked),
+        ...(tokenCursor === undefined ? {} : { cursor: tokenCursor }),
+      });
+      let deletedFromPage = false;
+      for (const key of page.keys) {
+        (result as { tokensChecked: number }).tokensChecked++;
+        const value = await this.kv.get(key.name, { type: 'json' });
+        if (value === null) continue;
+        const token = decodeKvAccessTokenParent(value);
+        const grantKey = kvGrantKey(this.namespace, token);
+        let exists = knownGrants.get(grantKey);
+        if (exists === undefined) {
+          exists = (await this.kv.get(grantKey)) !== null;
+          knownGrants.set(grantKey, exists);
+        }
+        if (!exists) {
+          await this.kv.delete(key.name);
+          (result as { tokensPurged: number }).tokensPurged++;
+          deletedFromPage = true;
+        }
+      }
+      tokensDone = page.cursor === undefined;
+      tokenCursor = deletedFromPage ? undefined : page.cursor;
     }
-    return { deleted, cursor: page.cursor, done: page.cursor === undefined };
+    return { ...result, done: tokensDone };
   }
 
   private async putGrant(grant: StoredGrant): Promise<void> {
@@ -646,12 +702,13 @@ class WorkersKvStorageConnection implements OAuthStorageConnection {
   private async collectUserClientGrants(
     userId: string,
     clientId: string,
-    exceptGrantId: string
+    exceptGrantId: string,
+    pageSize?: number
   ): Promise<StoredGrant[]> {
     const records: StoredGrant[] = [];
     let cursor: string | undefined;
     do {
-      const page = await this.listGrantsByUser({ userId, page: { cursor } });
+      const page = await this.listGrantsByUser({ userId, page: { cursor, limit: pageSize } });
       records.push(
         ...page.items.filter((grant) => grant.value.clientId === clientId && grant.value.id !== exceptGrantId)
       );
@@ -713,5 +770,14 @@ class WorkersKvStorageConnection implements OAuthStorageConnection {
       }
       throw new OAuthStorageError('internal', { cause: error, operation });
     }
+  }
+}
+
+function isClientMetadataUrl(clientId: string): boolean {
+  try {
+    const url = new URL(clientId);
+    return url.protocol === 'https:' && url.pathname !== '/';
+  } catch {
+    return false;
   }
 }

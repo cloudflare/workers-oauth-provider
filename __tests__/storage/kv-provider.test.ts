@@ -205,6 +205,27 @@ describe('Workers KV storage provider', () => {
     expect(WORKERS_KV_STORAGE_CAPABILITIES.issuance.grantWithAccessToken).toBe('best_effort');
   });
 
+  it('does not fail successful issuance when best-effort replacement cleanup fails', async () => {
+    await connection.grants.issue(
+      issueGrantInput({
+        client: { kind: 'external', clientId: 'client-1' },
+        grant: storedGrant(0, { id: 'old-grant' }),
+      })
+    );
+    kv.failNextDelete = new Error('cleanup failed');
+
+    expect(
+      await connection.grants.issue(
+        issueGrantInput({
+          client: { kind: 'external', clientId: 'client-1' },
+          grant: storedGrant(0, { id: 'new-grant' }),
+          replaceExistingUserClientGrants: true,
+        })
+      )
+    ).toEqual({ status: 'created' });
+    expect(kv.entries.has('grant:user-1:new-grant')).toBe(true);
+  });
+
   it('guards registered-client issuance with the observed legacy revision', async () => {
     await connection.clients.create(createClientInput(storedClient()));
     expect(
@@ -482,16 +503,20 @@ describe('Workers KV storage provider', () => {
       kv.seed(`token:user-1:expired-${index}:${DIGEST_C}`, token);
     }
 
-    let cursor: string | undefined;
     let done = false;
-    let deleted = 0;
+    let grantsPurged = 0;
     while (!done) {
-      const result = await connection.maintenance.purgeExpired({ now: 100, limit: 1, cursor });
-      deleted += result.deleted;
-      cursor = result.cursor;
+      const result = await connection.maintenance.purge({
+        now: 100,
+        limit: 1,
+        purgeOrphanedGrants: true,
+        purgeExpiredGrants: true,
+        purgeOrphanedTokens: true,
+      });
+      grantsPurged += result.grantsPurged;
       done = result.done;
     }
-    expect(deleted).toBe(6);
+    expect(grantsPurged).toBe(3);
     expect([...kv.entries.keys()]).toEqual([]);
   });
 

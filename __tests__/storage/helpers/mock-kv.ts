@@ -24,6 +24,7 @@ export class MockKvNamespace {
   failNextPut: Error | undefined;
   failPutAt: { readonly attempt: number; readonly error: Error } | undefined;
   putAttempts = 0;
+  failNextDelete: Error | undefined;
 
   asNamespace(): KVNamespace {
     return this as unknown as KVNamespace;
@@ -59,6 +60,11 @@ export class MockKvNamespace {
   }
 
   async delete(key: string): Promise<void> {
+    if (this.failNextDelete !== undefined) {
+      const error = this.failNextDelete;
+      this.failNextDelete = undefined;
+      throw error;
+    }
     this.entries.delete(key);
     this.deletes.push(key);
   }

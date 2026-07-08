@@ -4,6 +4,29 @@
   "description": "OAuth provider for Cloudflare Workers",
   "main": "dist/oauth-provider.js",
   "types": "dist/oauth-provider.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/oauth-provider.d.ts",
+      "import": "./dist/oauth-provider.js",
+      "default": "./dist/oauth-provider.js"
+    },
+    "./storage": {
+      "types": "./dist/storage/index.d.ts",
+      "import": "./dist/storage/index.js",
+      "default": "./dist/storage/index.js"
+    },
+    "./storage/kv": {
+      "types": "./dist/storage/kv/index.d.ts",
+      "import": "./dist/storage/kv/index.js",
+      "default": "./dist/storage/kv/index.js"
+    },
+    "./dist/oauth-provider.js": {
+      "types": "./dist/oauth-provider.d.ts",
+      "import": "./dist/oauth-provider.js",
+      "default": "./dist/oauth-provider.js"
+    },
+    "./package.json": "./package.json"
+  },
   "author": "Kenton Varda <kenton@cloudflare.com>",
   "license": "MIT",
   "sideEffects": false,
@@ -18,6 +41,7 @@
     "build": "tsdown",
     "build:watch": "tsdown --watch",
     "check": "npm run typecheck && npm run test",
+    "check:package": "node scripts/check-package.mjs",
     "typecheck": "tsc",
     "test": "vitest run",
     "test:watch": "vitest",

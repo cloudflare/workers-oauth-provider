@@ -1,7 +1,11 @@
 import { defineConfig } from 'tsdown';
 
 export default defineConfig({
-  entry: ['src/oauth-provider.ts'],
+  entry: {
+    'oauth-provider': 'src/oauth-provider.ts',
+    'storage/index': 'src/storage/index.ts',
+    'storage/kv/index': 'src/storage/kv/index.ts',
+  },
   format: ['esm'],
   dts: true,
   clean: true,

@@ -68,6 +68,8 @@ export type IssueGrantInput = ValidatedInput<
     readonly accessToken?: StoredAccessToken;
     /** Atomically revoke earlier grants for this user/client pair when supported. */
     readonly replaceExistingUserClientGrants?: boolean;
+    /** Optional bounded-query page size hint for compatibility adapters. */
+    readonly replacementPageSize?: number;
   },
   'issue_grant'
 >;
@@ -136,6 +138,7 @@ export function issueGrantInput(input: {
   readonly grant: StoredGrant;
   readonly accessToken?: StoredAccessToken;
   readonly replaceExistingUserClientGrants?: boolean;
+  readonly replacementPageSize?: number;
 }): IssueGrantInput {
   assertStoredGrant(input.grant);
   assertInitialStorageRevision(input.grant);
@@ -153,6 +156,12 @@ export function issueGrantInput(input: {
     typeof input.replaceExistingUserClientGrants !== 'boolean'
   ) {
     throw new TypeError('replaceExistingUserClientGrants must be a boolean');
+  }
+  if (
+    input.replacementPageSize !== undefined &&
+    (!Number.isSafeInteger(input.replacementPageSize) || input.replacementPageSize < 1)
+  ) {
+    throw new TypeError('replacementPageSize must be a positive safe integer');
   }
   if (input.accessToken !== undefined) {
     assertStoredAccessToken(input.accessToken);
@@ -315,10 +324,21 @@ export interface OAuthReplayStore {
   }): Promise<ReplayReservationResult>;
 }
 
-/** Result of one bounded physical-cleanup pass. */
-export interface PurgeExpiredResult {
-  readonly deleted: number;
-  readonly cursor?: string;
+/** Controls one bounded adapter-owned cleanup pass. */
+export interface PurgeStorageInput {
+  readonly now: UnixSeconds;
+  readonly limit: number;
+  readonly purgeOrphanedGrants: boolean;
+  readonly purgeExpiredGrants: boolean;
+  readonly purgeOrphanedTokens: boolean;
+}
+
+/** Result of one bounded adapter-owned cleanup pass. */
+export interface PurgeStorageResult {
+  readonly grantsChecked: number;
+  readonly grantsPurged: number;
+  readonly tokensChecked: number;
+  readonly tokensPurged: number;
   readonly done: boolean;
 }
 
@@ -328,11 +348,7 @@ export interface OAuthMaintenanceStore {
    * Removes expired or orphaned physical state. When unsupported, reject with
    * `unsupportedStorageOperation` before I/O.
    */
-  purgeExpired(input: {
-    readonly now: UnixSeconds;
-    readonly limit: number;
-    readonly cursor?: string;
-  }): Promise<PurgeExpiredResult>;
+  purge(input: PurgeStorageInput): Promise<PurgeStorageResult>;
 }
 
 /** Standard no-side-effect implementation for an unsupported async store method. */
@@ -341,6 +357,7 @@ export async function rejectUnsupportedStorageOperation(operation: string): Prom
 }
 
 function assertTokenBelongsToGrant(token: StoredAccessToken, grant: StoredGrant): void {
+  if (!token.value.grant) throw new TypeError('New access token must include grant metadata');
   if (token.value.userId !== grant.value.userId || token.value.grantId !== grant.value.id) {
     throw new TypeError('Access token must belong to the issued grant');
   }

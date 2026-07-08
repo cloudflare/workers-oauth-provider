@@ -41,9 +41,13 @@ export type StorageGrant = Omit<Grant, 'authCodeId' | 'refreshTokenId' | 'previo
   readonly previousRefreshTokenId?: CredentialId;
 };
 
-/** Stored access-token shape with its identifier constrained to a digest. */
-export type StorageAccessToken = Omit<Token, 'id'> & {
+/**
+ * Stored access-token shape with its identifier constrained to a digest.
+ * `grant` is optional only for legacy KV rows written before denormalization.
+ */
+export type StorageAccessToken = Omit<Token, 'id' | 'grant'> & {
   readonly id: CredentialId;
+  readonly grant?: Token['grant'];
 };
 
 /** Persistent user consent. This is reserved for the basic OIDC/consent roadmap. */
@@ -153,7 +157,10 @@ export function createStoredAccessToken(value: StorageAccessToken, metadata: Sto
     throw new TypeError('Access-token metadata timestamps must match the canonical token');
   }
   return createValidatedStored(
-    Object.freeze({ ...value, grant: Object.freeze({ ...value.grant }) }),
+    Object.freeze({
+      ...value,
+      ...(value.grant === undefined ? {} : { grant: Object.freeze({ ...value.grant }) }),
+    }),
     metadata,
     'access_token'
   );

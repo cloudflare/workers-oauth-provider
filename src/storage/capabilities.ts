@@ -170,6 +170,13 @@ export function assertStorageOperationSupported(guarantee: MutationGuarantee, op
   }
 }
 
+/** Throws before backend I/O when an indexed query is unavailable. */
+export function assertStorageQuerySupported(guarantee: QueryGuarantee, operation: string): void {
+  if (guarantee === 'unsupported') {
+    throw new OAuthStorageError('unsupported_operation', { operation });
+  }
+}
+
 function readCapability(capabilities: OAuthStorageCapabilities, path: StorageCapabilityPath): unknown {
   if (path === 'replayReservation') return capabilities.replayReservation;
   const [group, member] = path.split('.') as [

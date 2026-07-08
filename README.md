@@ -234,18 +234,49 @@ grant. This prevents stale tokens from continuing to use old `props` after a use
 `revokeExistingGrants: false` only if your application intentionally allows multiple concurrent grants for the same
 user and client.
 
-For users with many grants, `revokeExistingGrantsBatchSize` controls the KV page size used while scanning existing
-grants for revocation. It defaults to `50`, must be a positive integer, and is capped at Cloudflare KV's maximum page
-size of `1000`.
+For users with many grants, `revokeExistingGrantsBatchSize` supplies a bounded page-size hint while scanning existing
+grants for revocation. It defaults to `50`, must be a positive integer, and is capped at `1000` for compatibility with
+the default Workers KV adapter.
 
-This implementation requires that your worker is configured with a Workers KV namespace binding called `OAUTH_KV`, which is used to store token information. See the file `storage-schema.md` for details on the schema of this namespace.
+## Storage providers
+
+Workers KV remains the zero-configuration default. If `storage` is omitted, configure a KV namespace binding called
+`OAUTH_KV`; existing keys, JSON records, and active tokens remain compatible. See `storage-schema.md` for that physical
+schema.
+
+The equivalent explicit configuration is:
+
+```ts
+import { OAuthProvider } from '@cloudflare/workers-oauth-provider';
+import { workersKvStorage } from '@cloudflare/workers-oauth-provider/storage/kv';
+
+export default new OAuthProvider<Env>({
+  // ... other options ...
+  storage: workersKvStorage<Env>({
+    binding: (env) => env.OAUTH_KV,
+  }),
+});
+```
+
+Custom providers implement `OAuthStorageProvider` from `@cloudflare/workers-oauth-provider/storage`. The engine opens
+one request-scoped connection and depends on named OAuth operations rather than a KV-shaped CRUD API. Capability
+descriptors distinguish strong, best-effort, eventual, and unsupported behavior. Helpers passed to a request handler
+are valid only for that request; retaining one after the handler resolves produces an `unavailable` storage error.
+Helpers obtained from the original environment or `getOAuthApi()` are detached and open a fresh connection per call.
+
+`storageGuarantees` defaults to `"compatibility"`, preserving the current Workers KV behavior. Set it to `"strict"`
+only with an adapter whose conformance-tested capabilities satisfy every enabled flow. Use
+`provider.getStorageCompatibility()` to inspect the static report without opening storage.
+
+Workers KV is eventually consistent. Its authorization-code and refresh transitions, replay reservation, and cascade
+revocation are explicitly best-effort. The adapter does not claim transaction or fencing guarantees it cannot provide.
 
 The `env.OAUTH_PROVIDER` object available to the fetch handlers provides some methods to query the storage, including:
 
 - Create, list, modify, and delete client_id registrations (in addition to `lookupClient()`, already shown in the example code).
 - List all active authorization grants for a particular user.
 - Revoke (delete) an authorization grant.
-- Purge expired and orphaned data from the KV namespace.
+- Purge expired and orphaned data through the configured storage provider.
 
 Note that `deleteClient()` cascades: it revokes all grants (and their associated tokens) for the deleted client across all users.
 
@@ -445,7 +476,7 @@ By default, the `onError` callback is set to ``({ status, code, description }) =
 
 ## KV Namespace Cleanup
 
-The library uses KV TTLs to automatically expire access tokens, refresh tokens (grants), and dynamically registered clients. As defense-in-depth, the library also provides a `purgeExpiredData()` method that cleans up orphaned and expired records. This is designed to be called from a [Cron Trigger](https://developers.cloudflare.com/workers/configuration/cron-triggers/) (scheduled handler):
+Logical expiry is enforced by every storage provider; the default Workers KV adapter also uses native TTLs. As defense-in-depth, `purgeExpiredData()` delegates bounded cleanup of orphaned and expired records to the configured adapter. It is designed to be called from a [Cron Trigger](https://developers.cloudflare.com/workers/configuration/cron-triggers/) (scheduled handler):
 
 ```ts
 const oauthProvider = new OAuthProvider({
