@@ -115,15 +115,15 @@ Both D1 and SQLite-backed Durable Objects use SQLite, but their execution models
 
 They need separate adapters even if they share SQL fragments and record schemas.
 
-### PostgreSQL and MySQL
+### PostgreSQL through Hyperdrive
 
-Hyperdrive is connection pooling and optional query caching for an existing Postgres or MySQL database. It is not the database and it is not a SQL driver.
+Hyperdrive provides connection pooling and optional query caching for an existing PostgreSQL database. It is not the database and it is not a SQL driver.
 
-The application still supplies a driver such as `pg`, Postgres.js, or `mysql2`. The OAuth storage contract should accept a small driver-neutral connection factory instead of adding one of those packages as a runtime dependency.
+The application still supplies a PostgreSQL driver such as `pg` or Postgres.js. The OAuth storage contract should accept a small driver-neutral connection factory instead of adding one of those packages as a runtime dependency.
 
 Hyperdrive query caching must be disabled for the connection used by OAuth storage. Hyperdrive does not invalidate cached reads after writes and explicitly recommends a cache-disabled binding for authentication, sessions, and permissions.
 
-PlanetScale currently offers both Postgres and MySQL. A PlanetScale Postgres database uses the Postgres adapter. PlanetScale MySQL requires a separate MySQL adapter. D1 uses the D1 adapter, not the Postgres adapter.
+PlanetScale is a deployment choice behind Hyperdrive, not a separate storage adapter. A PlanetScale PostgreSQL database uses the same PostgreSQL adapter and capability profile as another PostgreSQL deployment. D1 uses the D1 adapter, not the PostgreSQL adapter.
 
 ## Architectural layers
 
@@ -943,7 +943,7 @@ Target guarantees:
 - all indexed queries;
 - manual or scheduled cleanup.
 
-The first adapter targets PostgreSQL. MySQL syntax, affected-row behavior, and locking differ enough to warrant a separate adapter.
+The adapter targets PostgreSQL.
 
 ### Redis adapter
 
@@ -1237,8 +1237,7 @@ An alternative is to ship Durable Object SQLite first if the immediate priority 
 
 - PostgreSQL adapter with a driver-neutral connection factory;
 - Redis adapter with script-capable client injection;
-- external examples for `pg`, Postgres.js, Hyperdrive, PlanetScale Postgres, and a supported Redis service;
-- separate MySQL adapter only after its SQL and transaction behavior has dedicated tests.
+- external examples for `pg`, Postgres.js, cache-disabled Hyperdrive, PlanetScale through Hyperdrive, and a supported Redis service.
 
 ### Phase 4: strict feature gates
 
@@ -1272,7 +1271,7 @@ The RFC is ready for implementation when:
 - the feature compatibility matrix has owners and tests;
 - KV compatibility behavior remains available without being described as strongly consistent;
 - Postgres and Redis integrations require no runtime dependency in the core package;
-- D1, Durable Object, Hyperdrive, PlanetScale, and Workers KV are classified correctly;
+- D1, Durable Object, Workers KV, and PostgreSQL are classified correctly, with Hyperdrive and PlanetScale treated as deployment infrastructure rather than adapters;
 - migration and schema versioning rules are clear;
 - the conformance suite can prove every strong capability under concurrency;
 - the source and package layout change has explicit maintainer approval.
@@ -1290,6 +1289,6 @@ The RFC is ready for implementation when:
 - [Durable Object concurrency guidance](https://developers.cloudflare.com/durable-objects/best-practices/rules-of-durable-objects/)
 - [D1 database API, transactional batches, and sessions](https://developers.cloudflare.com/d1/worker-api/d1-database/)
 - [Hyperdrive query caching and authentication guidance](https://developers.cloudflare.com/hyperdrive/concepts/query-caching/)
-- [Hyperdrive Postgres and MySQL driver setup](https://developers.cloudflare.com/hyperdrive/get-started/)
+- [Hyperdrive PostgreSQL driver setup](https://developers.cloudflare.com/hyperdrive/get-started/)
 - [OAuth 2.1 draft 15](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-v2-1-15)
 - [RFC 9700 refresh-token protection](https://www.rfc-editor.org/rfc/rfc9700.html#section-4.14)
