@@ -1,9 +1,9 @@
 # Pluggable storage providers
 
-**Status:** design RFC  
-**Scope:** storage contract, capability negotiation, adapter boundaries, and compatibility policy  
-**Out of scope:** implementing the adapters in this document  
-**Research baselines:** `workers-oauth-provider@0.8.1` (`f8e3ddd`), `better-auth@1.6.23` plus main (`fd6b8c1`), and `pi-mono` (`9a0a8d7c`)
+- **Status:** accepted implementation direction; implementation in progress
+- **Scope:** storage contract, capability negotiation, adapter boundaries, and compatibility policy
+- **Current implementation:** backend-neutral contract under `src/storage/`; provider-core migration and built-in adapters remain pending
+- **Research baselines:** `workers-oauth-provider@0.8.1` (`f8e3ddd`), `better-auth@1.6.23` plus main (`fd6b8c1`), and `pi-mono` (`9a0a8d7c`)
 
 ## Goal
 
