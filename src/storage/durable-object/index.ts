@@ -134,6 +134,7 @@ export type DurableObjectStorageCommand =
         readonly expectedGrantRevision: number;
         readonly token: StoredAccessToken;
       };
+      readonly now: number;
     }
   | { readonly operation: 'tokens.delete'; readonly key: AccessTokenKey }
   | { readonly operation: 'tokens.list'; readonly grant: GrantKey; readonly page?: PageRequest; readonly now: number }
@@ -300,7 +301,7 @@ class DurableObjectConnection implements OAuthStorageConnection {
       get: (key) => this.call({ operation: 'tokens.get', key, now: this.now() }),
       createForGrant: async (input) => {
         assertIssueAccessTokenInput(input);
-        return this.call({ operation: 'tokens.create', input });
+        return this.call({ operation: 'tokens.create', input, now: this.now() });
       },
       delete: (input) => this.call({ operation: 'tokens.delete', key: input.key }),
       listByGrant: (input) =>
@@ -370,7 +371,7 @@ interface SqlStorage {
 }
 interface ObjectStorage {
   readonly sql: SqlStorage;
-  transaction<T>(callback: () => T): T;
+  transactionSync<T>(callback: () => T): T;
   setAlarm?(scheduledTime: number | Date): Promise<void>;
 }
 interface ObjectState {
@@ -389,13 +390,13 @@ export class OAuthStorageObject {
 
   async execute(command: DurableObjectStorageCommand): Promise<unknown> {
     await this.ready;
-    return this.state.storage.transaction(() => this.executeTransaction(command));
+    return this.state.storage.transactionSync(() => this.executeTransaction(command));
   }
 
   async alarm(): Promise<void> {
     await this.ready;
     const now = Math.floor(Date.now() / 1000);
-    this.state.storage.transaction(() => {
+    this.state.storage.transactionSync(() => {
       this.sql.exec('DELETE FROM records WHERE expires_at IS NOT NULL AND expires_at <= ?', now);
       this.sql.exec('DELETE FROM leases WHERE expires_at <= ?', now);
       this.sql.exec('DELETE FROM replay WHERE expires_at <= ?', now);
@@ -454,7 +455,7 @@ export class OAuthStorageObject {
       case 'tokens.get':
         return this.readToken(command.key, command.now);
       case 'tokens.create':
-        return this.createToken(command.input);
+        return this.createToken(command.input, command.now);
       case 'tokens.delete':
         return this.deleteToken(command.key);
       case 'tokens.list':
@@ -651,6 +652,12 @@ export class OAuthStorageObject {
       const client = this.row('client', input.client.clientId);
       if (!client) return { status: 'client_not_found' };
       if (client.revision !== input.client.expectedRevision) return { status: 'client_conflict' };
+    } else {
+      this.sql.exec(
+        `INSERT OR IGNORE INTO records(kind,key,value,revision,expires_at) VALUES('external-client',?,?,0,NULL)`,
+        input.client.clientId,
+        JSON.stringify({ clientId: input.client.clientId })
+      );
     }
     if (input.replaceExistingUserClientGrants) {
       const prior = this.sql
@@ -782,11 +789,11 @@ export class OAuthStorageObject {
     return { status: 'revoked', deletedAccessTokens: count };
   }
   private createToken(
-    input: Extract<DurableObjectStorageCommand, { operation: 'tokens.create' }>['input']
+    input: Extract<DurableObjectStorageCommand, { operation: 'tokens.create' }>['input'],
+    now: number
   ): IssueAccessTokenResult {
     const grant = this.row('grant', this.grantKey(input.grant));
-    if (!grant || (grant.expires_at !== null && grant.expires_at <= input.token.metadata.createdAt))
-      return { status: 'grant_not_found' };
+    if (!grant || (grant.expires_at !== null && grant.expires_at <= now)) return { status: 'grant_not_found' };
     if (grant.revision !== input.expectedGrantRevision) return { status: 'grant_conflict' };
     return this.insert('token', input.token.value.id, input.token).status === 'created'
       ? { status: 'created' }
@@ -828,13 +835,12 @@ export class OAuthStorageObject {
     for (const row of grants) {
       grantsChecked++;
       const grant = this.decodeGrant(row);
-      const orphaned = !this.row('client', grant.value.clientId);
+      const orphaned = !this.row('client', grant.value.clientId) && !this.row('external-client', grant.value.clientId);
       const expired = row.expires_at !== null && row.expires_at <= command.now;
       if ((command.purgeOrphanedGrants && orphaned) || (command.purgeExpiredGrants && expired)) {
         const result = this.revoke({ userId: grant.value.userId, grantId: grant.value.id });
         if (result.status === 'revoked') {
           grantsPurged++;
-          tokensPurged += result.deletedAccessTokens;
         }
       }
     }
