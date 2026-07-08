@@ -12,6 +12,7 @@ import {
   createStoredAccessToken,
   createStoredClient,
   createStoredGrant,
+  createStoredConsent,
   credentialIdFromSha256,
   hideLogicallyExpired,
   type AccessTokenKey,
@@ -19,6 +20,7 @@ import {
   type StoredAccessToken,
   type StoredClient,
   type StoredGrant,
+  type StoredConsent,
 } from '../records';
 import type {
   CreateResult,
@@ -28,12 +30,15 @@ import type {
   ReplaceResult,
   ReplayReservationResult,
   RevokeGrantResult,
+  DeleteClientResult,
+  ReplaceConsentResult,
 } from '../results';
 import {
   assertCreateClientInput,
   assertIssueAccessTokenInput,
   assertIssueGrantInput,
   assertIssueGrantSupported,
+  assertCompareAndSwapConsentInput,
   assertReplaceClientInput,
   type OAuthAccessTokenStore,
   type OAuthClientStore,
@@ -61,20 +66,20 @@ export const DURABLE_OBJECT_SQLITE_STORAGE_CAPABILITIES: OAuthStorageCapabilitie
   issuance: {
     grantOnly: 'strong',
     grantWithAccessToken: 'strong',
-    replaceUserClientGrants: 'unsupported',
+    replaceUserClientGrants: 'strong',
     existingGrantAccessToken: 'strong',
   },
   transitions: { authorizationCode: 'strong', refreshToken: 'strong' },
   replayReservation: 'strong',
-  revocation: { accessToken: 'strong', grantCascade: 'strong', clientCascade: 'unsupported' },
-  consents: { compareAndSwap: 'unsupported', delete: 'unsupported' },
+  revocation: { accessToken: 'strong', grantCascade: 'strong', clientCascade: 'strong' },
+  consents: { compareAndSwap: 'strong', delete: 'strong' },
   queries: {
-    listClients: 'unsupported',
-    grantsByUser: 'unsupported',
-    grantsByClient: 'unsupported',
+    listClients: 'strong',
+    grantsByUser: 'strong',
+    grantsByClient: 'strong',
     tokensByGrant: 'strong',
-    consentsByUser: 'unsupported',
-    globalMaintenance: 'unsupported',
+    consentsByUser: 'strong',
+    globalMaintenance: 'strong',
   },
   expiration: { cleanup: 'scheduled', minimumTtlSeconds: 0 },
 });
@@ -89,6 +94,8 @@ export type DurableObjectStorageCommand =
       readonly expectedRevision: number;
       readonly client: StoredClient;
     }
+  | { readonly operation: 'clients.delete'; readonly clientId: string; readonly expectedRevision?: number }
+  | { readonly operation: 'clients.list'; readonly page?: PageRequest; readonly now: number }
   | { readonly operation: 'grants.get'; readonly key: GrantKey; readonly now: number }
   | {
       readonly operation: 'grants.issue';
@@ -100,7 +107,20 @@ export type DurableObjectStorageCommand =
         };
         readonly grant: StoredGrant;
         readonly accessToken?: StoredAccessToken;
+        readonly replaceExistingUserClientGrants?: boolean;
       };
+    }
+  | {
+      readonly operation: 'grants.list-user';
+      readonly userId: string;
+      readonly page?: PageRequest;
+      readonly now: number;
+    }
+  | {
+      readonly operation: 'grants.list-client';
+      readonly clientId: string;
+      readonly page?: PageRequest;
+      readonly now: number;
     }
   | { readonly operation: 'grants.begin'; readonly input: BeginGrantTransitionInput }
   | { readonly operation: 'grants.commit'; readonly input: ValidatedCommitGrantTransitionInput }
@@ -118,11 +138,35 @@ export type DurableObjectStorageCommand =
   | { readonly operation: 'tokens.delete'; readonly key: AccessTokenKey }
   | { readonly operation: 'tokens.list'; readonly grant: GrantKey; readonly page?: PageRequest; readonly now: number }
   | {
+      readonly operation: 'consents.get';
+      readonly userId: string;
+      readonly clientId: string;
+      readonly referenceId?: string;
+      readonly now: number;
+    }
+  | { readonly operation: 'consents.cas'; readonly consent: StoredConsent; readonly expectedRevision?: number }
+  | {
+      readonly operation: 'consents.delete';
+      readonly userId: string;
+      readonly clientId: string;
+      readonly referenceId?: string;
+      readonly expectedRevision?: number;
+    }
+  | { readonly operation: 'consents.list'; readonly userId: string; readonly page?: PageRequest; readonly now: number }
+  | {
       readonly operation: 'replay.reserve';
       readonly reservationNamespace: string;
       readonly keyHash: string;
       readonly expiresAt: number;
       readonly now: number;
+    }
+  | {
+      readonly operation: 'maintenance.purge';
+      readonly now: number;
+      readonly limit: number;
+      readonly purgeOrphanedGrants: boolean;
+      readonly purgeExpiredGrants: boolean;
+      readonly purgeOrphanedTokens: boolean;
     };
 
 /** Narrow RPC object boundary. Implementations may be a Durable Object stub or a test factory. */
@@ -144,11 +188,12 @@ export interface DurableObjectSqliteStorageOptions<Env> {
 /**
  * Creates the Durable Object SQLite adapter.
  *
- * Partition strategy v1 is deliberately fixed: each operation routes to the
- * aggregate named `oauth-do:v1:<namespace>:<kind>:<encoded aggregate id>`.
- * Clients use clientId, grants/tokens use userId + grantId, and replay entries
- * use reservation namespace + digest. This places all strong aggregate
- * operations in one object's serialization and SQLite transaction domain.
+ * Version 1 deliberately routes every operation in a namespace to one root
+ * object. This is the only serialization and SQLite transaction domain, so all
+ * advertised strong operations compose atomically. The explicit v1 trade-off
+ * is that one namespace is limited by a single Durable Object's throughput and
+ * storage limits; applications needing horizontal sharding must use a future
+ * contract version with correspondingly weaker cross-shard guarantees.
  */
 export function durableObjectSqliteStorage<Env>(
   options: DurableObjectSqliteStorageOptions<Env>
@@ -181,8 +226,8 @@ export function durableObjectSqliteStorage<Env>(
   return provider;
 }
 
-function aggregateName(namespace: string, kind: string, parts: readonly string[]): string {
-  return `oauth-do:v1:${encodeURIComponent(namespace)}:${kind}:${parts.map(encodeURIComponent).join(':')}`;
+function rootName(namespace: string): string {
+  return `oauth-do:v1:${encodeURIComponent(namespace)}:root`;
 }
 
 class DurableObjectConnection implements OAuthStorageConnection {
@@ -200,68 +245,66 @@ class DurableObjectConnection implements OAuthStorageConnection {
     private readonly clock: () => number
   ) {
     this.clients = Object.freeze<OAuthClientStore>({
-      get: (clientId) => this.call('client', [clientId], { operation: 'clients.get', clientId, now: this.now() }),
+      get: (clientId) => this.call({ operation: 'clients.get', clientId, now: this.now() }),
       create: async (input) => {
         assertCreateClientInput(input);
-        return this.call('client', [input.client.value.clientId], {
+        return this.call({
           operation: 'clients.create',
           client: input.client,
         });
       },
       replace: async (input) => {
         assertReplaceClientInput(input);
-        return this.call('client', [input.clientId], {
+        return this.call({
           operation: 'clients.replace',
           clientId: input.clientId,
           expectedRevision: input.expectedRevision,
           client: input.client,
         });
       },
-      deleteWithGrants: () => Promise.reject(unsupportedStorageOperation('clients.deleteWithGrants')),
-      list: () => Promise.reject(unsupportedStorageOperation('clients.list')),
+      deleteWithGrants: (input) => this.call({ operation: 'clients.delete', ...input }),
+      list: (page) => this.call({ operation: 'clients.list', page, now: this.now() }),
     });
     this.grants = Object.freeze<OAuthGrantStore>({
-      get: (key) => this.call('grant', [key.userId, key.grantId], { operation: 'grants.get', key, now: this.now() }),
+      get: (key) => this.call({ operation: 'grants.get', key, now: this.now() }),
       issue: async (input) => {
         assertIssueGrantInput(input);
         assertIssueGrantSupported(DURABLE_OBJECT_SQLITE_STORAGE_CAPABILITIES, input);
-        return this.call('grant', [input.grant.value.userId, input.grant.value.id], {
+        return this.call({
           operation: 'grants.issue',
           input,
         });
       },
-      listByUser: () => Promise.reject(unsupportedStorageOperation('grants.listByUser')),
-      listByClient: () => Promise.reject(unsupportedStorageOperation('grants.listByClient')),
+      listByUser: (input) => this.call({ operation: 'grants.list-user', ...input, now: this.now() }),
+      listByClient: (input) => this.call({ operation: 'grants.list-client', ...input, now: this.now() }),
       beginTransition: async (input) => {
         assertBeginGrantTransitionInput(input);
-        return this.call('grant', [input.grant.userId, input.grant.grantId], { operation: 'grants.begin', input });
+        return this.call({ operation: 'grants.begin', input });
       },
       commitTransition: async (input) => {
         assertCommitGrantTransitionInput(input);
-        return this.call('grant', [input.lease.grant.userId, input.lease.grant.grantId], {
+        return this.call({
           operation: 'grants.commit',
           input,
         });
       },
-      abortTransition: (input) =>
-        this.call('grant', [input.lease.grant.userId, input.lease.grant.grantId], { operation: 'grants.abort', input }),
+      abortTransition: (input) => this.call({ operation: 'grants.abort', input }),
       revoke: (input) =>
-        this.call('grant', [input.grant.userId, input.grant.grantId], {
+        this.call({
           operation: 'grants.revoke',
           key: input.grant,
           expectedRevision: input.expectedRevision,
         }),
     });
     this.accessTokens = Object.freeze<OAuthAccessTokenStore>({
-      get: (key) => this.call('grant', [key.userId, key.grantId], { operation: 'tokens.get', key, now: this.now() }),
+      get: (key) => this.call({ operation: 'tokens.get', key, now: this.now() }),
       createForGrant: async (input) => {
         assertIssueAccessTokenInput(input);
-        return this.call('grant', [input.grant.userId, input.grant.grantId], { operation: 'tokens.create', input });
+        return this.call({ operation: 'tokens.create', input });
       },
-      delete: (input) =>
-        this.call('grant', [input.key.userId, input.key.grantId], { operation: 'tokens.delete', key: input.key }),
+      delete: (input) => this.call({ operation: 'tokens.delete', key: input.key }),
       listByGrant: (input) =>
-        this.call('grant', [input.grant.userId, input.grant.grantId], {
+        this.call({
           operation: 'tokens.list',
           grant: input.grant,
           page: input.page,
@@ -269,21 +312,28 @@ class DurableObjectConnection implements OAuthStorageConnection {
         }),
     });
     this.consents = Object.freeze<OAuthConsentStore>({
-      get: () => Promise.reject(unsupportedStorageOperation('consents.get')),
-      compareAndSwap: () => Promise.reject(unsupportedStorageOperation('consents.compareAndSwap')),
-      delete: () => Promise.reject(unsupportedStorageOperation('consents.delete')),
-      listByUser: () => Promise.reject(unsupportedStorageOperation('consents.listByUser')),
+      get: (input) => this.call({ operation: 'consents.get', ...input, now: this.now() }),
+      compareAndSwap: async (input) => {
+        assertCompareAndSwapConsentInput(input);
+        return this.call({
+          operation: 'consents.cas',
+          consent: input.consent,
+          expectedRevision: input.expectedRevision,
+        });
+      },
+      delete: (input) => this.call({ operation: 'consents.delete', ...input }),
+      listByUser: (input) => this.call({ operation: 'consents.list', ...input, now: this.now() }),
     });
     this.replay = Object.freeze<OAuthReplayStore>({
       reserve: (input) =>
-        this.call('replay', [input.reservationNamespace, input.keyHash], {
+        this.call({
           operation: 'replay.reserve',
           ...input,
           now: this.now(),
         }),
     });
     this.maintenance = Object.freeze<OAuthMaintenanceStore>({
-      purge: () => Promise.reject(unsupportedStorageOperation('maintenance.purge')),
+      purge: (input) => this.call({ operation: 'maintenance.purge', ...input }),
     });
   }
   close(): void {
@@ -295,10 +345,10 @@ class DurableObjectConnection implements OAuthStorageConnection {
       throw new OAuthStorageError('invalid_configuration', { operation: 'storage.clock' });
     return value;
   }
-  private async call<T>(kind: string, parts: readonly string[], command: DurableObjectStorageCommand): Promise<T> {
+  private async call<T>(command: DurableObjectStorageCommand): Promise<T> {
     if (this.#closed) throw new OAuthStorageError('unavailable', { operation: command.operation });
     try {
-      return (await this.binding.getByName(aggregateName(this.namespace, kind, parts)).execute(command)) as T;
+      return (await this.binding.getByName(rootName(this.namespace)).execute(command)) as T;
     } catch (error) {
       if (isOAuthStorageError(error)) throw error;
       throw new OAuthStorageError('internal', { cause: error, operation: command.operation });
@@ -375,10 +425,24 @@ export class OAuthStorageObject {
         return this.insert('client', command.client.value.clientId, command.client);
       case 'clients.replace':
         return this.replaceClient(command);
+      case 'clients.delete':
+        return this.deleteClient(command.clientId, command.expectedRevision);
+      case 'clients.list':
+        return this.listRecords('client', 'clientId', undefined, command.page, command.now, (row) =>
+          this.decodeClient(row)
+        );
       case 'grants.get':
         return this.readGrant(command.key, command.now);
       case 'grants.issue':
         return this.issue(command.input);
+      case 'grants.list-user':
+        return this.listRecords('grant', 'userId', command.userId, command.page, command.now, (row) =>
+          this.decodeGrant(row)
+        );
+      case 'grants.list-client':
+        return this.listRecords('grant', 'clientId', command.clientId, command.page, command.now, (row) =>
+          this.decodeGrant(row)
+        );
       case 'grants.begin':
         return this.begin(command.input);
       case 'grants.commit':
@@ -395,8 +459,20 @@ export class OAuthStorageObject {
         return this.deleteToken(command.key);
       case 'tokens.list':
         return this.listTokens(command.grant, command.page, command.now);
+      case 'consents.get':
+        return this.readConsent(command.userId, command.clientId, command.referenceId, command.now);
+      case 'consents.cas':
+        return this.compareAndSwapConsent(command.consent, command.expectedRevision);
+      case 'consents.delete':
+        return this.deleteConsent(command);
+      case 'consents.list':
+        return this.listRecords('consent', 'userId', command.userId, command.page, command.now, (row) =>
+          this.decodeConsent(row)
+        );
       case 'replay.reserve':
         return this.reserveReplay(command);
+      case 'maintenance.purge':
+        return this.purge(command);
     }
   }
 
@@ -419,13 +495,24 @@ export class OAuthStorageObject {
     const stored = JSON.parse(row.value) as StoredAccessToken;
     return createStoredAccessToken(stored.value, stored.metadata);
   }
+  private decodeConsent(row: SqlRow): StoredConsent {
+    const stored = JSON.parse(row.value) as StoredConsent;
+    return createStoredConsent(stored.value, stored.metadata);
+  }
+  private consentKey(userId: string, clientId: string, referenceId?: string): string {
+    return JSON.stringify([userId, clientId, referenceId ?? null]);
+  }
   private grantKey(key: GrantKey): string {
     return JSON.stringify([key.userId, key.grantId]);
   }
   private tokenKey(key: AccessTokenKey): string {
     return key.tokenId;
   }
-  private insert(kind: string, key: string, value: StoredClient | StoredGrant | StoredAccessToken): CreateResult {
+  private insert(
+    kind: string,
+    key: string,
+    value: StoredClient | StoredGrant | StoredAccessToken | StoredConsent
+  ): CreateResult {
     const changed = this.sql
       .exec(
         'INSERT OR IGNORE INTO records(kind,key,value,revision,expires_at) VALUES(?,?,?,?,?) RETURNING key',
@@ -469,6 +556,94 @@ export class OAuthStorageObject {
     this.schedule(command.client.metadata.expiresAt);
     return { status: 'updated' };
   }
+  private deleteClient(clientId: string, expectedRevision?: number): DeleteClientResult {
+    const client = this.row('client', clientId);
+    if (!client) return { status: 'not_found' };
+    if (expectedRevision !== undefined && client.revision !== expectedRevision) return { status: 'conflict' };
+    const grants = this.sql
+      .exec<
+        SqlRow & { key: string }
+      >("SELECT key,value,revision,expires_at FROM records WHERE kind='grant' AND json_extract(value,'$.value.clientId')=?", clientId)
+      .toArray();
+    let tokens = 0;
+    for (const grant of grants) {
+      const value = this.decodeGrant(grant).value;
+      tokens += this.sql
+        .exec(
+          "DELETE FROM records WHERE kind='token' AND json_extract(value,'$.value.userId')=? AND json_extract(value,'$.value.grantId')=? RETURNING key",
+          value.userId,
+          value.id
+        )
+        .toArray().length;
+      this.sql.exec('DELETE FROM leases WHERE grant_key=?', grant.key);
+    }
+    this.sql.exec("DELETE FROM records WHERE kind='grant' AND json_extract(value,'$.value.clientId')=?", clientId);
+    this.sql.exec("DELETE FROM records WHERE kind='consent' AND json_extract(value,'$.value.clientId')=?", clientId);
+    this.sql.exec("DELETE FROM records WHERE kind='client' AND key=?", clientId);
+    return { status: 'deleted', deletedGrants: grants.length, deletedAccessTokens: tokens };
+  }
+  private listRecords<T>(
+    kind: string,
+    field: string,
+    value: string | undefined,
+    page: PageRequest | undefined,
+    now: number,
+    decode: (row: SqlRow) => T
+  ): Page<T> {
+    const request = createPageRequest(page);
+    const limit = request.limit ?? 1000;
+    const after = request.cursor ?? '';
+    const rows =
+      value === undefined
+        ? this.sql
+            .exec<
+              SqlRow & { key: string }
+            >('SELECT key,value,revision,expires_at FROM records WHERE kind=? AND key>? AND (expires_at IS NULL OR expires_at>?) ORDER BY key LIMIT ?', kind, after, now, limit + 1)
+            .toArray()
+        : this.sql
+            .exec<
+              SqlRow & { key: string }
+            >(`SELECT key,value,revision,expires_at FROM records WHERE kind=? AND key>? AND json_extract(value,'$.value.${field}')=? AND (expires_at IS NULL OR expires_at>?) ORDER BY key LIMIT ?`, kind, after, value, now, limit + 1)
+            .toArray();
+    const selected = rows.slice(0, limit);
+    return createPage(selected.map(decode), rows.length > limit ? selected[selected.length - 1]?.key : undefined);
+  }
+  private readConsent(
+    userId: string,
+    clientId: string,
+    referenceId: string | undefined,
+    now: number
+  ): StoredConsent | null {
+    const row = this.row('consent', this.consentKey(userId, clientId, referenceId));
+    return row ? hideLogicallyExpired(this.decodeConsent(row), now) : null;
+  }
+  private compareAndSwapConsent(consent: StoredConsent, expectedRevision?: number): ReplaceConsentResult {
+    const key = this.consentKey(consent.value.userId, consent.value.clientId, consent.value.referenceId);
+    const row = this.row('consent', key);
+    if (expectedRevision === undefined)
+      return this.insert('consent', key, consent).status === 'created' ? { status: 'created' } : { status: 'conflict' };
+    if (!row || row.revision !== expectedRevision) return { status: 'conflict' };
+    this.sql.exec(
+      'UPDATE records SET value=?,revision=?,expires_at=? WHERE kind=? AND key=? AND revision=?',
+      JSON.stringify(consent),
+      consent.metadata.revision,
+      consent.metadata.expiresAt ?? null,
+      'consent',
+      key,
+      expectedRevision
+    );
+    this.schedule(consent.metadata.expiresAt);
+    return { status: 'updated' };
+  }
+  private deleteConsent(command: Extract<DurableObjectStorageCommand, { operation: 'consents.delete' }>): DeleteResult {
+    const key = this.consentKey(command.userId, command.clientId, command.referenceId);
+    const row = this.row('consent', key);
+    if (!row) return { status: 'not_found' };
+    if (command.expectedRevision !== undefined && row.revision !== command.expectedRevision)
+      return { status: 'conflict' };
+    this.sql.exec("DELETE FROM records WHERE kind='consent' AND key=?", key);
+    return { status: 'deleted' };
+  }
   private issue(input: Extract<DurableObjectStorageCommand, { operation: 'grants.issue' }>['input']): IssueGrantResult {
     const key = this.grantKey({ userId: input.grant.value.userId, grantId: input.grant.value.id });
     if (this.row('grant', key)) return { status: 'conflict' };
@@ -476,6 +651,17 @@ export class OAuthStorageObject {
       const client = this.row('client', input.client.clientId);
       if (!client) return { status: 'client_not_found' };
       if (client.revision !== input.client.expectedRevision) return { status: 'client_conflict' };
+    }
+    if (input.replaceExistingUserClientGrants) {
+      const prior = this.sql
+        .exec<
+          SqlRow & { key: string }
+        >("SELECT key,value,revision,expires_at FROM records WHERE kind='grant' AND json_extract(value,'$.value.userId')=? AND json_extract(value,'$.value.clientId')=?", input.grant.value.userId, input.grant.value.clientId)
+        .toArray();
+      for (const row of prior) {
+        const grant = this.decodeGrant(row);
+        this.revoke({ userId: grant.value.userId, grantId: grant.value.id });
+      }
     }
     this.insert('grant', key, input.grant);
     if (input.accessToken && this.insert('token', input.accessToken.value.id, input.accessToken).status !== 'created')
@@ -542,7 +728,13 @@ export class OAuthStorageObject {
       .toArray()[0];
     if (!row || row.fence !== lease.fence) return false;
     const stored = JSON.parse(row.value) as GrantTransitionLease;
-    return stored.id === lease.id && stored.ownerId === lease.ownerId;
+    return (
+      stored.id === lease.id &&
+      stored.ownerId === lease.ownerId &&
+      stored.kind === lease.kind &&
+      stored.credentialId === lease.credentialId &&
+      stored.callbackIdempotencyKey === lease.callbackIdempotencyKey
+    );
   }
   private commit(input: ValidatedCommitGrantTransitionInput): unknown {
     if (input.now >= input.lease.expiresAt || !this.currentLease(input.lease)) return { status: 'lease_lost' };
@@ -593,7 +785,8 @@ export class OAuthStorageObject {
     input: Extract<DurableObjectStorageCommand, { operation: 'tokens.create' }>['input']
   ): IssueAccessTokenResult {
     const grant = this.row('grant', this.grantKey(input.grant));
-    if (!grant) return { status: 'grant_not_found' };
+    if (!grant || (grant.expires_at !== null && grant.expires_at <= input.token.metadata.createdAt))
+      return { status: 'grant_not_found' };
     if (grant.revision !== input.expectedGrantRevision) return { status: 'grant_conflict' };
     return this.insert('token', input.token.value.id, input.token).status === 'created'
       ? { status: 'created' }
@@ -621,6 +814,53 @@ export class OAuthStorageObject {
       selected.map((row) => this.decodeToken(row)),
       more ? selected[selected.length - 1]?.key : undefined
     );
+  }
+  private purge(command: Extract<DurableObjectStorageCommand, { operation: 'maintenance.purge' }>) {
+    let grantsChecked = 0,
+      grantsPurged = 0,
+      tokensChecked = 0,
+      tokensPurged = 0;
+    const grants = this.sql
+      .exec<
+        SqlRow & { key: string }
+      >("SELECT key,value,revision,expires_at FROM records WHERE kind='grant' ORDER BY key LIMIT ?", command.limit)
+      .toArray();
+    for (const row of grants) {
+      grantsChecked++;
+      const grant = this.decodeGrant(row);
+      const orphaned = !this.row('client', grant.value.clientId);
+      const expired = row.expires_at !== null && row.expires_at <= command.now;
+      if ((command.purgeOrphanedGrants && orphaned) || (command.purgeExpiredGrants && expired)) {
+        const result = this.revoke({ userId: grant.value.userId, grantId: grant.value.id });
+        if (result.status === 'revoked') {
+          grantsPurged++;
+          tokensPurged += result.deletedAccessTokens;
+        }
+      }
+    }
+    const remaining = Math.max(0, command.limit - grantsChecked);
+    const tokens = this.sql
+      .exec<
+        SqlRow & { key: string }
+      >("SELECT key,value,revision,expires_at FROM records WHERE kind='token' ORDER BY key LIMIT ?", remaining)
+      .toArray();
+    for (const row of tokens) {
+      tokensChecked++;
+      const token = this.decodeToken(row);
+      const orphaned = !this.row('grant', this.grantKey({ userId: token.value.userId, grantId: token.value.grantId }));
+      const expired = row.expires_at !== null && row.expires_at <= command.now;
+      if (expired || (command.purgeOrphanedTokens && orphaned)) {
+        this.sql.exec("DELETE FROM records WHERE kind='token' AND key=?", row.key);
+        tokensPurged++;
+      }
+    }
+    return {
+      grantsChecked,
+      grantsPurged,
+      tokensChecked,
+      tokensPurged,
+      done: grantsChecked + tokensChecked < command.limit,
+    };
   }
   private reserveReplay(
     command: Extract<DurableObjectStorageCommand, { operation: 'replay.reserve' }>
