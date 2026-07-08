@@ -278,6 +278,7 @@ Built-in adapters currently available:
 | Workers KV            | `.../storage/kv`             | Legacy-compatible, eventual and best-effort            |
 | Cloudflare D1         | `.../storage/d1`             | Strong guarded transitions and issuance; session reads |
 | Durable Object SQLite | `.../storage/durable-object` | Strong single-object serialization for one namespace   |
+| PostgreSQL            | `.../storage/postgres`       | Strong transactions through an injected client         |
 
 D1 example:
 
@@ -310,6 +311,25 @@ storage: durableObjectSqliteStorage<Env>({
 Configure `OAuthStorageObject` as a `new_sqlite_class` in Wrangler. Version 1 routes one logical namespace through one
 root Durable Object so every advertised operation shares a serialization and SQLite transaction domain. This provides
 strong semantics but limits that namespace to one Durable Object's throughput and 10 GB storage ceiling.
+
+PostgreSQL uses a small injected client contract and does not bundle a database driver:
+
+```ts
+import { postgresStorage } from '@cloudflare/workers-oauth-provider/storage/postgres';
+
+storage: postgresStorage<Env>({
+  clientFactory: {
+    acquire: (context) => acquireApplicationPostgresClient(context.env),
+  },
+});
+```
+
+Each acquired client must be one exclusive session for the request, support parameterized `query(sql, values)` calls,
+and keep `BEGIN`/`COMMIT`/`ROLLBACK` on that same session. Apply `POSTGRES_STORAGE_MIGRATIONS` (or call
+`migratePostgresStorage()` during controlled setup) before serving traffic.
+
+When connecting through Hyperdrive, use a cache-disabled binding for all OAuth storage queries. PlanetScale PostgreSQL
+uses this same PostgreSQL-through-Hyperdrive path; it is not a separate adapter.
 
 The `env.OAUTH_PROVIDER` object available to the fetch handlers provides some methods to query the storage, including:
 

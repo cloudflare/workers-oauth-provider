@@ -30,6 +30,11 @@
       "import": "./dist/storage/durable-object/index.js",
       "default": "./dist/storage/durable-object/index.js"
     },
+    "./storage/postgres": {
+      "types": "./dist/storage/postgres/index.d.ts",
+      "import": "./dist/storage/postgres/index.js",
+      "default": "./dist/storage/postgres/index.js"
+    },
     "./dist/oauth-provider.js": {
       "types": "./dist/oauth-provider.d.ts",
       "import": "./dist/oauth-provider.js",

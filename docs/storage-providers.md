@@ -2,7 +2,7 @@
 
 - **Status:** accepted implementation direction; implementation in progress
 - **Scope:** storage contract, capability negotiation, adapter boundaries, and compatibility policy
-- **Current implementation:** backend-neutral contract, request-scoped provider-core integration, Workers KV, D1, and single-root Durable Object SQLite; PostgreSQL and Redis remain pending
+- **Current implementation:** backend-neutral contract, request-scoped provider-core integration, Workers KV, D1, single-root Durable Object SQLite, and injected-client PostgreSQL; Redis remains pending
 - **Research baselines:** `workers-oauth-provider@0.8.1` (`f8e3ddd`), `better-auth@1.6.23` plus main (`fd6b8c1`), and `pi-mono` (`9a0a8d7c`)
 
 ## Goal

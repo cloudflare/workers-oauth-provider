@@ -34,6 +34,36 @@ jobs:
       - name: Run checks (typecheck + tests)
         run: npm run check
 
+  postgres-storage:
+    name: PostgreSQL storage
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: 'npm'
+      - run: npm ci
+      - name: Run real PostgreSQL adapter tests
+        run: npm test -- --run __tests__/storage/postgres/integration.test.ts
+        env:
+          RUN_POSTGRES_INTEGRATION: '1'
+          POSTGRES_HOST: 127.0.0.1
+          POSTGRES_PORT: '5432'
+
   # Check code formatting (fast, runs in parallel)
   format:
     name: Format Check
