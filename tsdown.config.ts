@@ -5,6 +5,8 @@ export default defineConfig({
     'oauth-provider': 'src/oauth-provider.ts',
     'storage/index': 'src/storage/index.ts',
     'storage/kv/index': 'src/storage/kv/index.ts',
+    'storage/d1/index': 'src/storage/d1/index.ts',
+    'storage/durable-object/index': 'src/storage/durable-object/index.ts',
   },
   format: ['esm'],
   dts: true,

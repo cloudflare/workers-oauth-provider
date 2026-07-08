@@ -20,6 +20,16 @@
       "import": "./dist/storage/kv/index.js",
       "default": "./dist/storage/kv/index.js"
     },
+    "./storage/d1": {
+      "types": "./dist/storage/d1/index.d.ts",
+      "import": "./dist/storage/d1/index.js",
+      "default": "./dist/storage/d1/index.js"
+    },
+    "./storage/durable-object": {
+      "types": "./dist/storage/durable-object/index.d.ts",
+      "import": "./dist/storage/durable-object/index.js",
+      "default": "./dist/storage/durable-object/index.js"
+    },
     "./dist/oauth-provider.js": {
       "types": "./dist/oauth-provider.d.ts",
       "import": "./dist/oauth-provider.js",

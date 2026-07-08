@@ -372,7 +372,9 @@ interface SqlStorage {
 interface ObjectStorage {
   readonly sql: SqlStorage;
   transactionSync<T>(callback: () => T): T;
+  getAlarm?(): Promise<number | null>;
   setAlarm?(scheduledTime: number | Date): Promise<void>;
+  deleteAlarm?(): Promise<void>;
 }
 interface ObjectState {
   readonly storage: ObjectStorage;
@@ -390,17 +392,38 @@ export class OAuthStorageObject {
 
   async execute(command: DurableObjectStorageCommand): Promise<unknown> {
     await this.ready;
-    return this.state.storage.transactionSync(() => this.executeTransaction(command));
+    const result = this.state.storage.transactionSync(() => this.executeTransaction(command));
+    await this.syncAlarm();
+    return result;
   }
 
   async alarm(): Promise<void> {
     await this.ready;
     const now = Math.floor(Date.now() / 1000);
     this.state.storage.transactionSync(() => {
-      this.sql.exec('DELETE FROM records WHERE expires_at IS NOT NULL AND expires_at <= ?', now);
+      const expiredClients = this.sql
+        .exec<
+          SqlRow & { key: string }
+        >("SELECT key,value,revision,expires_at FROM records WHERE kind='client' AND expires_at IS NOT NULL AND expires_at<=?", now)
+        .toArray();
+      for (const client of expiredClients) this.deleteClient(client.key, client.revision);
+      const expiredGrants = this.sql
+        .exec<
+          SqlRow & { key: string }
+        >("SELECT key,value,revision,expires_at FROM records WHERE kind='grant' AND expires_at IS NOT NULL AND expires_at<=?", now)
+        .toArray();
+      for (const row of expiredGrants) {
+        const grant = this.decodeGrant(row);
+        this.revoke({ userId: grant.value.userId, grantId: grant.value.id }, row.revision);
+      }
+      this.sql.exec(
+        "DELETE FROM records WHERE kind IN ('token','consent') AND expires_at IS NOT NULL AND expires_at<=?",
+        now
+      );
       this.sql.exec('DELETE FROM leases WHERE expires_at <= ?', now);
       this.sql.exec('DELETE FROM replay WHERE expires_at <= ?', now);
     });
+    await this.syncAlarm();
   }
 
   private migrate(): void {
@@ -414,6 +437,19 @@ export class OAuthStorageObject {
     this.sql.exec('CREATE TABLE IF NOT EXISTS fences (grant_key TEXT PRIMARY KEY, value INTEGER NOT NULL)');
     this.sql.exec(
       'CREATE TABLE IF NOT EXISTS replay (namespace TEXT NOT NULL, key_hash TEXT NOT NULL, expires_at INTEGER NOT NULL, PRIMARY KEY(namespace,key_hash))'
+    );
+    this.sql.exec('CREATE INDEX IF NOT EXISTS records_expiry ON records(kind,expires_at)');
+    this.sql.exec(
+      `CREATE INDEX IF NOT EXISTS grants_user ON records(json_extract(value,'$.value.userId'),key) WHERE kind='grant'`
+    );
+    this.sql.exec(
+      `CREATE INDEX IF NOT EXISTS grants_client ON records(json_extract(value,'$.value.clientId'),key) WHERE kind='grant'`
+    );
+    this.sql.exec(
+      `CREATE INDEX IF NOT EXISTS tokens_grant ON records(json_extract(value,'$.value.userId'),json_extract(value,'$.value.grantId'),key) WHERE kind='token'`
+    );
+    this.sql.exec(
+      `CREATE INDEX IF NOT EXISTS consents_user ON records(json_extract(value,'$.value.userId'),key) WHERE kind='consent'`
     );
     this.sql.exec('INSERT OR IGNORE INTO schema_migrations(version) VALUES (1)');
   }
@@ -506,6 +542,12 @@ export class OAuthStorageObject {
   private grantKey(key: GrantKey): string {
     return JSON.stringify([key.userId, key.grantId]);
   }
+  private grantProvenance(key: string): 'registered' | 'external' | undefined {
+    const row = this.row('grant-provenance', key);
+    if (!row) return undefined;
+    const parsed = JSON.parse(row.value) as { clientKind?: unknown };
+    return parsed.clientKind === 'registered' || parsed.clientKind === 'external' ? parsed.clientKind : undefined;
+  }
   private tokenKey(key: AccessTokenKey): string {
     return key.tokenId;
   }
@@ -524,7 +566,6 @@ export class OAuthStorageObject {
         value.metadata.expiresAt ?? null
       )
       .toArray().length;
-    this.schedule(value.metadata.expiresAt);
     return { status: changed ? 'created' : 'conflict' };
   }
   private readClient(key: string, now: number): StoredClient | null {
@@ -554,7 +595,6 @@ export class OAuthStorageObject {
       command.clientId,
       command.expectedRevision
     );
-    this.schedule(command.client.metadata.expiresAt);
     return { status: 'updated' };
   }
   private deleteClient(clientId: string, expectedRevision?: number): DeleteClientResult {
@@ -567,7 +607,10 @@ export class OAuthStorageObject {
       >("SELECT key,value,revision,expires_at FROM records WHERE kind='grant' AND json_extract(value,'$.value.clientId')=?", clientId)
       .toArray();
     let tokens = 0;
+    let deletedGrants = 0;
     for (const grant of grants) {
+      if (this.grantProvenance(grant.key) !== 'registered') continue;
+      deletedGrants++;
       const value = this.decodeGrant(grant).value;
       tokens += this.sql
         .exec(
@@ -578,10 +621,17 @@ export class OAuthStorageObject {
         .toArray().length;
       this.sql.exec('DELETE FROM leases WHERE grant_key=?', grant.key);
     }
-    this.sql.exec("DELETE FROM records WHERE kind='grant' AND json_extract(value,'$.value.clientId')=?", clientId);
+    this.sql.exec(
+      `DELETE FROM records WHERE kind='grant' AND key IN (SELECT key FROM records WHERE kind='grant-provenance' AND json_extract(value,'$.clientKind')='registered' AND json_extract(value,'$.clientId')=?)`,
+      clientId
+    );
+    this.sql.exec(
+      `DELETE FROM records WHERE kind='grant-provenance' AND json_extract(value,'$.clientKind')='registered' AND json_extract(value,'$.clientId')=?`,
+      clientId
+    );
     this.sql.exec("DELETE FROM records WHERE kind='consent' AND json_extract(value,'$.value.clientId')=?", clientId);
     this.sql.exec("DELETE FROM records WHERE kind='client' AND key=?", clientId);
-    return { status: 'deleted', deletedGrants: grants.length, deletedAccessTokens: tokens };
+    return { status: 'deleted', deletedGrants, deletedAccessTokens: tokens };
   }
   private listRecords<T>(
     kind: string,
@@ -633,7 +683,6 @@ export class OAuthStorageObject {
       key,
       expectedRevision
     );
-    this.schedule(consent.metadata.expiresAt);
     return { status: 'updated' };
   }
   private deleteConsent(command: Extract<DurableObjectStorageCommand, { operation: 'consents.delete' }>): DeleteResult {
@@ -652,12 +701,6 @@ export class OAuthStorageObject {
       const client = this.row('client', input.client.clientId);
       if (!client) return { status: 'client_not_found' };
       if (client.revision !== input.client.expectedRevision) return { status: 'client_conflict' };
-    } else {
-      this.sql.exec(
-        `INSERT OR IGNORE INTO records(kind,key,value,revision,expires_at) VALUES('external-client',?,?,0,NULL)`,
-        input.client.clientId,
-        JSON.stringify({ clientId: input.client.clientId })
-      );
     }
     if (input.replaceExistingUserClientGrants) {
       const prior = this.sql
@@ -671,6 +714,11 @@ export class OAuthStorageObject {
       }
     }
     this.insert('grant', key, input.grant);
+    this.sql.exec(
+      `INSERT INTO records(kind,key,value,revision,expires_at) VALUES('grant-provenance',?,?,0,NULL)`,
+      key,
+      JSON.stringify({ clientKind: input.client.kind, clientId: input.client.clientId })
+    );
     if (input.accessToken && this.insert('token', input.accessToken.value.id, input.accessToken).status !== 'created')
       throw new OAuthStorageError('conflict', { operation: 'grants.issue' });
     return { status: 'created' };
@@ -723,7 +771,6 @@ export class OAuthStorageObject {
       fence,
       lease.expiresAt
     );
-    this.schedule(lease.expiresAt);
     return validateBeginGrantTransitionResult(input, { status: 'acquired', grant, lease }, input.leaseTtlSeconds);
   }
   private currentLease(lease: GrantTransitionLease): boolean {
@@ -785,6 +832,7 @@ export class OAuthStorageObject {
       )
       .toArray().length;
     this.sql.exec('DELETE FROM records WHERE kind=? AND key=?', 'grant', physical);
+    this.sql.exec('DELETE FROM records WHERE kind=? AND key=?', 'grant-provenance', physical);
     this.sql.exec('DELETE FROM leases WHERE grant_key=?', physical);
     return { status: 'revoked', deletedAccessTokens: count };
   }
@@ -823,50 +871,66 @@ export class OAuthStorageObject {
     );
   }
   private purge(command: Extract<DurableObjectStorageCommand, { operation: 'maintenance.purge' }>) {
-    let grantsChecked = 0,
-      grantsPurged = 0,
-      tokensChecked = 0,
-      tokensPurged = 0;
-    const grants = this.sql
-      .exec<
-        SqlRow & { key: string }
-      >("SELECT key,value,revision,expires_at FROM records WHERE kind='grant' ORDER BY key LIMIT ?", command.limit)
-      .toArray();
-    for (const row of grants) {
-      grantsChecked++;
-      const grant = this.decodeGrant(row);
-      const orphaned = !this.row('client', grant.value.clientId) && !this.row('external-client', grant.value.clientId);
-      const expired = row.expires_at !== null && row.expires_at <= command.now;
-      if ((command.purgeOrphanedGrants && orphaned) || (command.purgeExpiredGrants && expired)) {
-        const result = this.revoke({ userId: grant.value.userId, grantId: grant.value.id });
-        if (result.status === 'revoked') {
+    let remaining = command.limit;
+    let grantsChecked = 0;
+    let grantsPurged = 0;
+    let tokensChecked = 0;
+    let tokensPurged = 0;
+    const grantPredicate = [
+      ...(command.purgeExpiredGrants ? ['g.expires_at IS NOT NULL AND g.expires_at<=?'] : []),
+      ...(command.purgeOrphanedGrants ? ["json_extract(p.value,'$.clientKind')='registered' AND c.key IS NULL"] : []),
+    ].join(' OR ');
+    if (grantPredicate && remaining > 0) {
+      const grants = this.sql
+        .exec<
+          SqlRow & { key: string }
+        >(`SELECT g.key,g.value,g.revision,g.expires_at FROM records g LEFT JOIN records p ON p.kind='grant-provenance' AND p.key=g.key LEFT JOIN records c ON c.kind='client' AND c.key=json_extract(g.value,'$.value.clientId') WHERE g.kind='grant' AND (${grantPredicate}) ORDER BY g.key LIMIT ?`, ...(command.purgeExpiredGrants ? [command.now] : []), remaining)
+        .toArray();
+      grantsChecked = grants.length;
+      remaining -= grantsChecked;
+      for (const row of grants) {
+        const grant = this.decodeGrant(row);
+        if (this.revoke({ userId: grant.value.userId, grantId: grant.value.id }).status === 'revoked') {
           grantsPurged++;
         }
       }
     }
-    const remaining = Math.max(0, command.limit - grantsChecked);
-    const tokens = this.sql
-      .exec<
-        SqlRow & { key: string }
-      >("SELECT key,value,revision,expires_at FROM records WHERE kind='token' ORDER BY key LIMIT ?", remaining)
-      .toArray();
-    for (const row of tokens) {
-      tokensChecked++;
-      const token = this.decodeToken(row);
-      const orphaned = !this.row('grant', this.grantKey({ userId: token.value.userId, grantId: token.value.grantId }));
-      const expired = row.expires_at !== null && row.expires_at <= command.now;
-      if (expired || (command.purgeOrphanedTokens && orphaned)) {
+    const tokenPredicate = [
+      't.expires_at IS NOT NULL AND t.expires_at<=?',
+      ...(command.purgeOrphanedTokens ? ['g.key IS NULL'] : []),
+    ].join(' OR ');
+    if (remaining > 0) {
+      const tokens = this.sql
+        .exec<
+          SqlRow & { key: string }
+        >(`SELECT t.key,t.value,t.revision,t.expires_at FROM records t LEFT JOIN records g ON g.kind='grant' AND g.key=json_array(json_extract(t.value,'$.value.userId'),json_extract(t.value,'$.value.grantId')) WHERE t.kind='token' AND (${tokenPredicate}) ORDER BY t.key LIMIT ?`, command.now, remaining)
+        .toArray();
+      tokensChecked = tokens.length;
+      for (const row of tokens) {
         this.sql.exec("DELETE FROM records WHERE kind='token' AND key=?", row.key);
         tokensPurged++;
       }
     }
-    return {
-      grantsChecked,
-      grantsPurged,
-      tokensChecked,
-      tokensPurged,
-      done: grantsChecked + tokensChecked < command.limit,
-    };
+    const moreGrants =
+      grantPredicate !== '' &&
+      this.sql
+        .exec<{
+          present: number;
+        }>(
+          `SELECT 1 AS present FROM records g LEFT JOIN records p ON p.kind='grant-provenance' AND p.key=g.key LEFT JOIN records c ON c.kind='client' AND c.key=json_extract(g.value,'$.value.clientId') WHERE g.kind='grant' AND (${grantPredicate}) LIMIT 1`,
+          ...(command.purgeExpiredGrants ? [command.now] : [])
+        )
+        .toArray().length > 0;
+    const moreTokens =
+      this.sql
+        .exec<{
+          present: number;
+        }>(
+          `SELECT 1 AS present FROM records t LEFT JOIN records g ON g.kind='grant' AND g.key=json_array(json_extract(t.value,'$.value.userId'),json_extract(t.value,'$.value.grantId')) WHERE t.kind='token' AND (${tokenPredicate}) LIMIT 1`,
+          command.now
+        )
+        .toArray().length > 0;
+    return { grantsChecked, grantsPurged, tokensChecked, tokensPurged, done: !moreGrants && !moreTokens };
   }
   private reserveReplay(
     command: Extract<DurableObjectStorageCommand, { operation: 'replay.reserve' }>
@@ -888,10 +952,29 @@ export class OAuthStorageObject {
         command.expiresAt
       )
       .toArray().length;
-    this.schedule(command.expiresAt);
     return { status: inserted ? 'reserved' : 'exists' };
   }
-  private schedule(expiresAt?: number): void {
-    if (expiresAt !== undefined && this.state.storage.setAlarm) void this.state.storage.setAlarm(expiresAt * 1000);
+  private async syncAlarm(): Promise<void> {
+    if (!this.state.storage.setAlarm) return;
+    const row = this.sql
+      .exec<{ expires_at: number | null }>(
+        `SELECT MIN(expires_at) AS expires_at FROM (
+          SELECT expires_at FROM records WHERE expires_at IS NOT NULL
+          UNION ALL SELECT expires_at FROM leases
+          UNION ALL SELECT expires_at FROM replay
+        )`
+      )
+      .toArray()[0];
+    const desired = row?.expires_at === null || row?.expires_at === undefined ? null : row.expires_at * 1000;
+    try {
+      const current = this.state.storage.getAlarm ? await this.state.storage.getAlarm() : null;
+      if (desired === null) {
+        if (current !== null && this.state.storage.deleteAlarm) await this.state.storage.deleteAlarm();
+      } else if (current !== desired) {
+        await this.state.storage.setAlarm(desired);
+      }
+    } catch {
+      // Alarm maintenance is best-effort; logical expiry remains authoritative.
+    }
   }
 }

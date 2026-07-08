@@ -72,12 +72,12 @@ export const D1_STORAGE_CAPABILITIES: OAuthStorageCapabilities = defineOAuthStor
   issuance: {
     grantOnly: 'strong',
     grantWithAccessToken: 'strong',
-    replaceUserClientGrants: 'unsupported',
+    replaceUserClientGrants: 'strong',
     existingGrantAccessToken: 'strong',
   },
   transitions: { authorizationCode: 'strong', refreshToken: 'strong' },
   replayReservation: 'strong',
-  revocation: { accessToken: 'strong', grantCascade: 'best_effort', clientCascade: 'best_effort' },
+  revocation: { accessToken: 'strong', grantCascade: 'strong', clientCascade: 'strong' },
   consents: { compareAndSwap: 'strong', delete: 'strong' },
   queries: {
     listClients: 'session',
@@ -203,8 +203,9 @@ class D1Connection implements OAuthStorageConnection {
   private stmt(sql: string, ...bindings: unknown[]): D1PreparedStatement {
     return this.db.prepare(sql).bind(...bindings);
   }
-  private expired(row: Row, now = this.now()): boolean {
-    return row.expires_at !== null && row.expires_at <= now;
+  private expired(row: Row | StorageMetadata, now = this.now()): boolean {
+    const expiresAt = 'expires_at' in row ? row.expires_at : row.expiresAt;
+    return expiresAt !== null && expiresAt !== undefined && expiresAt <= now;
   }
   private changes(result: D1Result): number {
     return Number(result.meta.changes ?? 0);
@@ -269,25 +270,27 @@ class D1Connection implements OAuthStorageConnection {
     if (!current) return { status: 'not_found' };
     if (input.expectedRevision !== undefined && current.metadata.revision !== input.expectedRevision)
       return { status: 'conflict' };
-    const tokenCount =
-      (await this.db
-        .prepare(
-          `SELECT COUNT(*) AS count FROM oauth_access_tokens t JOIN oauth_grants g ON g.namespace=t.namespace AND g.user_id=t.user_id AND g.grant_id=t.grant_id WHERE g.namespace=? AND g.client_id=?`
-        )
-        .bind(this.namespace, input.clientId)
-        .first<number>('count')) ?? 0;
-    const grantCount =
-      (await this.db
-        .prepare(`SELECT COUNT(*) AS count FROM oauth_grants WHERE namespace=? AND client_id=?`)
-        .bind(this.namespace, input.clientId)
-        .first<number>('count')) ?? 0;
-    await this.db.batch([
+    const guard = `EXISTS(SELECT 1 FROM oauth_clients c WHERE c.namespace=? AND c.client_id=? AND c.revision=?)`;
+    const guardBindings = [this.namespace, input.clientId, current.metadata.revision];
+    const results = await this.db.batch([
       this.stmt(
-        `DELETE FROM oauth_access_tokens WHERE namespace=? AND EXISTS(SELECT 1 FROM oauth_grants g WHERE g.namespace=oauth_access_tokens.namespace AND g.user_id=oauth_access_tokens.user_id AND g.grant_id=oauth_access_tokens.grant_id AND g.client_id=?)`,
+        `DELETE FROM oauth_access_tokens WHERE namespace=? AND ${guard} AND EXISTS(SELECT 1 FROM oauth_grants g WHERE g.namespace=oauth_access_tokens.namespace AND g.user_id=oauth_access_tokens.user_id AND g.grant_id=oauth_access_tokens.grant_id AND g.client_id=?)`,
         this.namespace,
+        ...guardBindings,
         input.clientId
       ),
-      this.stmt(`DELETE FROM oauth_grants WHERE namespace=? AND client_id=?`, this.namespace, input.clientId),
+      this.stmt(
+        `DELETE FROM oauth_transition_leases WHERE namespace=? AND ${guard} AND EXISTS(SELECT 1 FROM oauth_grants g WHERE g.namespace=oauth_transition_leases.namespace AND g.user_id=oauth_transition_leases.user_id AND g.grant_id=oauth_transition_leases.grant_id AND g.client_id=?)`,
+        this.namespace,
+        ...guardBindings,
+        input.clientId
+      ),
+      this.stmt(
+        `DELETE FROM oauth_grants WHERE namespace=? AND client_id=? AND ${guard}`,
+        this.namespace,
+        input.clientId,
+        ...guardBindings
+      ),
       this.stmt(
         `DELETE FROM oauth_clients WHERE namespace=? AND client_id=? AND revision=?`,
         this.namespace,
@@ -295,7 +298,14 @@ class D1Connection implements OAuthStorageConnection {
         current.metadata.revision
       ),
     ]);
-    return { status: 'deleted', deletedGrants: grantCount, deletedAccessTokens: tokenCount };
+    if (this.changes(results[3]!) !== 1) {
+      return (await this.getClient(input.clientId)) ? { status: 'conflict' } : { status: 'not_found' };
+    }
+    return {
+      status: 'deleted',
+      deletedGrants: this.changes(results[2]!),
+      deletedAccessTokens: this.changes(results[0]!),
+    };
   }
   private listClients(input: PageRequest = {}): Promise<Page<StoredClient>> {
     return this.list(
@@ -307,18 +317,22 @@ class D1Connection implements OAuthStorageConnection {
   }
 
   private async getGrant(key: GrantKey): Promise<StoredGrant | null> {
+    const grant = await this.getGrantRaw(key);
+    return grant && !this.expired(grant.metadata) ? grant : null;
+  }
+  private async getGrantRaw(key: GrantKey): Promise<StoredGrant | null> {
     const row = await this.first(
       `SELECT value_json,revision,created_at,expires_at FROM oauth_grants WHERE namespace=? AND user_id=? AND grant_id=?`,
       this.namespace,
       key.userId,
       key.grantId
     );
-    return !row || this.expired(row) ? null : this.decodeGrant(row);
+    return row ? this.decodeGrant(row) : null;
   }
   private async issueGrant(input: IssueGrantInput): Promise<IssueGrantResult> {
     assertIssueGrantInput(input);
-    if (input.replaceExistingUserClientGrants) throw unsupportedStorageOperation('grants.issue');
     const g = input.grant;
+    const issueMarker = crypto.randomUUID();
     const clientGuard =
       input.client.kind === 'registered'
         ? `EXISTS(SELECT 1 FROM oauth_clients WHERE namespace=? AND client_id=? AND revision=? AND (expires_at IS NULL OR expires_at>?))`
@@ -329,20 +343,61 @@ class D1Connection implements OAuthStorageConnection {
         : [];
     const statements = [
       this.stmt(
-        `INSERT INTO oauth_grants(namespace,user_id,grant_id,client_id,revision,created_at,expires_at,value_json) SELECT ?,?,?,?,?,?,?,? WHERE ${clientGuard}`,
+        `INSERT INTO oauth_grants(namespace,user_id,grant_id,client_id,client_kind,issue_marker,revision,created_at,expires_at,value_json) SELECT ?,?,?,?,?,?,?,?,?,? WHERE ${clientGuard}`,
         this.namespace,
         g.value.userId,
         g.value.id,
         g.value.clientId,
+        input.client.kind,
+        issueMarker,
         ...this.values(g),
         ...clientBindings
       ),
     ];
+    if (input.replaceExistingUserClientGrants) {
+      statements.push(
+        this.stmt(
+          `DELETE FROM oauth_access_tokens WHERE namespace=? AND EXISTS(SELECT 1 FROM oauth_grants issued WHERE issued.namespace=? AND issued.user_id=? AND issued.grant_id=? AND issued.issue_marker=?) AND EXISTS(SELECT 1 FROM oauth_grants prior WHERE prior.namespace=oauth_access_tokens.namespace AND prior.user_id=oauth_access_tokens.user_id AND prior.grant_id=oauth_access_tokens.grant_id AND prior.user_id=? AND prior.client_id=? AND prior.grant_id<>?)`,
+          this.namespace,
+          this.namespace,
+          g.value.userId,
+          g.value.id,
+          issueMarker,
+          g.value.userId,
+          g.value.clientId,
+          g.value.id
+        ),
+        this.stmt(
+          `DELETE FROM oauth_transition_leases WHERE namespace=? AND EXISTS(SELECT 1 FROM oauth_grants issued WHERE issued.namespace=? AND issued.user_id=? AND issued.grant_id=? AND issued.issue_marker=?) AND user_id=? AND grant_id IN (SELECT grant_id FROM oauth_grants WHERE namespace=? AND user_id=? AND client_id=? AND grant_id<>?)`,
+          this.namespace,
+          this.namespace,
+          g.value.userId,
+          g.value.id,
+          issueMarker,
+          g.value.userId,
+          this.namespace,
+          g.value.userId,
+          g.value.clientId,
+          g.value.id
+        ),
+        this.stmt(
+          `DELETE FROM oauth_grants WHERE namespace=? AND user_id=? AND client_id=? AND grant_id<>? AND EXISTS(SELECT 1 FROM oauth_grants issued WHERE issued.namespace=? AND issued.user_id=? AND issued.grant_id=? AND issued.issue_marker=?)`,
+          this.namespace,
+          g.value.userId,
+          g.value.clientId,
+          g.value.id,
+          this.namespace,
+          g.value.userId,
+          g.value.id,
+          issueMarker
+        )
+      );
+    }
     if (input.accessToken) {
       const t = input.accessToken;
       statements.push(
         this.stmt(
-          `INSERT INTO oauth_access_tokens(namespace,user_id,grant_id,token_id,revision,created_at,expires_at,value_json) SELECT ?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM oauth_grants WHERE namespace=? AND user_id=? AND grant_id=? AND revision=?)`,
+          `INSERT INTO oauth_access_tokens(namespace,user_id,grant_id,token_id,revision,created_at,expires_at,value_json) SELECT ?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM oauth_grants WHERE namespace=? AND user_id=? AND grant_id=? AND revision=? AND issue_marker=?)`,
           this.namespace,
           t.value.userId,
           t.value.grantId,
@@ -351,10 +406,20 @@ class D1Connection implements OAuthStorageConnection {
           this.namespace,
           g.value.userId,
           g.value.id,
-          g.metadata.revision
+          g.metadata.revision,
+          issueMarker
         )
       );
     }
+    statements.push(
+      this.stmt(
+        `UPDATE oauth_grants SET issue_marker=NULL WHERE namespace=? AND user_id=? AND grant_id=? AND issue_marker=?`,
+        this.namespace,
+        g.value.userId,
+        g.value.id,
+        issueMarker
+      )
+    );
     let results: D1Result[];
     try {
       results = await this.db.batch(statements);
@@ -362,8 +427,12 @@ class D1Connection implements OAuthStorageConnection {
       if (!isConstraintError(error)) throw error;
       results = [];
     }
-    if (results.length > 0 && this.changes(results[0]!) === 1 && results.slice(1).every((r) => this.changes(r) === 1)) {
-      return { status: 'created' };
+    if (results.length > 0 && this.changes(results[0]!) === 1) {
+      const tokenResult = input.accessToken ? results[results.length - 2] : undefined;
+      const clearedMarker = results[results.length - 1];
+      if ((!tokenResult || this.changes(tokenResult) === 1) && this.changes(clearedMarker!) === 1) {
+        return { status: 'created' };
+      }
     }
     if (input.client.kind === 'registered') {
       const client = await this.getClient(input.client.clientId);
@@ -381,26 +450,25 @@ class D1Connection implements OAuthStorageConnection {
     );
   }
   private async revokeGrant(key: GrantKey, expected?: number): Promise<RevokeGrantResult> {
-    const g = await this.getGrant(key);
+    const g = await this.getGrantRaw(key);
     if (!g) return { status: 'not_found' };
     if (expected !== undefined && g.metadata.revision !== expected) return { status: 'conflict' };
-    const count =
-      (await this.db
-        .prepare(`SELECT COUNT(*) AS count FROM oauth_access_tokens WHERE namespace=? AND user_id=? AND grant_id=?`)
-        .bind(this.namespace, key.userId, key.grantId)
-        .first<number>('count')) ?? 0;
-    await this.db.batch([
+    const guard = `EXISTS(SELECT 1 FROM oauth_grants g WHERE g.namespace=? AND g.user_id=? AND g.grant_id=? AND g.revision=?)`;
+    const guardBindings = [this.namespace, key.userId, key.grantId, g.metadata.revision];
+    const results = await this.db.batch([
       this.stmt(
-        `DELETE FROM oauth_access_tokens WHERE namespace=? AND user_id=? AND grant_id=?`,
+        `DELETE FROM oauth_access_tokens WHERE namespace=? AND user_id=? AND grant_id=? AND ${guard}`,
         this.namespace,
         key.userId,
-        key.grantId
+        key.grantId,
+        ...guardBindings
       ),
       this.stmt(
-        `DELETE FROM oauth_transition_leases WHERE namespace=? AND user_id=? AND grant_id=?`,
+        `DELETE FROM oauth_transition_leases WHERE namespace=? AND user_id=? AND grant_id=? AND ${guard}`,
         this.namespace,
         key.userId,
-        key.grantId
+        key.grantId,
+        ...guardBindings
       ),
       this.stmt(
         `DELETE FROM oauth_grants WHERE namespace=? AND user_id=? AND grant_id=? AND revision=?`,
@@ -410,7 +478,10 @@ class D1Connection implements OAuthStorageConnection {
         g.metadata.revision
       ),
     ]);
-    return { status: 'revoked', deletedAccessTokens: count };
+    if (this.changes(results[2]!) !== 1) {
+      return (await this.getGrant(key)) ? { status: 'conflict' } : { status: 'not_found' };
+    }
+    return { status: 'revoked', deletedAccessTokens: this.changes(results[0]!) };
   }
 
   private async getToken(key: AccessTokenKey): Promise<StoredAccessToken | null> {
@@ -545,6 +616,9 @@ class D1Connection implements OAuthStorageConnection {
   }): Promise<ReplayReservationResult> {
     credentialIdFromSha256(input.keyHash);
     const now = this.now();
+    if (!Number.isSafeInteger(input.expiresAt) || input.expiresAt <= now) {
+      throw new OAuthStorageError('conflict', { operation: 'replay.reserve' });
+    }
     await this.stmt(
       `DELETE FROM oauth_replay_reservations WHERE namespace=? AND reservation_namespace=? AND key_hash=? AND expires_at<=?`,
       this.namespace,
@@ -563,40 +637,70 @@ class D1Connection implements OAuthStorageConnection {
   }
   private async purge(input: PurgeStorageInput): Promise<PurgeStorageResult> {
     if (!Number.isSafeInteger(input.limit) || input.limit < 1) throw new TypeError('Purge limit must be positive');
-    const grantsChecked = input.purgeExpiredGrants || input.purgeOrphanedGrants ? input.limit : 0;
-    const tokensChecked = input.purgeOrphanedTokens ? input.limit : 0;
-    let grantsPurged = 0,
-      tokensPurged = 0;
-    if (grantsChecked) {
-      const r = await this.stmt(
-        `DELETE FROM oauth_grants WHERE rowid IN (SELECT g.rowid FROM oauth_grants g LEFT JOIN oauth_clients c ON c.namespace=g.namespace AND c.client_id=g.client_id WHERE g.namespace=? AND (${input.purgeExpiredGrants ? 'g.expires_at IS NOT NULL AND g.expires_at<=?' : '0'} OR ${input.purgeOrphanedGrants ? 'c.client_id IS NULL' : '0'}) LIMIT ?)`,
-        this.namespace,
-        ...(input.purgeExpiredGrants ? [input.now] : []),
-        input.limit
-      ).run();
-      grantsPurged = this.changes(r);
+    let remaining = input.limit;
+    let grantsChecked = 0;
+    let grantsPurged = 0;
+    let tokensChecked = 0;
+    let tokensPurged = 0;
+    const grantPredicate = [
+      ...(input.purgeExpiredGrants ? ['g.expires_at IS NOT NULL AND g.expires_at<=?'] : []),
+      ...(input.purgeOrphanedGrants ? ["g.client_kind='registered' AND c.client_id IS NULL"] : []),
+    ].join(' OR ');
+    if (grantPredicate && remaining > 0) {
+      const candidates = await this.db
+        .prepare(
+          `SELECT g.user_id,g.grant_id FROM oauth_grants g LEFT JOIN oauth_clients c ON c.namespace=g.namespace AND c.client_id=g.client_id WHERE g.namespace=? AND (${grantPredicate}) ORDER BY g.user_id,g.grant_id LIMIT ?`
+        )
+        .bind(this.namespace, ...(input.purgeExpiredGrants ? [input.now] : []), remaining)
+        .all<{ user_id: string; grant_id: string }>();
+      grantsChecked = candidates.results.length;
+      remaining -= grantsChecked;
+      for (const candidate of candidates.results) {
+        if ((await this.revokeGrant({ userId: candidate.user_id, grantId: candidate.grant_id })).status === 'revoked') {
+          grantsPurged++;
+        }
+      }
     }
-    if (tokensChecked) {
-      const r = await this.stmt(
-        `DELETE FROM oauth_access_tokens WHERE rowid IN (SELECT t.rowid FROM oauth_access_tokens t LEFT JOIN oauth_grants g ON g.namespace=t.namespace AND g.user_id=t.user_id AND g.grant_id=t.grant_id WHERE t.namespace=? AND ((t.expires_at IS NOT NULL AND t.expires_at<=?) OR g.grant_id IS NULL) LIMIT ?)`,
-        this.namespace,
-        input.now,
-        input.limit
-      ).run();
-      tokensPurged = this.changes(r);
+    if (input.purgeOrphanedTokens && remaining > 0) {
+      const candidates = await this.db
+        .prepare(
+          `SELECT t.user_id,t.grant_id,t.token_id FROM oauth_access_tokens t LEFT JOIN oauth_grants g ON g.namespace=t.namespace AND g.user_id=t.user_id AND g.grant_id=t.grant_id WHERE t.namespace=? AND ((t.expires_at IS NOT NULL AND t.expires_at<=?) OR g.grant_id IS NULL) ORDER BY t.user_id,t.grant_id,t.token_id LIMIT ?`
+        )
+        .bind(this.namespace, input.now, remaining)
+        .all<{ user_id: string; grant_id: string; token_id: string }>();
+      tokensChecked = candidates.results.length;
+      remaining -= tokensChecked;
+      for (const candidate of candidates.results) {
+        const deleted = await this.deleteToken({
+          userId: candidate.user_id,
+          grantId: candidate.grant_id,
+          tokenId: credentialIdFromSha256(candidate.token_id),
+        });
+        if (deleted.status === 'deleted') tokensPurged++;
+      }
     }
     await this.stmt(
       `DELETE FROM oauth_replay_reservations WHERE namespace=? AND expires_at<=?`,
       this.namespace,
       input.now
     ).run();
-    return {
-      grantsChecked,
-      grantsPurged,
-      tokensChecked,
-      tokensPurged,
-      done: grantsPurged < input.limit && tokensPurged < input.limit,
-    };
+    const moreGrants =
+      grantPredicate &&
+      (await this.db
+        .prepare(
+          `SELECT 1 AS present FROM oauth_grants g LEFT JOIN oauth_clients c ON c.namespace=g.namespace AND c.client_id=g.client_id WHERE g.namespace=? AND (${grantPredicate}) LIMIT 1`
+        )
+        .bind(this.namespace, ...(input.purgeExpiredGrants ? [input.now] : []))
+        .first<number>('present')) === 1;
+    const moreTokens =
+      input.purgeOrphanedTokens &&
+      (await this.db
+        .prepare(
+          `SELECT 1 AS present FROM oauth_access_tokens t LEFT JOIN oauth_grants g ON g.namespace=t.namespace AND g.user_id=t.user_id AND g.grant_id=t.grant_id WHERE t.namespace=? AND ((t.expires_at IS NOT NULL AND t.expires_at<=?) OR g.grant_id IS NULL) LIMIT 1`
+        )
+        .bind(this.namespace, input.now)
+        .first<number>('present')) === 1;
+    return { grantsChecked, grantsPurged, tokensChecked, tokensPurged, done: !moreGrants && !moreTokens };
   }
 
   private async list<T>(
@@ -670,7 +774,14 @@ class D1Connection implements OAuthStorageConnection {
           ? { status: 'already_consumed' }
           : { status: 'invalid_credential' };
       }
-      return { status: 'invalid_credential' };
+      const matchesConsumedCurrent =
+        grant.value.refreshTokenId === input.credentialId && grant.value.refreshTokenWrappedKey === undefined;
+      const matchesConsumedPrevious =
+        grant.value.previousRefreshTokenId === input.credentialId &&
+        grant.value.previousRefreshTokenWrappedKey === undefined;
+      return matchesConsumedCurrent || matchesConsumedPrevious
+        ? { status: 'already_consumed' }
+        : { status: 'invalid_credential' };
     }
     const grant = await this.getGrant(input.grant);
     const leaseRow = await this.db

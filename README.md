@@ -271,6 +271,46 @@ only with an adapter whose conformance-tested capabilities satisfy every enabled
 Workers KV is eventually consistent. Its authorization-code and refresh transitions, replay reservation, and cascade
 revocation are explicitly best-effort. The adapter does not claim transaction or fencing guarantees it cannot provide.
 
+Built-in adapters currently available:
+
+| Adapter               | Import                       | Guarantee profile                                      |
+| --------------------- | ---------------------------- | ------------------------------------------------------ |
+| Workers KV            | `.../storage/kv`             | Legacy-compatible, eventual and best-effort            |
+| Cloudflare D1         | `.../storage/d1`             | Strong guarded transitions and issuance; session reads |
+| Durable Object SQLite | `.../storage/durable-object` | Strong single-object serialization for one namespace   |
+
+D1 example:
+
+```ts
+import { d1Storage } from '@cloudflare/workers-oauth-provider/storage/d1';
+
+storage: d1Storage<Env>({
+  binding: (env) => env.OAUTH_DB,
+});
+```
+
+Apply the exported `D1_STORAGE_MIGRATIONS` before serving traffic; `migrateD1Storage()` is provided for controlled setup
+and tests. Do not run broad migrations on every OAuth request.
+
+Durable Object SQLite example:
+
+```ts
+import {
+  durableObjectSqliteStorage,
+  OAuthStorageObject,
+} from '@cloudflare/workers-oauth-provider/storage/durable-object';
+
+export { OAuthStorageObject };
+
+storage: durableObjectSqliteStorage<Env>({
+  binding: (env) => env.OAUTH_STORAGE,
+});
+```
+
+Configure `OAuthStorageObject` as a `new_sqlite_class` in Wrangler. Version 1 routes one logical namespace through one
+root Durable Object so every advertised operation shares a serialization and SQLite transaction domain. This provides
+strong semantics but limits that namespace to one Durable Object's throughput and 10 GB storage ceiling.
+
 The `env.OAUTH_PROVIDER` object available to the fetch handlers provides some methods to query the storage, including:
 
 - Create, list, modify, and delete client_id registrations (in addition to `lookupClient()`, already shown in the example code).

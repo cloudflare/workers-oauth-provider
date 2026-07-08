@@ -1,11 +1,13 @@
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { OAuthProvider } from '../../../src/oauth-provider';
 import {
   beginGrantTransitionInput,
   commitGrantTransitionInput,
   compareAndSwapConsentInput,
   createClientInput,
   createOAuthStorageOpenContext,
+  createStoredClient,
   createStoredConsent,
   createStoredGrant,
   issueAccessTokenInput,
@@ -38,6 +40,7 @@ class Cursor<T> implements Iterable<T> {
 class SqliteState {
   readonly database = new DatabaseSync(':memory:');
   readonly alarms: number[] = [];
+  alarm: number | null = null;
   failTransactionExecAt: number | undefined;
   private transactionExecCount = 0;
   private inTransaction = false;
@@ -71,8 +74,13 @@ class SqliteState {
         this.inTransaction = false;
       }
     },
+    getAlarm: async (): Promise<number | null> => this.alarm,
     setAlarm: async (scheduledTime: number | Date): Promise<void> => {
-      this.alarms.push(typeof scheduledTime === 'number' ? scheduledTime : scheduledTime.getTime());
+      this.alarm = typeof scheduledTime === 'number' ? scheduledTime : scheduledTime.getTime();
+      this.alarms.push(this.alarm);
+    },
+    deleteAlarm: async (): Promise<void> => {
+      this.alarm = null;
     },
   };
 
@@ -147,6 +155,25 @@ describe('Durable Object SQLite adapter against real SQLite statements', () => {
 
   afterEach(() => namespace.close());
 
+  it('satisfies the provider strict-mode requirements', () => {
+    const storage = durableObjectSqliteStorage<{ OBJECTS: OAuthStorageObjectNamespace }>({
+      binding: (env) => env.OBJECTS,
+      now: () => now,
+    });
+    expect(
+      () =>
+        new OAuthProvider({
+          apiRoute: '/api/',
+          apiHandler: { fetch: async () => new Response('api') },
+          defaultHandler: { fetch: async () => new Response('default') },
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: '/oauth/token',
+          storage,
+          storageGuarantees: 'strict',
+        })
+    ).not.toThrow();
+  });
+
   it('routes every namespace operation to one root and composes registered issue with client state', async () => {
     await connection.clients.create(createClientInput(storedClient(0)));
     expect(
@@ -183,8 +210,10 @@ describe('Durable Object SQLite adapter against real SQLite statements', () => {
         },
       }),
     });
+    const alarmsBeforeFailure = state.alarms.length;
     state.failTransactionExecAt = 2;
     await expect(connection.grants.issue(externalPlan)).rejects.toMatchObject({ code: 'internal' });
+    expect(state.alarms).toHaveLength(alarmsBeforeFailure);
     expect(await connection.grants.get({ userId: 'user-1', grantId: 'grant-1' })).toBeNull();
     expect(await connection.grants.issue(externalPlan)).toEqual({ status: 'created' });
     await connection.maintenance.purge({
@@ -195,6 +224,31 @@ describe('Durable Object SQLite adapter against real SQLite statements', () => {
       purgeOrphanedTokens: false,
     });
     expect(await connection.grants.get({ userId: 'user-1', grantId: 'grant-1' })).not.toBeNull();
+
+    const sharedId = 'https://client.example/meta';
+    await connection.clients.create(
+      createClientInput(
+        createStoredClient(
+          { ...storedClient().value, clientId: sharedId },
+          { schemaVersion: 1, revision: 0, createdAt: 100 }
+        )
+      )
+    );
+    await connection.grants.issue(
+      issueGrantInput({
+        client: { kind: 'registered', clientId: sharedId, expectedRevision: 0 },
+        grant: createStoredGrant(
+          { ...storedGrant().value, id: 'registered-grant', clientId: sharedId },
+          { schemaVersion: 1, revision: 0, createdAt: 100, expiresAt: 500 }
+        ),
+      })
+    );
+    expect(await connection.clients.deleteWithGrants({ clientId: sharedId })).toMatchObject({
+      status: 'deleted',
+      deletedGrants: 1,
+    });
+    expect(await connection.grants.get({ userId: 'user-1', grantId: 'grant-1' })).not.toBeNull();
+    expect(await connection.grants.get({ userId: 'user-1', grantId: 'registered-grant' })).toBeNull();
   });
 
   it('serializes contenders, persists fences, rejects stale commits, and rolls back commit faults', async () => {
@@ -298,7 +352,9 @@ describe('Durable Object SQLite adapter against real SQLite statements', () => {
     });
     const state = namespace.states.get('oauth-do:v1:default:root')!;
     expect(state.alarms.length).toBeGreaterThan(0);
+    expect(state.alarm).toBe(300_000);
     await new OAuthStorageObject(state).alarm();
+    expect(state.alarm).toBeNull();
     expect(
       await connection.maintenance.purge({
         now: 400,
@@ -308,6 +364,118 @@ describe('Durable Object SQLite adapter against real SQLite statements', () => {
         purgeOrphanedTokens: true,
       })
     ).toMatchObject({ done: true });
+  });
+
+  it('alarm cleanup cascades expired clients and grants to unexpired descendants', async () => {
+    const wallNow = Math.floor(Date.now() / 1000);
+    const past = wallNow - 1;
+    const future = wallNow + 1_000;
+    const expiringClient = createStoredClient(storedClient().value, {
+      schemaVersion: 1,
+      revision: 0,
+      createdAt: 100,
+      expiresAt: past,
+    });
+    await connection.clients.create(createClientInput(expiringClient));
+    const clientGrant = createStoredGrant(
+      { ...storedGrant().value, id: 'client-child', expiresAt: future },
+      { schemaVersion: 1, revision: 0, createdAt: 100, expiresAt: future }
+    );
+    const clientToken = storedAccessToken(0, {
+      grantId: 'client-child',
+      createdAt: 100,
+      expiresAt: future,
+    });
+    await connection.grants.issue(
+      issueGrantInput({
+        client: { kind: 'registered', clientId: 'client-1', expectedRevision: 0 },
+        grant: clientGrant,
+        accessToken: clientToken,
+      })
+    );
+
+    const expiredGrant = createStoredGrant(
+      {
+        ...storedGrant().value,
+        id: 'expired-root',
+        clientId: 'external',
+        expiresAt: past,
+      },
+      { schemaVersion: 1, revision: 0, createdAt: 100, expiresAt: past }
+    );
+    const grantToken = storedAccessToken(0, {
+      grantId: 'expired-root',
+      createdAt: 100,
+      expiresAt: future,
+      id: DIGEST_C,
+      grant: { ...storedAccessToken().value.grant!, clientId: 'external' },
+    });
+    await connection.grants.issue(
+      issueGrantInput({
+        client: { kind: 'external', clientId: 'external' },
+        grant: expiredGrant,
+        accessToken: grantToken,
+      })
+    );
+
+    const state = namespace.states.get('oauth-do:v1:default:root')!;
+    await new OAuthStorageObject(state).alarm();
+    expect(await connection.grants.get({ userId: 'user-1', grantId: 'client-child' })).toBeNull();
+    expect(
+      await connection.accessTokens.get({ userId: 'user-1', grantId: 'client-child', tokenId: clientToken.value.id })
+    ).toBeNull();
+    expect(await connection.grants.get({ userId: 'user-1', grantId: 'expired-root' })).toBeNull();
+    expect(
+      await connection.accessTokens.get({ userId: 'user-1', grantId: 'expired-root', tokenId: grantToken.value.id })
+    ).toBeNull();
+  });
+
+  it('makes bounded maintenance progress and does not starve token-only cleanup', async () => {
+    expect(await connection.clients.get('initialize')).toBeNull();
+    const state = namespace.states.get('oauth-do:v1:default:root')!;
+    const token = storedAccessToken(0, { grantId: 'missing-grant' });
+    state.storage.sql.exec(
+      `INSERT INTO records(kind,key,value,revision,expires_at) VALUES('token',?,?,0,?)`,
+      token.value.id,
+      JSON.stringify(token),
+      token.metadata.expiresAt
+    );
+    const tokenOnly = await connection.maintenance.purge({
+      now: 100,
+      limit: 1,
+      purgeExpiredGrants: false,
+      purgeOrphanedGrants: false,
+      purgeOrphanedTokens: true,
+    });
+    expect(tokenOnly).toMatchObject({ grantsChecked: 0, tokensChecked: 1, tokensPurged: 1, done: true });
+
+    for (const id of ['expired-1', 'expired-2']) {
+      await connection.grants.issue(
+        issueGrantInput({
+          client: { kind: 'external', clientId: 'external' },
+          grant: createStoredGrant(
+            { ...storedGrant().value, id, clientId: 'external', createdAt: 50, expiresAt: 90 },
+            { schemaVersion: 1, revision: 0, createdAt: 50, expiresAt: 90 }
+          ),
+        })
+      );
+    }
+    const first = await connection.maintenance.purge({
+      now: 100,
+      limit: 1,
+      purgeExpiredGrants: true,
+      purgeOrphanedGrants: false,
+      purgeOrphanedTokens: false,
+    });
+    expect(first).toMatchObject({ grantsChecked: 1, grantsPurged: 1, done: false });
+    const second = await connection.maintenance.purge({
+      now: 100,
+      limit: 1,
+      purgeExpiredGrants: true,
+      purgeOrphanedGrants: false,
+      purgeOrphanedTokens: false,
+    });
+    expect(second).toMatchObject({ grantsChecked: 1, grantsPurged: 1, done: true });
   });
 
   it('isolates namespaces and rejects operations after close', async () => {

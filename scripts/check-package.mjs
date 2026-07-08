@@ -39,9 +39,13 @@ try {
 import DeepProvider from '@cloudflare/workers-oauth-provider/dist/oauth-provider.js';
 import type { OAuthStorageProvider } from '@cloudflare/workers-oauth-provider/storage';
 import { workersKvStorage } from '@cloudflare/workers-oauth-provider/storage/kv';
-interface Env extends Cloudflare.Env { OAUTH_KV: KVNamespace }
+import { d1Storage } from '@cloudflare/workers-oauth-provider/storage/d1';
+import { durableObjectSqliteStorage, OAuthStorageObject } from '@cloudflare/workers-oauth-provider/storage/durable-object';
+interface Env extends Cloudflare.Env { OAUTH_KV: KVNamespace; DB: D1Database; OBJECTS: { getByName(name: string): { execute(command: unknown): Promise<unknown> } } }
 const storage: OAuthStorageProvider<Env> = workersKvStorage<Env>({ binding: env => env.OAUTH_KV });
-void [OAuthProvider, NamedProvider, DeepProvider, storage];
+const d1: OAuthStorageProvider<Env> = d1Storage<Env>({ binding: env => env.DB });
+const durable: OAuthStorageProvider<Env> = durableObjectSqliteStorage<Env>({ binding: env => env.OBJECTS });
+void [OAuthProvider, NamedProvider, DeepProvider, OAuthStorageObject, storage, d1, durable];
 `
   );
   const common = [
