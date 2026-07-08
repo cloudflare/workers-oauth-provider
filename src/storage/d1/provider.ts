@@ -52,8 +52,13 @@ import {
   type PurgeStorageResult,
   type ReplaceClientInput,
 } from '../stores';
-import type {
-  AbortGrantTransitionInput,
+import {
+  assertBeginGrantTransitionInput,
+  assertCommitGrantTransitionInput,
+  createGrantTransitionLease,
+  transitionLeaseId,
+  validateBeginGrantTransitionResult,
+  type AbortGrantTransitionInput,
   AbortGrantTransitionResult,
   BeginGrantTransitionInput,
   BeginGrantTransitionResult,
@@ -70,9 +75,9 @@ export const D1_STORAGE_CAPABILITIES: OAuthStorageCapabilities = defineOAuthStor
     replaceUserClientGrants: 'unsupported',
     existingGrantAccessToken: 'strong',
   },
-  transitions: { authorizationCode: 'unsupported', refreshToken: 'unsupported' },
+  transitions: { authorizationCode: 'strong', refreshToken: 'strong' },
   replayReservation: 'strong',
-  revocation: { accessToken: 'strong', grantCascade: 'strong', clientCascade: 'strong' },
+  revocation: { accessToken: 'strong', grantCascade: 'best_effort', clientCascade: 'best_effort' },
   consents: { compareAndSwap: 'strong', delete: 'strong' },
   queries: {
     listClients: 'session',
@@ -150,9 +155,9 @@ class D1Connection implements OAuthStorageConnection {
         this.run('grants.listByUser', () => this.listGrants('user_id = ?', input.userId, input.page)),
       listByClient: (input) =>
         this.run('grants.listByClient', () => this.listGrants('client_id = ?', input.clientId, input.page)),
-      beginTransition: (input) => this.unsupportedBegin(input),
-      commitTransition: (input) => this.unsupportedCommit(input),
-      abortTransition: (input) => this.unsupportedAbort(input),
+      beginTransition: (input) => this.run('grants.beginTransition', () => this.beginTransition(input)),
+      commitTransition: (input) => this.run('grants.commitTransition', () => this.commitTransition(input)),
+      abortTransition: (input) => this.run('grants.abortTransition', () => this.abortTransition(input)),
       revoke: (input) => this.run('grants.revoke', () => this.revokeGrant(input.grant, input.expectedRevision)),
     });
     this.accessTokens = Object.freeze<OAuthAccessTokenStore>({
@@ -313,30 +318,53 @@ class D1Connection implements OAuthStorageConnection {
   private async issueGrant(input: IssueGrantInput): Promise<IssueGrantResult> {
     assertIssueGrantInput(input);
     if (input.replaceExistingUserClientGrants) throw unsupportedStorageOperation('grants.issue');
-    if (input.client.kind === 'registered') {
-      const c = await this.getClient(input.client.clientId);
-      if (!c) return { status: 'client_not_found' };
-      if (c.metadata.revision !== input.client.expectedRevision) return { status: 'client_conflict' };
-    }
     const g = input.grant;
+    const clientGuard =
+      input.client.kind === 'registered'
+        ? `EXISTS(SELECT 1 FROM oauth_clients WHERE namespace=? AND client_id=? AND revision=? AND (expires_at IS NULL OR expires_at>?))`
+        : '1';
+    const clientBindings =
+      input.client.kind === 'registered'
+        ? [this.namespace, input.client.clientId, input.client.expectedRevision, this.now()]
+        : [];
     const statements = [
       this.stmt(
-        `INSERT OR IGNORE INTO oauth_grants(namespace,user_id,grant_id,client_id,revision,created_at,expires_at,value_json) VALUES(?,?,?,?,?,?,?,?)`,
+        `INSERT OR IGNORE INTO oauth_grants(namespace,user_id,grant_id,client_id,revision,created_at,expires_at,value_json) SELECT ?,?,?,?,?,?,?,? WHERE ${clientGuard}`,
         this.namespace,
         g.value.userId,
         g.value.id,
         g.value.clientId,
-        ...this.values(g)
+        ...this.values(g),
+        ...clientBindings
       ),
     ];
-    if (input.accessToken) statements.push(this.insertTokenStatement(input.accessToken));
+    if (input.accessToken) {
+      const t = input.accessToken;
+      statements.push(
+        this.stmt(
+          `INSERT OR IGNORE INTO oauth_access_tokens(namespace,user_id,grant_id,token_id,revision,created_at,expires_at,value_json) SELECT ?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM oauth_grants WHERE namespace=? AND user_id=? AND grant_id=? AND revision=?)`,
+          this.namespace,
+          t.value.userId,
+          t.value.grantId,
+          t.value.id,
+          ...this.values(t),
+          this.namespace,
+          g.value.userId,
+          g.value.id,
+          g.metadata.revision
+        )
+      );
+    }
     const results = await this.db.batch(statements);
-    return {
-      status:
-        this.changes(results[0]!) === 1 && results.slice(1).every((r) => this.changes(r) === 1)
-          ? 'created'
-          : 'conflict',
-    };
+    if (this.changes(results[0]!) === 1 && results.slice(1).every((r) => this.changes(r) === 1)) {
+      return { status: 'created' };
+    }
+    if (input.client.kind === 'registered') {
+      const client = await this.getClient(input.client.clientId);
+      if (!client) return { status: 'client_not_found' };
+      if (client.metadata.revision !== input.client.expectedRevision) return { status: 'client_conflict' };
+    }
+    return { status: 'conflict' };
   }
   private listGrants(predicate: string, value: string, page?: PageRequest): Promise<Page<StoredGrant>> {
     return this.list(
@@ -401,11 +429,26 @@ class D1Connection implements OAuthStorageConnection {
   }
   private async createToken(input: IssueAccessTokenInput): Promise<IssueAccessTokenResult> {
     assertIssueAccessTokenInput(input);
-    const g = await this.getGrant(input.grant);
-    if (!g) return { status: 'grant_not_found' };
-    if (g.metadata.revision !== input.expectedGrantRevision) return { status: 'grant_conflict' };
-    const r = await this.insertTokenStatement(input.token).run();
-    return { status: this.changes(r) ? 'created' : 'conflict' };
+    const t = input.token;
+    const r = await this.stmt(
+      `INSERT OR IGNORE INTO oauth_access_tokens(namespace,user_id,grant_id,token_id,revision,created_at,expires_at,value_json) SELECT ?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM oauth_grants WHERE namespace=? AND user_id=? AND grant_id=? AND revision=? AND (expires_at IS NULL OR expires_at>?))`,
+      this.namespace,
+      t.value.userId,
+      t.value.grantId,
+      t.value.id,
+      ...this.values(t),
+      this.namespace,
+      input.grant.userId,
+      input.grant.grantId,
+      input.expectedGrantRevision,
+      this.now()
+    ).run();
+    if (this.changes(r)) return { status: 'created' };
+    const grant = await this.getGrant(input.grant);
+    if (!grant) return { status: 'grant_not_found' };
+    return grant.metadata.revision !== input.expectedGrantRevision
+      ? { status: 'grant_conflict' }
+      : { status: 'conflict' };
   }
   private async deleteToken(key: AccessTokenKey): Promise<DeleteResult> {
     const r = await this.stmt(
@@ -567,14 +610,149 @@ class D1Connection implements OAuthStorageConnection {
     const selected = rows.slice(0, limit);
     return createPage(selected.map(decode), more ? selected[selected.length - 1]!.cursor_key : undefined);
   }
-  private async unsupportedBegin(_input: BeginGrantTransitionInput): Promise<BeginGrantTransitionResult> {
-    throw unsupportedStorageOperation('grants.beginTransition');
+  private async beginTransition(input: BeginGrantTransitionInput): Promise<BeginGrantTransitionResult> {
+    assertBeginGrantTransitionInput(input);
+    const leaseId = `${input.ownerId}:${input.now}`;
+    const expiresAt = input.now + input.leaseTtlSeconds;
+    const credentialGuard =
+      input.kind === 'authorization_code'
+        ? `json_extract(value_json,'$.authCodeId')=? AND json_extract(value_json,'$.authCodeWrappedKey') IS NOT NULL`
+        : `((json_extract(value_json,'$.refreshTokenId')=? AND json_extract(value_json,'$.refreshTokenWrappedKey') IS NOT NULL) OR (json_extract(value_json,'$.previousRefreshTokenId')=? AND json_extract(value_json,'$.previousRefreshTokenWrappedKey') IS NOT NULL))`;
+    const credentialBindings =
+      input.kind === 'authorization_code' ? [input.credentialId] : [input.credentialId, input.credentialId];
+    const result = await this.stmt(
+      `INSERT INTO oauth_transition_leases(namespace,user_id,grant_id,kind,lease_id,owner_id,credential_id,callback_key,fence,expected_revision,expires_at)
+       SELECT ?,g.user_id,g.grant_id,?,?,?,?,?,COALESCE(l.fence,0)+1,g.revision,?
+       FROM oauth_grants g LEFT JOIN oauth_transition_leases l ON l.namespace=g.namespace AND l.user_id=g.user_id AND l.grant_id=g.grant_id
+       WHERE g.namespace=? AND g.user_id=? AND g.grant_id=? AND (g.expires_at IS NULL OR g.expires_at>?) AND ${credentialGuard} AND (l.grant_id IS NULL OR l.expires_at<=?)
+       ON CONFLICT(namespace,user_id,grant_id) DO UPDATE SET kind=excluded.kind,lease_id=excluded.lease_id,owner_id=excluded.owner_id,credential_id=excluded.credential_id,callback_key=excluded.callback_key,fence=excluded.fence,expected_revision=excluded.expected_revision,expires_at=excluded.expires_at WHERE oauth_transition_leases.expires_at<=?`,
+      this.namespace,
+      input.kind,
+      leaseId,
+      input.ownerId,
+      input.credentialId,
+      input.callbackIdempotencyKey,
+      expiresAt,
+      this.namespace,
+      input.grant.userId,
+      input.grant.grantId,
+      input.now,
+      ...credentialBindings,
+      input.now,
+      input.now
+    ).run();
+    if (!this.changes(result)) {
+      const grant = await this.getGrant(input.grant);
+      if (!grant) return { status: 'not_found' };
+      const active = await this.first(
+        `SELECT value_json,revision,created_at,expires_at FROM oauth_transition_leases WHERE namespace=? AND user_id=? AND grant_id=? AND expires_at>?`,
+        this.namespace,
+        input.grant.userId,
+        input.grant.grantId,
+        input.now
+      );
+      if (active) return { status: 'busy', retryAfterSeconds: Math.max(1, active.expires_at! - input.now) };
+      const valid =
+        input.kind === 'authorization_code'
+          ? grant.value.authCodeId === input.credentialId && grant.value.authCodeWrappedKey !== undefined
+          : (grant.value.refreshTokenId === input.credentialId && grant.value.refreshTokenWrappedKey !== undefined) ||
+            (grant.value.previousRefreshTokenId === input.credentialId &&
+              grant.value.previousRefreshTokenWrappedKey !== undefined);
+      return valid ? { status: 'already_consumed' } : { status: 'invalid_credential' };
+    }
+    const grant = await this.getGrant(input.grant);
+    const leaseRow = await this.db
+      .prepare(
+        `SELECT fence,expected_revision,expires_at FROM oauth_transition_leases WHERE namespace=? AND user_id=? AND grant_id=? AND lease_id=?`
+      )
+      .bind(this.namespace, input.grant.userId, input.grant.grantId, leaseId)
+      .first<{ fence: number; expected_revision: number; expires_at: number }>();
+    if (!grant || !leaseRow) return { status: 'not_found' };
+    const lease = createGrantTransitionLease(
+      {
+        id: transitionLeaseId(leaseId),
+        grant: input.grant,
+        kind: input.kind,
+        credentialId: input.credentialId,
+        ownerId: input.ownerId,
+        fence: leaseRow.fence,
+        expectedRevision: leaseRow.expected_revision,
+        expiresAt: leaseRow.expires_at,
+        callbackIdempotencyKey: input.callbackIdempotencyKey,
+      },
+      input.now,
+      input.leaseTtlSeconds
+    );
+    return validateBeginGrantTransitionResult(input, { status: 'acquired', grant, lease }, input.leaseTtlSeconds);
   }
-  private async unsupportedCommit(_input: ValidatedCommitGrantTransitionInput): Promise<CommitGrantTransitionResult> {
-    throw unsupportedStorageOperation('grants.commitTransition');
+
+  private async commitTransition(input: ValidatedCommitGrantTransitionInput): Promise<CommitGrantTransitionResult> {
+    assertCommitGrantTransitionInput(input);
+    const lease = input.lease;
+    if (input.now >= lease.expiresAt) return { status: 'expired' };
+    const guard = `EXISTS(SELECT 1 FROM oauth_transition_leases l WHERE l.namespace=? AND l.user_id=? AND l.grant_id=? AND l.lease_id=? AND l.owner_id=? AND l.fence=? AND l.expected_revision=? AND l.expires_at>?)`;
+    const guardBindings = [
+      this.namespace,
+      lease.grant.userId,
+      lease.grant.grantId,
+      lease.id,
+      lease.ownerId,
+      lease.fence,
+      lease.expectedRevision,
+      input.now,
+    ];
+    const token = input.accessToken;
+    const results = await this.db.batch([
+      this.stmt(
+        `UPDATE oauth_grants SET revision=?,created_at=?,expires_at=?,value_json=? WHERE namespace=? AND user_id=? AND grant_id=? AND revision=? AND ${guard}`,
+        ...this.values(input.grant),
+        this.namespace,
+        lease.grant.userId,
+        lease.grant.grantId,
+        lease.expectedRevision,
+        ...guardBindings
+      ),
+      this.stmt(
+        `INSERT OR IGNORE INTO oauth_access_tokens(namespace,user_id,grant_id,token_id,revision,created_at,expires_at,value_json) SELECT ?,?,?,?,?,?,?,? WHERE ${guard} AND EXISTS(SELECT 1 FROM oauth_grants WHERE namespace=? AND user_id=? AND grant_id=? AND revision=?)`,
+        this.namespace,
+        token.value.userId,
+        token.value.grantId,
+        token.value.id,
+        ...this.values(token),
+        ...guardBindings,
+        this.namespace,
+        lease.grant.userId,
+        lease.grant.grantId,
+        input.grant.metadata.revision
+      ),
+      this.stmt(
+        `DELETE FROM oauth_transition_leases WHERE namespace=? AND user_id=? AND grant_id=? AND lease_id=? AND owner_id=? AND fence=? AND expected_revision=? AND expires_at>? AND EXISTS(SELECT 1 FROM oauth_grants WHERE namespace=? AND user_id=? AND grant_id=? AND revision=?) AND EXISTS(SELECT 1 FROM oauth_access_tokens WHERE namespace=? AND user_id=? AND grant_id=? AND token_id=?)`,
+        ...guardBindings,
+        this.namespace,
+        lease.grant.userId,
+        lease.grant.grantId,
+        input.grant.metadata.revision,
+        this.namespace,
+        token.value.userId,
+        token.value.grantId,
+        token.value.id
+      ),
+    ]);
+    return results.every((result) => this.changes(result) === 1) ? { status: 'committed' } : { status: 'lease_lost' };
   }
-  private async unsupportedAbort(_input: AbortGrantTransitionInput): Promise<AbortGrantTransitionResult> {
-    throw unsupportedStorageOperation('grants.abortTransition');
+
+  private async abortTransition(input: AbortGrantTransitionInput): Promise<AbortGrantTransitionResult> {
+    const lease = input.lease;
+    const result = await this.stmt(
+      `DELETE FROM oauth_transition_leases WHERE namespace=? AND user_id=? AND grant_id=? AND lease_id=? AND owner_id=? AND fence=?`,
+      this.namespace,
+      lease.grant.userId,
+      lease.grant.grantId,
+      lease.id,
+      lease.ownerId,
+      lease.fence
+    ).run();
+    return this.changes(result) ? { status: 'aborted' } : { status: 'lease_lost' };
   }
   private async run<T>(operation: string, task: () => Promise<T>): Promise<T> {
     if (this.#closed) throw new OAuthStorageError('internal', { operation });
