@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import migrationSql from '../../../src/storage/postgres/0001_initial.sql?raw';
-import { POSTGRES_STORAGE_CAPABILITIES, postgresStorage, type PostgresClient } from '../../../src/storage/postgres';
+import {
+  POSTGRES_STORAGE_CAPABILITIES,
+  POSTGRES_STORAGE_MIGRATIONS,
+  postgresStorage,
+  type PostgresClient,
+} from '../../../src/storage/postgres';
 import { createOAuthStorageOpenContext } from '../../../src/storage/lifecycle';
 import { issueGrantInput } from '../../../src/storage/stores';
 import { storedGrant } from '../fixtures';
@@ -48,6 +52,7 @@ describe('PostgreSQL storage adapter', () => {
   });
 
   it('ships immutable schema constraints, cascades, indexes, replay uniqueness and fencing', () => {
+    const migrationSql = POSTGRES_STORAGE_MIGRATIONS.flatMap((migration) => migration.statements).join(';');
     expect(migrationSql).toContain('PRIMARY KEY(namespace,reservation_namespace,key_hash)');
     expect(migrationSql).toContain('transition_fence bigint NOT NULL DEFAULT 0');
     expect(migrationSql.match(/ON DELETE CASCADE/g)).toHaveLength(2);
@@ -55,7 +60,7 @@ describe('PostgreSQL storage adapter', () => {
     expect(migrationSql).toContain('CHECK(registered_client_id IS NULL OR registered_client_id=client_id)');
     expect(migrationSql).toContain('FOREIGN KEY(namespace,registered_client_id)');
     expect(migrationSql).not.toContain('FOREIGN KEY(namespace,client_id)');
-    expect(migrationSql).toContain('CREATE INDEX oauth_grants_client_idx');
+    expect(migrationSql).toContain('CREATE INDEX IF NOT EXISTS oauth_grants_client_idx');
     expect(migrationSql).toContain('value jsonb NOT NULL');
   });
 

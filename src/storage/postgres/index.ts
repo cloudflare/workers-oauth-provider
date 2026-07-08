@@ -1,4 +1,11 @@
 import { defineOAuthStorageCapabilities, type OAuthStorageCapabilities } from '../capabilities';
+
+export {
+  migratePostgresStorage,
+  POSTGRES_STORAGE_MIGRATIONS,
+  POSTGRES_STORAGE_SCHEMA_VERSION,
+  type PostgresStorageMigration,
+} from './migrations';
 import { OAuthStorageError, isOAuthStorageError } from '../errors';
 import {
   defineStorageNamespace,
@@ -144,6 +151,12 @@ const TABLE = {
 export function postgresStorage<Env>(options: PostgresStorageOptions<Env>): OAuthStorageProvider<Env> {
   if (!options || !options.clientFactory || typeof options.clientFactory.acquire !== 'function')
     throw new TypeError('PostgreSQL storage requires a client factory');
+  if (options.now !== undefined && typeof options.now !== 'function') {
+    throw new TypeError('PostgreSQL storage clock must be a function');
+  }
+  if (options.randomId !== undefined && typeof options.randomId !== 'function') {
+    throw new TypeError('PostgreSQL storage randomId must be a function');
+  }
   const namespace = defineStorageNamespace(options.namespace);
   const clock = options.now ?? (() => Math.floor(Date.now() / 1000));
   const randomId = options.randomId ?? (() => crypto.randomUUID());
@@ -155,7 +168,12 @@ export function postgresStorage<Env>(options: PostgresStorageOptions<Env>): OAut
     async open(context: OAuthStorageOpenContext<Env>) {
       if (context.namespace !== namespace)
         throw new OAuthStorageError('invalid_configuration', { operation: 'storage.open' });
-      const client = await options.clientFactory.acquire(context);
+      let client: PostgresClient;
+      try {
+        client = await options.clientFactory.acquire(context);
+      } catch (cause) {
+        throw new OAuthStorageError('unavailable', { operation: 'storage.open', cause });
+      }
       if (!client || typeof client.query !== 'function' || typeof client.release !== 'function')
         throw new OAuthStorageError('invalid_configuration', { operation: 'storage.open' });
       return new Connection(client, namespace, clock, randomId);
@@ -302,13 +320,14 @@ class Connection implements OAuthStorageConnection {
         [this.namespace, i.clientId]
       );
       if (!q.rows[0]) return { status: 'not_found' };
-      if (i.expectedRevision !== undefined && q.rows[0].revision !== i.expectedRevision) return { status: 'conflict' };
+      if (i.expectedRevision !== undefined && Number(q.rows[0].revision) !== i.expectedRevision)
+        return { status: 'conflict' };
       const tc = await this.db.query<CountRow>(
-        `SELECT count(*) AS count FROM ${TABLE.tokens} t JOIN ${TABLE.grants} g USING(namespace,user_id,grant_id) WHERE g.namespace=$1 AND g.client_id=$2`,
+        `SELECT count(*) AS count FROM ${TABLE.tokens} t JOIN ${TABLE.grants} g USING(namespace,user_id,grant_id) WHERE g.namespace=$1 AND g.registered_client_id=$2`,
         [this.namespace, i.clientId]
       );
       const gc = await this.db.query<CountRow>(
-        `SELECT count(*) AS count FROM ${TABLE.grants} WHERE namespace=$1 AND client_id=$2`,
+        `SELECT count(*) AS count FROM ${TABLE.grants} WHERE namespace=$1 AND registered_client_id=$2`,
         [this.namespace, i.clientId]
       );
       await this.db.query(`DELETE FROM ${TABLE.clients} WHERE namespace=$1 AND client_id=$2`, [
@@ -337,7 +356,7 @@ class Connection implements OAuthStorageConnection {
           [this.namespace, i.client.clientId, this.now()]
         );
         if (!c.rows[0]) return { status: 'client_not_found' };
-        if (c.rows[0].revision !== i.client.expectedRevision) return { status: 'client_conflict' };
+        if (Number(c.rows[0].revision) !== i.client.expectedRevision) return { status: 'client_conflict' };
       }
       const g = await this.db.query(
         `INSERT INTO ${TABLE.grants}(namespace,user_id,grant_id,client_id,registered_client_id,value,schema_version,revision,created_at,expires_at,transition_fence) VALUES($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9,$10,0) ON CONFLICT DO NOTHING`,
@@ -364,8 +383,26 @@ class Connection implements OAuthStorageConnection {
       return { status: 'created' };
     });
   }
-  private listGrants(column: 'user_id' | 'client_id', value: string, p?: PageRequest) {
-    return this.list<StoredGrant>(TABLE.grants, 'grant_id', [`${column}=$2`, value], p, (r) => this.rowGrant(r));
+  private async listGrants(column: 'user_id' | 'client_id', value: string, p?: PageRequest) {
+    if (column === 'user_id') {
+      return this.list<StoredGrant>(TABLE.grants, 'grant_id', ['user_id=$2', value], p, (r) => this.rowGrant(r));
+    }
+    const request = createPageRequest(p);
+    const limit = request.limit ?? 100;
+    const cursor = decodeTupleCursor(request.cursor);
+    const values: unknown[] = [this.namespace, value, this.now()];
+    const after = cursor ? ` AND (user_id,grant_id)>($${values.push(cursor[0])},$${values.push(cursor[1])})` : '';
+    values.push(limit + 1);
+    const result = await this.db.query<Row & { page_user: string; page_grant: string }>(
+      `SELECT value,schema_version,revision,created_at,expires_at,user_id AS page_user,grant_id AS page_grant FROM ${TABLE.grants} WHERE namespace=$1 AND client_id=$2 AND (expires_at IS NULL OR expires_at>$3)${after} ORDER BY user_id,grant_id LIMIT $${values.length}`,
+      values
+    );
+    const rows = result.rows.slice(0, limit);
+    const last = rows[rows.length - 1];
+    return createPage(
+      rows.map((row) => this.rowGrant(row)),
+      result.rows.length > limit && last ? encodeTupleCursor([last.page_user, last.page_grant]) : undefined
+    );
   }
   private async begin(i: BeginGrantTransitionInput): Promise<BeginGrantTransitionResult> {
     assertBeginGrantTransitionInput(i);
@@ -391,7 +428,7 @@ class Connection implements OAuthStorageConnection {
           (current && grant.value.refreshTokenWrappedKey === undefined) ||
           (previous && grant.value.previousRefreshTokenWrappedKey === undefined)
         )
-          return { status: 'invalid_credential' };
+          return { status: 'already_consumed' };
       }
       const fence = Number(row.transition_fence) + 1,
         id = this.randomId(),
@@ -450,7 +487,7 @@ class Connection implements OAuthStorageConnection {
         Number(r.transition_lease_expires_at) <= i.now
       )
         return { status: 'lease_lost' };
-      if (r.revision !== i.lease.expectedRevision) return { status: 'conflict' };
+      if (Number(r.revision) !== i.lease.expectedRevision) return { status: 'conflict' };
       const updated = await this.db.query(
         `UPDATE ${TABLE.grants} SET client_id=$4,value=$5::jsonb,schema_version=$6,revision=$7,created_at=$8,expires_at=$9,transition_lease_id=NULL,transition_owner_id=NULL,transition_kind=NULL,transition_credential_id=NULL,transition_callback_key=NULL,transition_lease_expires_at=NULL WHERE namespace=$1 AND user_id=$2 AND grant_id=$3 AND revision=$10 AND transition_lease_id=$11 AND transition_owner_id=$12 AND transition_kind=$13 AND transition_credential_id=$14 AND transition_callback_key=$15 AND transition_lease_expires_at=$16 AND transition_fence=$17`,
         [
@@ -493,7 +530,7 @@ class Connection implements OAuthStorageConnection {
         [this.namespace, k.userId, k.grantId]
       );
       if (!q.rows[0]) return { status: 'not_found' };
-      if (revision !== undefined && q.rows[0].revision !== revision) return { status: 'conflict' };
+      if (revision !== undefined && Number(q.rows[0].revision) !== revision) return { status: 'conflict' };
       const c = await this.db.query<CountRow>(
         `SELECT count(*) AS count FROM ${TABLE.tokens} WHERE namespace=$1 AND user_id=$2 AND grant_id=$3`,
         [this.namespace, k.userId, k.grantId]
@@ -537,7 +574,7 @@ class Connection implements OAuthStorageConnection {
         [this.namespace, i.grant.userId, i.grant.grantId, this.now()]
       );
       if (!g.rows[0]) return { status: 'grant_not_found' };
-      if (g.rows[0].revision !== i.expectedGrantRevision) return { status: 'grant_conflict' };
+      if (Number(g.rows[0].revision) !== i.expectedGrantRevision) return { status: 'grant_conflict' };
       try {
         await this.insertToken(i.token);
       } catch (e) {
@@ -626,13 +663,22 @@ class Connection implements OAuthStorageConnection {
     if (r.rowCount) return { status: 'deleted' };
     return (await this.getConsent(i)) ? { status: 'conflict' } : { status: 'not_found' };
   }
-  private listConsents(user: string, p?: PageRequest) {
-    return this.list<StoredConsent>(
-      TABLE.consents,
-      "client_id || E'\\000' || reference_id",
-      ['user_id=$2', user],
-      p,
-      (r) => this.rowConsent(r)
+  private async listConsents(user: string, p?: PageRequest) {
+    const request = createPageRequest(p);
+    const limit = request.limit ?? 100;
+    const cursor = decodeTupleCursor(request.cursor);
+    const values: unknown[] = [this.namespace, user, this.now()];
+    const after = cursor ? ` AND (client_id,reference_id)>($${values.push(cursor[0])},$${values.push(cursor[1])})` : '';
+    values.push(limit + 1);
+    const result = await this.db.query<Row & { page_client: string; page_reference: string }>(
+      `SELECT value,schema_version,revision,created_at,expires_at,client_id AS page_client,reference_id AS page_reference FROM ${TABLE.consents} WHERE namespace=$1 AND user_id=$2 AND (expires_at IS NULL OR expires_at>$3)${after} ORDER BY client_id,reference_id LIMIT $${values.length}`,
+      values
+    );
+    const rows = result.rows.slice(0, limit);
+    const last = rows[rows.length - 1];
+    return createPage(
+      rows.map((row) => this.rowConsent(row)),
+      result.rows.length > limit && last ? encodeTupleCursor([last.page_client, last.page_reference]) : undefined
     );
   }
   private async reserve(i: {
@@ -686,9 +732,11 @@ class Connection implements OAuthStorageConnection {
     const req = createPageRequest(p),
       limit = req.limit ?? 100,
       cursor = decodeCursor(req.cursor),
-      conditions = ['namespace=$1', '(expires_at IS NULL OR expires_at>$' + (filter.length + 2) + ')'];
+      conditions = ['namespace=$1'];
     if (filter.length) conditions.push(String(filter[0]));
-    const values = [this.namespace, ...filter.slice(1), this.now()];
+    const values = [this.namespace, ...filter.slice(1)];
+    values.push(this.now());
+    conditions.push(`(expires_at IS NULL OR expires_at>$${values.length})`);
     if (cursor !== undefined) {
       values.push(cursor);
       conditions.push(`${order}>$${values.length}`);
@@ -740,6 +788,27 @@ function decodeCursor(v?: string) {
     return decodeURIComponent(escape(atob(v)));
   } catch {
     throw new TypeError('Invalid PostgreSQL page cursor');
+  }
+}
+function encodeTupleCursor(value: readonly [string, string]): string {
+  return encodeCursor(JSON.stringify(value));
+}
+function decodeTupleCursor(value?: string): [string, string] | undefined {
+  const decoded = decodeCursor(value);
+  if (decoded === undefined) return undefined;
+  try {
+    const parsed = JSON.parse(decoded) as unknown;
+    if (
+      !Array.isArray(parsed) ||
+      parsed.length !== 2 ||
+      typeof parsed[0] !== 'string' ||
+      typeof parsed[1] !== 'string'
+    ) {
+      throw new TypeError('Invalid PostgreSQL tuple cursor');
+    }
+    return [parsed[0], parsed[1]];
+  } catch {
+    throw new TypeError('Invalid PostgreSQL tuple cursor');
   }
 }
 function isUnique(e: unknown) {
