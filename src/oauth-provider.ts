@@ -1,6 +1,19 @@
 import { WorkerEntrypoint } from 'cloudflare:workers';
 
 import {
+  createOAuthStorageOpenContext,
+  resolveOAuthStorageCompatibility,
+  validateOAuthStorageProvider,
+  type MutationCapabilityPath,
+  type OAuthStorageCompatibilityReport,
+  type OAuthStorageConnection,
+  type OAuthStorageProvider,
+  type StorageFeatureRequirement,
+  type StorageRequirement,
+} from './storage';
+import { workersKvStorage } from './storage/kv';
+
+import {
   EMA_DEFAULT_CLOCK_SKEW_SECONDS,
   EMA_DEFAULT_MAX_ASSERTION_LIFETIME_SECONDS,
   EMA_ID_JAG_GRANT_PROFILE,
@@ -38,6 +51,11 @@ export type { EmaValidationError } from './ema/result';
 
 const PROTECTED_RESOURCE_WELL_KNOWN_PREFIX = '/.well-known/oauth-protected-resource';
 const NO_CACHE_HEADERS = { 'Cache-Control': 'no-store', Pragma: 'no-cache' } as const;
+const OAUTH_STORAGE_CONNECTION: unique symbol = Symbol('OAuthStorageConnection');
+
+type StorageBoundEnv<Env> = Env & {
+  readonly [OAUTH_STORAGE_CONNECTION]: OAuthStorageConnection;
+};
 
 // Log CIMD status on module load
 const hasStrictlyPublicFetch =
@@ -351,6 +369,19 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
    * If provided, the provider will implement dynamic client registration.
    */
   clientRegistrationEndpoint?: string;
+
+  /**
+   * Storage provider. Omitting this option preserves the existing `env.OAUTH_KV`
+   * binding and physical KV schema.
+   */
+  storage?: OAuthStorageProvider<Env>;
+
+  /**
+   * Storage guarantee policy. `compatibility` preserves legacy best-effort KV
+   * behavior; `strict` requires strong guarantees for enabled OAuth flows.
+   * Defaults to `compatibility`.
+   */
+  storageGuarantees?: 'compatibility' | 'strict';
 
   /**
    * Time-to-live for access tokens in seconds.
@@ -1283,6 +1314,11 @@ export class OAuthProvider<Env = Cloudflare.Env> {
   purgeExpiredData(env: Env, options?: PurgeOptions): Promise<PurgeResult> {
     return this.#impl.createOAuthHelpers(env).purgeExpiredData(options);
   }
+
+  /** Returns the static compatibility report without opening storage. */
+  getStorageCompatibility(): OAuthStorageCompatibilityReport {
+    return this.#impl.getStorageCompatibility();
+  }
 }
 
 /**
@@ -1327,6 +1363,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
   /** KV-backed best-effort `jti` replay store; only constructed when EMA is configured. */
   private readonly jtiStore: EmaJtiStore | undefined;
+
+  /** Authoritative configured storage provider. */
+  private readonly storageProvider: OAuthStorageProvider<Env>;
+
+  /** Constructor-time static compatibility report. */
+  private readonly storageCompatibility: OAuthStorageCompatibilityReport;
 
   /**
    * Creates a new OAuth provider instance
@@ -1390,20 +1432,40 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       accessTokenTTL: DEFAULT_ACCESS_TOKEN_TTL,
       refreshTokenTTL: DEFAULT_REFRESH_TOKEN_TTL,
       clientRegistrationTTL: DEFAULT_CLIENT_REGISTRATION_TTL,
+      storageGuarantees: 'compatibility',
       onError: ({ status, code, description }) =>
         console.warn(`OAuth error response: ${status} ${code} - ${description}`),
       ...options,
     };
 
-    // Cloudflare KV rejects token writes whose expiration is less than 60 seconds in the
-    // future, so an access token TTL below that would make every token issuance fail with
-    // an opaque KV 400 at runtime. Reject it at construction with a clear, actionable error.
-    if (
-      !Number.isInteger(this.options.accessTokenTTL) ||
-      this.options.accessTokenTTL! < KV_MIN_EXPIRATION_TTL_SECONDS
-    ) {
+    this.storageProvider =
+      this.options.storage ??
+      workersKvStorage<Env>({
+        binding: (env) => {
+          const kv = (env as { readonly OAUTH_KV?: KVNamespace }).OAUTH_KV;
+          if (!kv) throw new TypeError('The default storage provider requires an OAUTH_KV binding');
+          return kv;
+        },
+      });
+    validateOAuthStorageProvider(this.storageProvider);
+    this.storageCompatibility = resolveOAuthStorageCompatibility({
+      adapterId: this.storageProvider.id,
+      capabilities: this.storageProvider.capabilities,
+      features: this.getEnabledStorageRequirements(),
+    });
+    const unavailableFeatures = Object.entries(this.storageCompatibility.features)
+      .filter(([, feature]) => feature.status === 'unavailable')
+      .map(([feature]) => feature);
+    if (unavailableFeatures.length > 0) {
       throw new TypeError(
-        `accessTokenTTL must be an integer of at least ${KV_MIN_EXPIRATION_TTL_SECONDS} seconds (Cloudflare KV's minimum expiration window).`
+        `Storage provider ${this.storageProvider.id} cannot support enabled features: ${unavailableFeatures.join(', ')}`
+      );
+    }
+
+    const minimumAccessTokenTtl = this.storageProvider.capabilities.expiration.minimumTtlSeconds;
+    if (!Number.isInteger(this.options.accessTokenTTL) || this.options.accessTokenTTL! < minimumAccessTokenTtl) {
+      throw new TypeError(
+        `accessTokenTTL must be an integer of at least ${minimumAccessTokenTtl} seconds for storage provider ${this.storageProvider.id}.`
       );
     }
 
@@ -1415,6 +1477,75 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       });
       this.jtiStore = createKvJtiStore();
     }
+  }
+
+  /** Returns the constructor-time static storage compatibility report. */
+  getStorageCompatibility(): OAuthStorageCompatibilityReport {
+    return this.storageCompatibility;
+  }
+
+  private getEnabledStorageRequirements(): readonly StorageFeatureRequirement[] {
+    const features: StorageFeatureRequirement[] = [
+      {
+        feature: 'grant-issuance',
+        requirements: this.storageMutationRequirements('issuance.grantOnly'),
+      },
+      {
+        feature: 'authorization-code',
+        requirements: this.storageMutationRequirements('transitions.authorizationCode'),
+      },
+      {
+        feature: 'token-revocation',
+        requirements: [
+          ...this.storageMutationRequirements('revocation.accessToken'),
+          ...this.storageMutationRequirements('revocation.grantCascade'),
+        ],
+      },
+    ];
+    if (this.options.refreshTokenTTL !== 0) {
+      features.push({
+        feature: 'refresh-token',
+        requirements: this.storageMutationRequirements('transitions.refreshToken'),
+      });
+    }
+    if (this.options.allowImplicitFlow) {
+      features.push({
+        feature: 'implicit-compatibility',
+        requirements: this.storageMutationRequirements('issuance.grantWithAccessToken'),
+      });
+    }
+    if (this.options.allowTokenExchangeGrant) {
+      features.push({
+        feature: 'token-exchange',
+        requirements: this.storageMutationRequirements('issuance.existingGrantAccessToken'),
+      });
+    }
+    if (this.options.clientRegistrationEndpoint) {
+      features.push({
+        feature: 'dynamic-client-registration',
+        requirements: this.storageMutationRequirements('clients.create'),
+      });
+    }
+    if (this.options.enterpriseManagedAuthorization) {
+      features.push({
+        feature: 'enterprise-managed-authorization',
+        requirements: [
+          ...this.storageMutationRequirements('replayReservation'),
+          ...this.storageMutationRequirements('issuance.grantWithAccessToken'),
+        ],
+      });
+    }
+    return features;
+  }
+
+  private storageMutationRequirements(capability: MutationCapabilityPath): readonly StorageRequirement[] {
+    if (this.options.storageGuarantees === 'strict') {
+      return [{ capability, minimum: 'strong', consequence: 'reject' }];
+    }
+    return [
+      { capability, minimum: 'best_effort', consequence: 'reject' },
+      { capability, minimum: 'strong', consequence: 'warn' },
+    ];
   }
 
   /**
@@ -1512,6 +1643,15 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @returns A Promise resolving to an HTTP Response
    */
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    if (!(env as Record<string, unknown>).OAUTH_PROVIDER) {
+      (env as Record<string, unknown>).OAUTH_PROVIDER = this.createOAuthHelpers(env);
+    }
+    return this.withStorageConnection(env, ctx, 'request', request.signal, (boundEnv) =>
+      this.fetchWithStorage(request, boundEnv, ctx)
+    );
+  }
+
+  private async fetchWithStorage(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
     // Special handling for OPTIONS requests (CORS preflight)
@@ -3781,13 +3921,59 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
   }
   /**
-   * Creates the helper methods object for OAuth operations
-   * This is passed to the handler functions to allow them to interact with the OAuth system
-   * @param env - Cloudflare Worker environment variables
-   * @returns An instance of OAuthHelpers
+   * Creates helper methods bound to the request connection when present, or a
+   * detached facade that opens one connection around each public operation.
    */
   public createOAuthHelpers(env: any): OAuthHelpers {
-    return new OAuthHelpersImpl(env, this);
+    return new OAuthHelpersImpl(env, this, this.getStorageConnection(env));
+  }
+
+  /** Runs one detached helper operation on one request-scoped connection. */
+  async withStorageHelpers<T>(env: any, callback: (helpers: OAuthHelpers) => Promise<T>): Promise<T> {
+    return this.withStorageConnection(env as Env, undefined, 'helper', undefined, async (boundEnv) =>
+      callback(this.createOAuthHelpers(boundEnv))
+    );
+  }
+
+  private async withStorageConnection<T>(
+    env: Env,
+    executionContext: ExecutionContext | undefined,
+    kind: 'request' | 'helper' | 'maintenance',
+    signal: AbortSignal | undefined,
+    callback: (boundEnv: Env) => Promise<T>
+  ): Promise<T> {
+    const context = createOAuthStorageOpenContext({
+      provider: this.storageProvider,
+      env,
+      operationId: generateRandomString(24),
+      kind,
+      ...(executionContext === undefined ? {} : { executionContext }),
+      ...(signal === undefined ? {} : { signal }),
+    });
+    const connection = await this.storageProvider.open(context);
+    const boundEnv = Object.create(env as object) as StorageBoundEnv<Env> & Record<string, unknown>;
+    Object.defineProperty(boundEnv, OAUTH_STORAGE_CONNECTION, {
+      value: connection,
+      enumerable: false,
+      configurable: false,
+      writable: false,
+    });
+    Object.defineProperty(boundEnv, 'OAUTH_PROVIDER', {
+      value: new OAuthHelpersImpl(boundEnv, this, connection),
+      enumerable: true,
+      configurable: true,
+      writable: false,
+    });
+    try {
+      return await callback(boundEnv);
+    } finally {
+      await connection.close();
+    }
+  }
+
+  private getStorageConnection(env: any): OAuthStorageConnection | undefined {
+    if ((typeof env !== 'object' && typeof env !== 'function') || env === null) return undefined;
+    return (env as Partial<StorageBoundEnv<Env>>)[OAUTH_STORAGE_CONNECTION];
   }
 
   /**
@@ -4968,15 +5154,18 @@ async function unwrapKeyWithToken(tokenStr: string, wrappedKeyBase64: string): P
 class OAuthHelpersImpl implements OAuthHelpers {
   private env: any;
   private provider: OAuthProviderImpl<any>;
+  private readonly storage: OAuthStorageConnection | undefined;
 
   /**
    * Creates a new OAuthHelpers instance
    * @param env - Cloudflare Worker environment variables
    * @param provider - Reference to the parent provider instance
+   * @param storage - Request-scoped connection, omitted for detached helpers
    */
-  constructor(env: any, provider: OAuthProviderImpl<any>) {
+  constructor(env: any, provider: OAuthProviderImpl<any>, storage?: OAuthStorageConnection) {
     this.env = env;
     this.provider = provider;
+    this.storage = storage;
   }
 
   /**
@@ -4985,6 +5174,9 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * @returns The parsed authorization request parameters
    */
   async parseAuthRequest(request: Request): Promise<AuthRequest> {
+    if (!this.storage) {
+      return this.provider.withStorageHelpers(this.env, (helpers) => helpers.parseAuthRequest(request));
+    }
     const url = new URL(request.url);
     const responseType = url.searchParams.get('response_type') || '';
     const clientId = url.searchParams.get('client_id') || '';
@@ -5053,6 +5245,9 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * @returns A Promise resolving to the client info, or null if not found
    */
   async lookupClient(clientId: string): Promise<ClientInfo | null> {
+    if (!this.storage) {
+      return this.provider.withStorageHelpers(this.env, (helpers) => helpers.lookupClient(clientId));
+    }
     return await this.provider.getClient(this.env, clientId);
   }
 
@@ -5064,6 +5259,9 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * @returns A Promise resolving to an object containing the redirect URL
    */
   async completeAuthorization(options: CompleteAuthorizationOptions): Promise<{ redirectTo: string }> {
+    if (!this.storage) {
+      return this.provider.withStorageHelpers(this.env, (helpers) => helpers.completeAuthorization(options));
+    }
     const { clientId, redirectUri } = options.request;
 
     if (!clientId || !redirectUri) {
@@ -5249,6 +5447,9 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * @returns A Promise resolving to the created client info
    */
   async createClient(clientInfo: Partial<ClientInfo>): Promise<ClientInfo> {
+    if (!this.storage) {
+      return this.provider.withStorageHelpers(this.env, (helpers) => helpers.createClient(clientInfo));
+    }
     const clientId = generateRandomString(16);
 
     // Determine token endpoint auth method
@@ -5309,6 +5510,9 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * @returns A Promise resolving to the list result with items and optional cursor
    */
   async listClients(options?: ListOptions): Promise<ListResult<ClientInfo>> {
+    if (!this.storage) {
+      return this.provider.withStorageHelpers(this.env, (helpers) => helpers.listClients(options));
+    }
     // Prepare list options for KV
     const listOptions: { limit?: number; cursor?: string; prefix: string } = {
       prefix: 'client:',
@@ -5351,6 +5555,9 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * @returns A Promise resolving to the updated client info, or null if not found
    */
   async updateClient(clientId: string, updates: Partial<ClientInfo>): Promise<ClientInfo | null> {
+    if (!this.storage) {
+      return this.provider.withStorageHelpers(this.env, (helpers) => helpers.updateClient(clientId, updates));
+    }
     const client = await this.provider.getClient(this.env, clientId);
     if (!client) {
       return null;
@@ -5411,6 +5618,9 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * @returns A Promise resolving when the deletion is confirmed.
    */
   async deleteClient(clientId: string): Promise<void> {
+    if (!this.storage) {
+      return this.provider.withStorageHelpers(this.env, (helpers) => helpers.deleteClient(clientId));
+    }
     // Revoke all grants associated with this client across all users.
     // Grants are keyed as grant:{userId}:{grantId}, so we scan all grants
     // and check the clientId stored in each one.
@@ -5451,6 +5661,9 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * @returns A Promise resolving to the list result with grant summaries and optional cursor
    */
   async listUserGrants(userId: string, options?: ListOptions): Promise<ListResult<GrantSummary>> {
+    if (!this.storage) {
+      return this.provider.withStorageHelpers(this.env, (helpers) => helpers.listUserGrants(userId, options));
+    }
     // Prepare list options for KV
     const listOptions: { limit?: number; cursor?: string; prefix: string } = {
       prefix: `grant:${userId}:`,
@@ -5502,6 +5715,9 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * @returns A Promise resolving when the revocation is confirmed.
    */
   async revokeGrant(grantId: string, userId: string): Promise<void> {
+    if (!this.storage) {
+      return this.provider.withStorageHelpers(this.env, (helpers) => helpers.revokeGrant(grantId, userId));
+    }
     // Construct the full grant key with user ID
     const grantKey = `grant:${userId}:${grantId}`;
 
@@ -5551,6 +5767,9 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * @returns Promise resolving to token data with decrypted props, or null if token is invalid
    */
   async unwrapToken<T = any>(token: string): Promise<TokenSummary<T> | null> {
+    if (!this.storage) {
+      return this.provider.withStorageHelpers(this.env, (helpers) => helpers.unwrapToken<T>(token));
+    }
     return await this.provider.unwrapToken(token, this.env);
   }
 
@@ -5561,6 +5780,9 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * @returns Promise resolving to token response with new access token
    */
   async exchangeToken(options: ExchangeTokenOptions): Promise<TokenResponse> {
+    if (!this.storage) {
+      return this.provider.withStorageHelpers(this.env, (helpers) => helpers.exchangeToken(options));
+    }
     // Validate subject token first to get client info
     const tokenSummary = await this.unwrapToken(options.subjectToken);
     if (!tokenSummary) {
@@ -5585,6 +5807,9 @@ class OAuthHelpersImpl implements OAuthHelpers {
   }
 
   async purgeExpiredData(options?: PurgeOptions): Promise<PurgeResult> {
+    if (!this.storage) {
+      return this.provider.withStorageHelpers(this.env, (helpers) => helpers.purgeExpiredData(options));
+    }
     const batchSize = options?.batchSize ?? DEFAULT_PURGE_BATCH_SIZE;
     const purgeOrphanedGrants = options?.purgeOrphanedGrants !== false;
     const purgeExpiredGrants = options?.purgeExpiredGrants !== false;
