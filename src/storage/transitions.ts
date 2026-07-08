@@ -63,6 +63,18 @@ export type BeginGrantTransitionInput = Readonly<{
   readonly [BEGIN_INPUT_KIND]: true;
 };
 
+/** Asserts that input came from {@link beginGrantTransitionInput}. */
+export function assertBeginGrantTransitionInput(value: unknown): asserts value is BeginGrantTransitionInput {
+  if (
+    typeof value !== 'object' ||
+    value === null ||
+    !(BEGIN_INPUT_KIND in value) ||
+    (value as { readonly [BEGIN_INPUT_KIND]?: unknown })[BEGIN_INPUT_KIND] !== true
+  ) {
+    throw new TypeError('Expected validated begin-grant-transition input');
+  }
+}
+
 /** Discriminated transition acquisition outcome. */
 export type BeginGrantTransitionResult =
   | {
@@ -87,6 +99,18 @@ export type ValidatedCommitGrantTransitionInput = Readonly<{
 }> & {
   readonly [COMMIT_INPUT_KIND]: true;
 };
+
+/** Asserts that input came from {@link commitGrantTransitionInput}. */
+export function assertCommitGrantTransitionInput(value: unknown): asserts value is ValidatedCommitGrantTransitionInput {
+  if (
+    typeof value !== 'object' ||
+    value === null ||
+    !(COMMIT_INPUT_KIND in value) ||
+    (value as { readonly [COMMIT_INPUT_KIND]?: unknown })[COMMIT_INPUT_KIND] !== true
+  ) {
+    throw new TypeError('Expected validated commit-grant-transition input');
+  }
+}
 
 /** Discriminated transition commit outcome. */
 export type CommitGrantTransitionResult =

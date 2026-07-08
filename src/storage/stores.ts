@@ -99,6 +99,11 @@ export function createClientInput(client: StoredClient): CreateClientInput {
   return brandInput({ client }, 'create_client');
 }
 
+/** Asserts that input came from {@link createClientInput}. */
+export function assertCreateClientInput(value: unknown): asserts value is CreateClientInput {
+  assertStoreInputKind(value, 'create_client');
+}
+
 /** Creates a validated immediate-successor registered-client replacement plan. */
 export function replaceClientInput(
   clientId: string,
@@ -111,6 +116,11 @@ export function replaceClientInput(
   }
   assertNextStorageRevision(expectedRevision, client);
   return brandInput({ clientId, expectedRevision, client }, 'replace_client');
+}
+
+/** Asserts that input came from {@link replaceClientInput}. */
+export function assertReplaceClientInput(value: unknown): asserts value is ReplaceClientInput {
+  assertStoreInputKind(value, 'replace_client');
 }
 
 /**
@@ -152,6 +162,11 @@ export function issueGrantInput(input: {
   return brandInput({ ...input }, 'issue_grant');
 }
 
+/** Asserts that input came from {@link issueGrantInput}. */
+export function assertIssueGrantInput(value: unknown): asserts value is IssueGrantInput {
+  assertStoreInputKind(value, 'issue_grant');
+}
+
 /** Returns the one composite capability governing a validated grant-issuance plan. */
 export function getIssueGrantGuarantee(
   capabilities: OAuthStorageCapabilities,
@@ -183,6 +198,11 @@ export function issueAccessTokenInput(input: {
   return brandInput({ ...input, grant: Object.freeze({ ...input.grant }) }, 'issue_access_token');
 }
 
+/** Asserts that input came from {@link issueAccessTokenInput}. */
+export function assertIssueAccessTokenInput(value: unknown): asserts value is IssueAccessTokenInput {
+  assertStoreInputKind(value, 'issue_access_token');
+}
+
 /** Creates a validated persistent-consent compare-and-swap plan. */
 export function compareAndSwapConsentInput(input: {
   readonly consent: StoredConsent;
@@ -192,6 +212,11 @@ export function compareAndSwapConsentInput(input: {
   if (input.expectedRevision === undefined) assertInitialStorageRevision(input.consent);
   else assertNextStorageRevision(input.expectedRevision, input.consent);
   return brandInput({ ...input }, 'compare_and_swap_consent');
+}
+
+/** Asserts that input came from {@link compareAndSwapConsentInput}. */
+export function assertCompareAndSwapConsentInput(value: unknown): asserts value is CompareAndSwapConsentInput {
+  assertStoreInputKind(value, 'compare_and_swap_consent');
 }
 
 /** Dynamically registered client operations. External CIMD clients are not stored here. */
@@ -333,6 +358,17 @@ function brandInput<T, Kind extends string>(value: T, kind: Kind): ValidatedInpu
       writable: false,
     })
   ) as ValidatedInput<T, Kind>;
+}
+
+function assertStoreInputKind(value: unknown, expected: string): void {
+  if (
+    typeof value !== 'object' ||
+    value === null ||
+    !(STORE_INPUT_KIND in value) ||
+    (value as { readonly [STORE_INPUT_KIND]?: unknown })[STORE_INPUT_KIND] !== expected
+  ) {
+    throw new TypeError(`Expected validated ${expected} input`);
+  }
 }
 
 function assertNonNegativeSafeInteger(value: number, name: string): void {

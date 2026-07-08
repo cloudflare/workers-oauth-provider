@@ -135,7 +135,10 @@ export function createStoredGrant(value: StorageGrant, metadata: StorageMetadata
   for (const credential of [value.authCodeId, value.refreshTokenId, value.previousRefreshTokenId]) {
     if (credential !== undefined) credentialIdFromSha256(credential);
   }
-  if (metadata.createdAt !== value.createdAt || metadata.expiresAt !== value.expiresAt) {
+  if (
+    metadata.createdAt !== value.createdAt ||
+    (value.expiresAt !== undefined && metadata.expiresAt !== value.expiresAt)
+  ) {
     throw new TypeError('Grant metadata timestamps must match the canonical grant');
   }
   return createValidatedStored(Object.freeze({ ...value }), metadata, 'grant');
@@ -177,7 +180,7 @@ export function isLogicallyExpired(record: Stored<unknown>, now: UnixSeconds): b
 }
 
 /** Returns null for a logically expired record. */
-export function hideLogicallyExpired<T>(record: Stored<T> | null, now: UnixSeconds): Stored<T> | null {
+export function hideLogicallyExpired<T extends Stored<unknown>>(record: T | null, now: UnixSeconds): T | null {
   return record !== null && isLogicallyExpired(record, now) ? null : record;
 }
 
