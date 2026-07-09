@@ -20,6 +20,7 @@ export const D1_STORAGE_MIGRATIONS: readonly D1StorageMigration[] = Object.freez
       `CREATE INDEX IF NOT EXISTS oauth_consents_user ON oauth_consents(namespace, user_id, client_id, reference_id)`,
       `CREATE TABLE IF NOT EXISTS oauth_replay_reservations (namespace TEXT NOT NULL, reservation_namespace TEXT NOT NULL, key_hash TEXT NOT NULL, expires_at INTEGER NOT NULL, PRIMARY KEY(namespace, reservation_namespace, key_hash))`,
       `CREATE TABLE IF NOT EXISTS oauth_transition_leases (namespace TEXT NOT NULL, user_id TEXT NOT NULL, grant_id TEXT NOT NULL, kind TEXT NOT NULL, lease_id TEXT NOT NULL, owner_id TEXT NOT NULL, credential_id TEXT NOT NULL, callback_key TEXT NOT NULL, fence INTEGER NOT NULL, expected_revision INTEGER NOT NULL, expires_at INTEGER NOT NULL, PRIMARY KEY(namespace, user_id, grant_id))`,
+      `CREATE TABLE IF NOT EXISTS oauth_operation_assertions (id TEXT PRIMARY KEY, ok INTEGER NOT NULL CHECK(ok=1))`,
     ]),
   }),
 ]);
@@ -44,7 +45,7 @@ export async function migrateD1Storage(database: D1Database): Promise<void> {
       ...migration.statements.map((sql) => database.prepare(sql)),
       database
         .prepare(
-          `INSERT INTO oauth_storage_schema(id,version) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET version=excluded.version`
+          `INSERT INTO oauth_storage_schema(id,version) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET version=excluded.version WHERE oauth_storage_schema.version<excluded.version`
         )
         .bind(migration.version),
     ]);

@@ -765,7 +765,7 @@ class WorkersKvStorageConnection implements OAuthStorageConnection {
     } catch (error) {
       if (isOAuthStorageError(error)) throw error;
       const message = error instanceof Error ? error.message : '';
-      if (/429 Too Many Requests/i.test(message)) {
+      if (/\b429\b/.test(message)) {
         throw new OAuthStorageError('rate_limited', { cause: error, operation });
       }
       throw new OAuthStorageError('internal', { cause: error, operation });

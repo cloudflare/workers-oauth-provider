@@ -59,7 +59,9 @@ suite('PostgreSQL adapter against a real server', () => {
     await admin.query(
       'DROP TABLE IF EXISTS oauth_access_tokens,oauth_consents,oauth_replay_reservations,oauth_grants,oauth_clients,oauth_storage_schema CASCADE'
     );
-    await migratePostgresStorage(admin);
+    const concurrentMigrator = await connect();
+    await Promise.all([migratePostgresStorage(admin), migratePostgresStorage(concurrentMigrator)]);
+    concurrentMigrator.release();
     now = 100;
     factory = { acquire: () => connect() };
     provider = postgresStorage<Env>({ clientFactory: factory, now: () => now, randomId: () => crypto.randomUUID() });

@@ -427,31 +427,38 @@ export class OAuthStorageObject {
   }
 
   private migrate(): void {
-    this.sql.exec('CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY)');
-    this.sql.exec(
-      'CREATE TABLE IF NOT EXISTS records (kind TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, revision INTEGER NOT NULL, expires_at INTEGER, PRIMARY KEY(kind,key))'
-    );
-    this.sql.exec(
-      'CREATE TABLE IF NOT EXISTS leases (grant_key TEXT PRIMARY KEY, value TEXT NOT NULL, fence INTEGER NOT NULL, expires_at INTEGER NOT NULL)'
-    );
-    this.sql.exec('CREATE TABLE IF NOT EXISTS fences (grant_key TEXT PRIMARY KEY, value INTEGER NOT NULL)');
-    this.sql.exec(
-      'CREATE TABLE IF NOT EXISTS replay (namespace TEXT NOT NULL, key_hash TEXT NOT NULL, expires_at INTEGER NOT NULL, PRIMARY KEY(namespace,key_hash))'
-    );
-    this.sql.exec('CREATE INDEX IF NOT EXISTS records_expiry ON records(kind,expires_at)');
-    this.sql.exec(
-      `CREATE INDEX IF NOT EXISTS grants_user ON records(json_extract(value,'$.value.userId'),key) WHERE kind='grant'`
-    );
-    this.sql.exec(
-      `CREATE INDEX IF NOT EXISTS grants_client ON records(json_extract(value,'$.value.clientId'),key) WHERE kind='grant'`
-    );
-    this.sql.exec(
-      `CREATE INDEX IF NOT EXISTS tokens_grant ON records(json_extract(value,'$.value.userId'),json_extract(value,'$.value.grantId'),key) WHERE kind='token'`
-    );
-    this.sql.exec(
-      `CREATE INDEX IF NOT EXISTS consents_user ON records(json_extract(value,'$.value.userId'),key) WHERE kind='consent'`
-    );
-    this.sql.exec('INSERT OR IGNORE INTO schema_migrations(version) VALUES (1)');
+    this.state.storage.transactionSync(() => {
+      this.sql.exec('CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY)');
+      const current =
+        this.sql.exec<{ version: number }>('SELECT MAX(version) AS version FROM schema_migrations').toArray()[0]
+          ?.version ?? 0;
+      if (current > 1) {
+        throw new OAuthStorageError('schema_mismatch', { operation: 'storage.migrate' });
+      }
+      if (current === 1) return;
+      this.sql.exec(
+        'CREATE TABLE records (kind TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, revision INTEGER NOT NULL, expires_at INTEGER, PRIMARY KEY(kind,key))'
+      );
+      this.sql.exec(
+        'CREATE TABLE leases (grant_key TEXT PRIMARY KEY, value TEXT NOT NULL, fence INTEGER NOT NULL, expires_at INTEGER NOT NULL)'
+      );
+      this.sql.exec('CREATE TABLE fences (grant_key TEXT PRIMARY KEY, value INTEGER NOT NULL)');
+      this.sql.exec(
+        'CREATE TABLE replay (namespace TEXT NOT NULL, key_hash TEXT NOT NULL, expires_at INTEGER NOT NULL, PRIMARY KEY(namespace,key_hash))'
+      );
+      this.sql.exec('CREATE INDEX records_expiry ON records(kind,expires_at)');
+      this.sql.exec(`CREATE INDEX grants_user ON records(json_extract(value,'$.value.userId'),key) WHERE kind='grant'`);
+      this.sql.exec(
+        `CREATE INDEX grants_client ON records(json_extract(value,'$.value.clientId'),key) WHERE kind='grant'`
+      );
+      this.sql.exec(
+        `CREATE INDEX tokens_grant ON records(json_extract(value,'$.value.userId'),json_extract(value,'$.value.grantId'),key) WHERE kind='token'`
+      );
+      this.sql.exec(
+        `CREATE INDEX consents_user ON records(json_extract(value,'$.value.userId'),key) WHERE kind='consent'`
+      );
+      this.sql.exec('INSERT INTO schema_migrations(version) VALUES (1)');
+    });
   }
 
   private executeTransaction(command: DurableObjectStorageCommand): unknown {

@@ -103,6 +103,30 @@ describe('PostgreSQL storage adapter', () => {
     expect(registeredInsert.values[4]).toBe(grant.value.clientId);
   });
 
+  it('rejects PostgreSQL bigint values outside JavaScript safe-integer range', async () => {
+    const client = new RecordingClient();
+    client.query = async <Row = Readonly<Record<string, unknown>>>() => ({
+      rows: [
+        {
+          value: storedGrant().value,
+          schema_version: 1,
+          revision: '9007199254740992',
+          created_at: 100,
+          expires_at: 500,
+        },
+      ] as unknown as readonly Row[],
+      rowCount: 1,
+    });
+    const provider = postgresStorage({ clientFactory: { acquire: () => client }, now: () => 200 });
+    const connection = await provider.open(
+      createOAuthStorageOpenContext({ provider, env: {}, operationId: 'bigint', kind: 'request' })
+    );
+    await expect(connection.grants.get({ userId: 'user-1', grantId: 'grant-1' })).rejects.toMatchObject({
+      code: 'schema_mismatch',
+      operation: 'storage.decode',
+    });
+  });
+
   it('uses only positional placeholders and supplies every referenced value', async () => {
     const client = new RecordingClient();
     const provider = postgresStorage({ clientFactory: { acquire: () => client }, now: () => 200 });

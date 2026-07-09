@@ -23,6 +23,7 @@ import { DIGEST_A, DIGEST_B, DIGEST_C, storedAccessToken, storedClient, storedGr
 class SqliteD1 {
   readonly database = new DatabaseSync(':memory:');
   failBatchAt: number | undefined;
+  beforeBatch: (() => void) | undefined;
 
   prepare(sql: string): D1PreparedStatement {
     return new SqliteStatement(this, sql, []) as unknown as D1PreparedStatement;
@@ -31,6 +32,9 @@ class SqliteD1 {
   async batch(statements: D1PreparedStatement[]): Promise<D1Result[]> {
     this.database.exec('BEGIN IMMEDIATE');
     try {
+      const beforeBatch = this.beforeBatch;
+      this.beforeBatch = undefined;
+      beforeBatch?.();
       const results: D1Result[] = [];
       for (let index = 0; index < statements.length; index++) {
         if (this.failBatchAt === index) {
@@ -343,6 +347,18 @@ describe('D1 storage adapter against SQLite transaction semantics', () => {
     d1.failBatchAt = 1;
     await expect(connection.grants.commitTransition(commit)).rejects.toMatchObject({ code: 'internal' });
     expect((await connection.grants.get(first.lease.grant))?.metadata.revision).toBe(0);
+    await connection.accessTokens.createForGrant(
+      issueAccessTokenInput({
+        grant: first.lease.grant,
+        expectedGrantRevision: 0,
+        token: storedAccessToken(0),
+      })
+    );
+    expect(await connection.grants.commitTransition(commit)).toEqual({ status: 'conflict' });
+    expect((await connection.grants.get(first.lease.grant))?.metadata.revision).toBe(0);
+    await connection.accessTokens.delete({
+      key: { userId: 'user-1', grantId: 'grant-1', tokenId: storedAccessToken().value.id },
+    });
     expect(await connection.grants.commitTransition(commit)).toEqual({ status: 'committed' });
     expect(
       await connection.grants.beginTransition(
@@ -444,7 +460,7 @@ describe('D1 storage adapter against SQLite transaction semantics', () => {
     expect(await connection.grants.get({ userId: 'user-1', grantId: 'old-grant' })).not.toBeNull();
   });
 
-  it('atomically cascades client deletion with exact effect counts', async () => {
+  it('rolls back cascades when parent guards change before the batch', async () => {
     await connection.clients.create(createClientInput(storedClient(0)));
     await connection.grants.issue(
       issueGrantInput({
@@ -453,12 +469,53 @@ describe('D1 storage adapter against SQLite transaction semantics', () => {
         accessToken: storedAccessToken(0),
       })
     );
+    d1.beforeBatch = () => {
+      d1.database
+        .prepare(`UPDATE oauth_clients SET revision=1 WHERE namespace='default' AND client_id='client-1'`)
+        .run();
+    };
+    expect(await connection.clients.deleteWithGrants({ clientId: 'client-1' })).toEqual({ status: 'conflict' });
+    expect(await connection.grants.get({ userId: 'user-1', grantId: 'grant-1' })).not.toBeNull();
+    expect(
+      await connection.accessTokens.get({ userId: 'user-1', grantId: 'grant-1', tokenId: DIGEST_B })
+    ).not.toBeNull();
+
+    d1.beforeBatch = () => {
+      d1.database
+        .prepare(
+          `UPDATE oauth_grants SET revision=1 WHERE namespace='default' AND user_id='user-1' AND grant_id='grant-1'`
+        )
+        .run();
+    };
+    expect(await connection.grants.revoke({ grant: { userId: 'user-1', grantId: 'grant-1' } })).toEqual({
+      status: 'conflict',
+    });
+    expect(await connection.grants.get({ userId: 'user-1', grantId: 'grant-1' })).not.toBeNull();
+  });
+
+  it('atomically cascades only registered grants with exact effect counts', async () => {
+    await connection.clients.create(createClientInput(storedClient(0)));
+    await connection.grants.issue(
+      issueGrantInput({
+        client: { kind: 'registered', clientId: 'client-1', expectedRevision: 0 },
+        grant: storedGrant(0),
+        accessToken: storedAccessToken(0),
+      })
+    );
+    const external = createStoredGrant(
+      { ...storedGrant().value, id: 'external-same-id' },
+      { schemaVersion: 1, revision: 0, createdAt: 100, expiresAt: 500 }
+    );
+    await connection.grants.issue(
+      issueGrantInput({ client: { kind: 'external', clientId: 'client-1' }, grant: external })
+    );
     expect(await connection.clients.deleteWithGrants({ clientId: 'client-1', expectedRevision: 0 })).toEqual({
       status: 'deleted',
       deletedGrants: 1,
       deletedAccessTokens: 1,
     });
     expect(await connection.grants.get({ userId: 'user-1', grantId: 'grant-1' })).toBeNull();
+    expect(await connection.grants.get({ userId: 'user-1', grantId: 'external-same-id' })).not.toBeNull();
   });
 
   it('classifies consumed current and previous refresh credentials and rejects expired replay reservations', async () => {

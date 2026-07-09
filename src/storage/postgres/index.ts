@@ -320,7 +320,7 @@ class Connection implements OAuthStorageConnection {
         [this.namespace, i.clientId]
       );
       if (!q.rows[0]) return { status: 'not_found' };
-      if (i.expectedRevision !== undefined && Number(q.rows[0].revision) !== i.expectedRevision)
+      if (i.expectedRevision !== undefined && safeInteger(q.rows[0].revision, 'client revision') !== i.expectedRevision)
         return { status: 'conflict' };
       const tc = await this.db.query<CountRow>(
         `SELECT count(*) AS count FROM ${TABLE.tokens} t JOIN ${TABLE.grants} g USING(namespace,user_id,grant_id) WHERE g.namespace=$1 AND g.registered_client_id=$2`,
@@ -356,7 +356,8 @@ class Connection implements OAuthStorageConnection {
           [this.namespace, i.client.clientId, this.now()]
         );
         if (!c.rows[0]) return { status: 'client_not_found' };
-        if (Number(c.rows[0].revision) !== i.client.expectedRevision) return { status: 'client_conflict' };
+        if (safeInteger(c.rows[0].revision, 'client revision') !== i.client.expectedRevision)
+          return { status: 'client_conflict' };
       }
       const g = await this.db.query(
         `INSERT INTO ${TABLE.grants}(namespace,user_id,grant_id,client_id,registered_client_id,value,schema_version,revision,created_at,expires_at,transition_fence) VALUES($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9,$10,0) ON CONFLICT DO NOTHING`,
@@ -415,8 +416,13 @@ class Connection implements OAuthStorageConnection {
       const row = q.rows[0],
         grant = this.rowGrant(row);
       if (grant.metadata.expiresAt !== undefined && grant.metadata.expiresAt <= i.now) return { status: 'expired' };
-      if (row.transition_lease_id && Number(row.transition_lease_expires_at) > i.now)
-        return { status: 'busy', retryAfterSeconds: Math.max(1, Number(row.transition_lease_expires_at) - i.now) };
+      const activeLeaseExpiry =
+        row.transition_lease_expires_at === null
+          ? undefined
+          : safeInteger(row.transition_lease_expires_at, 'transition lease expiry');
+      if (row.transition_lease_id && activeLeaseExpiry !== undefined && activeLeaseExpiry > i.now) {
+        return { status: 'busy', retryAfterSeconds: Math.max(1, activeLeaseExpiry - i.now) };
+      }
       if (i.kind === 'authorization_code') {
         if (grant.value.authCodeId !== i.credentialId) return { status: 'invalid_credential' };
         if (grant.value.authCodeWrappedKey === undefined) return { status: 'already_consumed' };
@@ -430,7 +436,7 @@ class Connection implements OAuthStorageConnection {
         )
           return { status: 'already_consumed' };
       }
-      const fence = Number(row.transition_fence) + 1,
+      const fence = safeInteger(row.transition_fence, 'transition fence') + 1,
         id = this.randomId(),
         expires = i.now + i.leaseTtlSeconds;
       await this.db.query(
@@ -475,19 +481,19 @@ class Connection implements OAuthStorageConnection {
       );
       if (!q.rows[0]) return { status: 'not_found' };
       const r = q.rows[0];
-      if (r.expires_at !== null && Number(r.expires_at) <= i.now) return { status: 'expired' };
+      if (r.expires_at !== null && safeInteger(r.expires_at, 'grant expiry') <= i.now) return { status: 'expired' };
       if (
         r.transition_lease_id !== i.lease.id ||
         r.transition_owner_id !== i.lease.ownerId ||
         r.transition_kind !== i.lease.kind ||
         r.transition_credential_id !== i.lease.credentialId ||
         r.transition_callback_key !== i.lease.callbackIdempotencyKey ||
-        Number(r.transition_fence) !== i.lease.fence ||
-        Number(r.transition_lease_expires_at) !== i.lease.expiresAt ||
-        Number(r.transition_lease_expires_at) <= i.now
+        safeInteger(r.transition_fence, 'transition fence') !== i.lease.fence ||
+        safeInteger(r.transition_lease_expires_at, 'transition lease expiry') !== i.lease.expiresAt ||
+        safeInteger(r.transition_lease_expires_at, 'transition lease expiry') <= i.now
       )
         return { status: 'lease_lost' };
-      if (Number(r.revision) !== i.lease.expectedRevision) return { status: 'conflict' };
+      if (safeInteger(r.revision, 'grant revision') !== i.lease.expectedRevision) return { status: 'conflict' };
       const updated = await this.db.query(
         `UPDATE ${TABLE.grants} SET client_id=$4,value=$5::jsonb,schema_version=$6,revision=$7,created_at=$8,expires_at=$9,transition_lease_id=NULL,transition_owner_id=NULL,transition_kind=NULL,transition_credential_id=NULL,transition_callback_key=NULL,transition_lease_expires_at=NULL WHERE namespace=$1 AND user_id=$2 AND grant_id=$3 AND revision=$10 AND transition_lease_id=$11 AND transition_owner_id=$12 AND transition_kind=$13 AND transition_credential_id=$14 AND transition_callback_key=$15 AND transition_lease_expires_at=$16 AND transition_fence=$17`,
         [
@@ -530,7 +536,8 @@ class Connection implements OAuthStorageConnection {
         [this.namespace, k.userId, k.grantId]
       );
       if (!q.rows[0]) return { status: 'not_found' };
-      if (revision !== undefined && Number(q.rows[0].revision) !== revision) return { status: 'conflict' };
+      if (revision !== undefined && safeInteger(q.rows[0].revision, 'grant revision') !== revision)
+        return { status: 'conflict' };
       const c = await this.db.query<CountRow>(
         `SELECT count(*) AS count FROM ${TABLE.tokens} WHERE namespace=$1 AND user_id=$2 AND grant_id=$3`,
         [this.namespace, k.userId, k.grantId]
@@ -574,7 +581,8 @@ class Connection implements OAuthStorageConnection {
         [this.namespace, i.grant.userId, i.grant.grantId, this.now()]
       );
       if (!g.rows[0]) return { status: 'grant_not_found' };
-      if (Number(g.rows[0].revision) !== i.expectedGrantRevision) return { status: 'grant_conflict' };
+      if (safeInteger(g.rows[0].revision, 'grant revision') !== i.expectedGrantRevision)
+        return { status: 'grant_conflict' };
       try {
         await this.insertToken(i.token);
       } catch (e) {
@@ -770,14 +778,31 @@ function vals(
 }
 function meta(r: Row) {
   return {
-    schemaVersion: Number(r.schema_version),
-    revision: Number(r.revision),
-    createdAt: Number(r.created_at),
-    ...(r.expires_at === null ? {} : { expiresAt: Number(r.expires_at) }),
+    schemaVersion: safeInteger(r.schema_version, 'schema version'),
+    revision: safeInteger(r.revision, 'record revision'),
+    createdAt: safeInteger(r.created_at, 'record creation'),
+    ...(r.expires_at === null ? {} : { expiresAt: safeInteger(r.expires_at, 'record expiry') }),
   };
 }
 function num(v: number | string | undefined) {
-  return v === undefined ? 0 : Number(v);
+  return v === undefined ? 0 : safeInteger(v, 'count');
+}
+function safeInteger(value: unknown, field: string): number {
+  try {
+    if (typeof value === 'number') {
+      if (Number.isSafeInteger(value)) return value;
+      throw new Error(field);
+    }
+    if (typeof value === 'string' && /^-?\d+$/.test(value)) {
+      const integer = BigInt(value);
+      if (integer >= BigInt(Number.MIN_SAFE_INTEGER) && integer <= BigInt(Number.MAX_SAFE_INTEGER)) {
+        return Number(integer);
+      }
+    }
+  } catch (error) {
+    if (isOAuthStorageError(error)) throw error;
+  }
+  throw new OAuthStorageError('schema_mismatch', { operation: 'storage.decode' });
 }
 function encodeCursor(v: string) {
   return btoa(unescape(encodeURIComponent(v)));

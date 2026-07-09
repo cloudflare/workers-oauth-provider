@@ -155,6 +155,27 @@ describe('Durable Object SQLite adapter against real SQLite statements', () => {
 
   afterEach(() => namespace.close());
 
+  it('migrates transactionally and rejects newer schema versions', async () => {
+    expect(await connection.clients.get('initialize')).toBeNull();
+    const state = namespace.states.get('oauth-do:v1:default:root')!;
+    state.storage.sql.exec('INSERT INTO schema_migrations(version) VALUES (99)');
+    const newer = new OAuthStorageObject(state);
+    await expect(newer.execute({ operation: 'clients.get', clientId: 'x', now: 100 })).rejects.toMatchObject({
+      code: 'schema_mismatch',
+    });
+
+    const failedState = new SqliteState();
+    failedState.failTransactionExecAt = 3;
+    const failed = new OAuthStorageObject(failedState);
+    await expect(failed.execute({ operation: 'clients.get', clientId: 'x', now: 100 })).rejects.toThrow(
+      /injected SQLite effect failure/
+    );
+    failedState.failTransactionExecAt = undefined;
+    const recovered = new OAuthStorageObject(failedState);
+    expect(await recovered.execute({ operation: 'clients.get', clientId: 'x', now: 100 })).toBeNull();
+    failedState.close();
+  });
+
   it('satisfies the provider strict-mode requirements', () => {
     const storage = durableObjectSqliteStorage<{ OBJECTS: OAuthStorageObjectNamespace }>({
       binding: (env) => env.OBJECTS,

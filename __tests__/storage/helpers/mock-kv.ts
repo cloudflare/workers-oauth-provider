@@ -21,7 +21,9 @@ export class MockKvNamespace {
   readonly entries = new Map<string, MockKvEntry>();
   now = 100;
   pageSizeCap = 1000;
+  failNextGet: Error | undefined;
   failNextPut: Error | undefined;
+  failNextList: Error | undefined;
   failPutAt: { readonly attempt: number; readonly error: Error } | undefined;
   putAttempts = 0;
   failNextDelete: Error | undefined;
@@ -31,6 +33,11 @@ export class MockKvNamespace {
   }
 
   async get(key: string, options?: { readonly type?: string }): Promise<unknown> {
+    if (this.failNextGet !== undefined) {
+      const error = this.failNextGet;
+      this.failNextGet = undefined;
+      throw error;
+    }
     const entry = this.live(key);
     if (entry === undefined) return null;
     return options?.type === 'json' ? JSON.parse(entry.value) : entry.value;
@@ -74,6 +81,11 @@ export class MockKvNamespace {
     readonly list_complete: boolean;
     readonly cursor?: string;
   }> {
+    if (this.failNextList !== undefined) {
+      const error = this.failNextList;
+      this.failNextList = undefined;
+      throw error;
+    }
     const prefix = options.prefix ?? '';
     const keys = [...this.entries.keys()]
       .filter((key) => key.startsWith(prefix) && this.live(key) !== undefined)

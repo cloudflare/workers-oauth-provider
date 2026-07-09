@@ -32,31 +32,37 @@ export const POSTGRES_STORAGE_SCHEMA_VERSION =
 
 /** Applies pending PostgreSQL migrations on one exclusive session. */
 export async function migratePostgresStorage(client: PostgresClient): Promise<void> {
-  await client.query(
-    `CREATE TABLE IF NOT EXISTS oauth_storage_schema (id integer PRIMARY KEY CHECK(id=1), version integer NOT NULL)`
-  );
-  const result = await client.query<{ version: number | string }>(
-    `SELECT version FROM oauth_storage_schema WHERE id=1`
-  );
-  const current = result.rows[0] ? Number(result.rows[0].version) : 0;
-  if (current > POSTGRES_STORAGE_SCHEMA_VERSION) {
-    throw new OAuthStorageError('schema_mismatch', { operation: 'storage.migrate' });
-  }
-  for (const migration of POSTGRES_STORAGE_MIGRATIONS) {
-    if (migration.version <= current) continue;
-    await client.query('BEGIN');
-    try {
-      for (const statement of migration.statements) await client.query(statement);
-      await client.query(
-        `INSERT INTO oauth_storage_schema(id,version) VALUES(1,$1) ON CONFLICT(id) DO UPDATE SET version=EXCLUDED.version`,
-        [migration.version]
-      );
-      await client.query('COMMIT');
-    } catch (error) {
-      try {
-        await client.query('ROLLBACK');
-      } catch {}
-      throw error;
+  const lockId = 1_947_020_471;
+  await client.query(`SELECT pg_advisory_lock($1)`, [lockId]);
+  try {
+    await client.query(
+      `CREATE TABLE IF NOT EXISTS oauth_storage_schema (id integer PRIMARY KEY CHECK(id=1), version integer NOT NULL)`
+    );
+    const result = await client.query<{ version: number | string }>(
+      `SELECT version FROM oauth_storage_schema WHERE id=1`
+    );
+    const current = result.rows[0] ? Number(result.rows[0].version) : 0;
+    if (!Number.isSafeInteger(current) || current > POSTGRES_STORAGE_SCHEMA_VERSION) {
+      throw new OAuthStorageError('schema_mismatch', { operation: 'storage.migrate' });
     }
+    for (const migration of POSTGRES_STORAGE_MIGRATIONS) {
+      if (migration.version <= current) continue;
+      await client.query('BEGIN');
+      try {
+        for (const statement of migration.statements) await client.query(statement);
+        await client.query(
+          `INSERT INTO oauth_storage_schema(id,version) VALUES(1,$1) ON CONFLICT(id) DO UPDATE SET version=EXCLUDED.version WHERE oauth_storage_schema.version<EXCLUDED.version`,
+          [migration.version]
+        );
+        await client.query('COMMIT');
+      } catch (error) {
+        try {
+          await client.query('ROLLBACK');
+        } catch {}
+        throw error;
+      }
+    }
+  } finally {
+    await client.query(`SELECT pg_advisory_unlock($1)`, [lockId]);
   }
 }

@@ -272,39 +272,52 @@ class D1Connection implements OAuthStorageConnection {
       return { status: 'conflict' };
     const guard = `EXISTS(SELECT 1 FROM oauth_clients c WHERE c.namespace=? AND c.client_id=? AND c.revision=?)`;
     const guardBindings = [this.namespace, input.clientId, current.metadata.revision];
-    const results = await this.db.batch([
-      this.stmt(
-        `DELETE FROM oauth_access_tokens WHERE namespace=? AND ${guard} AND EXISTS(SELECT 1 FROM oauth_grants g WHERE g.namespace=oauth_access_tokens.namespace AND g.user_id=oauth_access_tokens.user_id AND g.grant_id=oauth_access_tokens.grant_id AND g.client_id=?)`,
-        this.namespace,
-        ...guardBindings,
-        input.clientId
-      ),
-      this.stmt(
-        `DELETE FROM oauth_transition_leases WHERE namespace=? AND ${guard} AND EXISTS(SELECT 1 FROM oauth_grants g WHERE g.namespace=oauth_transition_leases.namespace AND g.user_id=oauth_transition_leases.user_id AND g.grant_id=oauth_transition_leases.grant_id AND g.client_id=?)`,
-        this.namespace,
-        ...guardBindings,
-        input.clientId
-      ),
-      this.stmt(
-        `DELETE FROM oauth_grants WHERE namespace=? AND client_id=? AND ${guard}`,
-        this.namespace,
-        input.clientId,
-        ...guardBindings
-      ),
-      this.stmt(
-        `DELETE FROM oauth_clients WHERE namespace=? AND client_id=? AND revision=?`,
-        this.namespace,
-        input.clientId,
-        current.metadata.revision
-      ),
-    ]);
-    if (this.changes(results[3]!) !== 1) {
+    const assertionId = crypto.randomUUID();
+    let results: D1Result[];
+    try {
+      results = await this.db.batch([
+        this.stmt(
+          `INSERT INTO oauth_operation_assertions(id,ok) VALUES(?,CASE WHEN ${guard} THEN 1 ELSE 0 END)`,
+          assertionId,
+          ...guardBindings
+        ),
+        this.stmt(
+          `DELETE FROM oauth_access_tokens WHERE namespace=? AND ${guard} AND EXISTS(SELECT 1 FROM oauth_grants g WHERE g.namespace=oauth_access_tokens.namespace AND g.user_id=oauth_access_tokens.user_id AND g.grant_id=oauth_access_tokens.grant_id AND g.client_id=? AND g.client_kind='registered')`,
+          this.namespace,
+          ...guardBindings,
+          input.clientId
+        ),
+        this.stmt(
+          `DELETE FROM oauth_transition_leases WHERE namespace=? AND ${guard} AND EXISTS(SELECT 1 FROM oauth_grants g WHERE g.namespace=oauth_transition_leases.namespace AND g.user_id=oauth_transition_leases.user_id AND g.grant_id=oauth_transition_leases.grant_id AND g.client_id=? AND g.client_kind='registered')`,
+          this.namespace,
+          ...guardBindings,
+          input.clientId
+        ),
+        this.stmt(
+          `DELETE FROM oauth_grants WHERE namespace=? AND client_id=? AND client_kind='registered' AND ${guard}`,
+          this.namespace,
+          input.clientId,
+          ...guardBindings
+        ),
+        this.stmt(
+          `DELETE FROM oauth_clients WHERE namespace=? AND client_id=? AND revision=?`,
+          this.namespace,
+          input.clientId,
+          current.metadata.revision
+        ),
+        this.stmt(`DELETE FROM oauth_operation_assertions WHERE id=?`, assertionId),
+      ]);
+    } catch (error) {
+      if (!isConstraintError(error)) throw error;
+      return (await this.getClient(input.clientId)) ? { status: 'conflict' } : { status: 'not_found' };
+    }
+    if (this.changes(results[4]!) !== 1) {
       return (await this.getClient(input.clientId)) ? { status: 'conflict' } : { status: 'not_found' };
     }
     return {
       status: 'deleted',
-      deletedGrants: this.changes(results[2]!),
-      deletedAccessTokens: this.changes(results[0]!),
+      deletedGrants: this.changes(results[3]!),
+      deletedAccessTokens: this.changes(results[1]!),
     };
   }
   private listClients(input: PageRequest = {}): Promise<Page<StoredClient>> {
@@ -352,6 +365,14 @@ class D1Connection implements OAuthStorageConnection {
         issueMarker,
         ...this.values(g),
         ...clientBindings
+      ),
+      this.stmt(
+        `INSERT INTO oauth_operation_assertions(id,ok) VALUES(?,CASE WHEN EXISTS(SELECT 1 FROM oauth_grants WHERE namespace=? AND user_id=? AND grant_id=? AND issue_marker=?) THEN 1 ELSE 0 END)`,
+        issueMarker,
+        this.namespace,
+        g.value.userId,
+        g.value.id,
+        issueMarker
       ),
     ];
     if (input.replaceExistingUserClientGrants) {
@@ -418,7 +439,8 @@ class D1Connection implements OAuthStorageConnection {
         g.value.userId,
         g.value.id,
         issueMarker
-      )
+      ),
+      this.stmt(`DELETE FROM oauth_operation_assertions WHERE id=?`, issueMarker)
     );
     let results: D1Result[];
     try {
@@ -428,8 +450,8 @@ class D1Connection implements OAuthStorageConnection {
       results = [];
     }
     if (results.length > 0 && this.changes(results[0]!) === 1) {
-      const tokenResult = input.accessToken ? results[results.length - 2] : undefined;
-      const clearedMarker = results[results.length - 1];
+      const tokenResult = input.accessToken ? results[results.length - 3] : undefined;
+      const clearedMarker = results[results.length - 2];
       if ((!tokenResult || this.changes(tokenResult) === 1) && this.changes(clearedMarker!) === 1) {
         return { status: 'created' };
       }
@@ -455,33 +477,46 @@ class D1Connection implements OAuthStorageConnection {
     if (expected !== undefined && g.metadata.revision !== expected) return { status: 'conflict' };
     const guard = `EXISTS(SELECT 1 FROM oauth_grants g WHERE g.namespace=? AND g.user_id=? AND g.grant_id=? AND g.revision=?)`;
     const guardBindings = [this.namespace, key.userId, key.grantId, g.metadata.revision];
-    const results = await this.db.batch([
-      this.stmt(
-        `DELETE FROM oauth_access_tokens WHERE namespace=? AND user_id=? AND grant_id=? AND ${guard}`,
-        this.namespace,
-        key.userId,
-        key.grantId,
-        ...guardBindings
-      ),
-      this.stmt(
-        `DELETE FROM oauth_transition_leases WHERE namespace=? AND user_id=? AND grant_id=? AND ${guard}`,
-        this.namespace,
-        key.userId,
-        key.grantId,
-        ...guardBindings
-      ),
-      this.stmt(
-        `DELETE FROM oauth_grants WHERE namespace=? AND user_id=? AND grant_id=? AND revision=?`,
-        this.namespace,
-        key.userId,
-        key.grantId,
-        g.metadata.revision
-      ),
-    ]);
-    if (this.changes(results[2]!) !== 1) {
-      return (await this.getGrant(key)) ? { status: 'conflict' } : { status: 'not_found' };
+    const assertionId = crypto.randomUUID();
+    let results: D1Result[];
+    try {
+      results = await this.db.batch([
+        this.stmt(
+          `INSERT INTO oauth_operation_assertions(id,ok) VALUES(?,CASE WHEN ${guard} THEN 1 ELSE 0 END)`,
+          assertionId,
+          ...guardBindings
+        ),
+        this.stmt(
+          `DELETE FROM oauth_access_tokens WHERE namespace=? AND user_id=? AND grant_id=? AND ${guard}`,
+          this.namespace,
+          key.userId,
+          key.grantId,
+          ...guardBindings
+        ),
+        this.stmt(
+          `DELETE FROM oauth_transition_leases WHERE namespace=? AND user_id=? AND grant_id=? AND ${guard}`,
+          this.namespace,
+          key.userId,
+          key.grantId,
+          ...guardBindings
+        ),
+        this.stmt(
+          `DELETE FROM oauth_grants WHERE namespace=? AND user_id=? AND grant_id=? AND revision=?`,
+          this.namespace,
+          key.userId,
+          key.grantId,
+          g.metadata.revision
+        ),
+        this.stmt(`DELETE FROM oauth_operation_assertions WHERE id=?`, assertionId),
+      ]);
+    } catch (error) {
+      if (!isConstraintError(error)) throw error;
+      return (await this.getGrantRaw(key)) ? { status: 'conflict' } : { status: 'not_found' };
     }
-    return { status: 'revoked', deletedAccessTokens: this.changes(results[0]!) };
+    if (this.changes(results[3]!) !== 1) {
+      return (await this.getGrantRaw(key)) ? { status: 'conflict' } : { status: 'not_found' };
+    }
+    return { status: 'revoked', deletedAccessTokens: this.changes(results[1]!) };
   }
 
   private async getToken(key: AccessTokenKey): Promise<StoredAccessToken | null> {
@@ -825,6 +860,7 @@ class D1Connection implements OAuthStorageConnection {
       input.now,
     ];
     const token = input.accessToken;
+    const assertionId = crypto.randomUUID();
     let results: D1Result[];
     try {
       results = await this.db.batch([
@@ -838,12 +874,8 @@ class D1Connection implements OAuthStorageConnection {
           ...guardBindings
         ),
         this.stmt(
-          `INSERT INTO oauth_access_tokens(namespace,user_id,grant_id,token_id,revision,created_at,expires_at,value_json) SELECT ?,?,?,?,?,?,?,? WHERE ${guard} AND EXISTS(SELECT 1 FROM oauth_grants WHERE namespace=? AND user_id=? AND grant_id=? AND revision=?)`,
-          this.namespace,
-          token.value.userId,
-          token.value.grantId,
-          token.value.id,
-          ...this.values(token),
+          `INSERT INTO oauth_operation_assertions(id,ok) VALUES(?,CASE WHEN ${guard} AND EXISTS(SELECT 1 FROM oauth_grants WHERE namespace=? AND user_id=? AND grant_id=? AND revision=?) THEN 1 ELSE 0 END)`,
+          assertionId,
           ...guardBindings,
           this.namespace,
           lease.grant.userId,
@@ -851,22 +883,47 @@ class D1Connection implements OAuthStorageConnection {
           input.grant.metadata.revision
         ),
         this.stmt(
-          `UPDATE oauth_transition_leases SET lease_id='',owner_id='',credential_id='',callback_key='',expected_revision=?,expires_at=0 WHERE namespace=? AND user_id=? AND grant_id=? AND lease_id=? AND owner_id=? AND fence=? AND expected_revision=? AND expires_at>? AND EXISTS(SELECT 1 FROM oauth_grants WHERE namespace=? AND user_id=? AND grant_id=? AND revision=?) AND EXISTS(SELECT 1 FROM oauth_access_tokens WHERE namespace=? AND user_id=? AND grant_id=? AND token_id=?)`,
+          `INSERT INTO oauth_access_tokens(namespace,user_id,grant_id,token_id,revision,created_at,expires_at,value_json) VALUES(?,?,?,?,?,?,?,?)`,
+          this.namespace,
+          token.value.userId,
+          token.value.grantId,
+          token.value.id,
+          ...this.values(token)
+        ),
+        this.stmt(
+          `UPDATE oauth_transition_leases SET lease_id='',owner_id='',credential_id='',callback_key='',expected_revision=?,expires_at=0 WHERE namespace=? AND user_id=? AND grant_id=? AND lease_id=? AND owner_id=? AND fence=? AND expected_revision=? AND expires_at>?`,
           input.grant.metadata.revision,
-          ...guardBindings,
+          ...guardBindings
+        ),
+        this.stmt(
+          `UPDATE oauth_operation_assertions SET ok=CASE WHEN EXISTS(SELECT 1 FROM oauth_transition_leases WHERE namespace=? AND user_id=? AND grant_id=? AND fence=? AND lease_id='' AND expected_revision=? AND expires_at=0) AND EXISTS(SELECT 1 FROM oauth_access_tokens WHERE namespace=? AND user_id=? AND grant_id=? AND token_id=?) THEN 1 ELSE 0 END WHERE id=?`,
           this.namespace,
           lease.grant.userId,
           lease.grant.grantId,
+          lease.fence,
           input.grant.metadata.revision,
           this.namespace,
           token.value.userId,
           token.value.grantId,
-          token.value.id
+          token.value.id,
+          assertionId
         ),
+        this.stmt(`DELETE FROM oauth_operation_assertions WHERE id=?`, assertionId),
       ]);
     } catch (error) {
-      if (isConstraintError(error)) return { status: 'conflict' };
-      throw error;
+      if (!isConstraintError(error)) throw error;
+      const active = await this.db
+        .prepare(
+          `SELECT lease_id,owner_id,fence FROM oauth_transition_leases WHERE namespace=? AND user_id=? AND grant_id=?`
+        )
+        .bind(this.namespace, lease.grant.userId, lease.grant.grantId)
+        .first<{ lease_id: string; owner_id: string; fence: number }>();
+      return !active ||
+        active.lease_id !== lease.id ||
+        active.owner_id !== lease.ownerId ||
+        active.fence !== lease.fence
+        ? { status: 'lease_lost' }
+        : { status: 'conflict' };
     }
     return results.every((result) => this.changes(result) === 1) ? { status: 'committed' } : { status: 'lease_lost' };
   }

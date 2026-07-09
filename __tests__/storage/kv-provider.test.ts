@@ -541,6 +541,16 @@ describe('Workers KV storage provider', () => {
       code: 'internal',
       message: 'OAuth storage operation failed (internal)',
     });
+
+    kv.failNextGet = new Error('KV GET failed: 429');
+    await expect(connection.clients.get('client-1')).rejects.toMatchObject({ code: 'rate_limited' });
+    kv.failNextList = new Error('KV LIST failed: 429');
+    await expect(connection.clients.list()).rejects.toMatchObject({ code: 'rate_limited' });
+    kv.seed(`token:user-1:grant-1:${DIGEST_A}`, storedAccessToken(0, { id: DIGEST_A }).value);
+    kv.failNextDelete = new Error('KV DELETE failed: 429');
+    await expect(
+      connection.accessTokens.delete({ key: { userId: 'user-1', grantId: 'grant-1', tokenId: DIGEST_A } })
+    ).rejects.toMatchObject({ code: 'rate_limited' });
   });
 
   it('rejects operations after close', async () => {
