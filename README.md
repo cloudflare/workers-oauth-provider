@@ -347,6 +347,12 @@ JSON state document behind one hash-tagged key per logical namespace, so every m
 This avoids unsafe multi-key races and works with Redis Cluster, but each namespace is limited by one Redis key's size
 and one-key write throughput. Split large tenants across separate storage namespaces or use PostgreSQL/D1 instead.
 
+External adapters should run the runner-neutral cases exported from
+`@cloudflare/workers-oauth-provider/storage/testing`. The common suite covers lifecycle, namespace isolation, record
+round trips, CAS, logical expiry, grant/token cascades, replay, consent behavior, transition semantics, strong
+contention, and bounded maintenance. Backend-specific suites must additionally exercise real transactions/scripts,
+fault rollback, migrations, and concurrency for every capability they advertise as strong.
+
 The `env.OAUTH_PROVIDER` object available to the fetch handlers provides some methods to query the storage, including:
 
 - Create, list, modify, and delete client_id registrations (in addition to `lookupClient()`, already shown in the example code).

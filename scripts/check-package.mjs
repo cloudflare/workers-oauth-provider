@@ -23,6 +23,7 @@ for (const entry of [
   '../dist/storage/durable-object/index.js',
   '../dist/storage/postgres/index.js',
   '../dist/storage/redis/index.js',
+  '../dist/storage/testing/index.js',
 ]) {
   await import(pathToFileURL(new URL(entry, import.meta.url).pathname).href);
 }
@@ -51,13 +52,14 @@ import { d1Storage } from '@cloudflare/workers-oauth-provider/storage/d1';
 import { durableObjectSqliteStorage, OAuthStorageObject } from '@cloudflare/workers-oauth-provider/storage/durable-object';
 import { postgresStorage } from '@cloudflare/workers-oauth-provider/storage/postgres';
 import { redisStorage } from '@cloudflare/workers-oauth-provider/storage/redis';
+import { createOAuthStorageConformanceCases } from '@cloudflare/workers-oauth-provider/storage/testing';
 interface Env extends Cloudflare.Env { OAUTH_KV: KVNamespace; DB: D1Database; OBJECTS: { getByName(name: string): { execute(command: unknown): Promise<unknown> } } }
 const storage: OAuthStorageProvider<Env> = workersKvStorage<Env>({ binding: env => env.OAUTH_KV });
 const d1: OAuthStorageProvider<Env> = d1Storage<Env>({ binding: env => env.DB });
 const durable: OAuthStorageProvider<Env> = durableObjectSqliteStorage<Env>({ binding: env => env.OBJECTS });
 const postgres = postgresStorage<Env>({ clientFactory: { acquire: async () => ({ query: async () => ({ rows: [], rowCount: 0 }), release() {} }) } });
 const redis = redisStorage<Env>({ client: async () => ({ get: async () => null, eval: async () => 1 }) });
-void [OAuthProvider, NamedProvider, DeepProvider, OAuthStorageObject, storage, d1, durable, postgres, redis];
+void [OAuthProvider, NamedProvider, DeepProvider, OAuthStorageObject, storage, d1, durable, postgres, redis, createOAuthStorageConformanceCases];
 `
   );
   const common = [

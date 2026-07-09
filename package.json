@@ -40,6 +40,11 @@
       "import": "./dist/storage/redis/index.js",
       "default": "./dist/storage/redis/index.js"
     },
+    "./storage/testing": {
+      "types": "./dist/storage/testing/index.d.ts",
+      "import": "./dist/storage/testing/index.js",
+      "default": "./dist/storage/testing/index.js"
+    },
     "./dist/oauth-provider.js": {
       "types": "./dist/oauth-provider.d.ts",
       "import": "./dist/oauth-provider.js",

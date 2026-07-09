@@ -9,6 +9,7 @@ export default defineConfig({
     'storage/durable-object/index': 'src/storage/durable-object/index.ts',
     'storage/postgres/index': 'src/storage/postgres/index.ts',
     'storage/redis/index': 'src/storage/redis/index.ts',
+    'storage/testing/index': 'src/storage/testing/index.ts',
   },
   format: ['esm'],
   dts: true,
