@@ -279,6 +279,7 @@ Built-in adapters currently available:
 | Cloudflare D1         | `.../storage/d1`             | Strong guarded transitions and issuance; session reads |
 | Durable Object SQLite | `.../storage/durable-object` | Strong single-object serialization for one namespace   |
 | PostgreSQL            | `.../storage/postgres`       | Strong transactions through an injected client         |
+| Redis                 | `.../storage/redis`          | Strong single-key Lua CAS per namespace                |
 
 D1 example:
 
@@ -330,6 +331,21 @@ and keep `BEGIN`/`COMMIT`/`ROLLBACK` on that same session. Apply `POSTGRES_STORA
 
 When connecting through Hyperdrive, use a cache-disabled binding for all OAuth storage queries. PlanetScale PostgreSQL
 uses this same PostgreSQL-through-Hyperdrive path; it is not a separate adapter.
+
+Redis also uses a small injected client and requires atomic Lua evaluation:
+
+```ts
+import { redisStorage } from '@cloudflare/workers-oauth-provider/storage/redis';
+
+storage: redisStorage<Env>({
+  client: (env) => wrapRedisClient(env.REDIS),
+});
+```
+
+The injected client must provide authoritative-primary `get()` and `eval()` operations. Version 1 stores one versioned
+JSON state document behind one hash-tagged key per logical namespace, so every mutation composes through one Lua CAS.
+This avoids unsafe multi-key races and works with Redis Cluster, but each namespace is limited by one Redis key's size
+and one-key write throughput. Split large tenants across separate storage namespaces or use PostgreSQL/D1 instead.
 
 The `env.OAUTH_PROVIDER` object available to the fetch handlers provides some methods to query the storage, including:
 

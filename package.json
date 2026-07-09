@@ -35,6 +35,11 @@
       "import": "./dist/storage/postgres/index.js",
       "default": "./dist/storage/postgres/index.js"
     },
+    "./storage/redis": {
+      "types": "./dist/storage/redis/index.d.ts",
+      "import": "./dist/storage/redis/index.js",
+      "default": "./dist/storage/redis/index.js"
+    },
     "./dist/oauth-provider.js": {
       "types": "./dist/oauth-provider.d.ts",
       "import": "./dist/oauth-provider.js",

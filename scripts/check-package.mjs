@@ -16,8 +16,16 @@ for (const entry of Object.values(packageJson.exports)) {
 }
 
 for (const target of targets) await access(new URL(`..${target.slice(1)}`, import.meta.url));
-await import(pathToFileURL(new URL('../dist/storage/index.js', import.meta.url).pathname).href);
-await import(pathToFileURL(new URL('../dist/storage/kv/index.js', import.meta.url).pathname).href);
+for (const entry of [
+  '../dist/storage/index.js',
+  '../dist/storage/kv/index.js',
+  '../dist/storage/d1/index.js',
+  '../dist/storage/durable-object/index.js',
+  '../dist/storage/postgres/index.js',
+  '../dist/storage/redis/index.js',
+]) {
+  await import(pathToFileURL(new URL(entry, import.meta.url).pathname).href);
+}
 
 const dryRun = run('npm', ['pack', '--dry-run', '--json', '--ignore-scripts']);
 const files = new Set(JSON.parse(dryRun)[0].files.map((file) => `./${file.path}`));
@@ -42,12 +50,14 @@ import { workersKvStorage } from '@cloudflare/workers-oauth-provider/storage/kv'
 import { d1Storage } from '@cloudflare/workers-oauth-provider/storage/d1';
 import { durableObjectSqliteStorage, OAuthStorageObject } from '@cloudflare/workers-oauth-provider/storage/durable-object';
 import { postgresStorage } from '@cloudflare/workers-oauth-provider/storage/postgres';
+import { redisStorage } from '@cloudflare/workers-oauth-provider/storage/redis';
 interface Env extends Cloudflare.Env { OAUTH_KV: KVNamespace; DB: D1Database; OBJECTS: { getByName(name: string): { execute(command: unknown): Promise<unknown> } } }
 const storage: OAuthStorageProvider<Env> = workersKvStorage<Env>({ binding: env => env.OAUTH_KV });
 const d1: OAuthStorageProvider<Env> = d1Storage<Env>({ binding: env => env.DB });
 const durable: OAuthStorageProvider<Env> = durableObjectSqliteStorage<Env>({ binding: env => env.OBJECTS });
 const postgres = postgresStorage<Env>({ clientFactory: { acquire: async () => ({ query: async () => ({ rows: [], rowCount: 0 }), release() {} }) } });
-void [OAuthProvider, NamedProvider, DeepProvider, OAuthStorageObject, storage, d1, durable, postgres];
+const redis = redisStorage<Env>({ client: async () => ({ get: async () => null, eval: async () => 1 }) });
+void [OAuthProvider, NamedProvider, DeepProvider, OAuthStorageObject, storage, d1, durable, postgres, redis];
 `
   );
   const common = [
