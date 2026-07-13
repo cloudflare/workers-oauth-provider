@@ -244,6 +244,7 @@ function replayAggregate(reservationNamespace: string, keyHash: string): Durable
 
 class DurableObjectConnection implements OAuthStorageConnection {
   #closed = false;
+  readonly #objectNames = new Map<string, Promise<string>>();
   readonly clients: OAuthClientStore;
   readonly grants: OAuthGrantStore;
   readonly accessTokens: OAuthAccessTokenStore;
@@ -356,6 +357,7 @@ class DurableObjectConnection implements OAuthStorageConnection {
   }
   close(): void {
     this.#closed = true;
+    this.#objectNames.clear();
   }
   private now(): number {
     const value = this.clock();
@@ -374,7 +376,13 @@ class DurableObjectConnection implements OAuthStorageConnection {
     if (this.#closed) throw new OAuthStorageError('unavailable', { operation: operation.operation });
     try {
       const command: DurableObjectStorageCommand = { ...operation, namespace: this.namespace, aggregate };
-      return (await this.binding.getByName(await objectName(this.namespace, aggregate)).execute(command)) as T;
+      const key = `${aggregate.kind}\0${aggregate.key}`;
+      let name = this.#objectNames.get(key);
+      if (name === undefined) {
+        name = objectName(this.namespace, aggregate);
+        this.#objectNames.set(key, name);
+      }
+      return (await this.binding.getByName(await name).execute(command)) as T;
     } catch (error) {
       if (isOAuthStorageError(error)) throw error;
       throw new OAuthStorageError('internal', { cause: error, operation: operation.operation });

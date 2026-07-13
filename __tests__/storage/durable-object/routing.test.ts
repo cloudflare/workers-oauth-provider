@@ -115,6 +115,34 @@ describe('partitioned Durable Object routing', () => {
     }
   });
 
+  it('derives one object name per aggregate within a request-scoped connection', async () => {
+    const digest = vi.spyOn(crypto.subtle, 'digest');
+    const namespace: OAuthStorageObjectNamespace = {
+      getByName() {
+        return { execute: async () => null };
+      },
+    };
+    const provider = durableObjectSqliteStorage({ binding: () => namespace, now: () => 200 });
+    const connection = await provider.open({
+      env: {},
+      namespace: 'default',
+      operationId: 'cache',
+      kind: 'request',
+    });
+
+    await connection.grants.get({ userId: 'user-1', grantId: 'grant-1' });
+    await connection.accessTokens.get({ userId: 'user-1', grantId: 'grant-1', tokenId: DIGEST_A });
+    await connection.consents.get({ userId: 'user-1', clientId: 'client-1' });
+    await connection.grants.listByUser({ userId: 'user-1' });
+    expect(digest).toHaveBeenCalledTimes(1);
+
+    // The same raw key in a different aggregate kind must not alias the user route.
+    await connection.clients.get('user-1');
+    expect(digest).toHaveBeenCalledTimes(2);
+    connection.close();
+    digest.mockRestore();
+  });
+
   it('rejects unsupported and post-close calls before touching the namespace', async () => {
     const getByName = vi.fn();
     const provider = durableObjectSqliteStorage({ binding: () => ({ getByName }), namespace: 'closed' });
