@@ -54,6 +54,15 @@ if (!hasStrictlyPublicFetch) {
 // Types
 
 /**
+ * The environment bindings the provider itself requires. The deployer's full
+ * environment (`Env`) is threaded through alongside this shape so that
+ * handlers and callbacks receive their app-specific bindings untouched.
+ */
+interface ProviderEnv {
+  OAUTH_KV: KVNamespace;
+}
+
+/**
  * Enum representing the type of handler (ExportedHandler or WorkerEntrypoint)
  */
 enum HandlerType {
@@ -256,7 +265,7 @@ export interface ClientRegistrationCallbackResult {
 /**
  * Input parameters for the resolveExternalToken callback function
  */
-export interface ResolveExternalTokenInput {
+export interface ResolveExternalTokenInput<Env = Cloudflare.Env> {
   /**
    * The token string that was provided in the Authorization header
    */
@@ -270,7 +279,7 @@ export interface ResolveExternalTokenInput {
   /**
    * Cloudflare Worker environment variables
    */
-  env: any;
+  env: Env;
 }
 
 /**
@@ -456,7 +465,7 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
    * Throw this package's exported {@link OAuthError} to return a structured OAuth error response.
    * Other thrown errors remain unexpected failures and are re-thrown.
    */
-  resolveExternalToken?: (input: ResolveExternalTokenInput) => Promise<ResolveExternalTokenResult | null>;
+  resolveExternalToken?: (input: ResolveExternalTokenInput<Env>) => Promise<ResolveExternalTokenResult | null>;
 
   /**
    * Optional callback function that is called whenever the OAuthProvider returns an error response.
@@ -1267,7 +1276,7 @@ interface CreateAccessTokenOptions {
   /**
    * Cloudflare Worker environment variables
    */
-  env: any;
+  env: ProviderEnv;
 }
 
 /**
@@ -1295,7 +1304,7 @@ export class OAuthProvider<Env = Cloudflare.Env> {
    * @returns A Promise resolving to an HTTP Response
    */
   fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    return this.#impl.fetch(request, env, ctx);
+    return this.#impl.fetch(request, env as Env & ProviderEnv, ctx);
   }
 
   /**
@@ -1307,7 +1316,7 @@ export class OAuthProvider<Env = Cloudflare.Env> {
    * @returns Statistics about what was checked and purged
    */
   purgeExpiredData(env: Env, options?: PurgeOptions): Promise<PurgeResult> {
-    return this.#impl.createOAuthHelpers(env).purgeExpiredData(options);
+    return this.#impl.createOAuthHelpers(env as Env & ProviderEnv).purgeExpiredData(options);
   }
 }
 
@@ -1319,7 +1328,7 @@ export class OAuthProvider<Env = Cloudflare.Env> {
  */
 export function getOAuthApi<Env = Cloudflare.Env>(options: OAuthProviderOptions<Env>, env: Env): OAuthHelpers {
   const impl = new OAuthProviderImpl<Env>(options);
-  return impl.createOAuthHelpers(env);
+  return impl.createOAuthHelpers(env as Env & ProviderEnv);
 }
 
 /**
@@ -1572,7 +1581,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @param ctx - Cloudflare Worker execution context
    * @returns A Promise resolving to an HTTP Response
    */
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  async fetch(request: Request, env: Env & ProviderEnv, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
     // Special handling for OPTIONS requests (CORS preflight)
@@ -1669,7 +1678,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @param env - Cloudflare Worker environment variables
    * @returns Promise resolving to token data with decrypted props, or null if token is invalid
    */
-  async unwrapToken<T = any>(token: string, env: any): Promise<TokenSummary<T> | null> {
+  async unwrapToken<T = any>(token: string, env: Env & ProviderEnv): Promise<TokenSummary<T> | null> {
     const parts = token.split(':');
     const isPossiblyInternalFormat = parts.length === 3;
 
@@ -1811,7 +1820,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    */
   private async parseTokenEndpointRequest(
     request: Request,
-    env: any
+    env: Env & ProviderEnv
   ): Promise<
     | {
         body: any;
@@ -2216,7 +2225,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   private async handleTokenRequest(
     body: any,
     clientInfo: ClientInfo,
-    env: any,
+    env: Env & ProviderEnv,
     requestUrl: URL,
     request: Request
   ): Promise<Response> {
@@ -2293,7 +2302,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @param env - Cloudflare Worker environment variables
    * @returns Response with token data or error
    */
-  private async handleAuthorizationCodeGrant(body: any, clientInfo: ClientInfo, env: any): Promise<Response> {
+  private async handleAuthorizationCodeGrant(
+    body: any,
+    clientInfo: ClientInfo,
+    env: Env & ProviderEnv
+  ): Promise<Response> {
     const code = body.code;
     const redirectUri = body.redirect_uri;
     const codeVerifier = body.code_verifier;
@@ -2567,7 +2580,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @param env - Cloudflare Worker environment variables
    * @returns Response with token data or error
    */
-  private async handleRefreshTokenGrant(body: any, clientInfo: ClientInfo, env: any): Promise<Response> {
+  private async handleRefreshTokenGrant(body: any, clientInfo: ClientInfo, env: Env & ProviderEnv): Promise<Response> {
     const refreshToken = body.refresh_token;
 
     if (!refreshToken) {
@@ -2869,7 +2882,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     requestedResource: string | string[] | undefined,
     expiresIn: number | undefined,
     clientInfo: ClientInfo,
-    env: any
+    env: Env & ProviderEnv
   ): Promise<TokenResponse & { issued_token_type?: string }> {
     // Unwrap and validate the subject token
     const tokenSummary = await this.unwrapToken(subjectToken, env);
@@ -3036,7 +3049,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @param env - Cloudflare Worker environment variables
    * @returns Response with new token data or error
    */
-  private async handleTokenExchangeGrant(body: any, clientInfo: ClientInfo, env: any): Promise<Response> {
+  private async handleTokenExchangeGrant(body: any, clientInfo: ClientInfo, env: Env & ProviderEnv): Promise<Response> {
     const subjectToken = body.subject_token;
     const subjectTokenType = body.subject_token_type;
     const requestedTokenType = body.requested_token_type || 'urn:ietf:params:oauth:token-type:access_token';
@@ -3125,7 +3138,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   private async handleJwtBearerGrant(
     body: any,
     clientInfo: ClientInfo,
-    env: any,
+    env: Env & ProviderEnv,
     requestUrl: URL,
     request: Request
   ): Promise<Response> {
@@ -3176,7 +3189,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   private async runEmaPipeline(args: {
     body: any;
     clientInfo: ClientInfo;
-    env: any;
+    env: Env & ProviderEnv;
     requestUrl: URL;
     request: Request;
     enterpriseOptions: EmaOptions<Env>;
@@ -3346,7 +3359,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     assertionScopes: string[];
     resource: string;
     accessTokenTTLSeconds: number;
-    env: any;
+    env: Env & ProviderEnv;
     now: number;
   }): Promise<TokenResponse> {
     // Defense-in-depth downscope: the mapper's output is filtered through the
@@ -3401,7 +3414,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @param env - Cloudflare Worker environment variables
    * @returns Response confirming revocation or error
    */
-  private async handleRevocationRequest(body: any, clientInfo: ClientInfo, env: any): Promise<Response> {
+  private async handleRevocationRequest(body: any, clientInfo: ClientInfo, env: Env & ProviderEnv): Promise<Response> {
     // Handle the revocation request with client ownership verification
     return this.revokeToken(body, clientInfo, env);
   }
@@ -3415,7 +3428,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @param env - Cloudflare Worker environment variables
    * @returns Response confirming revocation or error
    */
-  private async revokeToken(body: any, clientInfo: ClientInfo, env: any): Promise<Response> {
+  private async revokeToken(body: any, clientInfo: ClientInfo, env: Env & ProviderEnv): Promise<Response> {
     const token = body.token;
     const tokenTypeHint = body.token_type_hint;
 
@@ -3457,7 +3470,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     userId: string,
     grantId: string,
     clientInfo: ClientInfo,
-    env: any
+    env: Env & ProviderEnv
   ): Promise<boolean> {
     const tokenData: Token | null = await env.OAUTH_KV.get(`token:${userId}:${grantId}:${tokenId}`, { type: 'json' });
     if (!tokenData) return false;
@@ -3482,7 +3495,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     userId: string,
     grantId: string,
     clientInfo: ClientInfo,
-    env: any
+    env: Env & ProviderEnv
   ): Promise<boolean> {
     const grantData: Grant | null = await env.OAUTH_KV.get(`grant:${userId}:${grantId}`, { type: 'json' });
     if (!grantData) return false;
@@ -3500,7 +3513,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @param grantId - The grant ID extracted from the token
    * @param env - Cloudflare Worker environment variables
    */
-  private async revokeSpecificAccessToken(tokenId: string, userId: string, grantId: string, env: any): Promise<void> {
+  private async revokeSpecificAccessToken(
+    tokenId: string,
+    userId: string,
+    grantId: string,
+    env: Env & ProviderEnv
+  ): Promise<void> {
     const tokenKey = `token:${userId}:${grantId}:${tokenId}`;
     await env.OAUTH_KV.delete(tokenKey);
   }
@@ -3511,7 +3529,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @param env - Cloudflare Worker environment variables
    * @returns Response with client registration data or error
    */
-  private async handleClientRegistration(request: Request, env: any): Promise<Response> {
+  private async handleClientRegistration(request: Request, env: Env & ProviderEnv): Promise<Response> {
     if (!this.options.clientRegistrationEndpoint) {
       return this.createErrorResponse('not_implemented', {
         description: 'Client registration is not enabled',
@@ -3709,7 +3727,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @param ctx - Cloudflare Worker execution context
    * @returns Response from the API handler or error
    */
-  private async handleApiRequest(request: Request, env: any, ctx: ExecutionContext): Promise<Response> {
+  private async handleApiRequest(request: Request, env: Env & ProviderEnv, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     // Per RFC 9728 §5.1, include the request path so the resource_metadata URL
     // points to the correct path-suffixed well-known endpoint (RFC 9728 §3.1)
@@ -3909,8 +3927,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @param env - Cloudflare Worker environment variables
    * @returns An instance of OAuthHelpers
    */
-  public createOAuthHelpers(env: any): OAuthHelpers {
-    return new OAuthHelpersImpl(env, this);
+  public createOAuthHelpers(env: Env & ProviderEnv): OAuthHelpers {
+    return new OAuthHelpersImpl<Env>(env, this);
   }
 
   /**
@@ -3920,7 +3938,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @param grantData - The grant data to save
    * @param now - Current timestamp in seconds
    */
-  private async saveGrantWithTTL(env: any, grantKey: string, grantData: Grant, now: number): Promise<void> {
+  private async saveGrantWithTTL(
+    env: Env & ProviderEnv,
+    grantKey: string,
+    grantData: Grant,
+    now: number
+  ): Promise<void> {
     // Use absolute expiration timestamp if grant has an expiration.
     // Cloudflare KV rejects expirations less than 60 seconds in the future, so clamp the
     // absolute expiration to that minimum plus a small margin (KV validates against its own
@@ -3969,7 +3992,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * propagate, and a CIMD metadata fetch failure throws `CimdFetchError`), so an
    * upstream outage is distinguishable from an unregistered client.
    */
-  async getClient(env: any, clientId: string): Promise<ClientInfo | null> {
+  async getClient(env: Env & ProviderEnv, clientId: string): Promise<ClientInfo | null> {
     // Check if this is a CIMD (Client ID Metadata Document) URL
     if (this.isClientMetadataUrl(clientId)) {
       if (!this.options.clientIdMetadataDocumentEnabled) {
@@ -5275,16 +5298,16 @@ async function unwrapKeyWithToken(tokenStr: string, wrappedKeyBase64: string): P
  * Class that implements the OAuth helper methods
  * Provides methods for OAuth operations needed by handlers
  */
-class OAuthHelpersImpl implements OAuthHelpers {
-  private env: any;
-  private provider: OAuthProviderImpl<any>;
+class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
+  private env: Env & ProviderEnv;
+  private provider: OAuthProviderImpl<Env>;
 
   /**
    * Creates a new OAuthHelpers instance
    * @param env - Cloudflare Worker environment variables
    * @param provider - Reference to the parent provider instance
    */
-  constructor(env: any, provider: OAuthProviderImpl<any>) {
+  constructor(env: Env & ProviderEnv, provider: OAuthProviderImpl<Env>) {
     this.env = env;
     this.provider = provider;
   }
