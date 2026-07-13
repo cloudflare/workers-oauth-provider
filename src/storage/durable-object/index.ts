@@ -487,16 +487,10 @@ export class OAuthStorageObject {
         );
         this.sql.exec('CREATE INDEX records_expiry ON records(kind,expires_at)');
         this.sql.exec(
-          `CREATE INDEX grants_user ON records(json_extract(value,'$.value.userId'),key) WHERE kind='grant'`
-        );
-        this.sql.exec(
           `CREATE INDEX grants_client ON records(json_extract(value,'$.value.clientId'),key) WHERE kind='grant'`
         );
         this.sql.exec(
           `CREATE INDEX tokens_grant ON records(json_extract(value,'$.value.userId'),json_extract(value,'$.value.grantId'),key) WHERE kind='token'`
-        );
-        this.sql.exec(
-          `CREATE INDEX consents_user ON records(json_extract(value,'$.value.userId'),key) WHERE kind='consent'`
         );
         this.sql.exec('INSERT INTO schema_migrations(version) VALUES (1)');
       }
@@ -585,9 +579,7 @@ export class OAuthStorageObject {
       case 'grants.issue':
         return this.issue(command.input);
       case 'grants.list-user':
-        return this.listRecords('grant', 'userId', command.userId, command.page, command.now, (row) =>
-          this.decodeGrant(row)
-        );
+        return this.listRecords('grant', command.page, command.now, (row) => this.decodeGrant(row));
       case 'grants.begin':
         return this.begin(command.input);
       case 'grants.commit':
@@ -611,9 +603,7 @@ export class OAuthStorageObject {
       case 'consents.delete':
         return this.deleteConsent(command);
       case 'consents.list':
-        return this.listRecords('consent', 'userId', command.userId, command.page, command.now, (row) =>
-          this.decodeConsent(row)
-        );
+        return this.listRecords('consent', command.page, command.now, (row) => this.decodeConsent(row));
       case 'replay.reserve':
         return this.reserveReplay(command);
     }
@@ -702,8 +692,6 @@ export class OAuthStorageObject {
   }
   private listRecords<T>(
     kind: string,
-    field: string,
-    value: string | undefined,
     page: PageRequest | undefined,
     now: number,
     decode: (row: SqlRow) => T
@@ -711,18 +699,11 @@ export class OAuthStorageObject {
     const request = createPageRequest(page);
     const limit = request.limit ?? 1000;
     const after = request.cursor ?? '';
-    const rows =
-      value === undefined
-        ? this.sql
-            .exec<
-              SqlRow & { key: string }
-            >('SELECT key,value,revision,expires_at FROM records WHERE kind=? AND key>? AND (expires_at IS NULL OR expires_at>?) ORDER BY key LIMIT ?', kind, after, now, limit + 1)
-            .toArray()
-        : this.sql
-            .exec<
-              SqlRow & { key: string }
-            >(`SELECT key,value,revision,expires_at FROM records WHERE kind=? AND key>? AND json_extract(value,'$.value.${field}')=? AND (expires_at IS NULL OR expires_at>?) ORDER BY key LIMIT ?`, kind, after, value, now, limit + 1)
-            .toArray();
+    const rows = this.sql
+      .exec<
+        SqlRow & { key: string }
+      >('SELECT key,value,revision,expires_at FROM records WHERE kind=? AND key>? AND (expires_at IS NULL OR expires_at>?) ORDER BY key LIMIT ?', kind, after, now, limit + 1)
+      .toArray();
     const selected = rows.slice(0, limit);
     return createPage(selected.map(decode), rows.length > limit ? selected[selected.length - 1]?.key : undefined);
   }
@@ -768,7 +749,7 @@ export class OAuthStorageObject {
       const prior = this.sql
         .exec<
           SqlRow & { key: string }
-        >("SELECT key,value,revision,expires_at FROM records WHERE kind='grant' AND json_extract(value,'$.value.userId')=? AND json_extract(value,'$.value.clientId')=?", input.grant.value.userId, input.grant.value.clientId)
+        >("SELECT key,value,revision,expires_at FROM records WHERE kind='grant' AND json_extract(value,'$.value.clientId')=?", input.grant.value.clientId)
         .toArray();
       for (const row of prior) {
         const grant = this.decodeGrant(row);
