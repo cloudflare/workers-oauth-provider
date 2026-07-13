@@ -235,6 +235,54 @@ describe('partitioned Durable Object SQLite adapter against real SQLite statemen
     failedState.close();
   });
 
+  it('creates grant and token indexes only for user aggregates', async () => {
+    await connection.clients.get('client-1');
+    await connection.grants.get({ userId: 'user-1', grantId: 'grant-1' });
+    await connection.replay.reserve({ reservationNamespace: 'ema-jti', keyHash: DIGEST_B, expiresAt: 300 });
+    const indexes = (state: SqliteState) =>
+      state.database
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type='index' AND name IN ('grants_client','tokens_grant') ORDER BY name"
+        )
+        .all();
+    expect(indexes(namespace.state('client', 'client-1'))).toEqual([]);
+    expect(indexes(namespace.state('user', 'user-1'))).toEqual([{ name: 'grants_client' }, { name: 'tokens_grant' }]);
+    expect(indexes(namespace.state('replay', JSON.stringify(['ema-jti', DIGEST_B.slice(0, 2)])))).toEqual([]);
+  });
+
+  it('rolls back first user binding when aggregate-index creation fails', async () => {
+    const state = new SqliteState();
+    const object = new OAuthStorageObject(state);
+    const command: DurableObjectStorageCommand = {
+      namespace: 'default',
+      aggregate: { kind: 'user', key: 'user-1' },
+      operation: 'grants.get',
+      key: { userId: 'user-1', grantId: 'grant-1' },
+      now: 100,
+    };
+    state.failTransactionExecAt = 3;
+    await expect(object.execute(command)).rejects.toThrow(/injected SQLite effect failure/);
+    expect(state.database.prepare('SELECT COUNT(*) AS count FROM aggregate_metadata').get()).toEqual({ count: 0 });
+    expect(
+      state.database
+        .prepare(
+          "SELECT COUNT(*) AS count FROM sqlite_master WHERE type='index' AND name IN ('grants_client','tokens_grant')"
+        )
+        .get()
+    ).toEqual({ count: 0 });
+
+    expect(await object.execute(command)).toBeNull();
+    expect(state.database.prepare('SELECT COUNT(*) AS count FROM aggregate_metadata').get()).toEqual({ count: 1 });
+    expect(
+      state.database
+        .prepare(
+          "SELECT COUNT(*) AS count FROM sqlite_master WHERE type='index' AND name IN ('grants_client','tokens_grant')"
+        )
+        .get()
+    ).toEqual({ count: 2 });
+    state.close();
+  });
+
   it('advertises compatibility issuance and rejects the partitioned adapter in strict mode', () => {
     const storage = durableObjectSqliteStorage<{ OBJECTS: OAuthStorageObjectNamespace }>({
       binding: (env) => env.OBJECTS,

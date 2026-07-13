@@ -486,12 +486,6 @@ export class OAuthStorageObject {
           'CREATE TABLE replay (namespace TEXT NOT NULL, key_hash TEXT NOT NULL, expires_at INTEGER NOT NULL, PRIMARY KEY(namespace,key_hash))'
         );
         this.sql.exec('CREATE INDEX records_expiry ON records(kind,expires_at)');
-        this.sql.exec(
-          `CREATE INDEX grants_client ON records(json_extract(value,'$.value.clientId'),key) WHERE kind='grant'`
-        );
-        this.sql.exec(
-          `CREATE INDEX tokens_grant ON records(json_extract(value,'$.value.grantId'),key) WHERE kind='token'`
-        );
         this.sql.exec('INSERT INTO schema_migrations(version) VALUES (1)');
       }
       this.sql.exec(
@@ -504,12 +498,14 @@ export class OAuthStorageObject {
   private bindAggregate(command: DurableObjectStorageCommand): void {
     this.assertAggregateMatchesOperation(command);
     const aggregate = command.aggregate;
-    this.sql.exec(
-      'INSERT OR IGNORE INTO aggregate_metadata(singleton,namespace,kind,aggregate_key) VALUES(1,?,?,?)',
-      command.namespace,
-      aggregate.kind,
-      aggregate.key
-    );
+    const created = this.sql
+      .exec(
+        'INSERT OR IGNORE INTO aggregate_metadata(singleton,namespace,kind,aggregate_key) VALUES(1,?,?,?) RETURNING singleton',
+        command.namespace,
+        aggregate.kind,
+        aggregate.key
+      )
+      .toArray().length;
     const stored = this.sql
       .exec<{
         namespace: string;
@@ -523,6 +519,14 @@ export class OAuthStorageObject {
       stored.aggregate_key !== aggregate.key
     ) {
       throw new OAuthStorageError('invalid_configuration', { operation: 'storage.route' });
+    }
+    if (created && aggregate.kind === 'user') {
+      this.sql.exec(
+        `CREATE INDEX IF NOT EXISTS grants_client ON records(json_extract(value,'$.value.clientId'),key) WHERE kind='grant'`
+      );
+      this.sql.exec(
+        `CREATE INDEX IF NOT EXISTS tokens_grant ON records(json_extract(value,'$.value.grantId'),key) WHERE kind='token'`
+      );
     }
   }
 
