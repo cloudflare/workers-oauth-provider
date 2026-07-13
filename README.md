@@ -277,7 +277,7 @@ Built-in adapters currently available:
 | --------------------- | ---------------------------- | ------------------------------------------------------ |
 | Workers KV            | `.../storage/kv`             | Legacy-compatible, eventual and best-effort            |
 | Cloudflare D1         | `.../storage/d1`             | Strong guarded transitions and issuance; session reads |
-| Durable Object SQLite | `.../storage/durable-object` | Strong single-object serialization for one namespace   |
+| Durable Object SQLite | `.../storage/durable-object` | Strong per-user aggregates; limited global operations  |
 | PostgreSQL            | `.../storage/postgres`       | Strong transactions through an injected client         |
 | Redis                 | `.../storage/redis`          | Strong single-key Lua CAS per namespace                |
 
@@ -309,9 +309,15 @@ storage: durableObjectSqliteStorage<Env>({
 });
 ```
 
-Configure `OAuthStorageObject` as a `new_sqlite_class` in Wrangler. Version 1 routes one logical namespace through one
-root Durable Object so every advertised operation shares a serialization and SQLite transaction domain. This provides
-strong semantics but limits that namespace to one Durable Object's throughput and 10 GB storage ceiling.
+Configure `OAuthStorageObject` as a `new_sqlite_class` in Wrangler. The adapter hashes the namespace and logical key
+into separate objects: one per user for grants, access tokens, consent, and transitions; one per registered client; and
+one of 256 replay shards per reservation namespace. Same-user issuance, token mutation, grant revocation, consent CAS, and fenced transitions
+share one SQLite transaction domain. Registered-client validation is a best-effort cross-object precondition.
+
+Without an external authoritative index, client listing, grants-by-client, cross-user client cascade, and global purge
+are unsupported and reject before Durable Object I/O. Consequently the partitioned adapter is a compatibility-profile
+backend and does not satisfy `storageGuarantees: "strict"`; use D1, PostgreSQL, or Redis when every enabled flow must have
+a complete strong profile.
 
 PostgreSQL uses a small injected client contract and does not bundle a database driver:
 

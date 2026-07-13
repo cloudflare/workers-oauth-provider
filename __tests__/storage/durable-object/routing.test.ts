@@ -5,44 +5,57 @@ import {
   type DurableObjectStorageCommand,
   type OAuthStorageObjectNamespace,
 } from '../../../src/storage/durable-object';
-import { createClientInput, issueGrantInput } from '../../../src/storage';
-import { storedClient, storedGrant } from '../fixtures';
+import {
+  compareAndSwapConsentInput,
+  createClientInput,
+  createStoredConsent,
+  issueGrantInput,
+} from '../../../src/storage';
+import { DIGEST_A, storedClient, storedGrant } from '../fixtures';
 
-/** Descriptor-to-test map. Every strong capability has an explicit assertion here or an operation test below. */
 const EXPECTED_STRONG = [
   'clients.create',
   'clients.replace',
-  'issuance.grantOnly',
-  'issuance.grantWithAccessToken',
-  'issuance.replaceUserClientGrants',
   'issuance.existingGrantAccessToken',
   'transitions.authorizationCode',
   'transitions.refreshToken',
   'replayReservation',
   'revocation.accessToken',
   'revocation.grantCascade',
-  'revocation.clientCascade',
   'consents.compareAndSwap',
   'consents.delete',
   'consistency.readAfterWrite',
-  'queries.listClients',
   'queries.grantsByUser',
-  'queries.grantsByClient',
   'queries.tokensByGrant',
   'queries.consentsByUser',
+] as const;
+
+const EXPECTED_UNSUPPORTED = [
+  'revocation.clientCascade',
+  'queries.listClients',
+  'queries.grantsByClient',
   'queries.globalMaintenance',
 ] as const;
 
-describe('Durable Object root routing', () => {
-  it('maps every advertised strong descriptor to this suite', () => {
-    const c = DURABLE_OBJECT_SQLITE_STORAGE_CAPABILITIES as unknown as Record<string, unknown>;
-    for (const path of EXPECTED_STRONG) {
-      const value = path.split('.').reduce<unknown>((v, key) => (v as Record<string, unknown>)[key], c);
-      expect(value, path).toBe('strong');
-    }
+function capability(path: string): unknown {
+  return path
+    .split('.')
+    .reduce<unknown>(
+      (value, key) => (value as Readonly<Record<string, unknown>>)[key],
+      DURABLE_OBJECT_SQLITE_STORAGE_CAPABILITIES as unknown as Readonly<Record<string, unknown>>
+    );
+}
+
+describe('partitioned Durable Object routing', () => {
+  it('maps strong and unsupported descriptors to explicit adapter behavior', () => {
+    for (const path of EXPECTED_STRONG) expect(capability(path), path).toBe('strong');
+    for (const path of EXPECTED_UNSUPPORTED) expect(capability(path), path).toBe('unsupported');
+    expect(DURABLE_OBJECT_SQLITE_STORAGE_CAPABILITIES.issuance.grantOnly).toBe('best_effort');
+    expect(DURABLE_OBJECT_SQLITE_STORAGE_CAPABILITIES.issuance.grantWithAccessToken).toBe('best_effort');
+    expect(DURABLE_OBJECT_SQLITE_STORAGE_CAPABILITIES.issuance.replaceUserClientGrants).toBe('best_effort');
   });
 
-  it('routes client, grant, query, consent, replay, and maintenance commands to one deterministic root', async () => {
+  it('routes client, user, and replay commands to deterministic independent objects', async () => {
     const names: string[] = [];
     const commands: DurableObjectStorageCommand[] = [];
     const namespace: OAuthStorageObjectNamespace = {
@@ -52,10 +65,10 @@ describe('Durable Object root routing', () => {
           execute: vi.fn(async (command: DurableObjectStorageCommand) => {
             commands.push(command);
             if (command.operation === 'clients.get') return storedClient();
+            if (command.operation === 'clients.create') return { status: 'created' };
             if (command.operation === 'grants.issue') return { status: 'created' };
-            if (command.operation.endsWith('list')) return { items: [] };
-            if (command.operation === 'maintenance.purge')
-              return { grantsChecked: 0, grantsPurged: 0, tokensChecked: 0, tokensPurged: 0, done: true };
+            if (command.operation === 'consents.cas') return { status: 'created' };
+            if (command.operation === 'replay.reserve') return { status: 'reserved' };
             return null;
           }),
         };
@@ -72,40 +85,47 @@ describe('Durable Object root routing', () => {
       operationId: 'test',
       kind: 'request',
     });
-    await connection.clients.get('client-1');
+    await connection.clients.create(createClientInput(storedClient()));
     await connection.grants.issue(
       issueGrantInput({
         client: { kind: 'registered', clientId: 'client-1', expectedRevision: 0 },
         grant: storedGrant(),
       })
     );
-    await connection.clients.list();
-    await connection.consents.listByUser({ userId: 'user-1' });
-    await connection.maintenance.purge({
-      now: 200,
-      limit: 10,
-      purgeOrphanedGrants: true,
-      purgeExpiredGrants: true,
-      purgeOrphanedTokens: true,
-    });
-    expect(new Set(names)).toEqual(new Set(['oauth-do:v1:tenant%2Fa:root']));
-    expect(commands.map((command) => command.operation)).toEqual([
-      'clients.get',
-      'grants.issue',
-      'clients.list',
-      'consents.list',
-      'maintenance.purge',
-    ]);
+    await connection.consents.compareAndSwap(
+      compareAndSwapConsentInput({
+        consent: createStoredConsent(
+          { userId: 'user-1', clientId: 'client-1', scope: ['read'], updatedAt: 200 },
+          { schemaVersion: 1, revision: 0, createdAt: 100 }
+        ),
+      })
+    );
+    await connection.replay.reserve({ reservationNamespace: 'ema-jti', keyHash: DIGEST_A, expiresAt: 300 });
+
+    expect(commands.map((command) => command.namespace)).toEqual(Array(5).fill('tenant/a'));
+    expect(commands.map((command) => command.aggregate.kind)).toEqual(['client', 'client', 'user', 'user', 'replay']);
+    expect(commands[2]?.aggregate).toEqual({ kind: 'user', key: 'user-1' });
+    expect(commands[3]?.aggregate).toEqual({ kind: 'user', key: 'user-1' });
+    expect(new Set(names).size).toBe(3);
+    for (const name of new Set(names)) {
+      expect(name).toMatch(/^oauth-do:v2:(?:client|user|replay):[0-9a-f]{64}$/);
+      expect(name).not.toContain('tenant');
+      expect(name).not.toContain('user-1');
+      expect(name).not.toContain('client-1');
+    }
   });
 
-  it('rejects calls after close without touching the namespace', async () => {
+  it('rejects unsupported and post-close calls before touching the namespace', async () => {
     const getByName = vi.fn();
     const provider = durableObjectSqliteStorage({ binding: () => ({ getByName }), namespace: 'closed' });
     const connection = await provider.open({ env: {}, namespace: 'closed', operationId: 'test', kind: 'request' });
+    await expect(connection.clients.list()).rejects.toMatchObject({ code: 'unsupported_operation' });
+    expect(getByName).not.toHaveBeenCalled();
     connection.close();
     await expect(connection.clients.create(createClientInput(storedClient()))).rejects.toMatchObject({
       code: 'unavailable',
     });
+    await expect(connection.clients.list()).rejects.toMatchObject({ code: 'unavailable' });
     expect(getByName).not.toHaveBeenCalled();
   });
 });

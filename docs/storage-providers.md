@@ -2,7 +2,7 @@
 
 - **Status:** accepted implementation direction; implementation in progress
 - **Scope:** storage contract, capability negotiation, adapter boundaries, and compatibility policy
-- **Current implementation:** backend-neutral contract, request-scoped provider-core integration, Workers KV, D1, single-root Durable Object SQLite, injected-client PostgreSQL, single-key scripted Redis, and a runner-neutral conformance suite
+- **Current implementation:** backend-neutral contract, request-scoped provider-core integration, Workers KV, D1, per-user Durable Object SQLite, injected-client PostgreSQL, single-key scripted Redis, and a runner-neutral conformance suite
 - **Research baselines:** `workers-oauth-provider@0.8.1` (`f8e3ddd`), `better-auth@1.6.23` plus main (`fd6b8c1`), and `pi-mono` (`9a0a8d7c`)
 
 ## Goal
@@ -239,15 +239,17 @@ new OAuthProvider({
 ### Durable Object SQLite
 
 ```ts
-import { durableObjectStorage, OAuthStorageObject } from '@cloudflare/workers-oauth-provider/storage/durable-object';
+import {
+  durableObjectSqliteStorage,
+  OAuthStorageObject,
+} from '@cloudflare/workers-oauth-provider/storage/durable-object';
 
 export { OAuthStorageObject };
 
 new OAuthProvider({
   // ...
-  storage: durableObjectStorage<Env>({
-    namespace: (env) => env.OAUTH_STORAGE,
-    partition: 'grant',
+  storage: durableObjectSqliteStorage<Env>({
+    binding: (env) => env.OAUTH_STORAGE,
   }),
 });
 ```
@@ -844,42 +846,30 @@ The adapter is zero-migration and remains the default for backward compatibility
 
 Physical model:
 
-- route each client record to `client:{clientId}`;
-- route each grant and its access-token records to `grant:{grantId}` by default;
-- route a user's consent records to `consent:{userId}`;
-- route each replay reservation to a deterministic object derived from its namespace and hash;
-- execute transition methods inside the owning grant object;
-- use SQLite tables rather than emulating KV unless migration compatibility requires a temporary record table;
-- use alarms or logical expiry for cleanup;
+- hash the namespace, aggregate kind, and logical key before deriving a Durable Object name;
+- route each registered client to its own client object;
+- route a user's grants, access tokens, consent records, transition leases, and fences to one user object;
+- route each replay reservation to one of 256 deterministic shards per reservation namespace, selected by the first digest byte;
+- persist aggregate identity in each object's SQLite database and reject commands routed to the wrong object;
+- execute user-local issue, transition, revocation, token, and consent methods inside one SQLite transaction;
+- use alarms plus authoritative logical expiry for local cleanup;
 - never rely on discovering Durable Object IDs.
 
-Grant partition options:
+The user aggregate is intentional. A grant aggregate would reduce contention further, but `listByUser` and replacement of earlier grants for one user/client would then cross objects. User partitioning preserves those operations while ensuring unrelated users do not share one throughput or storage ceiling.
 
-- `grant`: one aggregate per grant, smallest contention domain and natural transition boundary;
-- `user`: one aggregate per user, easier per-user grant listing and revocation but a larger contention domain;
-- custom fixed sharding can be considered later.
+Registered-client validation is a read of the client object followed by the user-object transaction. It is therefore advertised as `best_effort`, not `strong`. Client deletion with a cross-user cascade is unsupported, so it cannot race with grant issuance while claiming a strong cascade.
 
-`grant` should be the default for transition correctness. It co-locates exactly the records needed for code exchange, refresh rotation, token validation, and grant revocation. Other record types use their own deterministic partitions and do not share this option.
+There is no global index in this adapter. Client listing, grants-by-client, cross-user client cascade, and global maintenance reject before Durable Object I/O. Applications that need those operations should use D1, PostgreSQL, Redis, or implement a composite provider with an authoritative index.
 
-Point operations do not require a global index. Global queries need a separate index strategy. Options include:
+Implemented guarantees:
 
-- a D1 index;
-- a sharded catalog Durable Object;
-- a KV best-effort index;
-- no global query support.
-
-The index choice changes query capabilities and must be part of the provider descriptor. A KV index must not upgrade cross-partition operations to `strong`.
-
-Target guarantees:
-
-- strong per-partition read-after-write;
+- strong per-object read-after-write;
 - strong client create and compare-and-swap within one client object;
-- strong grant transitions;
-- strong consent operations and user consent listing;
-- strong replay reservation when routed consistently;
-- strong grant cascade within a partition;
-- query capabilities depend on configured index and grant partition;
-- scheduled cleanup.
+- best-effort initial grant issuance because the registered-client guard crosses objects;
+- strong user-local existing-grant token issuance, code and refresh transitions, grant cascades, consent operations, and per-user queries;
+- strong replay reservation within a deterministic bounded shard;
+- scheduled local cleanup;
+- compatibility profile only: strict mode rejects this adapter for enabled issuance flows.
 
 ### D1 adapter
 
@@ -998,29 +988,29 @@ Without atomic scripts, the adapter advertises compatibility guarantees only.
 
 This table describes the intended profiles. An adapter does not earn a `full` cell until its conformance tests pass.
 
-| Capability or feature           | Workers KV                | DO SQLite, grant partition            | D1                  | PostgreSQL            | Redis with scripts                      |
-| ------------------------------- | ------------------------- | ------------------------------------- | ------------------- | --------------------- | --------------------------------------- |
-| Point reads and writes          | Full, eventual visibility | Full, strong per record partition     | Full                | Full                  | Full                                    |
-| List clients                    | Full, eventual            | Requires global index                 | Full target         | Full target           | Full target with index                  |
-| Strong client create and update | Unavailable               | Full per client                       | Full target         | Full target           | Full target                             |
-| Atomic grant plus initial token | Unavailable               | Full within grant                     | Full target         | Full target           | Full target                             |
-| Guarded token exchange issue    | Unavailable               | Full within grant                     | Full target         | Full target           | Full target                             |
-| Authorization-code flow         | Compatibility             | Full                                  | Full target         | Full target           | Full target                             |
-| Strict single code consumption  | Unavailable               | Full                                  | Full target         | Full target           | Full target                             |
-| Existing refresh grace          | Compatibility             | Full                                  | Full target         | Full target           | Full target                             |
-| Strict refresh rotation         | Unavailable               | Full                                  | Full target         | Full target           | Full target                             |
-| Serialized callback per grant   | Unavailable               | Full                                  | Full target         | Full target           | Full target                             |
-| Atomic EMA replay reservation   | Unavailable               | Full when routed consistently         | Full target         | Full target           | Full target                             |
-| Immediate token revocation      | Compatibility             | Full within grant                     | Full target         | Full target           | Full within grant                       |
-| List grants by user             | Full, eventual            | Requires index or user partition      | Full target         | Full target           | Full target with index                  |
-| List grants by client           | Full, eventual            | Requires global index                 | Full target         | Full target           | Full target with index                  |
-| Delete-client cascade           | Compatibility             | Requires global coordinator and index | Full target         | Full target           | Compatibility or full with index repair |
-| Persistent consent              | Planned compatibility     | Full by user                          | Full target         | Full target           | Full target with index                  |
-| Native physical TTL             | Full, minimum 60 seconds  | Alarm cleanup                         | No, logical cleanup | No, logical cleanup   | Full                                    |
-| Global purge                    | Full scan, eventual       | Requires global index                 | Full target         | Full target           | Indexed cleanup target                  |
-| Runtime dependencies in core    | None                      | None                                  | None                | None, client injected | None, client injected                   |
+| Capability or feature           | Workers KV                | DO SQLite, user partition     | D1                  | PostgreSQL            | Redis with scripts                      |
+| ------------------------------- | ------------------------- | ----------------------------- | ------------------- | --------------------- | --------------------------------------- |
+| Point reads and writes          | Full, eventual visibility | Full, strong per object       | Full                | Full                  | Full                                    |
+| List clients                    | Full, eventual            | Unsupported                   | Full target         | Full target           | Full target with index                  |
+| Strong client create and update | Unavailable               | Full per client               | Full target         | Full target           | Full target                             |
+| Atomic grant plus initial token | Unavailable               | Best-effort client guard      | Full target         | Full target           | Full target                             |
+| Guarded token exchange issue    | Unavailable               | Full within user              | Full target         | Full target           | Full target                             |
+| Authorization-code flow         | Compatibility             | Full within user              | Full target         | Full target           | Full target                             |
+| Strict single code consumption  | Unavailable               | Full                          | Full target         | Full target           | Full target                             |
+| Existing refresh grace          | Compatibility             | Full                          | Full target         | Full target           | Full target                             |
+| Strict refresh rotation         | Unavailable               | Full                          | Full target         | Full target           | Full target                             |
+| Serialized callback per grant   | Unavailable               | Full within user              | Full target         | Full target           | Full target                             |
+| Atomic EMA replay reservation   | Unavailable               | Full when routed consistently | Full target         | Full target           | Full target                             |
+| Immediate token revocation      | Compatibility             | Full within user              | Full target         | Full target           | Full within grant                       |
+| List grants by user             | Full, eventual            | Full                          | Full target         | Full target           | Full target with index                  |
+| List grants by client           | Full, eventual            | Unsupported                   | Full target         | Full target           | Full target with index                  |
+| Delete-client cascade           | Compatibility             | Unsupported                   | Full target         | Full target           | Compatibility or full with index repair |
+| Persistent consent              | Planned compatibility     | Full by user                  | Full target         | Full target           | Full target with index                  |
+| Native physical TTL             | Full, minimum 60 seconds  | Alarm cleanup                 | No, logical cleanup | No, logical cleanup   | Full                                    |
+| Global purge                    | Full scan, eventual       | Unsupported                   | Full target         | Full target           | Indexed cleanup target                  |
+| Runtime dependencies in core    | None                      | None                          | None                | None, client injected | None, client injected                   |
 
-A real Redis service without scripts moves strict transition and reservation cells to `unavailable`. A DO adapter using KV for its global index keeps global query and cascade cells in `compatibility` even though per-grant transitions are strong.
+A real Redis service without scripts moves strict transition and reservation cells to `unavailable`. The built-in DO adapter has no global index: its user-local operations remain strong while global query and cascade cells are unsupported.
 
 ## Schema and migrations
 
@@ -1237,7 +1227,7 @@ This phase proves the seam but does not claim to fix KV races.
 Recommended order:
 
 1. D1 for a complete, dependency-free, globally queryable Cloudflare database adapter.
-2. Durable Object SQLite for serialized per-grant state and a documented global-index choice.
+2. Durable Object SQLite for serialized per-user state with global operations explicitly unsupported.
 
 An alternative is to ship Durable Object SQLite first if the immediate priority is the upstream refresh race rather than broad client and grant administration.
 
@@ -1258,8 +1248,8 @@ An alternative is to ship Durable Object SQLite first if the immediate priority 
 ## Open decisions
 
 1. Should D1 or Durable Object SQLite be the first strong adapter?
-2. Should the Durable Object adapter require D1 for global indexes, offer an optional KV compatibility index, or omit global queries initially?
-3. Should the first Durable Object adapter use one object per client, one object per consent owner, and one object per grant as proposed, or use a smaller fixed shard set to reduce object count?
+2. Should a future composite Durable Object adapter add a D1-backed authoritative global index?
+3. Should a future high-cardinality profile offer one object per grant in exchange for making per-user replacement and listing non-local?
 4. Should the PostgreSQL and Redis implementations ship as package subpaths or separate packages from the start?
 5. Should strict storage guarantees be opt-in during one minor release and become the default in the next major release?
 6. Should the transition lease support renewal in contract version 1, or should callbacks be constrained to a fixed maximum duration first?

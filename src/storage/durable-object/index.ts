@@ -30,7 +30,6 @@ import type {
   ReplaceResult,
   ReplayReservationResult,
   RevokeGrantResult,
-  DeleteClientResult,
   ReplaceConsentResult,
 } from '../results';
 import {
@@ -59,33 +58,40 @@ import {
   type ValidatedCommitGrantTransitionInput,
 } from '../transitions';
 
-/** Guarantees proved by the single-aggregate Durable Object SQLite implementation. */
+/** Guarantees proved by the partitioned Durable Object SQLite implementation. */
 export const DURABLE_OBJECT_SQLITE_STORAGE_CAPABILITIES: OAuthStorageCapabilities = defineOAuthStorageCapabilities({
   consistency: { readAfterWrite: 'strong' },
   clients: { create: 'strong', replace: 'strong' },
   issuance: {
-    grantOnly: 'strong',
-    grantWithAccessToken: 'strong',
-    replaceUserClientGrants: 'strong',
+    // Registered-client validation crosses the client and user objects.
+    grantOnly: 'best_effort',
+    grantWithAccessToken: 'best_effort',
+    replaceUserClientGrants: 'best_effort',
     existingGrantAccessToken: 'strong',
   },
   transitions: { authorizationCode: 'strong', refreshToken: 'strong' },
   replayReservation: 'strong',
-  revocation: { accessToken: 'strong', grantCascade: 'strong', clientCascade: 'strong' },
+  revocation: { accessToken: 'strong', grantCascade: 'strong', clientCascade: 'unsupported' },
   consents: { compareAndSwap: 'strong', delete: 'strong' },
   queries: {
-    listClients: 'strong',
+    listClients: 'unsupported',
     grantsByUser: 'strong',
-    grantsByClient: 'strong',
+    grantsByClient: 'unsupported',
     tokensByGrant: 'strong',
     consentsByUser: 'strong',
-    globalMaintenance: 'strong',
+    globalMaintenance: 'unsupported',
   },
   expiration: { cleanup: 'scheduled', minimumTtlSeconds: 0 },
 });
 
-/** RPC-safe commands accepted by {@link OAuthStorageObject}. */
-export type DurableObjectStorageCommand =
+/** One deterministic Durable Object aggregate. User aggregates own grants, tokens, consent, and transitions. */
+export type DurableObjectStorageAggregate =
+  | { readonly kind: 'user'; readonly key: string }
+  | { readonly kind: 'client'; readonly key: string }
+  | { readonly kind: 'replay'; readonly key: string };
+
+/** RPC-safe operation accepted by {@link OAuthStorageObject}. */
+export type DurableObjectStorageOperation =
   | { readonly operation: 'clients.get'; readonly clientId: string; readonly now: number }
   | { readonly operation: 'clients.create'; readonly client: StoredClient }
   | {
@@ -94,8 +100,6 @@ export type DurableObjectStorageCommand =
       readonly expectedRevision: number;
       readonly client: StoredClient;
     }
-  | { readonly operation: 'clients.delete'; readonly clientId: string; readonly expectedRevision?: number }
-  | { readonly operation: 'clients.list'; readonly page?: PageRequest; readonly now: number }
   | { readonly operation: 'grants.get'; readonly key: GrantKey; readonly now: number }
   | {
       readonly operation: 'grants.issue';
@@ -113,12 +117,6 @@ export type DurableObjectStorageCommand =
   | {
       readonly operation: 'grants.list-user';
       readonly userId: string;
-      readonly page?: PageRequest;
-      readonly now: number;
-    }
-  | {
-      readonly operation: 'grants.list-client';
-      readonly clientId: string;
       readonly page?: PageRequest;
       readonly now: number;
     }
@@ -160,15 +158,13 @@ export type DurableObjectStorageCommand =
       readonly keyHash: string;
       readonly expiresAt: number;
       readonly now: number;
-    }
-  | {
-      readonly operation: 'maintenance.purge';
-      readonly now: number;
-      readonly limit: number;
-      readonly purgeOrphanedGrants: boolean;
-      readonly purgeExpiredGrants: boolean;
-      readonly purgeOrphanedTokens: boolean;
     };
+
+/** Routed command accepted by {@link OAuthStorageObject}. */
+export type DurableObjectStorageCommand = DurableObjectStorageOperation & {
+  readonly namespace: string;
+  readonly aggregate: DurableObjectStorageAggregate;
+};
 
 /** Narrow RPC object boundary. Implementations may be a Durable Object stub or a test factory. */
 export interface OAuthStorageObjectStub {
@@ -189,12 +185,10 @@ export interface DurableObjectSqliteStorageOptions<Env> {
 /**
  * Creates the Durable Object SQLite adapter.
  *
- * Version 1 deliberately routes every operation in a namespace to one root
- * object. This is the only serialization and SQLite transaction domain, so all
- * advertised strong operations compose atomically. The explicit v1 trade-off
- * is that one namespace is limited by a single Durable Object's throughput and
- * storage limits; applications needing horizontal sharding must use a future
- * contract version with correspondingly weaker cross-shard guarantees.
+ * User-owned records route to one object per namespace and user. Client records
+ * and replay reservations use separate deterministic objects or shards. Operations within
+ * one user aggregate are strongly atomic; cross-user queries and client cascades
+ * are deliberately unsupported without an external authoritative index.
  */
 export function durableObjectSqliteStorage<Env>(
   options: DurableObjectSqliteStorageOptions<Env>
@@ -227,8 +221,25 @@ export function durableObjectSqliteStorage<Env>(
   return provider;
 }
 
-function rootName(namespace: string): string {
-  return `oauth-do:v1:${encodeURIComponent(namespace)}:root`;
+async function objectName(namespace: string, aggregate: DurableObjectStorageAggregate): Promise<string> {
+  const bytes = new TextEncoder().encode(JSON.stringify([namespace, aggregate.kind, aggregate.key]));
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  const hash = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+  return `oauth-do:v2:${aggregate.kind}:${hash}`;
+}
+
+function userAggregate(userId: string): DurableObjectStorageAggregate {
+  return { kind: 'user', key: userId };
+}
+
+function clientAggregate(clientId: string): DurableObjectStorageAggregate {
+  return { kind: 'client', key: clientId };
+}
+
+function replayAggregate(reservationNamespace: string, keyHash: string): DurableObjectStorageAggregate {
+  // One shard per first digest byte bounds object count while retaining strong
+  // set-if-absent serialization for each complete replay identifier.
+  return { kind: 'replay', key: JSON.stringify([reservationNamespace, keyHash.slice(0, 2)]) };
 }
 
 class DurableObjectConnection implements OAuthStorageConnection {
@@ -246,66 +257,71 @@ class DurableObjectConnection implements OAuthStorageConnection {
     private readonly clock: () => number
   ) {
     this.clients = Object.freeze<OAuthClientStore>({
-      get: (clientId) => this.call({ operation: 'clients.get', clientId, now: this.now() }),
+      get: (clientId) => this.call(clientAggregate(clientId), { operation: 'clients.get', clientId, now: this.now() }),
       create: async (input) => {
         assertCreateClientInput(input);
-        return this.call({
+        return this.call(clientAggregate(input.client.value.clientId), {
           operation: 'clients.create',
           client: input.client,
         });
       },
       replace: async (input) => {
         assertReplaceClientInput(input);
-        return this.call({
+        return this.call(clientAggregate(input.clientId), {
           operation: 'clients.replace',
           clientId: input.clientId,
           expectedRevision: input.expectedRevision,
           client: input.client,
         });
       },
-      deleteWithGrants: (input) => this.call({ operation: 'clients.delete', ...input }),
-      list: (page) => this.call({ operation: 'clients.list', page, now: this.now() }),
+      deleteWithGrants: () => this.unsupported('clients.deleteWithGrants'),
+      list: () => this.unsupported('clients.list'),
     });
     this.grants = Object.freeze<OAuthGrantStore>({
-      get: (key) => this.call({ operation: 'grants.get', key, now: this.now() }),
+      get: (key) => this.call(userAggregate(key.userId), { operation: 'grants.get', key, now: this.now() }),
       issue: async (input) => {
         assertIssueGrantInput(input);
         assertIssueGrantSupported(DURABLE_OBJECT_SQLITE_STORAGE_CAPABILITIES, input);
-        return this.call({
-          operation: 'grants.issue',
-          input,
-        });
+        if (input.client.kind === 'registered') {
+          const client = await this.call<StoredClient | null>(clientAggregate(input.client.clientId), {
+            operation: 'clients.get',
+            clientId: input.client.clientId,
+            now: this.now(),
+          });
+          if (!client) return { status: 'client_not_found' };
+          if (client.metadata.revision !== input.client.expectedRevision) return { status: 'client_conflict' };
+        }
+        return this.call(userAggregate(input.grant.value.userId), { operation: 'grants.issue', input });
       },
-      listByUser: (input) => this.call({ operation: 'grants.list-user', ...input, now: this.now() }),
-      listByClient: (input) => this.call({ operation: 'grants.list-client', ...input, now: this.now() }),
+      listByUser: (input) =>
+        this.call(userAggregate(input.userId), { operation: 'grants.list-user', ...input, now: this.now() }),
+      listByClient: () => this.unsupported('grants.listByClient'),
       beginTransition: async (input) => {
         assertBeginGrantTransitionInput(input);
-        return this.call({ operation: 'grants.begin', input });
+        return this.call(userAggregate(input.grant.userId), { operation: 'grants.begin', input });
       },
       commitTransition: async (input) => {
         assertCommitGrantTransitionInput(input);
-        return this.call({
-          operation: 'grants.commit',
-          input,
-        });
+        return this.call(userAggregate(input.lease.grant.userId), { operation: 'grants.commit', input });
       },
-      abortTransition: (input) => this.call({ operation: 'grants.abort', input }),
+      abortTransition: (input) =>
+        this.call(userAggregate(input.lease.grant.userId), { operation: 'grants.abort', input }),
       revoke: (input) =>
-        this.call({
+        this.call(userAggregate(input.grant.userId), {
           operation: 'grants.revoke',
           key: input.grant,
           expectedRevision: input.expectedRevision,
         }),
     });
     this.accessTokens = Object.freeze<OAuthAccessTokenStore>({
-      get: (key) => this.call({ operation: 'tokens.get', key, now: this.now() }),
+      get: (key) => this.call(userAggregate(key.userId), { operation: 'tokens.get', key, now: this.now() }),
       createForGrant: async (input) => {
         assertIssueAccessTokenInput(input);
-        return this.call({ operation: 'tokens.create', input, now: this.now() });
+        return this.call(userAggregate(input.grant.userId), { operation: 'tokens.create', input, now: this.now() });
       },
-      delete: (input) => this.call({ operation: 'tokens.delete', key: input.key }),
+      delete: (input) => this.call(userAggregate(input.key.userId), { operation: 'tokens.delete', key: input.key }),
       listByGrant: (input) =>
-        this.call({
+        this.call(userAggregate(input.grant.userId), {
           operation: 'tokens.list',
           grant: input.grant,
           page: input.page,
@@ -313,28 +329,29 @@ class DurableObjectConnection implements OAuthStorageConnection {
         }),
     });
     this.consents = Object.freeze<OAuthConsentStore>({
-      get: (input) => this.call({ operation: 'consents.get', ...input, now: this.now() }),
+      get: (input) => this.call(userAggregate(input.userId), { operation: 'consents.get', ...input, now: this.now() }),
       compareAndSwap: async (input) => {
         assertCompareAndSwapConsentInput(input);
-        return this.call({
+        return this.call(userAggregate(input.consent.value.userId), {
           operation: 'consents.cas',
           consent: input.consent,
           expectedRevision: input.expectedRevision,
         });
       },
-      delete: (input) => this.call({ operation: 'consents.delete', ...input }),
-      listByUser: (input) => this.call({ operation: 'consents.list', ...input, now: this.now() }),
+      delete: (input) => this.call(userAggregate(input.userId), { operation: 'consents.delete', ...input }),
+      listByUser: (input) =>
+        this.call(userAggregate(input.userId), { operation: 'consents.list', ...input, now: this.now() }),
     });
     this.replay = Object.freeze<OAuthReplayStore>({
       reserve: (input) =>
-        this.call({
+        this.call(replayAggregate(input.reservationNamespace, input.keyHash), {
           operation: 'replay.reserve',
           ...input,
           now: this.now(),
         }),
     });
     this.maintenance = Object.freeze<OAuthMaintenanceStore>({
-      purge: (input) => this.call({ operation: 'maintenance.purge', ...input }),
+      purge: () => this.unsupported('maintenance.purge'),
     });
   }
   close(): void {
@@ -346,13 +363,21 @@ class DurableObjectConnection implements OAuthStorageConnection {
       throw new OAuthStorageError('invalid_configuration', { operation: 'storage.clock' });
     return value;
   }
-  private async call<T>(command: DurableObjectStorageCommand): Promise<T> {
-    if (this.#closed) throw new OAuthStorageError('unavailable', { operation: command.operation });
+  private async unsupported(operation: string): Promise<never> {
+    if (this.#closed) throw new OAuthStorageError('unavailable', { operation });
+    throw unsupportedStorageOperation(operation);
+  }
+  private async call<T>(
+    aggregate: DurableObjectStorageAggregate,
+    operation: DurableObjectStorageOperation
+  ): Promise<T> {
+    if (this.#closed) throw new OAuthStorageError('unavailable', { operation: operation.operation });
     try {
-      return (await this.binding.getByName(rootName(this.namespace)).execute(command)) as T;
+      const command: DurableObjectStorageCommand = { ...operation, namespace: this.namespace, aggregate };
+      return (await this.binding.getByName(await objectName(this.namespace, aggregate)).execute(command)) as T;
     } catch (error) {
       if (isOAuthStorageError(error)) throw error;
-      throw new OAuthStorageError('internal', { cause: error, operation: command.operation });
+      throw new OAuthStorageError('internal', { cause: error, operation: operation.operation });
     }
   }
 }
@@ -381,7 +406,7 @@ interface ObjectState {
   blockConcurrencyWhile<T>(callback: () => Promise<T>): Promise<T>;
 }
 
-/** Durable Object implementation owning one v1 aggregate and its local SQLite database. */
+/** Durable Object implementation owning one keyed aggregate and its local SQLite database. */
 export class OAuthStorageObject {
   private readonly sql: SqlStorage;
   private ready: Promise<void>;
@@ -392,7 +417,10 @@ export class OAuthStorageObject {
 
   async execute(command: DurableObjectStorageCommand): Promise<unknown> {
     await this.ready;
-    const result = this.state.storage.transactionSync(() => this.executeTransaction(command));
+    const result = this.state.storage.transactionSync(() => {
+      this.bindAggregate(command);
+      return this.executeTransaction(command);
+    });
     await this.syncAlarm();
     return result;
   }
@@ -406,7 +434,9 @@ export class OAuthStorageObject {
           SqlRow & { key: string }
         >("SELECT key,value,revision,expires_at FROM records WHERE kind='client' AND expires_at IS NOT NULL AND expires_at<=?", now)
         .toArray();
-      for (const client of expiredClients) this.deleteClient(client.key, client.revision);
+      for (const client of expiredClients) {
+        this.sql.exec("DELETE FROM records WHERE kind='client' AND key=? AND revision=?", client.key, client.revision);
+      }
       const expiredGrants = this.sql
         .exec<
           SqlRow & { key: string }
@@ -432,33 +462,106 @@ export class OAuthStorageObject {
       const current =
         this.sql.exec<{ version: number }>('SELECT MAX(version) AS version FROM schema_migrations').toArray()[0]
           ?.version ?? 0;
-      if (current > 1) {
+      if (current > 2) {
         throw new OAuthStorageError('schema_mismatch', { operation: 'storage.migrate' });
       }
-      if (current === 1) return;
+      if (current === 2) return;
+      if (current === 0) {
+        this.sql.exec(
+          'CREATE TABLE records (kind TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, revision INTEGER NOT NULL, expires_at INTEGER, PRIMARY KEY(kind,key))'
+        );
+        this.sql.exec(
+          'CREATE TABLE leases (grant_key TEXT PRIMARY KEY, value TEXT NOT NULL, fence INTEGER NOT NULL, expires_at INTEGER NOT NULL)'
+        );
+        this.sql.exec('CREATE TABLE fences (grant_key TEXT PRIMARY KEY, value INTEGER NOT NULL)');
+        this.sql.exec(
+          'CREATE TABLE replay (namespace TEXT NOT NULL, key_hash TEXT NOT NULL, expires_at INTEGER NOT NULL, PRIMARY KEY(namespace,key_hash))'
+        );
+        this.sql.exec('CREATE INDEX records_expiry ON records(kind,expires_at)');
+        this.sql.exec(
+          `CREATE INDEX grants_user ON records(json_extract(value,'$.value.userId'),key) WHERE kind='grant'`
+        );
+        this.sql.exec(
+          `CREATE INDEX grants_client ON records(json_extract(value,'$.value.clientId'),key) WHERE kind='grant'`
+        );
+        this.sql.exec(
+          `CREATE INDEX tokens_grant ON records(json_extract(value,'$.value.userId'),json_extract(value,'$.value.grantId'),key) WHERE kind='token'`
+        );
+        this.sql.exec(
+          `CREATE INDEX consents_user ON records(json_extract(value,'$.value.userId'),key) WHERE kind='consent'`
+        );
+        this.sql.exec('INSERT INTO schema_migrations(version) VALUES (1)');
+      }
       this.sql.exec(
-        'CREATE TABLE records (kind TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, revision INTEGER NOT NULL, expires_at INTEGER, PRIMARY KEY(kind,key))'
+        'CREATE TABLE aggregate_metadata (singleton INTEGER PRIMARY KEY CHECK(singleton=1), namespace TEXT NOT NULL, kind TEXT NOT NULL, aggregate_key TEXT NOT NULL)'
       );
-      this.sql.exec(
-        'CREATE TABLE leases (grant_key TEXT PRIMARY KEY, value TEXT NOT NULL, fence INTEGER NOT NULL, expires_at INTEGER NOT NULL)'
-      );
-      this.sql.exec('CREATE TABLE fences (grant_key TEXT PRIMARY KEY, value INTEGER NOT NULL)');
-      this.sql.exec(
-        'CREATE TABLE replay (namespace TEXT NOT NULL, key_hash TEXT NOT NULL, expires_at INTEGER NOT NULL, PRIMARY KEY(namespace,key_hash))'
-      );
-      this.sql.exec('CREATE INDEX records_expiry ON records(kind,expires_at)');
-      this.sql.exec(`CREATE INDEX grants_user ON records(json_extract(value,'$.value.userId'),key) WHERE kind='grant'`);
-      this.sql.exec(
-        `CREATE INDEX grants_client ON records(json_extract(value,'$.value.clientId'),key) WHERE kind='grant'`
-      );
-      this.sql.exec(
-        `CREATE INDEX tokens_grant ON records(json_extract(value,'$.value.userId'),json_extract(value,'$.value.grantId'),key) WHERE kind='token'`
-      );
-      this.sql.exec(
-        `CREATE INDEX consents_user ON records(json_extract(value,'$.value.userId'),key) WHERE kind='consent'`
-      );
-      this.sql.exec('INSERT INTO schema_migrations(version) VALUES (1)');
+      this.sql.exec('INSERT INTO schema_migrations(version) VALUES (2)');
     });
+  }
+
+  private bindAggregate(command: DurableObjectStorageCommand): void {
+    this.assertAggregateMatchesOperation(command);
+    const aggregate = command.aggregate;
+    this.sql.exec(
+      'INSERT OR IGNORE INTO aggregate_metadata(singleton,namespace,kind,aggregate_key) VALUES(1,?,?,?)',
+      command.namespace,
+      aggregate.kind,
+      aggregate.key
+    );
+    const stored = this.sql
+      .exec<{
+        namespace: string;
+        kind: string;
+        aggregate_key: string;
+      }>('SELECT namespace,kind,aggregate_key FROM aggregate_metadata WHERE singleton=1')
+      .one();
+    if (
+      stored.namespace !== command.namespace ||
+      stored.kind !== aggregate.kind ||
+      stored.aggregate_key !== aggregate.key
+    ) {
+      throw new OAuthStorageError('invalid_configuration', { operation: 'storage.route' });
+    }
+  }
+
+  private assertAggregateMatchesOperation(command: DurableObjectStorageCommand): void {
+    const expected: DurableObjectStorageAggregate | undefined = (() => {
+      switch (command.operation) {
+        case 'clients.get':
+        case 'clients.replace':
+          return clientAggregate(command.clientId);
+        case 'clients.create':
+          return clientAggregate(command.client.value.clientId);
+        case 'grants.get':
+        case 'grants.revoke':
+        case 'tokens.get':
+        case 'tokens.delete':
+          return userAggregate(command.key.userId);
+        case 'grants.issue':
+          return userAggregate(command.input.grant.value.userId);
+        case 'grants.list-user':
+        case 'consents.get':
+        case 'consents.delete':
+        case 'consents.list':
+          return userAggregate(command.userId);
+        case 'grants.begin':
+          return userAggregate(command.input.grant.userId);
+        case 'grants.commit':
+        case 'grants.abort':
+          return userAggregate(command.input.lease.grant.userId);
+        case 'tokens.create':
+          return userAggregate(command.input.grant.userId);
+        case 'tokens.list':
+          return userAggregate(command.grant.userId);
+        case 'consents.cas':
+          return userAggregate(command.consent.value.userId);
+        case 'replay.reserve':
+          return replayAggregate(command.reservationNamespace, command.keyHash);
+      }
+    })();
+    if (!expected || expected.kind !== command.aggregate.kind || expected.key !== command.aggregate.key) {
+      throw unsupportedStorageOperation(command.operation);
+    }
   }
 
   private executeTransaction(command: DurableObjectStorageCommand): unknown {
@@ -469,22 +572,12 @@ export class OAuthStorageObject {
         return this.insert('client', command.client.value.clientId, command.client);
       case 'clients.replace':
         return this.replaceClient(command);
-      case 'clients.delete':
-        return this.deleteClient(command.clientId, command.expectedRevision);
-      case 'clients.list':
-        return this.listRecords('client', 'clientId', undefined, command.page, command.now, (row) =>
-          this.decodeClient(row)
-        );
       case 'grants.get':
         return this.readGrant(command.key, command.now);
       case 'grants.issue':
         return this.issue(command.input);
       case 'grants.list-user':
         return this.listRecords('grant', 'userId', command.userId, command.page, command.now, (row) =>
-          this.decodeGrant(row)
-        );
-      case 'grants.list-client':
-        return this.listRecords('grant', 'clientId', command.clientId, command.page, command.now, (row) =>
           this.decodeGrant(row)
         );
       case 'grants.begin':
@@ -515,8 +608,6 @@ export class OAuthStorageObject {
         );
       case 'replay.reserve':
         return this.reserveReplay(command);
-      case 'maintenance.purge':
-        return this.purge(command);
     }
   }
 
@@ -549,12 +640,6 @@ export class OAuthStorageObject {
   private grantKey(key: GrantKey): string {
     return JSON.stringify([key.userId, key.grantId]);
   }
-  private grantProvenance(key: string): 'registered' | 'external' | undefined {
-    const row = this.row('grant-provenance', key);
-    if (!row) return undefined;
-    const parsed = JSON.parse(row.value) as { clientKind?: unknown };
-    return parsed.clientKind === 'registered' || parsed.clientKind === 'external' ? parsed.clientKind : undefined;
-  }
   private tokenKey(key: AccessTokenKey): string {
     return key.tokenId;
   }
@@ -585,7 +670,10 @@ export class OAuthStorageObject {
   }
   private readToken(key: AccessTokenKey, now: number): StoredAccessToken | null {
     const row = this.row('token', this.tokenKey(key));
-    return row ? hideLogicallyExpired(this.decodeToken(row), now) : null;
+    if (!row) return null;
+    const token = this.decodeToken(row);
+    if (token.value.userId !== key.userId || token.value.grantId !== key.grantId) return null;
+    return hideLogicallyExpired(token, now);
   }
   private replaceClient(
     command: Extract<DurableObjectStorageCommand, { operation: 'clients.replace' }>
@@ -603,42 +691,6 @@ export class OAuthStorageObject {
       command.expectedRevision
     );
     return { status: 'updated' };
-  }
-  private deleteClient(clientId: string, expectedRevision?: number): DeleteClientResult {
-    const client = this.row('client', clientId);
-    if (!client) return { status: 'not_found' };
-    if (expectedRevision !== undefined && client.revision !== expectedRevision) return { status: 'conflict' };
-    const grants = this.sql
-      .exec<
-        SqlRow & { key: string }
-      >("SELECT key,value,revision,expires_at FROM records WHERE kind='grant' AND json_extract(value,'$.value.clientId')=?", clientId)
-      .toArray();
-    let tokens = 0;
-    let deletedGrants = 0;
-    for (const grant of grants) {
-      if (this.grantProvenance(grant.key) !== 'registered') continue;
-      deletedGrants++;
-      const value = this.decodeGrant(grant).value;
-      tokens += this.sql
-        .exec(
-          "DELETE FROM records WHERE kind='token' AND json_extract(value,'$.value.userId')=? AND json_extract(value,'$.value.grantId')=? RETURNING key",
-          value.userId,
-          value.id
-        )
-        .toArray().length;
-      this.sql.exec('DELETE FROM leases WHERE grant_key=?', grant.key);
-    }
-    this.sql.exec(
-      `DELETE FROM records WHERE kind='grant' AND key IN (SELECT key FROM records WHERE kind='grant-provenance' AND json_extract(value,'$.clientKind')='registered' AND json_extract(value,'$.clientId')=?)`,
-      clientId
-    );
-    this.sql.exec(
-      `DELETE FROM records WHERE kind='grant-provenance' AND json_extract(value,'$.clientKind')='registered' AND json_extract(value,'$.clientId')=?`,
-      clientId
-    );
-    this.sql.exec("DELETE FROM records WHERE kind='consent' AND json_extract(value,'$.value.clientId')=?", clientId);
-    this.sql.exec("DELETE FROM records WHERE kind='client' AND key=?", clientId);
-    return { status: 'deleted', deletedGrants, deletedAccessTokens: tokens };
   }
   private listRecords<T>(
     kind: string,
@@ -704,11 +756,6 @@ export class OAuthStorageObject {
   private issue(input: Extract<DurableObjectStorageCommand, { operation: 'grants.issue' }>['input']): IssueGrantResult {
     const key = this.grantKey({ userId: input.grant.value.userId, grantId: input.grant.value.id });
     if (this.row('grant', key)) return { status: 'conflict' };
-    if (input.client.kind === 'registered') {
-      const client = this.row('client', input.client.clientId);
-      if (!client) return { status: 'client_not_found' };
-      if (client.revision !== input.client.expectedRevision) return { status: 'client_conflict' };
-    }
     if (input.replaceExistingUserClientGrants) {
       const prior = this.sql
         .exec<
@@ -721,11 +768,6 @@ export class OAuthStorageObject {
       }
     }
     this.insert('grant', key, input.grant);
-    this.sql.exec(
-      `INSERT INTO records(kind,key,value,revision,expires_at) VALUES('grant-provenance',?,?,0,NULL)`,
-      key,
-      JSON.stringify({ clientKind: input.client.kind, clientId: input.client.clientId })
-    );
     if (input.accessToken && this.insert('token', input.accessToken.value.id, input.accessToken).status !== 'created')
       throw new OAuthStorageError('conflict', { operation: 'grants.issue' });
     return { status: 'created' };
@@ -839,7 +881,6 @@ export class OAuthStorageObject {
       )
       .toArray().length;
     this.sql.exec('DELETE FROM records WHERE kind=? AND key=?', 'grant', physical);
-    this.sql.exec('DELETE FROM records WHERE kind=? AND key=?', 'grant-provenance', physical);
     this.sql.exec('DELETE FROM leases WHERE grant_key=?', physical);
     return { status: 'revoked', deletedAccessTokens: count };
   }
@@ -855,11 +896,12 @@ export class OAuthStorageObject {
       : { status: 'conflict' };
   }
   private deleteToken(key: AccessTokenKey): DeleteResult {
-    return this.sql
-      .exec('DELETE FROM records WHERE kind=? AND key=? RETURNING key', 'token', this.tokenKey(key))
-      .toArray().length
-      ? { status: 'deleted' }
-      : { status: 'not_found' };
+    const row = this.row('token', this.tokenKey(key));
+    if (!row) return { status: 'not_found' };
+    const token = this.decodeToken(row);
+    if (token.value.userId !== key.userId || token.value.grantId !== key.grantId) return { status: 'not_found' };
+    this.sql.exec("DELETE FROM records WHERE kind='token' AND key=?", this.tokenKey(key));
+    return { status: 'deleted' };
   }
   private listTokens(grant: GrantKey, page: PageRequest | undefined, now: number): Page<StoredAccessToken> {
     const request = createPageRequest(page);
@@ -876,68 +918,6 @@ export class OAuthStorageObject {
       selected.map((row) => this.decodeToken(row)),
       more ? selected[selected.length - 1]?.key : undefined
     );
-  }
-  private purge(command: Extract<DurableObjectStorageCommand, { operation: 'maintenance.purge' }>) {
-    let remaining = command.limit;
-    let grantsChecked = 0;
-    let grantsPurged = 0;
-    let tokensChecked = 0;
-    let tokensPurged = 0;
-    const grantPredicate = [
-      ...(command.purgeExpiredGrants ? ['g.expires_at IS NOT NULL AND g.expires_at<=?'] : []),
-      ...(command.purgeOrphanedGrants ? ["json_extract(p.value,'$.clientKind')='registered' AND c.key IS NULL"] : []),
-    ].join(' OR ');
-    if (grantPredicate && remaining > 0) {
-      const grants = this.sql
-        .exec<
-          SqlRow & { key: string }
-        >(`SELECT g.key,g.value,g.revision,g.expires_at FROM records g LEFT JOIN records p ON p.kind='grant-provenance' AND p.key=g.key LEFT JOIN records c ON c.kind='client' AND c.key=json_extract(g.value,'$.value.clientId') WHERE g.kind='grant' AND (${grantPredicate}) ORDER BY g.key LIMIT ?`, ...(command.purgeExpiredGrants ? [command.now] : []), remaining)
-        .toArray();
-      grantsChecked = grants.length;
-      remaining -= grantsChecked;
-      for (const row of grants) {
-        const grant = this.decodeGrant(row);
-        if (this.revoke({ userId: grant.value.userId, grantId: grant.value.id }).status === 'revoked') {
-          grantsPurged++;
-        }
-      }
-    }
-    const tokenPredicate = [
-      't.expires_at IS NOT NULL AND t.expires_at<=?',
-      ...(command.purgeOrphanedTokens ? ['g.key IS NULL'] : []),
-    ].join(' OR ');
-    if (remaining > 0) {
-      const tokens = this.sql
-        .exec<
-          SqlRow & { key: string }
-        >(`SELECT t.key,t.value,t.revision,t.expires_at FROM records t LEFT JOIN records g ON g.kind='grant' AND g.key=json_array(json_extract(t.value,'$.value.userId'),json_extract(t.value,'$.value.grantId')) WHERE t.kind='token' AND (${tokenPredicate}) ORDER BY t.key LIMIT ?`, command.now, remaining)
-        .toArray();
-      tokensChecked = tokens.length;
-      for (const row of tokens) {
-        this.sql.exec("DELETE FROM records WHERE kind='token' AND key=?", row.key);
-        tokensPurged++;
-      }
-    }
-    const moreGrants =
-      grantPredicate !== '' &&
-      this.sql
-        .exec<{
-          present: number;
-        }>(
-          `SELECT 1 AS present FROM records g LEFT JOIN records p ON p.kind='grant-provenance' AND p.key=g.key LEFT JOIN records c ON c.kind='client' AND c.key=json_extract(g.value,'$.value.clientId') WHERE g.kind='grant' AND (${grantPredicate}) LIMIT 1`,
-          ...(command.purgeExpiredGrants ? [command.now] : [])
-        )
-        .toArray().length > 0;
-    const moreTokens =
-      this.sql
-        .exec<{
-          present: number;
-        }>(
-          `SELECT 1 AS present FROM records t LEFT JOIN records g ON g.kind='grant' AND g.key=json_array(json_extract(t.value,'$.value.userId'),json_extract(t.value,'$.value.grantId')) WHERE t.kind='token' AND (${tokenPredicate}) LIMIT 1`,
-          command.now
-        )
-        .toArray().length > 0;
-    return { grantsChecked, grantsPurged, tokensChecked, tokensPurged, done: !moreGrants && !moreTokens };
   }
   private reserveReplay(
     command: Extract<DurableObjectStorageCommand, { operation: 'replay.reserve' }>
@@ -963,17 +943,17 @@ export class OAuthStorageObject {
   }
   private async syncAlarm(): Promise<void> {
     if (!this.state.storage.setAlarm) return;
-    const row = this.sql
-      .exec<{ expires_at: number | null }>(
-        `SELECT MIN(expires_at) AS expires_at FROM (
-          SELECT expires_at FROM records WHERE expires_at IS NOT NULL
-          UNION ALL SELECT expires_at FROM leases
-          UNION ALL SELECT expires_at FROM replay
-        )`
-      )
-      .toArray()[0];
-    const desired = row?.expires_at === null || row?.expires_at === undefined ? null : row.expires_at * 1000;
     try {
+      const row = this.sql
+        .exec<{ expires_at: number | null }>(
+          `SELECT MIN(expires_at) AS expires_at FROM (
+            SELECT expires_at FROM records WHERE expires_at IS NOT NULL
+            UNION ALL SELECT expires_at FROM leases
+            UNION ALL SELECT expires_at FROM replay
+          )`
+        )
+        .toArray()[0];
+      const desired = row?.expires_at === null || row?.expires_at === undefined ? null : row.expires_at * 1000;
       const current = this.state.storage.getAlarm ? await this.state.storage.getAlarm() : null;
       if (desired === null) {
         if (current !== null && this.state.storage.deleteAlarm) await this.state.storage.deleteAlarm();

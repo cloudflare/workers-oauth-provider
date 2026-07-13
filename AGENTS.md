@@ -111,6 +111,7 @@ export class OAuthProvider {
 - Raw authorization codes, tokens, refresh tokens, client secrets, and replay identifiers never cross the storage boundary; only SHA-256 identifiers do.
 - PostgreSQL and Redis adapters use injected client contracts and add no runtime dependencies.
 - D1 and Durable Object SQLite remain distinct adapters.
+- Durable Object SQLite partitions by user for grants, tokens, consent, and transitions; global cross-user operations stay unsupported without an authoritative index.
 - PlanetScale uses the PostgreSQL adapter through a cache-disabled Hyperdrive binding; it is not a separate adapter.
 - Every advertised guarantee requires conformance and concurrency tests.
 
