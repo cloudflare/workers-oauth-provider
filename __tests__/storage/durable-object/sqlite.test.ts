@@ -511,6 +511,29 @@ describe('partitioned Durable Object SQLite adapter against real SQLite statemen
     expect((await connection.consents.listByUser({ userId: 'user-1' })).items).toHaveLength(1);
   });
 
+  it('rejects a different-user cascade command before local effects', async () => {
+    await connection.grants.issue(
+      issueGrantInput({
+        client: { kind: 'external', clientId: 'client-1' },
+        grant: storedGrant(),
+        accessToken: storedAccessToken(),
+      })
+    );
+    const userState = namespace.state('user', 'user-1');
+    await expect(
+      new OAuthStorageObject(userState).execute({
+        namespace: 'default',
+        aggregate: { kind: 'user', key: 'user-1' },
+        operation: 'grants.revoke',
+        key: { userId: 'user-2', grantId: 'grant-1' },
+      })
+    ).rejects.toMatchObject({ code: 'unsupported_operation', operation: 'grants.revoke' });
+    expect(await connection.grants.get({ userId: 'user-1', grantId: 'grant-1' })).not.toBeNull();
+    expect(
+      await connection.accessTokens.get({ userId: 'user-1', grantId: 'grant-1', tokenId: DIGEST_B })
+    ).not.toBeNull();
+  });
+
   it('requires the full token parent key for reads and deletion', async () => {
     await connection.grants.issue(
       issueGrantInput({

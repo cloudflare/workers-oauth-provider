@@ -490,7 +490,7 @@ export class OAuthStorageObject {
           `CREATE INDEX grants_client ON records(json_extract(value,'$.value.clientId'),key) WHERE kind='grant'`
         );
         this.sql.exec(
-          `CREATE INDEX tokens_grant ON records(json_extract(value,'$.value.userId'),json_extract(value,'$.value.grantId'),key) WHERE kind='token'`
+          `CREATE INDEX tokens_grant ON records(json_extract(value,'$.value.grantId'),key) WHERE kind='token'`
         );
         this.sql.exec('INSERT INTO schema_migrations(version) VALUES (1)');
       }
@@ -863,9 +863,8 @@ export class OAuthStorageObject {
     if (expectedRevision !== undefined && row.revision !== expectedRevision) return { status: 'conflict' };
     const count = this.sql
       .exec(
-        "DELETE FROM records WHERE kind=? AND json_extract(value,'$.value.userId')=? AND json_extract(value,'$.value.grantId')=? RETURNING key",
+        "DELETE FROM records WHERE kind=? AND json_extract(value,'$.value.grantId')=? RETURNING key",
         'token',
-        key.userId,
         key.grantId
       )
       .toArray().length;
@@ -899,7 +898,7 @@ export class OAuthStorageObject {
     const rows = this.sql
       .exec<
         SqlRow & { key: string }
-      >("SELECT key,value,revision,expires_at FROM records WHERE kind=? AND key>? AND json_extract(value,'$.value.userId')=? AND json_extract(value,'$.value.grantId')=? AND (expires_at IS NULL OR expires_at>?) ORDER BY key LIMIT ?", 'token', after, grant.userId, grant.grantId, now, limit + 1)
+      >("SELECT key,value,revision,expires_at FROM records WHERE kind=? AND key>? AND json_extract(value,'$.value.grantId')=? AND (expires_at IS NULL OR expires_at>?) ORDER BY key LIMIT ?", 'token', after, grant.grantId, now, limit + 1)
       .toArray();
     const more = rows.length > limit;
     const selected = rows.slice(0, limit);
