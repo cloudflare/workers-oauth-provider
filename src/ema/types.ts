@@ -152,25 +152,6 @@ export interface EmaJwksProvider {
 }
 
 /**
- * Internal store for replay protection of ID-JAG `jti` values.
- *
- * The default KV-backed implementation is best-effort — KV is eventually
- * consistent, so two near-simultaneous token requests presenting the same
- * assertion from different colos can both read "not seen" and both succeed.
- * Surrounding checks (signature, short `exp`, `nbf`, `aud`, `resource`,
- * client binding) constrain the practical attack window.
- */
-export interface EmaJtiStore {
-  markUsed(input: {
-    issuer: string;
-    jti: string;
-    exp: number;
-    now: number;
-    env: { OAUTH_KV: KVNamespace };
-  }): Promise<Result<void, EmaValidationError>>;
-}
-
-/**
  * Input passed to a dynamic `EmaTrustedIssuerResolver`.
  *
  * The `iss` value comes from the assertion's unverified payload — it is

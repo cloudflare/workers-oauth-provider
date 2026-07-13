@@ -1,6 +1,6 @@
-# OAuth KV Storage Schema
+# Default Workers KV storage schema
 
-This document describes the schema used in the OAUTH_KV storage for the OAuth 2.0 provider library. The library uses Cloudflare Workers KV to store all OAuth-related data, including client registrations, authorization grants, and tokens.
+This document describes the physical schema used by the default Workers KV adapter. Other storage adapters use their own versioned schemas and migrations. The KV adapter preserves these existing keys and JSON values without adding storage-envelope metadata.
 
 ## Overview
 
@@ -12,11 +12,12 @@ The system implements end-to-end encryption for sensitive application-specific p
 
 All keys in the KV namespace follow a consistent pattern to make them easily identifiable:
 
-| Prefix            | Purpose                   | Example                |
-| ----------------- | ------------------------- | ---------------------- |
-| `client:`         | Client registration data  | `client:abc123`        |
-| `grant:{userId}:` | Authorization grant data  | `grant:user123:xyz789` |
-| `token:`          | Access and refresh tokens | `token:ghi789`         |
+| Prefix                      | Purpose                        | Example                                                                                 |
+| --------------------------- | ------------------------------ | --------------------------------------------------------------------------------------- |
+| `client:`                   | Client registration data       | `client:abc123`                                                                         |
+| `grant:{userId}:`           | Grants and refresh-token state | `grant:user123:xyz789`                                                                  |
+| `token:{userId}:{grantId}:` | Access-token data              | `token:user123:xyz789:5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8` |
+| `enterprise-jti:`           | EMA assertion replay markers   | `enterprise-jti:5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8`       |
 
 ## Data Structures
 
@@ -131,9 +132,9 @@ Grant records store information about permissions a user has granted to an appli
 
 > **Note:** The grant record includes the hash of the authorization code initially, which is replaced by the hash of the refresh token after the code is exchanged. The record has a 10-minute TTL during authorization, which is replaced by the refresh token TTL when the code is exchanged.
 
-### Tokens
+### Access tokens
 
-Token records store metadata about issued access tokens, including denormalized grant information for faster access.
+Token records store metadata about issued access tokens, including denormalized grant information for faster access. Refresh-token hashes and wrapped keys remain in the grant record.
 
 **Key format:** `token:{userId}:{grantId}:{tokenId}`
 
@@ -157,7 +158,15 @@ Token records store metadata about issued access tokens, including denormalized 
 
 > **Note:** The token format is `{userId}:{grantId}:{random-secret}` which embeds the identifiers needed for efficient lookups. The token key format includes the user ID and grant ID to enable efficient revocation of all tokens for a specific grant. The token record contains denormalized grant information to eliminate the need for a separate grant lookup during token validation. The token also carries a wrapped encryption key that can only be unwrapped using the actual token string, allowing decryption of the encrypted props.
 
-**TTL:** Access tokens typically have a 1 hour (3600 seconds) TTL by default
+**TTL:** Access tokens typically have a 1 hour (3600 seconds) TTL by default.
+
+### Enterprise replay markers
+
+**Key format:** `enterprise-jti:{sha256(issuer + "\\n" + jti)}`
+
+**Value:** the literal string `1`
+
+The marker expires after the assertion can no longer be accepted. Workers KV does not offer atomic set-if-absent, so this replay reservation is explicitly best-effort.
 
 ## Security Considerations
 

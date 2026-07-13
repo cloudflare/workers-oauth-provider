@@ -29,9 +29,12 @@ When in doubt about OAuth behavior, the MCP specification takes precedence for M
 ```
 workers-oauth-provider/
 ├── src/
-│   └── oauth-provider.ts      # Single source file (~4,600 lines)
+│   ├── oauth-provider.ts      # Auditable OAuth protocol and engine core
+│   ├── ema/                   # Enterprise-managed authorization helpers
+│   └── storage/               # Backend-neutral storage contract and adapters
 ├── __tests__/
-│   ├── oauth-provider.test.ts # Comprehensive test suite (~9,400 lines)
+│   ├── oauth-provider.test.ts # Comprehensive provider test suite
+│   ├── storage/               # Storage contract and adapter tests
 │   ├── setup.ts               # Vitest setup and mocking
 │   └── mocks/
 │       └── cloudflare-workers.ts
@@ -47,7 +50,7 @@ workers-oauth-provider/
 └── README.md                  # Usage documentation
 ```
 
-**Single-file architecture:** All implementation is in `src/oauth-provider.ts`. This is intentional for security review — all code in one place aids auditing.
+**Auditable core architecture:** OAuth protocol validation, cryptography, record construction, endpoint behavior, and error mapping remain in `src/oauth-provider.ts`. Storage contracts and backend-specific implementation details live under `src/storage/` so SQL, Redis commands, Durable Object routing, and KV encoding do not leak into the protocol core. Keep adapter boundaries narrow and independently testable.
 
 ## Setup
 
@@ -60,14 +63,15 @@ Node 24+ required.
 
 ## Commands
 
-| Command              | What it does                              |
-| -------------------- | ----------------------------------------- |
-| `npm run build`      | Builds single-file ESM bundle with tsdown |
-| `npm run check`      | Runs typecheck + tests                    |
-| `npm run typecheck`  | TypeScript type checking (no emit)        |
-| `npm run test`       | Runs vitest test suite                    |
-| `npm run test:watch` | Runs vitest in watch mode                 |
-| `npm run prettier`   | Formats all files with Prettier           |
+| Command                 | What it does                                        |
+| ----------------------- | --------------------------------------------------- |
+| `npm run build`         | Builds root and storage ESM entrypoints with tsdown |
+| `npm run check`         | Runs typecheck + tests                              |
+| `npm run check:package` | Verifies package export and pack targets            |
+| `npm run typecheck`     | TypeScript type checking (no emit)                  |
+| `npm run test`          | Runs vitest test suite                              |
+| `npm run test:watch`    | Runs vitest in watch mode                           |
+| `npm run prettier`      | Formats all files with Prettier                     |
 
 ## Code standards
 
@@ -98,6 +102,18 @@ export class OAuthProvider {
 ```
 
 **Dual handler support:** The library supports both `ExportedHandler` (plain objects) and `WorkerEntrypoint` (classes) patterns. Maintain both for backwards compatibility.
+
+**Storage boundaries:**
+
+- `src/storage/` defines named OAuth domain operations, not a generic KV or SQL CRUD interface.
+- Capability descriptors must state externally observable guarantees and must never overstate atomicity.
+- `unsupported` operations fail before backend I/O with `OAuthStorageError`.
+- Raw authorization codes, tokens, refresh tokens, client secrets, and replay identifiers never cross the storage boundary; only SHA-256 identifiers do.
+- PostgreSQL and Redis adapters use injected client contracts and add no runtime dependencies.
+- D1 and Durable Object SQLite remain distinct adapters.
+- Durable Object SQLite partitions by user for grants, tokens, consent, and transitions; global cross-user operations stay unsupported without an authoritative index.
+- PlanetScale uses the PostgreSQL adapter through a cache-disabled Hyperdrive binding; it is not a separate adapter.
+- Every advertised guarantee requires conformance and concurrency tests.
 
 ### Formatting
 
