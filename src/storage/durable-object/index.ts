@@ -660,6 +660,22 @@ export class OAuthStorageObject {
     const row = this.row(kind, key);
     return row ? hideLogicallyExpired(this.decode(row, create), now) : null;
   }
+  private update(
+    kind: string,
+    key: string,
+    value: StoredClient | StoredGrant | StoredConsent,
+    expectedRevision: number
+  ): void {
+    this.sql.exec(
+      'UPDATE records SET value=?,revision=?,expires_at=? WHERE kind=? AND key=? AND revision=?',
+      JSON.stringify(value),
+      value.metadata.revision,
+      value.metadata.expiresAt ?? null,
+      kind,
+      key,
+      expectedRevision
+    );
+  }
   private readToken(key: AccessTokenKey, now: number): StoredAccessToken | null {
     const row = this.row('token', key.tokenId);
     if (!row) return null;
@@ -673,15 +689,7 @@ export class OAuthStorageObject {
     const row = this.row('client', command.clientId);
     if (!row) return { status: 'not_found' };
     if (row.revision !== command.expectedRevision) return { status: 'conflict' };
-    this.sql.exec(
-      'UPDATE records SET value=?,revision=?,expires_at=? WHERE kind=? AND key=? AND revision=?',
-      JSON.stringify(command.client),
-      command.client.metadata.revision,
-      command.client.metadata.expiresAt ?? null,
-      'client',
-      command.clientId,
-      command.expectedRevision
-    );
+    this.update('client', command.clientId, command.client, command.expectedRevision);
     return { status: 'updated' };
   }
   private listRecords<T>(
@@ -707,15 +715,7 @@ export class OAuthStorageObject {
     if (expectedRevision === undefined)
       return this.insert('consent', key, consent).status === 'created' ? { status: 'created' } : { status: 'conflict' };
     if (!row || row.revision !== expectedRevision) return { status: 'conflict' };
-    this.sql.exec(
-      'UPDATE records SET value=?,revision=?,expires_at=? WHERE kind=? AND key=? AND revision=?',
-      JSON.stringify(consent),
-      consent.metadata.revision,
-      consent.metadata.expiresAt ?? null,
-      'consent',
-      key,
-      expectedRevision
-    );
+    this.update('consent', key, consent, expectedRevision);
     return { status: 'updated' };
   }
   private deleteConsent(command: Extract<DurableObjectStorageCommand, { operation: 'consents.delete' }>): DeleteResult {
@@ -821,15 +821,7 @@ export class OAuthStorageObject {
     if (row.expires_at !== null && row.expires_at <= input.now) return { status: 'expired' };
     if (row.revision !== input.lease.expectedRevision) return { status: 'conflict' };
     if (this.row('token', input.accessToken.value.id)) return { status: 'conflict' };
-    this.sql.exec(
-      'UPDATE records SET value=?,revision=?,expires_at=? WHERE kind=? AND key=? AND revision=?',
-      JSON.stringify(input.grant),
-      input.grant.metadata.revision,
-      input.grant.metadata.expiresAt ?? null,
-      'grant',
-      key,
-      input.lease.expectedRevision
-    );
+    this.update('grant', key, input.grant, input.lease.expectedRevision);
     this.insert('token', input.accessToken.value.id, input.accessToken);
     this.sql.exec('DELETE FROM leases WHERE grant_key=? AND fence=?', key, input.lease.fence);
     return { status: 'committed' };
