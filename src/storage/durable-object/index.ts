@@ -451,7 +451,7 @@ export class OAuthStorageObject {
         >("SELECT key,value,revision,expires_at FROM records WHERE kind='grant' AND expires_at IS NOT NULL AND expires_at<=?", now)
         .toArray();
       for (const row of expiredGrants) {
-        const grant = this.decodeGrant(row);
+        const grant = this.decode(row, createStoredGrant);
         this.revoke({ userId: grant.value.userId, grantId: grant.value.id }, row.revision);
       }
       this.sql.exec(
@@ -569,17 +569,17 @@ export class OAuthStorageObject {
   private executeTransaction(command: DurableObjectStorageCommand): unknown {
     switch (command.operation) {
       case 'clients.get':
-        return this.readClient(command.clientId, command.now);
+        return this.readRecord('client', command.clientId, command.now, createStoredClient);
       case 'clients.create':
         return this.insert('client', command.client.value.clientId, command.client);
       case 'clients.replace':
         return this.replaceClient(command);
       case 'grants.get':
-        return this.readGrant(command.key, command.now);
+        return this.readRecord('grant', this.grantKey(command.key), command.now, createStoredGrant);
       case 'grants.issue':
         return this.issue(command.input);
       case 'grants.list-user':
-        return this.listRecords('grant', command.page, command.now, (row) => this.decodeGrant(row));
+        return this.listRecords('grant', command.page, command.now, (row) => this.decode(row, createStoredGrant));
       case 'grants.begin':
         return this.begin(command.input);
       case 'grants.commit':
@@ -597,13 +597,18 @@ export class OAuthStorageObject {
       case 'tokens.list':
         return this.listTokens(command.grant, command.page, command.now);
       case 'consents.get':
-        return this.readConsent(command.userId, command.clientId, command.referenceId, command.now);
+        return this.readRecord(
+          'consent',
+          this.consentKey(command.userId, command.clientId, command.referenceId),
+          command.now,
+          createStoredConsent
+        );
       case 'consents.cas':
         return this.compareAndSwapConsent(command.consent, command.expectedRevision);
       case 'consents.delete':
         return this.deleteConsent(command);
       case 'consents.list':
-        return this.listRecords('consent', command.page, command.now, (row) => this.decodeConsent(row));
+        return this.listRecords('consent', command.page, command.now, (row) => this.decode(row, createStoredConsent));
       case 'replay.reserve':
         return this.reserveReplay(command);
     }
@@ -616,30 +621,18 @@ export class OAuthStorageObject {
         .toArray()[0] ?? null
     );
   }
-  private decodeClient(row: SqlRow): StoredClient {
-    const stored = JSON.parse(row.value) as StoredClient;
-    return createStoredClient(stored.value, stored.metadata);
-  }
-  private decodeGrant(row: SqlRow): StoredGrant {
-    const stored = JSON.parse(row.value) as StoredGrant;
-    return createStoredGrant(stored.value, stored.metadata);
-  }
-  private decodeToken(row: SqlRow): StoredAccessToken {
-    const stored = JSON.parse(row.value) as StoredAccessToken;
-    return createStoredAccessToken(stored.value, stored.metadata);
-  }
-  private decodeConsent(row: SqlRow): StoredConsent {
-    const stored = JSON.parse(row.value) as StoredConsent;
-    return createStoredConsent(stored.value, stored.metadata);
+  private decode<T extends StoredClient | StoredGrant | StoredAccessToken | StoredConsent>(
+    row: SqlRow,
+    create: (value: T['value'], metadata: T['metadata']) => T
+  ): T {
+    const stored = JSON.parse(row.value) as T;
+    return create(stored.value, stored.metadata);
   }
   private consentKey(userId: string, clientId: string, referenceId?: string): string {
     return JSON.stringify([userId, clientId, referenceId ?? null]);
   }
   private grantKey(key: GrantKey): string {
     return JSON.stringify([key.userId, key.grantId]);
-  }
-  private tokenKey(key: AccessTokenKey): string {
-    return key.tokenId;
   }
   private insert(
     kind: string,
@@ -658,18 +651,19 @@ export class OAuthStorageObject {
       .toArray().length;
     return { status: changed ? 'created' : 'conflict' };
   }
-  private readClient(key: string, now: number): StoredClient | null {
-    const row = this.row('client', key);
-    return row ? hideLogicallyExpired(this.decodeClient(row), now) : null;
-  }
-  private readGrant(key: GrantKey, now: number): StoredGrant | null {
-    const row = this.row('grant', this.grantKey(key));
-    return row ? hideLogicallyExpired(this.decodeGrant(row), now) : null;
+  private readRecord<T extends StoredClient | StoredGrant | StoredConsent>(
+    kind: string,
+    key: string,
+    now: number,
+    create: (value: T['value'], metadata: T['metadata']) => T
+  ): T | null {
+    const row = this.row(kind, key);
+    return row ? hideLogicallyExpired(this.decode(row, create), now) : null;
   }
   private readToken(key: AccessTokenKey, now: number): StoredAccessToken | null {
-    const row = this.row('token', this.tokenKey(key));
+    const row = this.row('token', key.tokenId);
     if (!row) return null;
-    const token = this.decodeToken(row);
+    const token = this.decode(row, createStoredAccessToken);
     if (token.value.userId !== key.userId || token.value.grantId !== key.grantId) return null;
     return hideLogicallyExpired(token, now);
   }
@@ -707,15 +701,6 @@ export class OAuthStorageObject {
     const selected = rows.slice(0, limit);
     return createPage(selected.map(decode), rows.length > limit ? selected[selected.length - 1]?.key : undefined);
   }
-  private readConsent(
-    userId: string,
-    clientId: string,
-    referenceId: string | undefined,
-    now: number
-  ): StoredConsent | null {
-    const row = this.row('consent', this.consentKey(userId, clientId, referenceId));
-    return row ? hideLogicallyExpired(this.decodeConsent(row), now) : null;
-  }
   private compareAndSwapConsent(consent: StoredConsent, expectedRevision?: number): ReplaceConsentResult {
     const key = this.consentKey(consent.value.userId, consent.value.clientId, consent.value.referenceId);
     const row = this.row('consent', key);
@@ -752,7 +737,7 @@ export class OAuthStorageObject {
         >("SELECT key,value,revision,expires_at FROM records WHERE kind='grant' AND json_extract(value,'$.value.clientId')=?", input.grant.value.clientId)
         .toArray();
       for (const row of prior) {
-        const grant = this.decodeGrant(row);
+        const grant = this.decode(row, createStoredGrant);
         this.revoke({ userId: grant.value.userId, grantId: grant.value.id });
       }
     }
@@ -762,7 +747,7 @@ export class OAuthStorageObject {
     return { status: 'created' };
   }
   private begin(input: BeginGrantTransitionInput): unknown {
-    const grant = this.readGrant(input.grant, input.now);
+    const grant = this.readRecord('grant', this.grantKey(input.grant), input.now, createStoredGrant);
     if (!grant) return this.row('grant', this.grantKey(input.grant)) ? { status: 'expired' } : { status: 'not_found' };
     if (input.kind === 'authorization_code') {
       if (grant.value.authCodeId !== input.credentialId) return { status: 'invalid_credential' };
@@ -884,11 +869,11 @@ export class OAuthStorageObject {
       : { status: 'conflict' };
   }
   private deleteToken(key: AccessTokenKey): DeleteResult {
-    const row = this.row('token', this.tokenKey(key));
+    const row = this.row('token', key.tokenId);
     if (!row) return { status: 'not_found' };
-    const token = this.decodeToken(row);
+    const token = this.decode(row, createStoredAccessToken);
     if (token.value.userId !== key.userId || token.value.grantId !== key.grantId) return { status: 'not_found' };
-    this.sql.exec("DELETE FROM records WHERE kind='token' AND key=?", this.tokenKey(key));
+    this.sql.exec("DELETE FROM records WHERE kind='token' AND key=?", key.tokenId);
     return { status: 'deleted' };
   }
   private listTokens(grant: GrantKey, page: PageRequest | undefined, now: number): Page<StoredAccessToken> {
@@ -903,7 +888,7 @@ export class OAuthStorageObject {
     const more = rows.length > limit;
     const selected = rows.slice(0, limit);
     return createPage(
-      selected.map((row) => this.decodeToken(row)),
+      selected.map((row) => this.decode(row, createStoredAccessToken)),
       more ? selected[selected.length - 1]?.key : undefined
     );
   }
