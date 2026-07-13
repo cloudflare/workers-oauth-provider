@@ -485,7 +485,6 @@ export class OAuthStorageObject {
         this.sql.exec(
           'CREATE TABLE replay (namespace TEXT NOT NULL, key_hash TEXT NOT NULL, expires_at INTEGER NOT NULL, PRIMARY KEY(namespace,key_hash))'
         );
-        this.sql.exec('CREATE INDEX records_expiry ON records(kind,expires_at)');
         this.sql.exec('INSERT INTO schema_migrations(version) VALUES (1)');
       }
       this.sql.exec(
@@ -520,13 +519,16 @@ export class OAuthStorageObject {
     ) {
       throw new OAuthStorageError('invalid_configuration', { operation: 'storage.route' });
     }
-    if (created && aggregate.kind === 'user') {
-      this.sql.exec(
-        `CREATE INDEX IF NOT EXISTS grants_client ON records(json_extract(value,'$.value.clientId'),key) WHERE kind='grant'`
-      );
-      this.sql.exec(
-        `CREATE INDEX IF NOT EXISTS tokens_grant ON records(json_extract(value,'$.value.grantId'),key) WHERE kind='token'`
-      );
+    if (created && aggregate.kind !== 'replay') {
+      this.sql.exec('CREATE INDEX IF NOT EXISTS records_expiry ON records(kind,expires_at)');
+      if (aggregate.kind === 'user') {
+        this.sql.exec(
+          `CREATE INDEX IF NOT EXISTS grants_client ON records(json_extract(value,'$.value.clientId'),key) WHERE kind='grant'`
+        );
+        this.sql.exec(
+          `CREATE INDEX IF NOT EXISTS tokens_grant ON records(json_extract(value,'$.value.grantId'),key) WHERE kind='token'`
+        );
+      }
     }
   }
 

@@ -235,18 +235,22 @@ describe('partitioned Durable Object SQLite adapter against real SQLite statemen
     failedState.close();
   });
 
-  it('creates grant and token indexes only for user aggregates', async () => {
+  it('creates only aggregate-specific indexes', async () => {
     await connection.clients.get('client-1');
     await connection.grants.get({ userId: 'user-1', grantId: 'grant-1' });
     await connection.replay.reserve({ reservationNamespace: 'ema-jti', keyHash: DIGEST_B, expiresAt: 300 });
     const indexes = (state: SqliteState) =>
       state.database
         .prepare(
-          "SELECT name FROM sqlite_master WHERE type='index' AND name IN ('grants_client','tokens_grant') ORDER BY name"
+          "SELECT name FROM sqlite_master WHERE type='index' AND name IN ('records_expiry','grants_client','tokens_grant') ORDER BY name"
         )
         .all();
-    expect(indexes(namespace.state('client', 'client-1'))).toEqual([]);
-    expect(indexes(namespace.state('user', 'user-1'))).toEqual([{ name: 'grants_client' }, { name: 'tokens_grant' }]);
+    expect(indexes(namespace.state('client', 'client-1'))).toEqual([{ name: 'records_expiry' }]);
+    expect(indexes(namespace.state('user', 'user-1'))).toEqual([
+      { name: 'grants_client' },
+      { name: 'records_expiry' },
+      { name: 'tokens_grant' },
+    ]);
     expect(indexes(namespace.state('replay', JSON.stringify(['ema-jti', DIGEST_B.slice(0, 2)])))).toEqual([]);
   });
 
@@ -266,7 +270,7 @@ describe('partitioned Durable Object SQLite adapter against real SQLite statemen
     expect(
       state.database
         .prepare(
-          "SELECT COUNT(*) AS count FROM sqlite_master WHERE type='index' AND name IN ('grants_client','tokens_grant')"
+          "SELECT COUNT(*) AS count FROM sqlite_master WHERE type='index' AND name IN ('records_expiry','grants_client','tokens_grant')"
         )
         .get()
     ).toEqual({ count: 0 });
@@ -276,10 +280,10 @@ describe('partitioned Durable Object SQLite adapter against real SQLite statemen
     expect(
       state.database
         .prepare(
-          "SELECT COUNT(*) AS count FROM sqlite_master WHERE type='index' AND name IN ('grants_client','tokens_grant')"
+          "SELECT COUNT(*) AS count FROM sqlite_master WHERE type='index' AND name IN ('records_expiry','grants_client','tokens_grant')"
         )
         .get()
-    ).toEqual({ count: 2 });
+    ).toEqual({ count: 3 });
     state.close();
   });
 
