@@ -527,41 +527,41 @@ export class OAuthStorageObject {
   }
 
   private assertAggregateMatchesOperation(command: DurableObjectStorageCommand): void {
-    const expected: DurableObjectStorageAggregate | undefined = (() => {
+    const expected: readonly [DurableObjectStorageAggregate['kind'], string] = (() => {
       switch (command.operation) {
         case 'clients.get':
         case 'clients.replace':
-          return clientAggregate(command.clientId);
+          return ['client', command.clientId];
         case 'clients.create':
-          return clientAggregate(command.client.value.clientId);
+          return ['client', command.client.value.clientId];
         case 'grants.get':
         case 'grants.revoke':
         case 'tokens.get':
         case 'tokens.delete':
-          return userAggregate(command.key.userId);
+          return ['user', command.key.userId];
         case 'grants.issue':
-          return userAggregate(command.input.grant.value.userId);
+          return ['user', command.input.grant.value.userId];
         case 'grants.list-user':
         case 'consents.get':
         case 'consents.delete':
         case 'consents.list':
-          return userAggregate(command.userId);
+          return ['user', command.userId];
         case 'grants.begin':
-          return userAggregate(command.input.grant.userId);
+          return ['user', command.input.grant.userId];
         case 'grants.commit':
         case 'grants.abort':
-          return userAggregate(command.input.lease.grant.userId);
+          return ['user', command.input.lease.grant.userId];
         case 'tokens.create':
-          return userAggregate(command.input.grant.userId);
+          return ['user', command.input.grant.userId];
         case 'tokens.list':
-          return userAggregate(command.grant.userId);
+          return ['user', command.grant.userId];
         case 'consents.cas':
-          return userAggregate(command.consent.value.userId);
+          return ['user', command.consent.value.userId];
         case 'replay.reserve':
-          return replayAggregate(command.reservationNamespace, command.keyHash);
+          return ['replay', replayAggregate(command.reservationNamespace, command.keyHash).key];
       }
     })();
-    if (!expected || expected.kind !== command.aggregate.kind || expected.key !== command.aggregate.key) {
+    if (expected[0] !== command.aggregate.kind || expected[1] !== command.aggregate.key) {
       throw unsupportedStorageOperation(command.operation);
     }
   }
