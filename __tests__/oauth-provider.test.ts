@@ -3663,6 +3663,24 @@ describe('OAuthProvider', () => {
       });
     });
 
+    it('should use the configured resource when the ID-JAG omits its optional resource claim', async () => {
+      const tokenResponse = await exchangeAssertion(await createAssertion({ resource: undefined }));
+      expect(tokenResponse.status).toBe(200);
+      const tokens = await tokenResponse.json<{ access_token?: string; resource?: string }>();
+
+      expect(tokens.access_token).toBeDefined();
+      expect(tokens.resource).toBe(resource);
+
+      const apiResponse = await enterpriseProvider.fetch(
+        createMockRequest('https://example.com/api/test', 'GET', {
+          Authorization: `Bearer ${tokens.access_token}`,
+        }),
+        mockEnv,
+        mockCtx
+      );
+      expect(apiResponse.status).toBe(200);
+    });
+
     it('should accept ES256 assertions when the trusted issuer allows ES256', async () => {
       const ecKey = await createEcJwtKey();
       privateKey = ecKey.privateKey;

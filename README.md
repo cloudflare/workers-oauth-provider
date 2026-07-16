@@ -393,11 +393,11 @@ new OAuthProvider({
 
 Setup:
 
-1. Configure your IdP as an ID-JAG issuer with this worker's origin as the resource and a public JWKS endpoint.
+1. Configure your IdP as an ID-JAG issuer with a public JWKS endpoint. If it includes the optional `resource` claim, configure it with the MCP endpoint URL.
 2. Set `resourceMetadata.resource` to the MCP endpoint URL (required when EMA is enabled).
 3. Implement `trustedIssuers` as a resolver — for multi-tenant deployments it can read `env` / `clientInfo` to look up per-tenant IdP config without redeploying.
 
-The AS enforces `resolved.issuer === iss` (confused-deputy guard) and validates ID-JAG `typ`, signature, audience, client binding, resource, `exp` / `iat` / `nbf`, max lifetime, and `jti` replay. Refresh tokens are not issued for this grant — the ID-JAG itself is the renewable assertion.
+The AS enforces `resolved.issuer === iss` (confused-deputy guard) and validates ID-JAG `typ`, signature, audience, client binding, any supplied resource, `exp` / `iat` / `nbf`, max lifetime, and `jti` replay. When the optional `resource` claim is omitted, the AS uses `resourceMetadata.resource`, so issued tokens remain pinned to the configured MCP resource. Refresh tokens are not issued for this grant — the ID-JAG itself is the renewable assertion.
 
 ### Public clients
 
@@ -410,7 +410,7 @@ enterpriseManagedAuthorization: {
 }
 ```
 
-This is useful for clients registered via a [Client ID Metadata Document (CIMD)](https://modelcontextprotocol.io/), which are always public and therefore cannot present a client secret. With this enabled, trust rests on the IdP-issued, signature-verified, short-lived, single-use ID-JAG assertion (audience-, resource-, and client-bound) rather than on a separately presented client secret. Leave it unset (default `false`) to keep the spec-default behavior of requiring client authentication.
+This is useful for clients registered via a [Client ID Metadata Document (CIMD)](https://modelcontextprotocol.io/), which are always public and therefore cannot present a client secret. With this enabled, trust rests on the IdP-issued, signature-verified, short-lived, single-use ID-JAG assertion (audience- and client-bound), together with the provider's configured resource pinning, rather than on a separately presented client secret. Leave it unset (default `false`) to keep the spec-default behavior of requiring client authentication.
 
 Experimental — the MCP extension is still a draft.
 

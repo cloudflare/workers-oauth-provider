@@ -22,7 +22,11 @@ export interface EmaIdJagClaims {
   /** Authorization server issuer URL or URLs for which this assertion is intended. */
   aud: string | string[];
 
-  /** RFC 9728 resource identifier of the MCP server. */
+  /**
+   * Effective RFC 9728 resource identifier of the MCP server. When the ID-JAG
+   * omits its optional `resource` claim, the provider supplies its configured
+   * `resourceMetadata.resource` value.
+   */
   resource: string;
 
   /** OAuth client identifier this assertion was issued to. */
@@ -74,7 +78,10 @@ export interface EmaClaimsMapperInput<Env = Cloudflare.Env> {
   /** Authenticated OAuth client that presented the assertion. */
   clientInfo: ClientInfo;
 
-  /** Validated MCP resource identifier from the assertion. */
+  /**
+   * Effective MCP resource identifier. Taken from the assertion when present,
+   * otherwise from the provider's configured `resourceMetadata.resource`.
+   */
   resource: string;
 
   /** Requested scopes after downscoping to the assertion's scope claim, if present. */
@@ -263,8 +270,9 @@ export interface EmaOptions<Env = Cloudflare.Env> {
    * always public (`none`) and therefore cannot present a client secret. The
    * security trade-off is documented in the README: the trust then rests on
    * the IdP-issued, signature-verified, short-lived, single-use ID-JAG
-   * assertion (audience-, resource-, and client-bound) rather than on a
-   * separately presented client secret.
+   * assertion (audience- and client-bound), together with the provider's
+   * configured resource pinning, rather than on a separately presented client
+   * secret.
    */
   allowPublicClients?: boolean;
 }
