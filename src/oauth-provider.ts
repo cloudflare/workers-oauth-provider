@@ -1746,19 +1746,33 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       return this.createErrorResponse('invalid_request', { description: 'Method not allowed', statusCode: 405 });
     }
 
-    let contentType = request.headers.get('Content-Type') || '';
+    const contentType = request.headers.get('Content-Type') || '';
     let body: any = {};
 
-    // According to OAuth 2.0 RFC 6749/7009, requests MUST use application/x-www-form-urlencoded
-    if (!contentType.includes('application/x-www-form-urlencoded')) {
+    // According to OAuth 2.0 RFC 6749/7009, requests MUST use application/x-www-form-urlencoded.
+    // Parse the media type strictly: strip any parameters (e.g. "; charset=utf-8") and
+    // compare the exact media type. A `includes()` check is too loose and would accept
+    // malformed headers such as "application/json, application/x-www-form-urlencoded",
+    // which then cause request.formData() to throw and crash the worker.
+    const mediaType = contentType.split(';')[0].trim().toLowerCase();
+    if (mediaType !== 'application/x-www-form-urlencoded') {
       return this.createErrorResponse('invalid_request', {
         description: 'Content-Type must be application/x-www-form-urlencoded',
         statusCode: 400,
       });
     }
 
-    // Process application/x-www-form-urlencoded
-    const formData = await request.formData();
+    // Process application/x-www-form-urlencoded. Parsing can still throw if the body is
+    // not actually valid form data, so guard it and return a 400 instead of crashing.
+    let formData: FormData;
+    try {
+      formData = await request.formData();
+    } catch {
+      return this.createErrorResponse('invalid_request', {
+        description: 'Request body must be valid application/x-www-form-urlencoded data',
+        statusCode: 400,
+      });
+    }
     const processedKeys = new Set<string>();
     for (const [key, value] of formData.entries()) {
       if (processedKeys.has(key)) {
