@@ -2120,6 +2120,35 @@ describe('OAuthProvider', () => {
       expect(error.error_description).toBe('Client must not use multiple authentication methods');
     });
 
+    it('should reject malformed percent-encoding in Basic auth credentials', async () => {
+      const malformedCredentials = [`%ZZ:${clientSecret}`, `${encodeURIComponent(clientId)}:%ZZ`];
+
+      for (const credentials of malformedCredentials) {
+        const params = new URLSearchParams();
+        params.append('grant_type', 'refresh_token');
+        params.append('refresh_token', 'invalid-refresh-token');
+
+        const tokenRequest = createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            Authorization: `Basic ${btoa(credentials)}`,
+          },
+          params.toString()
+        );
+
+        const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+
+        expect(tokenResponse.status).toBe(401);
+        expect(tokenResponse.headers.get('WWW-Authenticate')).toBe('Basic realm="OAuth"');
+        expect(await tokenResponse.json<any>()).toEqual({
+          error: 'invalid_client',
+          error_description: 'Client authentication failed: invalid Basic credentials',
+        });
+      }
+    });
+
     it('should decode Basic auth credentials with form-url-encoding semantics', async () => {
       const secretWithReservedCharacters = 'secret with spaces:and:colons';
       await oauthProvider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);

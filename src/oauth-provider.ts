@@ -1812,13 +1812,24 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         return this.createErrorResponse('invalid_client', {
           description: 'Client authentication failed: invalid Basic credentials',
           statusCode: 401,
+          headers: { 'WWW-Authenticate': 'Basic realm="OAuth"' },
         });
       }
 
       const id = credentials.substring(0, separatorIndex);
       const secret = credentials.substring(separatorIndex + 1);
-      clientId = decodeFormUrlEncodedComponent(id);
-      clientSecret = decodeFormUrlEncodedComponent(secret);
+      try {
+        clientId = decodeFormUrlEncodedComponent(id);
+        clientSecret = decodeFormUrlEncodedComponent(secret);
+      } catch {
+        // RFC 6749 §5.2 requires a 401 and matching challenge when
+        // authentication was attempted through the Authorization header.
+        return this.createErrorResponse('invalid_client', {
+          description: 'Client authentication failed: invalid Basic credentials',
+          statusCode: 401,
+          headers: { 'WWW-Authenticate': 'Basic realm="OAuth"' },
+        });
+      }
     } else {
       // Form parameters
       clientId = body.client_id;
