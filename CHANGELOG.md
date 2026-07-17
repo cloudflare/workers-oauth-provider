@@ -1,5 +1,19 @@
 # @cloudflare/workers-oauth-provider
 
+## 0.8.3
+
+### Patch Changes
+
+- [#240](https://github.com/cloudflare/workers-oauth-provider/pull/240) [`0061270`](https://github.com/cloudflare/workers-oauth-provider/commit/0061270c4a18b1d81dad87a6521a4c00f934c91e) Thanks [@agent-think](https://github.com/apps/agent-think)! - Fix worker crash (HTTP 500) when the `/token` request sends a malformed
+  `Content-Type` header. The endpoint previously used a loose `includes()` check,
+  so a header such as `application/json, application/x-www-form-urlencoded` passed
+  validation and then caused `request.formData()` to throw. The media type is now
+  parsed strictly (parameters are stripped and the exact media type is compared),
+  and form parsing is guarded so invalid bodies return a `400 invalid_request`
+  instead of crashing the worker.
+
+- [#246](https://github.com/cloudflare/workers-oauth-provider/pull/246) [`771a207`](https://github.com/cloudflare/workers-oauth-provider/commit/771a207ad507c05d63885989dd0d318894a0ec8d) Thanks [@agent-think](https://github.com/apps/agent-think)! - Validate the RFC 8707 resource parameter before consuming an authorization code, so a token request rejected with `invalid_target` can be retried with an allowed resource.
+
 ## 0.8.2
 
 ### Patch Changes
