@@ -6024,7 +6024,7 @@ describe('OAuthProvider', () => {
   });
 
   describe('Resource Parameter Downscoping (RFC 8707)', () => {
-    it('should reject upscoping attempt (requesting resource not in authorization)', async () => {
+    it('should reject upscoping without consuming the authorization code', async () => {
       // Create a client
       const clientData = {
         redirect_uris: ['https://client.example.com/callback'],
@@ -6078,6 +6078,25 @@ describe('OAuthProvider', () => {
       const error = await tokenResponse.json<any>();
       expect(error.error).toBe('invalid_target');
       expect(error.error_description).toContain('not included in the authorization request');
+
+      // A rejected token request did not exchange the code, so retrying it with
+      // a resource from the original grant should succeed.
+      params.set('resource', 'https://api1.example.com');
+      const retryResponse = await oauthProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          params.toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+
+      expect(retryResponse.status).toBe(200);
+      const tokens = await retryResponse.json<any>();
+      expect(tokens.access_token).toBeDefined();
+      expect(tokens.resource).toBe('https://api1.example.com');
     });
 
     it('should allow downscoping (requesting subset of authorized resources)', async () => {
