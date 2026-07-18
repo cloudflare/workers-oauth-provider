@@ -353,6 +353,14 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
   clientRegistrationEndpoint?: string;
 
   /**
+   * Optional URL for the token introspection endpoint (RFC 7662).
+   * If provided, the provider will implement token introspection, allowing
+   * resource servers to query the authorization server about the state of
+   * an access token. Only confidential clients can introspect tokens.
+   */
+  introspectionEndpoint?: string;
+
+  /**
    * Time-to-live for access tokens in seconds.
    * Defaults to 1 hour (3600 seconds) if not specified.
    */
@@ -1522,7 +1530,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         url.pathname === '/.well-known/oauth-authorization-server' ||
         this.isProtectedResourceMetadataRequest(url) ||
         this.isTokenEndpoint(url) ||
-        (this.options.clientRegistrationEndpoint && this.isClientRegistrationEndpoint(url))
+        (this.options.clientRegistrationEndpoint && this.isClientRegistrationEndpoint(url)) ||
+        (this.options.introspectionEndpoint && this.matchEndpoint(url, this.options.introspectionEndpoint))
       ) {
         // Create an empty 204 No Content response with CORS headers
         return this.addCorsHeaders(
@@ -1572,6 +1581,16 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Handle client registration endpoint
     if (this.options.clientRegistrationEndpoint && this.isClientRegistrationEndpoint(url)) {
       const response = await this.handleClientRegistration(request, env);
+      return this.addCorsHeaders(response, request);
+    }
+
+    // Handle token introspection endpoint (RFC 7662)
+    if (this.options.introspectionEndpoint && this.matchEndpoint(url, this.options.introspectionEndpoint)) {
+      const parsed = await this.parseTokenEndpointRequest(request, env);
+      if (parsed instanceof Response) {
+        return this.addCorsHeaders(parsed, request);
+      }
+      const response = await this.handleIntrospection(parsed.body, parsed.clientInfo, env, url);
       return this.addCorsHeaders(response, request);
     }
 
@@ -1996,6 +2015,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       registrationEndpoint = this.getFullEndpointUrl(this.options.clientRegistrationEndpoint, requestUrl);
     }
 
+    let introspectionEndpoint: string | undefined = undefined;
+    if (this.options.introspectionEndpoint) {
+      introspectionEndpoint = this.getFullEndpointUrl(this.options.introspectionEndpoint, requestUrl);
+    }
+
     // Determine supported response types
     const responseTypesSupported = ['code'];
 
@@ -2039,9 +2063,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       revocation_endpoint: tokenEndpoint, // Reusing token endpoint for revocation
       // not implemented: revocation_endpoint_auth_methods_supported
       // not implemented: revocation_endpoint_auth_signing_alg_values_supported
-      // not implemented: introspection_endpoint
-      // not implemented: introspection_endpoint_auth_methods_supported
-      // not implemented: introspection_endpoint_auth_signing_alg_values_supported
+      introspection_endpoint: introspectionEndpoint,
+      introspection_endpoint_auth_methods_supported: introspectionEndpoint
+        ? ['client_secret_basic', 'client_secret_post']
+        : undefined,
       code_challenge_methods_supported: this.options.allowPlainPKCE !== false ? ['plain', 'S256'] : ['S256'], // PKCE support
       // MCP Client ID Metadata Document support (CIMD)
       // Only enabled when global_fetch_strictly_public compat flag is set (for SSRF protection)
@@ -3618,6 +3643,70 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     return new Response(JSON.stringify(response), {
       status: 201,
+      headers: { 'Content-Type': 'application/json', ...NO_CACHE_HEADERS },
+    });
+  }
+
+  /** Token introspection (RFC 7662). Confidential clients only. */
+  private async handleIntrospection(body: any, clientInfo: ClientInfo, env: any, requestUrl: URL): Promise<Response> {
+    // RFC 7662 §2.1: Only confidential clients can introspect tokens
+    if (clientInfo.tokenEndpointAuthMethod === 'none') {
+      return this.createErrorResponse('unauthorized_client', {
+        description: 'Token introspection requires a confidential client',
+        statusCode: 401,
+      });
+    }
+
+    const token = body.token;
+    if (!token) {
+      return this.createErrorResponse('invalid_request', { description: 'token parameter is required' });
+    }
+
+    // Try to unwrap the token to get its details
+    const tokenSummary = await this.unwrapToken(token, env);
+
+    if (!tokenSummary) {
+      // RFC 7662 §2.2: inactive response for invalid/expired/unknown tokens
+      return new Response(JSON.stringify({ active: false }), {
+        headers: { 'Content-Type': 'application/json', ...NO_CACHE_HEADERS },
+      });
+    }
+
+    // RFC 7662 §2.1: tokens not issued to the requesting client report as inactive
+    if (tokenSummary.grant.clientId !== clientInfo.clientId) {
+      return new Response(JSON.stringify({ active: false }), {
+        headers: { 'Content-Type': 'application/json', ...NO_CACHE_HEADERS },
+      });
+    }
+
+    // Derive issuer from configured tokenEndpoint, not request URL (Host header is spoofable)
+    const issuer = this.isPath(this.options.tokenEndpoint)
+      ? requestUrl.origin
+      : new URL(this.options.tokenEndpoint).origin;
+
+    // Build the RFC 7662 §2.2 introspection response
+    const introspectionResponse: Record<string, unknown> = {
+      active: true,
+      iss: issuer,
+      client_id: tokenSummary.grant.clientId,
+      token_type: 'bearer',
+      exp: tokenSummary.expiresAt,
+      iat: tokenSummary.createdAt,
+      sub: tokenSummary.userId,
+    };
+
+    // Include scope if present
+    const scope = tokenSummary.scope;
+    if (scope && scope.length > 0) {
+      introspectionResponse.scope = scope.join(' ');
+    }
+
+    // Include audience if present (RFC 8707)
+    if (tokenSummary.audience) {
+      introspectionResponse.aud = tokenSummary.audience;
+    }
+
+    return new Response(JSON.stringify(introspectionResponse), {
       headers: { 'Content-Type': 'application/json', ...NO_CACHE_HEADERS },
     });
   }
