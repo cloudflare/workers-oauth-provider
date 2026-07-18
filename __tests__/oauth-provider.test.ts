@@ -121,6 +121,18 @@ class MockKV {
 /**
  * Mock execution context for Cloudflare Workers
  */
+const VERIFIED_OAUTH_CONTEXT = Symbol.for('cloudflare.workers-oauth-provider.verified-context.v1');
+
+interface TestVerifiedOAuthContext {
+  version: 1;
+  token: string;
+  clientId: string;
+  scopes: string[];
+  expiresAt?: number;
+  resource?: string;
+  props: Record<string, unknown>;
+}
+
 class MockExecutionContext implements ExecutionContext {
   props: any = {};
 
@@ -422,12 +434,16 @@ describe('OAuthProvider', () => {
       });
 
       // Request to Users API should be handled by UsersApiHandler
-      const usersResponse = await providerWithMultiHandler.fetch(usersApiRequest, mockEnv, mockCtx);
+      const usersResponse = await providerWithMultiHandler.fetch(usersApiRequest, mockEnv, new MockExecutionContext());
       expect(usersResponse.status).toBe(200);
       expect(await usersResponse.text()).toBe('Users API response');
 
       // Request to Documents API should be handled by DocumentsApiHandler
-      const documentsResponse = await providerWithMultiHandler.fetch(documentsApiRequest, mockEnv, mockCtx);
+      const documentsResponse = await providerWithMultiHandler.fetch(
+        documentsApiRequest,
+        mockEnv,
+        new MockExecutionContext()
+      );
       expect(documentsResponse.status).toBe(200);
       expect(await documentsResponse.text()).toBe('Documents API response');
     });
@@ -3006,14 +3022,14 @@ describe('OAuthProvider', () => {
       const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
         Authorization: `Bearer ${newTokens.access_token}`,
       });
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, new MockExecutionContext());
       expect(apiResponse.status).toBe(200);
 
       // Verify original token still works
       const originalApiRequest = createMockRequest('https://example.com/api/test', 'GET', {
         Authorization: `Bearer ${accessToken}`,
       });
-      const originalApiResponse = await oauthProvider.fetch(originalApiRequest, mockEnv, mockCtx);
+      const originalApiResponse = await oauthProvider.fetch(originalApiRequest, mockEnv, new MockExecutionContext());
       expect(originalApiResponse.status).toBe(200);
     });
 
@@ -5163,6 +5179,7 @@ describe('OAuthProvider', () => {
 
   describe('Token Validation and API Access', () => {
     let accessToken: string;
+    let accessTokenClientId: string;
 
     // Helper to get through authorization and token exchange to get an access token
     async function getAccessToken() {
@@ -5215,6 +5232,7 @@ describe('OAuthProvider', () => {
       const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
       const tokens = await tokenResponse.json<any>();
       accessToken = tokens.access_token;
+      accessTokenClientId = clientId;
     }
 
     beforeEach(async () => {
@@ -5323,6 +5341,52 @@ describe('OAuthProvider', () => {
       expect(data.success).toBe(true);
       expect(data.user).toEqual({ userId: 'test-user-123', username: 'TestUser' });
     });
+
+    it('should attach verified internal token metadata to the request context', async () => {
+      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: `Bearer ${accessToken}`,
+      });
+
+      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+
+      expect(apiResponse.status).toBe(200);
+      const verified = (mockCtx as unknown as Record<symbol, TestVerifiedOAuthContext>)[VERIFIED_OAUTH_CONTEXT];
+      expect(verified).toEqual({
+        version: 1,
+        token: accessToken,
+        clientId: accessTokenClientId,
+        scopes: ['read', 'write'],
+        expiresAt: expect.any(Number),
+        props: { userId: 'test-user-123', username: 'TestUser' },
+      });
+      expect(verified.props).toBe(mockCtx.props);
+    });
+
+    it('should fail closed when verified identity is already installed', async () => {
+      const requestCtx = new MockExecutionContext();
+      const existing = { version: 1, clientId: 'other-client' };
+      Object.defineProperty(requestCtx, VERIFIED_OAUTH_CONTEXT, {
+        value: existing,
+        enumerable: false,
+        writable: false,
+        configurable: false,
+      });
+
+      const response = await oauthProvider.fetch(
+        createMockRequest('https://example.com/api/test', 'GET', {
+          Authorization: `Bearer ${accessToken}`,
+        }),
+        mockEnv,
+        requestCtx
+      );
+
+      expect(response.status).toBe(500);
+      expect(await response.json()).toEqual({
+        error: 'server_error',
+        error_description: 'Unable to establish verified request context',
+      });
+      expect((requestCtx as unknown as Record<symbol, unknown>)[VERIFIED_OAUTH_CONTEXT]).toBe(existing);
+    });
   });
 
   describe('Audience Validation (RFC 7519 Section 4.1.3)', () => {
@@ -5416,6 +5480,26 @@ describe('OAuthProvider', () => {
       expect(data.success).toBe(true);
     });
 
+    it('should carry the concrete audience that matched the current resource server', async () => {
+      const accessToken = await getAccessTokenWithResource([
+        'https://api1.example.com',
+        'https://api2.example.com/api',
+      ]);
+      const requestCtx = new MockExecutionContext();
+
+      const response = await oauthProvider.fetch(
+        createMockRequest('https://api2.example.com/api/test', 'GET', {
+          Authorization: `Bearer ${accessToken}`,
+        }),
+        mockEnv,
+        requestCtx
+      );
+
+      expect(response.status).toBe(200);
+      const verified = (requestCtx as unknown as Record<symbol, TestVerifiedOAuthContext>)[VERIFIED_OAUTH_CONTEXT];
+      expect(verified.resource).toBe('https://api2.example.com/api');
+    });
+
     it('should accept token with multiple resources at all specified resource servers (E2E)', async () => {
       // Request token for two resource servers
       const accessToken = await getAccessTokenWithResource(['https://api1.example.com', 'https://api2.example.com']);
@@ -5424,7 +5508,7 @@ describe('OAuthProvider', () => {
       const api1Request = createMockRequest('https://api1.example.com/api/test', 'GET', {
         Authorization: `Bearer ${accessToken}`,
       });
-      const api1Response = await oauthProvider.fetch(api1Request, mockEnv, mockCtx);
+      const api1Response = await oauthProvider.fetch(api1Request, mockEnv, new MockExecutionContext());
       expect(api1Response.status).toBe(200);
       const api1Data = await api1Response.json<{ success: boolean }>();
       expect(api1Data.success).toBe(true);
@@ -5433,7 +5517,7 @@ describe('OAuthProvider', () => {
       const api2Request = createMockRequest('https://api2.example.com/api/test', 'GET', {
         Authorization: `Bearer ${accessToken}`,
       });
-      const api2Response = await oauthProvider.fetch(api2Request, mockEnv, mockCtx);
+      const api2Response = await oauthProvider.fetch(api2Request, mockEnv, new MockExecutionContext());
       expect(api2Response.status).toBe(200);
       const api2Data = await api2Response.json<{ success: boolean }>();
       expect(api2Data.success).toBe(true);
@@ -5442,7 +5526,7 @@ describe('OAuthProvider', () => {
       const api3Request = createMockRequest('https://api3.example.com/api/test', 'GET', {
         Authorization: `Bearer ${accessToken}`,
       });
-      const api3Response = await oauthProvider.fetch(api3Request, mockEnv, mockCtx);
+      const api3Response = await oauthProvider.fetch(api3Request, mockEnv, new MockExecutionContext());
       expect(api3Response.status).toBe(401);
       const api3Error = await api3Response.json<{ error: string }>();
       expect(api3Error.error).toBe('invalid_token');
@@ -5450,16 +5534,19 @@ describe('OAuthProvider', () => {
 
     it('should accept token without audience claim (backward compatibility)', async () => {
       const accessToken = await getAccessTokenWithResource(undefined);
+      const requestCtx = new MockExecutionContext();
 
       const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
         Authorization: `Bearer ${accessToken}`,
       });
 
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, requestCtx);
 
       expect(apiResponse.status).toBe(200);
       const data = await apiResponse.json<{ success: boolean }>();
       expect(data.success).toBe(true);
+      const verified = (requestCtx as unknown as Record<symbol, TestVerifiedOAuthContext>)[VERIFIED_OAUTH_CONTEXT];
+      expect(verified.resource).toBeUndefined();
     });
 
     it('should reject token with wrong audience (HTTP 401)', async () => {
@@ -5806,7 +5893,7 @@ describe('OAuthProvider', () => {
       expect(data.success).toBe(true);
     });
 
-    it('should validate audience for external tokens with matching audience', async () => {
+    it('should validate audience for external tokens with matching audience without fabricating verified metadata', async () => {
       const externalProvider = new OAuthProvider({
         apiRoute: ['/api/', 'https://example.com/'],
         apiHandler: TestApiHandler,
@@ -5830,11 +5917,14 @@ describe('OAuthProvider', () => {
         Authorization: 'Bearer external-token-with-audience',
       });
 
-      const apiResponse = await externalProvider.fetch(apiRequest, mockEnv, mockCtx);
+      const externalCtx = new MockExecutionContext();
+      const apiResponse = await externalProvider.fetch(apiRequest, mockEnv, externalCtx);
 
       expect(apiResponse.status).toBe(200);
       const data = await apiResponse.json<any>();
       expect(data.success).toBe(true);
+      expect(externalCtx.props).toEqual({ userId: 'external-user', source: 'external' });
+      expect((externalCtx as unknown as Record<symbol, unknown>)[VERIFIED_OAUTH_CONTEXT]).toBeUndefined();
     });
 
     it('should reject external tokens with wrong audience', async () => {
@@ -7265,7 +7355,7 @@ describe('OAuthProvider', () => {
         Authorization: `Bearer ${tokens.access_token}`,
       });
 
-      const apiResponse = await specialProvider.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await specialProvider.fetch(apiRequest, mockEnv, new MockExecutionContext());
       const apiData = await apiResponse.json<any>();
       expect(apiData.user.tokenOnly).toBe(true);
 
@@ -7291,7 +7381,7 @@ describe('OAuthProvider', () => {
         Authorization: `Bearer ${newTokens.access_token}`,
       });
 
-      const api2Response = await specialProvider.fetch(api2Request, mockEnv, mockCtx);
+      const api2Response = await specialProvider.fetch(api2Request, mockEnv, new MockExecutionContext());
       const api2Data = await api2Response.json<any>();
 
       // With the enhanced implementation, the token props now inherit from grant props
@@ -7598,7 +7688,7 @@ describe('OAuthProvider', () => {
         Authorization: `Bearer ${newTokens.access_token}`,
       });
 
-      const apiResponse1 = await testProvider.fetch(apiRequest1, mockEnv, mockCtx);
+      const apiResponse1 = await testProvider.fetch(apiRequest1, mockEnv, new MockExecutionContext());
       const apiData1 = await apiResponse1.json<any>();
 
       // Print the actual API response to debug
@@ -7636,7 +7726,7 @@ describe('OAuthProvider', () => {
         Authorization: `Bearer ${secondTokens.access_token}`,
       });
 
-      const apiResponse2 = await testProvider.fetch(apiRequest2, mockEnv, mockCtx);
+      const apiResponse2 = await testProvider.fetch(apiRequest2, mockEnv, new MockExecutionContext());
       const apiData2 = await apiResponse2.json<any>();
 
       // The updatedCount should be 2 now (incremented again during the second refresh)
@@ -10544,7 +10634,7 @@ describe('OAuthProvider', () => {
     async function callApi(
       provider: OAuthProvider<TestEnv>,
       env: any,
-      ctx: MockExecutionContext,
+      _ctx: MockExecutionContext,
       accessToken: string
     ): Promise<{ status: number; body: any }> {
       const response = await provider.fetch(
@@ -10552,7 +10642,7 @@ describe('OAuthProvider', () => {
           Authorization: `Bearer ${accessToken}`,
         }),
         env,
-        ctx
+        new MockExecutionContext()
       );
       return { status: response.status, body: await response.json<any>() };
     }
