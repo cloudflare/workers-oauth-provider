@@ -2755,7 +2755,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * `OAuthProviderImpl` is not exposed outside this module, this is still effectively
    * module-private.
    * @param subjectToken - The subject token to exchange
-   * @param requestedScopes - Optional narrowed scopes (must be subset of original)
+   * @param requestedScopes - Optional narrowed scopes (must be a subset of the subject token's scopes)
    * @param requestedResource - Optional resource/audience (must be subset of original if original had resource)
    * @param expiresIn - Optional TTL override in seconds
    * @param clientInfo - The client making the exchange request
@@ -2784,8 +2784,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       throw new OAuthError('invalid_grant', { description: 'Grant not found' });
     }
 
-    // If scopes are requested, validate they are a subset of the original grant scopes
-    let tokenScopes: string[] = this.downscope(requestedScopes, grantData.scope);
+    // An exchanged token inherits the subject token's scopes unless a narrower subset is requested.
+    let tokenScopes: string[] = this.downscope(requestedScopes, tokenSummary.scope);
 
     // Parse and validate resource parameter (RFC 8707) if provided
     const originOnly = !!this.options.resourceMatchOriginOnly;
@@ -2902,9 +2902,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
           accessTokenEncryptionKey = tokenResult.key;
         }
 
-        // If accessTokenScope was specified, use it for this token
+        // If accessTokenScope was specified, use it for this token while preserving
+        // the subject token as the upper bound.
         if (callbackResult.accessTokenScope) {
-          tokenScopes = this.downscope(callbackResult.accessTokenScope, grantData.scope);
+          tokenScopes = this.downscope(callbackResult.accessTokenScope, tokenSummary.scope);
         }
       }
     }

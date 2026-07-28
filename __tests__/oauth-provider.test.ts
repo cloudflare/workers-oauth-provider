@@ -2968,6 +2968,34 @@ describe('OAuthProvider', () => {
       clientSecret = client.client_secret;
     }
 
+    async function exchangeAccessToken(subjectToken: string, scope?: string) {
+      const params = new URLSearchParams();
+      params.append('grant_type', 'urn:ietf:params:oauth:grant-type:token-exchange');
+      params.append('subject_token', subjectToken);
+      params.append('subject_token_type', 'urn:ietf:params:oauth:token-type:access_token');
+      params.append('requested_token_type', 'urn:ietf:params:oauth:token-type:access_token');
+      if (scope !== undefined) {
+        params.append('scope', scope);
+      }
+
+      const response = await oauthProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+          },
+          params.toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+
+      expect(response.status).toBe(200);
+      return response.json<any>();
+    }
+
     beforeEach(async () => {
       await getAccessToken();
       await createExchangeClient();
@@ -3041,6 +3069,22 @@ describe('OAuthProvider', () => {
 
       const newTokens = await exchangeResponse.json<any>();
       expect(newTokens.scope).toBe('read write'); // Should have narrowed scopes
+    });
+
+    it("should inherit a subject token's scopes across chained exchanges", async () => {
+      const narrowedToken = await exchangeAccessToken(accessToken, 'read');
+      expect(narrowedToken.scope).toBe('read');
+
+      const inheritedToken = await exchangeAccessToken(narrowedToken.access_token);
+      expect(inheritedToken.scope).toBe('read');
+    });
+
+    it("should filter chained exchange scopes against the subject token's scopes", async () => {
+      const narrowedToken = await exchangeAccessToken(accessToken, 'read');
+      expect(narrowedToken.scope).toBe('read');
+
+      const filteredToken = await exchangeAccessToken(narrowedToken.access_token, 'read write admin');
+      expect(filteredToken.scope).toBe('read');
     });
 
     it('should silently remove invalid scopes from token exchange', async () => {
@@ -7799,12 +7843,13 @@ describe('OAuthProvider', () => {
       expect(refreshCount).toBe(1);
     });
 
-    it('should apply accessTokenScope from callback during token exchange', async () => {
+    it('should apply accessTokenScope from callback within subject token scopes during token exchange', async () => {
+      let tokenExchangeCount = 0;
       const scopeCallback = async (options: any) => {
         if (options.grantType === 'urn:ietf:params:oauth:grant-type:token-exchange') {
+          tokenExchangeCount++;
           return {
-            // Override: restrict to 'read' only during token exchange
-            accessTokenScope: ['read'],
+            accessTokenScope: tokenExchangeCount === 1 ? ['read'] : ['read', 'write', 'profile'],
           };
         }
       };
@@ -7900,8 +7945,32 @@ describe('OAuthProvider', () => {
       );
       expect(exchRes.status).toBe(200);
       const newTokens = await exchRes.json<any>();
-      // Callback overrode scopes to 'read' only
       expect(newTokens.scope).toBe('read');
+
+      // Exchange the narrowed token again. The callback's scope remains bounded by
+      // the scopes carried by the subject token.
+      const chainedParams = new URLSearchParams();
+      chainedParams.append('grant_type', 'urn:ietf:params:oauth:grant-type:token-exchange');
+      chainedParams.append('subject_token', newTokens.access_token);
+      chainedParams.append('subject_token_type', 'urn:ietf:params:oauth:token-type:access_token');
+      chainedParams.append('requested_token_type', 'urn:ietf:params:oauth:token-type:access_token');
+
+      const chainedRes = await scopeProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            Authorization: `Basic ${btoa(`${exchClient.client_id}:${exchClient.client_secret}`)}`,
+          },
+          chainedParams.toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+      expect(chainedRes.status).toBe(200);
+      const chainedTokens = await chainedRes.json<any>();
+      expect(chainedTokens.scope).toBe('read');
     });
 
     it('should clamp accessTokenScope from callback to grant scopes', async () => {
