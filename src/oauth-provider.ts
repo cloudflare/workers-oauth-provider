@@ -1755,19 +1755,33 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       return this.createErrorResponse('invalid_request', { description: 'Method not allowed', statusCode: 405 });
     }
 
-    let contentType = request.headers.get('Content-Type') || '';
+    const contentType = request.headers.get('Content-Type') || '';
     let body: any = {};
 
-    // According to OAuth 2.0 RFC 6749/7009, requests MUST use application/x-www-form-urlencoded
-    if (!contentType.includes('application/x-www-form-urlencoded')) {
+    // According to OAuth 2.0 RFC 6749/7009, requests MUST use application/x-www-form-urlencoded.
+    // Parse the media type strictly: strip any parameters (e.g. "; charset=utf-8") and
+    // compare the exact media type. A `includes()` check is too loose and would accept
+    // malformed headers such as "application/json, application/x-www-form-urlencoded",
+    // which then cause request.formData() to throw and crash the worker.
+    const mediaType = contentType.split(';')[0].trim().toLowerCase();
+    if (mediaType !== 'application/x-www-form-urlencoded') {
       return this.createErrorResponse('invalid_request', {
         description: 'Content-Type must be application/x-www-form-urlencoded',
         statusCode: 400,
       });
     }
 
-    // Process application/x-www-form-urlencoded
-    const formData = await request.formData();
+    // Process application/x-www-form-urlencoded. Parsing can still throw if the body is
+    // not actually valid form data, so guard it and return a 400 instead of crashing.
+    let formData: FormData;
+    try {
+      formData = await request.formData();
+    } catch {
+      return this.createErrorResponse('invalid_request', {
+        description: 'Request body must be valid application/x-www-form-urlencoded data',
+        statusCode: 400,
+      });
+    }
     const processedKeys = new Set<string>();
     for (const [key, value] of formData.entries()) {
       if (processedKeys.has(key)) {
@@ -2247,6 +2261,32 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       }
     }
 
+    // Parse and validate the resource parameter before exchanging the authorization code (RFC 8707)
+    // Validate downscoping: token request resources must be a subset of grant resources
+    const originOnly = !!this.options.resourceMatchOriginOnly;
+    if (body.resource && grantData.resource) {
+      const requestedResources = Array.isArray(body.resource) ? body.resource : [body.resource];
+      const grantedResources = Array.isArray(grantData.resource) ? grantData.resource : [grantData.resource];
+
+      // Check that all requested resources are in the granted resources
+      for (const requested of requestedResources) {
+        if (!grantedResources.some((granted) => resourceMatches(requested, granted, originOnly))) {
+          return this.createErrorResponse('invalid_target', {
+            description: 'Requested resource was not included in the authorization request',
+          });
+        }
+      }
+    }
+
+    // Use resource from token request if provided, otherwise use resource from grant
+    const audience = parseResourceParameter(body.resource || grantData.resource);
+    if ((body.resource || grantData.resource) && !audience) {
+      // RFC 8707 Section 2: invalid or unacceptable resource
+      return this.createErrorResponse('invalid_target', {
+        description: 'The resource parameter must be a valid absolute URI without a fragment',
+      });
+    }
+
     // Define the access token TTL, may be updated by callback if provided
     let accessTokenTTL = this.options.accessTokenTTL!;
     // Define the refresh token TTL, may be updated by callback if provided
@@ -2372,32 +2412,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Save the updated grant with TTL matching refresh token expiration (if any)
     await this.saveGrantWithTTL(env, grantKey, grantData, now);
-
-    // Parse and validate resource parameter (RFC 8707)
-    // Validate downscoping: token request resources must be subset of grant resources
-    const originOnly = !!this.options.resourceMatchOriginOnly;
-    if (body.resource && grantData.resource) {
-      const requestedResources = Array.isArray(body.resource) ? body.resource : [body.resource];
-      const grantedResources = Array.isArray(grantData.resource) ? grantData.resource : [grantData.resource];
-
-      // Check that all requested resources are in the granted resources
-      for (const requested of requestedResources) {
-        if (!grantedResources.some((granted) => resourceMatches(requested, granted, originOnly))) {
-          return this.createErrorResponse('invalid_target', {
-            description: 'Requested resource was not included in the authorization request',
-          });
-        }
-      }
-    }
-
-    // Use resource from token request if provided, otherwise use resource from grant
-    const audience = parseResourceParameter(body.resource || grantData.resource);
-    if ((body.resource || grantData.resource) && !audience) {
-      // RFC 8707 Section 2.1: invalid or unacceptable resource
-      return this.createErrorResponse('invalid_target', {
-        description: 'The resource parameter must be a valid absolute URI without a fragment',
-      });
-    }
 
     // Create and store access token with potentially narrowed scopes
     const accessToken = await this.createAccessToken({

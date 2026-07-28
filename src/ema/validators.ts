@@ -170,13 +170,14 @@ interface ValidateClaimsInput {
 }
 
 /**
- * Validate every required ID-JAG claim and produce a typed `ValidatedIdJag`.
+ * Validate the ID-JAG claims and produce a typed `ValidatedIdJag`.
  *
  * Enforces (in order):
- *   - presence + type of `iss`, `sub`, `aud`, `resource`, `client_id`, `jti`, `exp`, `iat`
+ *   - presence + type of `iss`, `sub`, `aud`, `client_id`, `jti`, `exp`, `iat`
  *   - `aud` contains the AS's expected audience
  *   - `client_id` matches the authenticated client
- *   - `resource` is a valid RFC 8707 URI and matches the AS's configured resource
+ *   - optional `resource` is a valid RFC 8707 URI and matches the AS's configured resource
+ *   - the configured resource is used when `resource` is omitted
  *   - `exp` is in the future
  *   - `iat` is not more than `clockSkewSeconds` in the future
  *   - `nbf` (if present) is ≤ `now + clockSkewSeconds`
@@ -203,7 +204,11 @@ export function validateIdJagClaims(input: ValidateClaimsInput): Result<Validate
   const aud = readAudienceClaim(rawClaims);
   if (!aud.ok) return aud;
 
-  const resource = readRequiredString(rawClaims, 'resource');
+  // The MCP EMA profile follows the core ID-JAG specification in making
+  // `resource` optional. Keep tokens pinned to this provider's declared
+  // resource when the IdP omits the claim; a present claim is still validated.
+  const resource =
+    rawClaims.resource === undefined ? ok(configuredResource) : readRequiredString(rawClaims, 'resource');
   if (!resource.ok) return resource;
 
   const claimClientId = readRequiredString(rawClaims, 'client_id');

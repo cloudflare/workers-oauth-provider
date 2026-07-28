@@ -1,5 +1,11 @@
 # @cloudflare/workers-oauth-provider
 
+## 0.8.2
+
+### Patch Changes
+
+- [#241](https://github.com/cloudflare/workers-oauth-provider/pull/241) [`76d2fcd`](https://github.com/cloudflare/workers-oauth-provider/commit/76d2fcd7911015acb561d9e59ac76dc61a577951) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Allow EMA ID-JAG assertions to omit the optional `resource` claim, falling back to the provider's configured protected resource.
+
 ## 0.8.1
 
 ### Patch Changes

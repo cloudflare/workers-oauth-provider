@@ -2055,6 +2055,47 @@ describe('OAuthProvider', () => {
       expect(error.error_description).toBe('Request parameter "grant_type" must not be repeated');
     });
 
+    it('should reject a Content-Type header that merely contains the form media type without crashing', async () => {
+      // Regression test for #239: a header like
+      // "application/json, application/x-www-form-urlencoded" used to pass the loose
+      // `includes()` check, then request.formData() threw and crashed the worker (500).
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/json, application/x-www-form-urlencoded' },
+        JSON.stringify({ grant_type: 'authorization_code' })
+      );
+
+      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+
+      expect(tokenResponse.status).toBe(400);
+      const error = await tokenResponse.json<any>();
+      expect(error.error).toBe('invalid_request');
+      expect(error.error_description).toBe('Content-Type must be application/x-www-form-urlencoded');
+    });
+
+    it('should accept a form Content-Type that includes parameters', async () => {
+      const params = new URLSearchParams();
+      params.append('grant_type', 'refresh_token');
+      params.append('refresh_token', 'invalid-refresh-token');
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8' },
+        params.toString()
+      );
+
+      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+
+      // The Content-Type check must pass (we get past it to an invalid_grant, not a
+      // Content-Type rejection).
+      const error = await tokenResponse.json<any>();
+      expect(error.error_description).not.toBe('Content-Type must be application/x-www-form-urlencoded');
+    });
+
     it('should reject requests that combine Basic auth with form client credentials', async () => {
       const params = new URLSearchParams();
       params.append('grant_type', 'refresh_token');
@@ -3661,6 +3702,24 @@ describe('OAuthProvider', () => {
         subject: 'employee-123',
         email: 'employee@example.com',
       });
+    });
+
+    it('should use the configured resource when the ID-JAG omits its optional resource claim', async () => {
+      const tokenResponse = await exchangeAssertion(await createAssertion({ resource: undefined }));
+      expect(tokenResponse.status).toBe(200);
+      const tokens = await tokenResponse.json<{ access_token?: string; resource?: string }>();
+
+      expect(tokens.access_token).toBeDefined();
+      expect(tokens.resource).toBe(resource);
+
+      const apiResponse = await enterpriseProvider.fetch(
+        createMockRequest('https://example.com/api/test', 'GET', {
+          Authorization: `Bearer ${tokens.access_token}`,
+        }),
+        mockEnv,
+        mockCtx
+      );
+      expect(apiResponse.status).toBe(200);
     });
 
     it('should accept ES256 assertions when the trusted issuer allows ES256', async () => {
@@ -5965,7 +6024,7 @@ describe('OAuthProvider', () => {
   });
 
   describe('Resource Parameter Downscoping (RFC 8707)', () => {
-    it('should reject upscoping attempt (requesting resource not in authorization)', async () => {
+    it('should reject upscoping without consuming the authorization code', async () => {
       // Create a client
       const clientData = {
         redirect_uris: ['https://client.example.com/callback'],
@@ -6019,6 +6078,25 @@ describe('OAuthProvider', () => {
       const error = await tokenResponse.json<any>();
       expect(error.error).toBe('invalid_target');
       expect(error.error_description).toContain('not included in the authorization request');
+
+      // A rejected token request did not exchange the code, so retrying it with
+      // a resource from the original grant should succeed.
+      params.set('resource', 'https://api1.example.com');
+      const retryResponse = await oauthProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          params.toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+
+      expect(retryResponse.status).toBe(200);
+      const tokens = await retryResponse.json<any>();
+      expect(tokens.access_token).toBeDefined();
+      expect(tokens.resource).toBe('https://api1.example.com');
     });
 
     it('should allow downscoping (requesting subset of authorized resources)', async () => {

@@ -262,6 +262,23 @@ describe('validateIdJagClaims', () => {
     expect(r.ok).toBe(true);
   });
 
+  it('uses the configured resource when the optional resource claim is omitted', () => {
+    const { resource: _omit, ...claimsWithoutResource } = validClaims;
+    const r = validateIdJagClaims({ rawClaims: claimsWithoutResource, ...claimsArgs });
+    expect(r).toMatchObject({
+      ok: true,
+      value: {
+        resource: claimsArgs.configuredResource,
+        claims: { resource: claimsArgs.configuredResource },
+      },
+    });
+  });
+
+  it('rejects a present but empty resource claim', () => {
+    const r = validateIdJagClaims({ rawClaims: { ...validClaims, resource: '' }, ...claimsArgs });
+    expect(r).toMatchObject({ ok: false, error: { reason: 'invalid_claim', claim: 'resource' } });
+  });
+
   it('rejects missing required claims with the claim name', () => {
     const { sub: _omit, ...rest } = validClaims;
     const r = validateIdJagClaims({ rawClaims: rest, ...claimsArgs });
