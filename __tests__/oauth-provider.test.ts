@@ -6782,9 +6782,37 @@ describe('OAuthProvider', () => {
       expect(response.headers.get('Access-Control-Allow-Origin')).toBe('https://client.example.com');
       expect(response.headers.get('Access-Control-Allow-Methods')).toBe('*');
       expect(response.headers.get('Access-Control-Allow-Headers')).toBe('Authorization, *');
+      expect(response.headers.get('Access-Control-Expose-Headers')).toBe('WWW-Authenticate, Retry-After');
 
       const error = await response.json<any>();
       expect(error.error).toBe('invalid_token');
+    });
+
+    it('should preserve handler-supplied CORS exposed headers', async () => {
+      const provider = new OAuthProvider({
+        apiRoute: '/api/',
+        apiHandler: {
+          fetch: () =>
+            Promise.resolve(
+              new Response('ok', {
+                headers: { 'Access-Control-Expose-Headers': 'X-Request-Id, www-authenticate' },
+              })
+            ),
+        },
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        resolveExternalToken: async () => ({ props: {} }),
+      });
+      const request = createMockRequest('https://example.com/api/test', 'GET', {
+        Origin: 'https://client.example.com',
+        Authorization: 'Bearer external-token',
+      });
+
+      const response = await provider.fetch(request, mockEnv, mockCtx);
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get('Access-Control-Expose-Headers')).toBe('X-Request-Id, www-authenticate, Retry-After');
     });
 
     it('should add CORS headers to token endpoint error responses', async () => {
@@ -8831,6 +8859,187 @@ describe('OAuthProvider', () => {
       // Verify the external token callback was called
       expect(externalTokenCalls.length).toBe(1);
       expect(externalTokenCalls[0].token).toBe('invalid-external-token');
+    });
+
+    it('should convert OAuthError from external validation into a structured invalid_token response', async () => {
+      const provider = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        resolveExternalToken: async () => {
+          throw new OAuthError('invalid_token', {
+            description: 'external token expired',
+            statusCode: 401,
+          });
+        },
+      });
+      const request = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: 'Bearer expired-external-token',
+      });
+
+      const response = await provider.fetch(request, mockEnv, mockCtx);
+
+      expect(response.status).toBe(401);
+      expect(response.headers.get('Cache-Control')).toBe('no-store');
+      expect(response.headers.get('WWW-Authenticate')).toBe(
+        'Bearer realm="OAuth", resource_metadata="https://example.com/.well-known/oauth-protected-resource/api/test", error="invalid_token"'
+      );
+      await expect(response.json()).resolves.toEqual({
+        error: 'invalid_token',
+        error_description: 'external token expired',
+      });
+    });
+
+    it('should convert insufficient_scope from external validation into a structured 403 response', async () => {
+      const provider = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        resolveExternalToken: async () => {
+          throw new OAuthError('insufficient_scope', {
+            description: 'Account Resources: Read is required',
+            statusCode: 403,
+            headers: { 'X-Trace-Id': 'trace-123' },
+            requiredScopes: ['account:read', 'profile:read', 'account:read'],
+          });
+        },
+      });
+      const request = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: 'Bearer under-scoped-external-token',
+      });
+
+      const response = await provider.fetch(request, mockEnv, mockCtx);
+
+      expect(response.status).toBe(403);
+      expect(response.headers.get('X-Trace-Id')).toBe('trace-123');
+      expect(response.headers.get('WWW-Authenticate')).toBe(
+        'Bearer realm="OAuth", resource_metadata="https://example.com/.well-known/oauth-protected-resource/api/test", error="insufficient_scope", scope="account:read profile:read"'
+      );
+      await expect(response.json()).resolves.toEqual({
+        error: 'insufficient_scope',
+        error_description: 'Account Resources: Read is required',
+      });
+    });
+
+    it.each<{
+      code: string;
+      description: string;
+      status: number;
+      headers: Record<string, string>;
+    }>([
+      {
+        code: 'temporarily_unavailable',
+        description: 'external authorization server rate limited',
+        status: 429,
+        headers: { 'Retry-After': '17' },
+      },
+      {
+        code: 'server_error',
+        description: 'external authorization server unavailable',
+        status: 502,
+        headers: { 'X-Upstream-Status': '503' },
+      },
+    ])(
+      'should preserve a structured $status external validation failure',
+      async ({ code, description, status, headers }) => {
+        const provider = new OAuthProvider({
+          apiRoute: ['/api/'],
+          apiHandler: TestApiHandler,
+          defaultHandler: testDefaultHandler,
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: '/oauth/token',
+          resolveExternalToken: async () => {
+            throw new OAuthError(code, { description, statusCode: status, headers });
+          },
+        });
+        const request = createMockRequest('https://example.com/api/test', 'GET', {
+          Authorization: 'Bearer unavailable-external-token',
+        });
+
+        const response = await provider.fetch(request, mockEnv, mockCtx);
+
+        expect(response.status).toBe(status);
+        for (const [name, value] of Object.entries(headers)) {
+          expect(response.headers.get(name)).toBe(value);
+        }
+        expect(response.headers.get('WWW-Authenticate')).toBeNull();
+        await expect(response.json()).resolves.toEqual({
+          error: code,
+          error_description: description,
+        });
+      }
+    );
+
+    it('should reject invalid requiredScopes before constructing a challenge', async () => {
+      const provider = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        resolveExternalToken: async () => {
+          throw new OAuthError('insufficient_scope', {
+            description: 'invalid scope configuration',
+            statusCode: 403,
+            requiredScopes: ['scope with spaces'],
+          });
+        },
+      });
+      const request = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: 'Bearer external-token',
+      });
+
+      await expect(provider.fetch(request, mockEnv, mockCtx)).rejects.toThrow(
+        'OAuthError requiredScopes must contain valid OAuth scope tokens'
+      );
+    });
+
+    it('should preserve a caller-supplied WWW-Authenticate challenge', async () => {
+      const challenge = 'Bearer realm="external", error="invalid_token"';
+      const provider = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        resolveExternalToken: async () => {
+          throw new OAuthError('invalid_token', {
+            description: 'external token rejected',
+            statusCode: 401,
+            headers: { 'www-authenticate': challenge },
+            requiredScopes: ['ignored because the caller supplied the complete challenge'],
+          });
+        },
+      });
+      const request = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: 'Bearer rejected-external-token',
+      });
+
+      const response = await provider.fetch(request, mockEnv, mockCtx);
+
+      expect(response.headers.get('WWW-Authenticate')).toBe(challenge);
+    });
+
+    it('should rethrow non-OAuthError failures from external validation', async () => {
+      const provider = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        resolveExternalToken: async () => {
+          throw new Error('external validator bug');
+        },
+      });
+      const request = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: 'Bearer external-token',
+      });
+
+      await expect(provider.fetch(request, mockEnv, mockCtx)).rejects.toThrow('external validator bug');
     });
 
     it('should prioritize internal tokens over external validation', async () => {
