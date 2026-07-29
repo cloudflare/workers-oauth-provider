@@ -4246,10 +4246,15 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       const clientId = OAuthProviderImpl.validateStringField(rawMetadata.client_id, 'client_id');
       const clientName = OAuthProviderImpl.validateStringField(rawMetadata.client_name, 'client_name');
       const redirectUris = OAuthProviderImpl.validateStringArray(rawMetadata.redirect_uris, 'redirect_uris');
-      const tokenEndpointAuthMethod = OAuthProviderImpl.validateStringField(
+      const declaredAuthMethod = OAuthProviderImpl.validateStringField(
         rawMetadata.token_endpoint_auth_method,
         'token_endpoint_auth_method'
       );
+      const authMethodChoices = OAuthProviderImpl.validateStringArray(
+        rawMetadata.token_endpoint_auth_methods_supported,
+        'token_endpoint_auth_methods_supported'
+      );
+      const tokenEndpointAuthMethod = declaredAuthMethod ?? (authMethodChoices?.includes('none') ? 'none' : undefined);
 
       // Validate that client_id matches the URL (required by spec)
       if (clientId !== metadataUrl) {
@@ -4264,10 +4269,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         throw new Error('redirect_uris is required and must not be empty');
       }
 
-      if (tokenEndpointAuthMethod && !OAuthProviderImpl.CIMD_ALLOWED_AUTH_METHODS.includes(tokenEndpointAuthMethod)) {
+      if (
+        (declaredAuthMethod && !OAuthProviderImpl.CIMD_ALLOWED_AUTH_METHODS.includes(declaredAuthMethod)) ||
+        (authMethodChoices &&
+          !authMethodChoices.some((method) => OAuthProviderImpl.CIMD_ALLOWED_AUTH_METHODS.includes(method)))
+      ) {
         throw new Error(
-          `token_endpoint_auth_method "${tokenEndpointAuthMethod}" is not allowed for CIMD clients. ` +
-            `Allowed methods: ${OAuthProviderImpl.CIMD_ALLOWED_AUTH_METHODS.join(', ')}`
+          `CIMD client does not support an accepted token endpoint authentication method. ` +
+            `Supported methods: ${OAuthProviderImpl.CIMD_ALLOWED_AUTH_METHODS.join(', ')}`
         );
       }
 
