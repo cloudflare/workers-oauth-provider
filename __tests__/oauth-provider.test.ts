@@ -10395,7 +10395,7 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(CimdFetchError);
       });
     });
 
@@ -10414,7 +10414,7 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(CimdFetchError);
       });
 
       it.each([
@@ -10880,18 +10880,19 @@ describe('OAuthProvider', () => {
         expect(warnSpy).toHaveBeenCalledWith(expect.anything(), expect.stringContaining('does not match'));
       });
 
-      it('should expose the metadata URL and underlying reason on the thrown error', async () => {
+      it('should expose stable and diagnostic fields on the thrown error', async () => {
         globalThis.fetch = vi.fn().mockResolvedValue(new Response('Blocked', { status: 403 }));
 
         const error = await oauthProvider.fetch(makeAuthRequest(), mockEnv, mockCtx).then(
           () => {
             throw new Error('expected rejection');
           },
-          (e) => e
+          (cause) => cause
         );
         expect(error).toBeInstanceOf(CimdFetchError);
         expect(error.metadataUrl).toBe(cimdUrl);
-        expect(error.reason).toContain('HTTP 403');
+        expect(error.reason).toBe('metadata_resolution_failed');
+        expect(error.detail).toContain('HTTP 403');
       });
     });
 
@@ -10912,8 +10913,34 @@ describe('OAuthProvider', () => {
 
         const response = await oauthProvider.fetch(makeTokenRequest(), mockEnv, mockCtx);
         expect(response.status).toBe(401);
+        expect(response.headers.get('WWW-Authenticate')).toBeNull();
         const body = await response.json<any>();
         expect(body.error).toBe('invalid_client');
+      });
+
+      it('should retain the Basic challenge when CIMD resolution fails', async () => {
+        globalThis.fetch = vi.fn().mockResolvedValue(new Response('Blocked', { status: 403 }));
+
+        const response = await oauthProvider.fetch(
+          createMockRequest(
+            'https://example.com/oauth/token',
+            'POST',
+            {
+              'Content-Type': 'application/x-www-form-urlencoded',
+              Authorization: `Basic ${btoa(`${encodeURIComponent(cimdUrl)}:`)}`,
+            },
+            'grant_type=authorization_code&code=test-code'
+          ),
+          mockEnv,
+          mockCtx
+        );
+
+        expect(response.status).toBe(401);
+        expect(response.headers.get('WWW-Authenticate')).toBe('Basic realm="OAuth"');
+        expect(await response.json<any>()).toEqual({
+          error: 'invalid_client',
+          error_description: 'Client not found',
+        });
       });
 
       it('should report the fetch failure through onError while keeping the wire response generic', async () => {
@@ -10950,7 +10977,11 @@ describe('OAuthProvider', () => {
             status: 401,
             internal: {
               category: 'client-id-metadata-document',
-              reason: expect.stringContaining('HTTP 403'),
+              reason: 'metadata_resolution_failed',
+              detail: {
+                metadataUrl: cimdUrl,
+                message: expect.stringContaining('HTTP 403'),
+              },
             },
             request: tokenRequest,
           })

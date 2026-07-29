@@ -608,7 +608,22 @@ new OAuthProvider({
 
 The compatibility flag is required for SSRF (Server-Side Request Forgery) protection. Due to a legacy quirk, `fetch()` requests to URLs within your zone's domain are sent directly to the origin server, bypassing Cloudflare. The `global_fetch_strictly_public` flag disables this behavior. See [Cloudflare's documentation](https://developers.cloudflare.com/workers/configuration/compatibility-flags/#global-fetch-strictly-public) for more details.
 
-When CIMD is not enabled (the default), URL-formatted `client_id` values fall through to standard KV lookup. When enabled, if fetching the metadata document fails, the library logs a warning and returns an `invalid_client` error, allowing MCP clients to recover by falling back to Dynamic Client Registration.
+When CIMD is not enabled (the default), URL-formatted `client_id` values fall through to standard KV lookup. When enabled, if fetching or validating the metadata document fails, the token endpoint returns a generic `invalid_client` response. The `onError` callback receives `internal.category: "client-id-metadata-document"`, the stable reason `metadata_resolution_failed`, diagnostic details, and the originating request. Use request metadata for correlation, but do not log its credentials or body.
+
+`OAuthHelpers.lookupClient()`, `parseAuthRequest()`, `completeAuthorization()`, and `exchangeToken()` throw `CimdFetchError` when they cannot resolve a CIMD client. `lookupClient()` returns `null` only when the client does not exist:
+
+```ts
+import { CimdFetchError } from '@cloudflare/workers-oauth-provider';
+
+try {
+  const client = await env.OAUTH_PROVIDER.lookupClient(clientId);
+} catch (error) {
+  if (error instanceof CimdFetchError) {
+    console.error(error.reason, error.metadataUrl, error.detail);
+  }
+  throw error;
+}
+```
 
 The OAuth metadata endpoint reports `client_id_metadata_document_supported: true` only when both the option is enabled and the compatibility flag is present.
 

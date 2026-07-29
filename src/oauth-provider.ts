@@ -554,13 +554,15 @@ export interface OAuthHelpers {
    * Parses an OAuth authorization request from the HTTP request
    * @param request - The HTTP request containing OAuth parameters
    * @returns The parsed authorization request parameters
+   * @throws {@link CimdFetchError} when the client ID is a CIMD URL whose document cannot be resolved
    */
   parseAuthRequest(request: Request): Promise<AuthRequest>;
 
   /**
    * Looks up a client by its client ID
    * @param clientId - The client ID to look up
-   * @returns A Promise resolving to the client info, or null if not found
+   * @returns A Promise resolving to the client info, or null if the client does not exist
+   * @throws {@link CimdFetchError} when the client ID is a CIMD URL whose document cannot be resolved
    */
   lookupClient(clientId: string): Promise<ClientInfo | null>;
 
@@ -568,6 +570,7 @@ export interface OAuthHelpers {
    * Completes an authorization request by creating a grant and authorization code
    * @param options - Options specifying the grant details
    * @returns A Promise resolving to an object containing the redirect URL
+   * @throws {@link CimdFetchError} when the client ID is a CIMD URL whose document cannot be resolved
    */
   completeAuthorization(options: CompleteAuthorizationOptions): Promise<{ redirectTo: string }>;
 
@@ -629,6 +632,7 @@ export interface OAuthHelpers {
    * Implements OAuth 2.0 Token Exchange (RFC 8693)
    * @param options - Options for token exchange including subject token and optional modifications
    * @returns Promise resolving to token response with new access token
+   * @throws {@link CimdFetchError} when the grant's client ID is a CIMD URL whose document cannot be resolved
    */
   exchangeToken(options: ExchangeTokenOptions): Promise<TokenResponse>;
 
@@ -1779,12 +1783,22 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     return `${requestUrl.origin}${suffix}`;
   }
 
-  private createInvalidClientResponse(description: string, basicAuthenticationAttempted: boolean): Response {
-    return this.createErrorResponse('invalid_client', {
-      description,
-      statusCode: 401,
-      ...(basicAuthenticationAttempted ? { headers: { 'WWW-Authenticate': BASIC_AUTH_CHALLENGE } } : {}),
-    });
+  private createInvalidClientResponse(
+    description: string,
+    basicAuthenticationAttempted: boolean,
+    internal?: { category: string; reason: string; detail?: unknown },
+    request?: Request
+  ): Response {
+    return this.createErrorResponse(
+      'invalid_client',
+      {
+        description,
+        statusCode: 401,
+        ...(basicAuthenticationAttempted ? { headers: { 'WWW-Authenticate': BASIC_AUTH_CHALLENGE } } : {}),
+      },
+      internal,
+      request
+    );
   }
 
   /**
@@ -1894,13 +1908,17 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       if (error instanceof CimdFetchError) {
         // Same wire response as an unknown client — the CIMD spec prescribes no
         // error body for metadata fetch failures — but the deployer's onError
-        // hook receives the real reason, so an upstream outage blocking the
-        // metadata URL is observable instead of masquerading as an
-        // unregistered client.
-        return this.createErrorResponse(
-          'invalid_client',
-          { description: 'Client not found', statusCode: 401 },
-          { category: 'client-id-metadata-document', reason: error.reason },
+        // hook receives a stable reason and diagnostic details, so an upstream
+        // outage blocking the metadata URL is observable instead of masquerading
+        // as an unregistered client.
+        return this.createInvalidClientResponse(
+          'Client not found',
+          basicAuthenticationAttempted,
+          {
+            category: 'client-id-metadata-document',
+            reason: error.reason,
+            detail: { metadataUrl: error.metadataUrl, message: error.detail },
+          },
           request
         );
       }
@@ -4593,17 +4611,24 @@ export class OAuthError extends Error {
  * failures should catch it to preserve their error contract.
  */
 export class CimdFetchError extends Error {
+  /** Stable reason slug suitable for telemetry and control flow. */
+  public readonly reason = 'metadata_resolution_failed' as const;
   /** The CIMD URL whose fetch or validation failed. */
   public readonly metadataUrl: string;
   /** The underlying failure message (e.g. "Failed to fetch client metadata: HTTP 403"). */
-  public readonly reason: string;
+  public readonly detail: string;
 
+  /**
+   * Creates an error for a failed CIMD fetch or validation.
+   * @param metadataUrl - The CIMD URL that could not be resolved
+   * @param cause - The underlying fetch or validation failure
+   */
   constructor(metadataUrl: string, cause: unknown) {
-    const reason = cause instanceof Error ? cause.message : String(cause);
-    super(`CIMD fetch failed for ${metadataUrl}: ${reason}`);
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    super(`CIMD fetch failed for ${metadataUrl}: ${detail}`);
     this.name = 'CimdFetchError';
     this.metadataUrl = metadataUrl;
-    this.reason = reason;
+    this.detail = detail;
   }
 }
 
@@ -5250,6 +5275,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * Parses an OAuth authorization request from the HTTP request
    * @param request - The HTTP request containing OAuth parameters
    * @returns The parsed authorization request parameters
+   * @throws CimdFetchError when the client ID is a CIMD URL whose document cannot be resolved
    */
   async parseAuthRequest(request: Request): Promise<AuthRequest> {
     const url = new URL(request.url);
@@ -5349,6 +5375,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * - For implicit flow: generating an access token directly
    * @param options - Options specifying the grant details
    * @returns A Promise resolving to an object containing the redirect URL
+   * @throws CimdFetchError when the client ID is a CIMD URL whose document cannot be resolved
    */
   async completeAuthorization(options: CompleteAuthorizationOptions): Promise<{ redirectTo: string }> {
     const { clientId, redirectUri } = options.request;
@@ -5864,6 +5891,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * Implements OAuth 2.0 Token Exchange (RFC 8693)
    * @param options - Options for token exchange including subject token and optional modifications
    * @returns Promise resolving to token response with new access token
+   * @throws CimdFetchError when the grant's client ID is a CIMD URL whose document cannot be resolved
    */
   async exchangeToken(options: ExchangeTokenOptions): Promise<TokenResponse> {
     // Validate subject token first to get client info
