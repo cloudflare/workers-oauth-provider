@@ -3,6 +3,7 @@ import { WorkerEntrypoint } from 'cloudflare:workers';
 import {
   buildOAuthServerCapabilities,
   isValidOAuthScopeToken,
+  validateAuthorizationResponseType,
   validateAuthorizationServerScopes,
   validateClientCapabilities,
   type OAuthServerCapabilities,
@@ -580,6 +581,7 @@ export interface OAuthHelpers {
    * Parses an OAuth authorization request from the HTTP request
    * @param request - The HTTP request containing OAuth parameters
    * @returns The parsed authorization request parameters
+   * @throws Error when the response type is missing, unsupported, or not registered for the client
    * @throws {@link CimdFetchError} when the client ID is a CIMD URL whose document cannot be resolved
    */
   parseAuthRequest(request: Request): Promise<AuthRequest>;
@@ -596,6 +598,7 @@ export interface OAuthHelpers {
    * Completes an authorization request by creating a grant and authorization code
    * @param options - Options specifying the grant details
    * @returns A Promise resolving to an object containing the redirect URL
+   * @throws Error when the request's response type is not permitted
    * @throws {@link CimdFetchError} when the client ID is a CIMD URL whose document cannot be resolved
    */
   completeAuthorization(options: CompleteAuthorizationOptions): Promise<{ redirectTo: string }>;
@@ -1682,17 +1685,15 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Call the default handler based on its type
     // Note: We don't add CORS headers to default handler responses
     if (this.typedDefaultHandler.type === HandlerType.EXPORTED_HANDLER) {
-      // It's an object with a fetch method
       return this.typedDefaultHandler.handler.fetch(
         request as Parameters<ExportedHandlerWithFetch<Env>['fetch']>[0],
         env,
         ctx
       );
-    } else {
-      // It's a WorkerEntrypoint class - instantiate it with ctx and env in that order
-      const handler = new this.typedDefaultHandler.handler(ctx, env);
-      return handler.fetch(request);
     }
+
+    const handler = new this.typedDefaultHandler.handler(ctx, env);
+    return handler.fetch(request);
   }
 
   /**
@@ -5399,6 +5400,7 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
    * Parses an OAuth authorization request from the HTTP request
    * @param request - The HTTP request containing OAuth parameters
    * @returns The parsed authorization request parameters
+   * @throws Error when the response type is missing, unsupported, or not registered for the client
    * @throws CimdFetchError when the client ID is a CIMD URL whose document cannot be resolved
    */
   async parseAuthRequest(request: Request): Promise<AuthRequest> {
@@ -5435,16 +5437,6 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
     }
     resource ??= url.origin;
 
-    // Check if implicit flow is requested but not allowed
-    if (responseType === 'token' && !this.provider.options.allowImplicitFlow) {
-      throw new Error('The implicit grant flow is not enabled for this provider');
-    }
-
-    // Check if plain PKCE method is used but not allowed (OAuth 2.1 recommends S256 only)
-    if (codeChallengeMethod === 'plain' && this.provider.options.allowPlainPKCE === false) {
-      throw new Error('The plain PKCE method is not allowed. Use S256 instead.');
-    }
-
     // Validate the client ID and redirect URI
     if (clientId) {
       const clientInfo = await this.lookupClient(clientId);
@@ -5452,16 +5444,17 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
       if (!clientInfo) {
         throw new Error(`Invalid client. The clientId provided does not match to this client.`);
       }
+      if (!redirectUri || !isValidRedirectUri(redirectUri, clientInfo.redirectUris)) {
+        throw new Error(
+          `Invalid redirect URI. The redirect URI provided does not match any registered URI for this client.`
+        );
+      }
+      validateAuthorizationResponseType(this.provider.serverCapabilities, responseType, clientInfo.responseTypes);
+      if (codeChallengeMethod === 'plain' && this.provider.options.allowPlainPKCE === false) {
+        throw new Error('The plain PKCE method is not allowed. Use S256 instead.');
+      }
       if (responseType === 'code' && clientInfo.tokenEndpointAuthMethod === 'none' && !codeChallenge) {
         throw new Error('Public clients must use PKCE with the authorization code flow.');
-      }
-      // If client exists, validate the redirect URI against registered URIs
-      if (clientInfo && redirectUri) {
-        if (!isValidRedirectUri(redirectUri, clientInfo.redirectUris)) {
-          throw new Error(
-            `Invalid redirect URI. The redirect URI provided does not match any registered URI for this client.`
-          );
-        }
       }
     }
 
@@ -5499,6 +5492,7 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
    * - For implicit flow: generating an access token directly
    * @param options - Options specifying the grant details
    * @returns A Promise resolving to an object containing the redirect URL
+   * @throws Error when the request's response type is not permitted
    * @throws CimdFetchError when the client ID is a CIMD URL whose document cannot be resolved
    */
   async completeAuthorization(options: CompleteAuthorizationOptions): Promise<{ redirectTo: string }> {
@@ -5515,6 +5509,11 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
         'Invalid redirect URI. The redirect URI provided does not match any registered URI for this client.'
       );
     }
+    validateAuthorizationResponseType(
+      this.provider.serverCapabilities,
+      options.request.responseType,
+      clientInfo.responseTypes
+    );
 
     // completeAuthorization() is a public helper and callers can pass a
     // reconstructed AuthRequest rather than one returned directly by

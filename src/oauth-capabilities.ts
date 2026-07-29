@@ -49,6 +49,20 @@ export function validateClientCapabilities(server: OAuthServerCapabilities, clie
   }
 }
 
+export function validateAuthorizationResponseType(
+  server: OAuthServerCapabilities,
+  responseType: string,
+  clientResponseTypes: readonly string[] | undefined
+): void {
+  if (!responseType) throw new Error('invalid_request: response_type is required');
+  if (!server.responseTypes.includes(responseType)) {
+    throw new Error(`unsupported_response_type: the authorization server does not support ${responseType}`);
+  }
+  if (!(clientResponseTypes ?? ['code']).includes(responseType)) {
+    throw new Error(`unauthorized_client: the client is not registered for response_type ${responseType}`);
+  }
+}
+
 export function validateAuthorizationServerScopes(scopes: readonly string[] | undefined): void {
   if (!scopes) return;
   if (scopes.some((scope) => !isValidOAuthScopeToken(scope))) {

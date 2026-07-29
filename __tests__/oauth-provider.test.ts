@@ -1582,6 +1582,78 @@ describe('OAuthProvider', () => {
       expect(grants.keys.length).toBe(1);
     });
 
+    it.each([
+      ['missing response_type', '', 'invalid_request'],
+      ['unsupported response_type', '&response_type=unsupported', 'unsupported_response_type'],
+    ])('should reject %s without creating authorization state', async (_label, responseType, code) => {
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read&state=state-123${responseType}`
+      );
+
+      await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(code);
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys).toHaveLength(0);
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'token:' })).keys).toHaveLength(0);
+    });
+
+    it('should prioritize a missing response_type over later PKCE validation', async () => {
+      const providerWithoutPlainPkce = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        allowPlainPKCE: false,
+      });
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}&state=state-123`
+      );
+
+      await expect(providerWithoutPlainPkce.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('invalid_request');
+    });
+
+    it('should reject a response type excluded by registered client metadata', async () => {
+      const registrationResponse = await oauthProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify({
+            redirect_uris: [redirectUri],
+            client_name: 'Implicit Only Client',
+            token_endpoint_auth_method: 'none',
+            grant_types: ['implicit'],
+            response_types: ['token'],
+          })
+        ),
+        mockEnv,
+        mockCtx
+      );
+      const client = await registrationResponse.json<any>();
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${client.client_id}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}&state=state-123` +
+          `&code_challenge=test-challenge&code_challenge_method=plain`
+      );
+
+      await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('unauthorized_client');
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys).toHaveLength(0);
+    });
+
+    it('should keep unsupported response errors local when the redirect URI is invalid', async () => {
+      const invalidRedirectUri = 'https://attacker.example.com/callback';
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=unsupported&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(invalidRedirectUri)}&state=state-123`
+      );
+
+      await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid redirect URI');
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys).toHaveLength(0);
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'token:' })).keys).toHaveLength(0);
+    });
+
     it('should reject authorization request with invalid redirect URI', async () => {
       // Create an authorization request with an invalid redirect URI
       const invalidRedirectUri = 'https://attacker.example.com/callback';
@@ -1651,6 +1723,41 @@ describe('OAuthProvider', () => {
       expect(grants.keys.length).toBe(0);
     });
 
+    it('should reject unsupported response types in completeAuthorization before storage', async () => {
+      await oauthProvider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
+      const helpers = mockEnv.OAUTH_PROVIDER!;
+      const authRequest = await helpers.parseAuthRequest(
+        createMockRequest(
+          `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+            `&redirect_uri=${encodeURIComponent(redirectUri)}&scope=read&state=state-123`
+        )
+      );
+
+      await helpers.completeAuthorization({
+        request: authRequest,
+        userId: 'test-user-123',
+        metadata: {},
+        scope: ['read'],
+        props: {},
+      });
+      const originalGrantKeys = (await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys.map((key) => key.name);
+
+      await expect(
+        helpers.completeAuthorization({
+          request: { ...authRequest, responseType: 'unsupported' },
+          userId: 'test-user-123',
+          metadata: {},
+          scope: ['read'],
+          props: {},
+        })
+      ).rejects.toThrow('unsupported_response_type');
+
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys.map((key) => key.name)).toEqual(
+        originalGrantKeys
+      );
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'token:' })).keys).toHaveLength(0);
+    });
+
     it('should reject completeAuthorization if redirect_uri is invalid', async () => {
       // This test ensures that completeAuthorization re-validates the redirect_uri.
       const authRequest = createMockRequest(
@@ -1692,6 +1799,8 @@ describe('OAuthProvider', () => {
         redirect_uris: ['https://spa-client.example.com/callback'],
         client_name: 'SPA Test Client',
         token_endpoint_auth_method: 'none', // Public client
+        grant_types: ['authorization_code', 'implicit'],
+        response_types: ['code', 'token'],
       };
 
       const request = createMockRequest(
@@ -1791,15 +1900,11 @@ describe('OAuthProvider', () => {
           `&scope=read%20write&state=xyz123`
       );
 
-      // Mock parseAuthRequest to test error handling
-      vi.spyOn(authRequest, 'formData').mockImplementation(() => {
-        throw new Error('The implicit grant flow is not enabled for this provider');
-      });
-
-      // Expect an error response
       await expect(providerWithoutImplicit.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
-        'The implicit grant flow is not enabled for this provider'
+        'unsupported_response_type'
       );
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys).toHaveLength(0);
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'token:' })).keys).toHaveLength(0);
     });
 
     it('should reject plain PKCE when allowPlainPKCE is false', async () => {

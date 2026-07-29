@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   buildOAuthServerCapabilities,
+  validateAuthorizationResponseType,
   validateAuthorizationServerScopes,
   validateClientCapabilities,
 } from '../src/oauth-capabilities';
@@ -48,6 +49,14 @@ describe('OAuth server capabilities', () => {
     ],
   ])('rejects %s', (_label, client) => {
     expect(() => validateClientCapabilities(defaults, client)).toThrow();
+  });
+
+  it.each([
+    ['', ['code'], 'invalid_request'],
+    ['token', ['code', 'token'], 'unsupported_response_type'],
+    ['code', ['token'], 'unauthorized_client'],
+  ])('rejects response type %j against client %j', (responseType, clientResponseTypes, error) => {
+    expect(() => validateAuthorizationResponseType(defaults, responseType, clientResponseTypes)).toThrow(error);
   });
 
   it('accepts capabilities that the server advertises', () => {
