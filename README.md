@@ -269,6 +269,7 @@ new OAuthProvider({
       throw new OAuthError('insufficient_scope', {
         description: 'The external token needs the account:read scope',
         statusCode: 403,
+        requiredScopes: ['account:read'],
       });
     }
     if (result.kind === 'rate_limited') {
@@ -290,9 +291,12 @@ The callback has three outcomes:
 - Return `null` for a generic `401 invalid_token` response.
 - Throw this package's exported `OAuthError` for an intentional structured response. Standard `invalid_token` 401
   and `insufficient_scope` 403 errors receive a resource-specific `WWW-Authenticate` challenge unless the error
-  supplies one.
+  supplies one. Set `requiredScopes` on `insufficient_scope` to include the operation's minimum scopes in the
+  challenge for step-up authorization.
 
-Other thrown values are re-thrown so unexpected validator bugs remain visible as 500s.
+Other thrown values are re-thrown so unexpected validator bugs remain visible as 500s. For cross-origin requests,
+the provider exposes `WWW-Authenticate` and `Retry-After` through CORS so browser clients can read discovery,
+step-up, and backoff guidance.
 
 ## Token Exchange Callback
 
@@ -405,6 +409,7 @@ async function refreshUpstream(props) {
 - `options.description` — human-readable text returned in `error_description`.
 - `options.statusCode` — HTTP status code (default `400`).
 - `options.headers` — additional response headers, such as `Retry-After` for transient failures. There is no implicit `Retry-After` default for callback-thrown errors.
+- `options.requiredScopes` — minimum scopes for a protected resource operation. On a structured `403 insufficient_scope` from `resolveExternalToken`, the provider validates, deduplicates, and serializes them into the synthesized `WWW-Authenticate` challenge.
 
 Only `OAuthError` from this package is converted into a structured response. Plain errors, plain objects with a `code` field, and app-local error classes continue to surface as 500s so unexpected failures stay visible. Import `OAuthError` from `@cloudflare/workers-oauth-provider` rather than copying or re-implementing it.
 

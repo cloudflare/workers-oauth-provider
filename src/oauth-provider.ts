@@ -1976,6 +1976,20 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     newResponse.headers.set('Access-Control-Allow-Methods', '*');
     // Include Authorization explicitly since it's not included in * for security reasons
     newResponse.headers.set('Access-Control-Allow-Headers', 'Authorization, *');
+
+    // Browser-based OAuth/MCP clients need these non-safelisted response
+    // headers for authorization discovery, step-up challenges, and backoff.
+    // Preserve any headers the API handler already chose to expose.
+    const exposedHeaders = (newResponse.headers.get('Access-Control-Expose-Headers') ?? '')
+      .split(',')
+      .map((name) => name.trim())
+      .filter(Boolean);
+    for (const requiredHeader of ['WWW-Authenticate', 'Retry-After']) {
+      if (!exposedHeaders.some((name) => name.toLowerCase() === requiredHeader.toLowerCase())) {
+        exposedHeaders.push(requiredHeader);
+      }
+    }
+    newResponse.headers.set('Access-Control-Expose-Headers', exposedHeaders.join(', '));
     newResponse.headers.set('Access-Control-Max-Age', '86400'); // 24 hours
 
     return newResponse;
@@ -2146,16 +2160,21 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       (error.code === 'invalid_token' && error.statusCode === 401) ||
       (error.code === 'insufficient_scope' && error.statusCode === 403);
 
+    let challengeHeaders: Record<string, string> | undefined;
+    if (resourceMetadataUrl && isBearerError && !hasChallenge) {
+      const requiredScopes = [...new Set(error.options.requiredScopes ?? [])];
+      if (requiredScopes.some((scope) => !isValidOAuthScopeToken(scope))) {
+        throw new TypeError('OAuthError requiredScopes must contain valid OAuth scope tokens');
+      }
+      challengeHeaders = {
+        ...headers,
+        'WWW-Authenticate': this.buildWwwAuthenticateHeader(resourceMetadataUrl, error.code, undefined, requiredScopes),
+      };
+    }
+
     return this.createErrorResponse(error.code, {
       ...error.options,
-      ...(resourceMetadataUrl && isBearerError && !hasChallenge
-        ? {
-            headers: {
-              ...headers,
-              'WWW-Authenticate': this.buildWwwAuthenticateHeader(resourceMetadataUrl, error.code),
-            },
-          }
-        : {}),
+      ...(challengeHeaders ? { headers: challengeHeaders } : {}),
     });
   }
 
@@ -4285,8 +4304,16 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   /**
    * Builds a WWW-Authenticate header value with resource_metadata per RFC 9728 §5.1
    */
-  private buildWwwAuthenticateHeader(resourceMetadataUrl: string, error: string, errorDescription?: string): string {
+  private buildWwwAuthenticateHeader(
+    resourceMetadataUrl: string,
+    error: string,
+    errorDescription?: string,
+    requiredScopes: string[] = []
+  ): string {
     let header = `Bearer realm="OAuth", resource_metadata="${resourceMetadataUrl}", error="${error}"`;
+    if (requiredScopes.length > 0) {
+      header += `, scope="${requiredScopes.join(' ')}"`;
+    }
     if (errorDescription) {
       header += `, error_description="${errorDescription}"`;
     }
@@ -4366,6 +4393,17 @@ export interface OAuthErrorOptions {
    * number of seconds or an HTTP-date.
    */
   headers?: Record<string, string>;
+
+  /**
+   * Minimum scopes needed for the protected resource operation.
+   *
+   * When `resolveExternalToken` throws a standard bearer-token error with
+   * HTTP 401 or 403, these values are serialized into the synthesized
+   * `WWW-Authenticate` challenge's `scope` parameter. This is especially
+   * useful for step-up authorization after `insufficient_scope`. Each value
+   * must use the OAuth scope-token grammar from RFC 6749 §3.3.
+   */
+  requiredScopes?: string[];
 }
 
 /**

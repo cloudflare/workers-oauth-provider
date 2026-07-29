@@ -6731,9 +6731,37 @@ describe('OAuthProvider', () => {
       expect(response.headers.get('Access-Control-Allow-Origin')).toBe('https://client.example.com');
       expect(response.headers.get('Access-Control-Allow-Methods')).toBe('*');
       expect(response.headers.get('Access-Control-Allow-Headers')).toBe('Authorization, *');
+      expect(response.headers.get('Access-Control-Expose-Headers')).toBe('WWW-Authenticate, Retry-After');
 
       const error = await response.json<any>();
       expect(error.error).toBe('invalid_token');
+    });
+
+    it('should preserve handler-supplied CORS exposed headers', async () => {
+      const provider = new OAuthProvider({
+        apiRoute: '/api/',
+        apiHandler: {
+          fetch: () =>
+            Promise.resolve(
+              new Response('ok', {
+                headers: { 'Access-Control-Expose-Headers': 'X-Request-Id, www-authenticate' },
+              })
+            ),
+        },
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        resolveExternalToken: async () => ({ props: {} }),
+      });
+      const request = createMockRequest('https://example.com/api/test', 'GET', {
+        Origin: 'https://client.example.com',
+        Authorization: 'Bearer external-token',
+      });
+
+      const response = await provider.fetch(request, mockEnv, mockCtx);
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get('Access-Control-Expose-Headers')).toBe('X-Request-Id, www-authenticate, Retry-After');
     });
 
     it('should add CORS headers to token endpoint error responses', async () => {
@@ -8825,6 +8853,7 @@ describe('OAuthProvider', () => {
             description: 'Account Resources: Read is required',
             statusCode: 403,
             headers: { 'X-Trace-Id': 'trace-123' },
+            requiredScopes: ['account:read', 'profile:read', 'account:read'],
           });
         },
       });
@@ -8836,7 +8865,9 @@ describe('OAuthProvider', () => {
 
       expect(response.status).toBe(403);
       expect(response.headers.get('X-Trace-Id')).toBe('trace-123');
-      expect(response.headers.get('WWW-Authenticate')).toContain('error="insufficient_scope"');
+      expect(response.headers.get('WWW-Authenticate')).toBe(
+        'Bearer realm="OAuth", resource_metadata="https://example.com/.well-known/oauth-protected-resource/api/test", error="insufficient_scope", scope="account:read profile:read"'
+      );
       await expect(response.json()).resolves.toEqual({
         error: 'insufficient_scope',
         error_description: 'Account Resources: Read is required',
@@ -8892,6 +8923,30 @@ describe('OAuthProvider', () => {
       }
     );
 
+    it('should reject invalid requiredScopes before constructing a challenge', async () => {
+      const provider = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        resolveExternalToken: async () => {
+          throw new OAuthError('insufficient_scope', {
+            description: 'invalid scope configuration',
+            statusCode: 403,
+            requiredScopes: ['scope with spaces'],
+          });
+        },
+      });
+      const request = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: 'Bearer external-token',
+      });
+
+      await expect(provider.fetch(request, mockEnv, mockCtx)).rejects.toThrow(
+        'OAuthError requiredScopes must contain valid OAuth scope tokens'
+      );
+    });
+
     it('should preserve a caller-supplied WWW-Authenticate challenge', async () => {
       const challenge = 'Bearer realm="external", error="invalid_token"';
       const provider = new OAuthProvider({
@@ -8905,6 +8960,7 @@ describe('OAuthProvider', () => {
             description: 'external token rejected',
             statusCode: 401,
             headers: { 'www-authenticate': challenge },
+            requiredScopes: ['ignored because the caller supplied the complete challenge'],
           });
         },
       });
