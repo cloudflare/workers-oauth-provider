@@ -398,6 +398,15 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
   allowPlainPKCE?: boolean;
 
   /**
+   * Restrict redirect URIs to HTTPS or HTTP loopback addresses, as required
+   * by the MCP authorization security specification.
+   *
+   * Defaults to false so non-MCP native applications can continue using
+   * private-use URI schemes.
+   */
+  enforceMcpRedirectUriSecurity?: boolean;
+
+  /**
    * Controls whether OAuth 2.0 Token Exchange (RFC 8693) is allowed.
    * When false, the token exchange grant type will not be advertised in metadata
    * and token exchange requests will be rejected.
@@ -3509,7 +3518,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
       // Validate each redirect URI scheme
       for (const uri of redirectUris) {
-        validateRedirectUriScheme(uri);
+        validateRedirectUriScheme(uri, !!this.options.enforceMcpRedirectUriSecurity);
       }
 
       clientInfo = {
@@ -4175,6 +4184,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       if (!redirectUris || redirectUris.length === 0) {
         throw new Error('redirect_uris is required and must not be empty');
       }
+      for (const uri of redirectUris) {
+        validateRedirectUriScheme(uri, !!this.options.enforceMcpRedirectUriSecurity);
+      }
 
       if (tokenEndpointAuthMethod && !OAuthProviderImpl.CIMD_ALLOWED_AUTH_METHODS.includes(tokenEndpointAuthMethod)) {
         throw new Error(
@@ -4645,7 +4657,7 @@ async function generateTokenId(token: string): Promise<string> {
  * @param redirectUri - The redirect URI to validate
  * @throws Error if the URI uses a blacklisted scheme or contains control characters
  */
-function validateRedirectUriScheme(redirectUri: string): void {
+function validateRedirectUriScheme(redirectUri: string, enforceMcpSecurity = false): void {
   // List of dangerous pseudo-schemes that should not be allowed
   const dangerousSchemes = ['javascript:', 'data:', 'vbscript:', 'file:', 'mailto:', 'blob:'];
 
@@ -4676,6 +4688,18 @@ function validateRedirectUriScheme(redirectUri: string): void {
   for (const dangerousScheme of dangerousSchemes) {
     if (scheme === dangerousScheme) {
       throw new Error('Invalid redirect URI');
+    }
+  }
+
+  if (enforceMcpSecurity) {
+    let parsed: URL;
+    try {
+      parsed = new URL(normalized);
+    } catch {
+      throw new Error('Invalid redirect URI');
+    }
+    if (parsed.protocol !== 'https:' && !(parsed.protocol === 'http:' && isLoopbackUri(normalized))) {
+      throw new Error('MCP redirect URIs must use HTTPS or an HTTP loopback address');
     }
   }
 }
@@ -5014,7 +5038,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
 
     // Validate redirect URI to prevent javascript: URIs / XSS attacks
     // Using helper function that normalizes and checks in a case-insensitive manner
-    validateRedirectUriScheme(redirectUri);
+    validateRedirectUriScheme(redirectUri, !!this.provider.options.enforceMcpRedirectUriSecurity);
 
     // Parse and validate resource parameter (RFC 8707)
     const resource = parseResourceParameter(resourceParam);
@@ -5293,7 +5317,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
 
     // Validate each redirect URI scheme
     for (const uri of newClient.redirectUris) {
-      validateRedirectUriScheme(uri);
+      validateRedirectUriScheme(uri, !!this.provider.options.enforceMcpRedirectUriSecurity);
     }
 
     // Only generate and store client secret for confidential clients

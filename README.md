@@ -251,6 +251,20 @@ Note that `deleteClient()` cascades: it revokes all grants (and their associated
 
 See the `OAuthHelpers` interface definition for full API details.
 
+### MCP redirect URI security
+
+MCP deployments can restrict redirect URIs to HTTPS or HTTP loopback addresses across DCR, programmatic clients,
+and Client ID Metadata Documents:
+
+```ts
+new OAuthProvider({
+  // ... other options ...
+  enforceMcpRedirectUriSecurity: true,
+});
+```
+
+This option defaults to `false` so non-MCP native OAuth applications can continue using private-use URI schemes.
+
 ## Token Exchange Callback
 
 This library allows you to update the `props` value during token exchanges by configuring a callback function. This is useful for scenarios where the application needs to perform additional processing when tokens are issued or refreshed.

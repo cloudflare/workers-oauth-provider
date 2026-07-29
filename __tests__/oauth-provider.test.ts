@@ -1862,6 +1862,65 @@ describe('OAuthProvider', () => {
       });
     });
 
+    describe('MCP redirect URI security', () => {
+      const strictProvider = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        enforceMcpRedirectUriSecurity: true,
+      });
+
+      it.each(['http://remote.example.com/callback', 'myapp://callback'])('should reject %s', async (redirectUri) => {
+        const response = await strictProvider.fetch(
+          createMockRequest(
+            'https://example.com/oauth/register',
+            'POST',
+            { 'Content-Type': 'application/json' },
+            JSON.stringify({
+              redirect_uris: [redirectUri],
+              client_name: 'MCP Client',
+              token_endpoint_auth_method: 'none',
+            })
+          ),
+          mockEnv,
+          mockCtx
+        );
+
+        expect(response.status).toBe(400);
+        await expect(response.json()).resolves.toMatchObject({
+          error: 'invalid_client_metadata',
+          error_description: 'MCP redirect URIs must use HTTPS or an HTTP loopback address',
+        });
+      });
+
+      it.each([
+        'https://client.example.com/callback',
+        'http://localhost:3000/callback',
+        'http://127.0.0.1:8787/callback',
+        'http://[::1]:8787/callback',
+      ])('should accept %s', async (redirectUri) => {
+        const response = await strictProvider.fetch(
+          createMockRequest(
+            'https://example.com/oauth/register',
+            'POST',
+            { 'Content-Type': 'application/json' },
+            JSON.stringify({
+              redirect_uris: [redirectUri],
+              client_name: 'MCP Client',
+              token_endpoint_auth_method: 'none',
+            })
+          ),
+          mockEnv,
+          mockCtx
+        );
+
+        expect(response.status).toBe(201);
+      });
+    });
+
     describe('should allow legitimate URIs', () => {
       const legitimateUris = [
         'https://client.example.com/callback',
