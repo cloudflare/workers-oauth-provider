@@ -601,7 +601,7 @@ describe('OAuthProvider', () => {
       const metadata = await response.json<any>();
       expect(metadata.resource).toBe('https://example.com');
       expect(metadata.authorization_servers).toEqual(['https://example.com']);
-      expect(metadata.scopes_supported).toEqual(['read', 'write', 'profile']);
+      expect(metadata.scopes_supported).toBeUndefined();
       expect(metadata.bearer_methods_supported).toEqual(['header']);
       expect(metadata.resource_name).toBeUndefined();
     });
@@ -617,7 +617,7 @@ describe('OAuthProvider', () => {
         resourceMetadata: {
           resource: 'https://api.example.com',
           authorization_servers: ['https://auth.example.com'],
-          scopes_supported: ['custom:read', 'custom:write'],
+          scopes_supported: ['custom:read', 'offline_access', 'custom:write', 'custom:read'],
           bearer_methods_supported: ['header'],
           resource_name: 'Example API',
         },
@@ -681,7 +681,7 @@ describe('OAuthProvider', () => {
       ).toThrow(message);
     });
 
-    it('should fall back to top-level scopesSupported when resourceMetadata.scopes_supported is not set', async () => {
+    it('should not infer protected resource requirements from authorization server scopes', async () => {
       const providerWithPartialMetadata = new OAuthProvider({
         apiRoute: ['/api/'],
         apiHandler: TestApiHandler,
@@ -694,23 +694,36 @@ describe('OAuthProvider', () => {
         },
       });
 
-      const request = createMockRequest('https://example.com/.well-known/oauth-protected-resource');
-      const response = await providerWithPartialMetadata.fetch(request, mockEnv, mockCtx);
+      const resourceResponse = await providerWithPartialMetadata.fetch(
+        createMockRequest('https://example.com/.well-known/oauth-protected-resource'),
+        mockEnv,
+        mockCtx
+      );
+      const resourceMetadata = await resourceResponse.json<any>();
+      expect(resourceMetadata.resource).toBe('https://api.example.com');
+      expect(resourceMetadata.authorization_servers).toEqual(['https://example.com']);
+      expect(resourceMetadata.scopes_supported).toBeUndefined();
 
-      const metadata = await response.json<any>();
-      expect(metadata.resource).toBe('https://api.example.com');
-      expect(metadata.authorization_servers).toEqual(['https://example.com']);
-      expect(metadata.scopes_supported).toEqual(['read', 'write']);
+      const authorizationServerResponse = await providerWithPartialMetadata.fetch(
+        createMockRequest('https://example.com/.well-known/oauth-authorization-server'),
+        mockEnv,
+        mockCtx
+      );
+      const authorizationServerMetadata = await authorizationServerResponse.json<any>();
+      expect(authorizationServerMetadata.scopes_supported).toEqual(['read', 'offline_access', 'write', 'read']);
     });
 
-    it('should include resource scopes but not offline_access in bearer challenges', async () => {
+    it('should include explicit resource scopes but not offline_access in bearer challenges', async () => {
       const provider = new OAuthProvider({
         apiRoute: ['/api/'],
         apiHandler: TestApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
-        scopesSupported: ['read', 'offline_access', 'write'],
+        scopesSupported: ['admin'],
+        resourceMetadata: {
+          scopes_supported: ['read', 'offline_access', 'write', 'read'],
+        },
       });
 
       const response = await provider.fetch(
@@ -724,6 +737,46 @@ describe('OAuthProvider', () => {
       expect(response.status).toBe(401);
       expect(response.headers.get('WWW-Authenticate')).toContain('scope="read write"');
       expect(response.headers.get('WWW-Authenticate')).not.toContain('offline_access');
+      expect(response.headers.get('WWW-Authenticate')).not.toContain('admin');
+    });
+
+    it('should keep missing-credential challenges error-free while providing explicit resource scopes', async () => {
+      const provider = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        resourceMetadata: {
+          scopes_supported: ['read', 'offline_access', 'read'],
+        },
+      });
+
+      const response = await provider.fetch(createMockRequest('https://example.com/api/test'), mockEnv, mockCtx);
+      const challenge = response.headers.get('WWW-Authenticate');
+
+      expect(response.status).toBe(401);
+      expect(challenge).toContain('scope="read"');
+      expect(challenge).not.toContain('offline_access');
+      expect(challenge).not.toContain('error=');
+      expect(await response.text()).toBe('');
+    });
+
+    it('should omit challenge scopes when only authorization server scopes are configured', async () => {
+      const provider = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        scopesSupported: ['read', 'write', 'admin'],
+      });
+
+      const response = await provider.fetch(createMockRequest('https://example.com/api/test'), mockEnv, mockCtx);
+
+      expect(response.status).toBe(401);
+      expect(response.headers.get('WWW-Authenticate')).not.toContain('scope=');
+      expect(response.headers.get('WWW-Authenticate')).not.toContain('error=');
     });
 
     it('should add CORS headers to protected resource metadata endpoint', async () => {
@@ -9407,12 +9460,15 @@ describe('OAuthProvider', () => {
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
+        resourceMetadata: {
+          scopes_supported: ['baseline:read', 'offline_access'],
+        },
         resolveExternalToken: async () => {
           throw new OAuthError('insufficient_scope', {
             description: 'Account Resources: Read is required',
             statusCode: 403,
             headers: { 'X-Trace-Id': 'trace-123' },
-            requiredScopes: ['account:read', 'profile:read', 'account:read'],
+            requiredScopes: ['account:read', 'offline_access', 'profile:read', 'account:read'],
           });
         },
       });
@@ -9427,6 +9483,8 @@ describe('OAuthProvider', () => {
       expect(response.headers.get('WWW-Authenticate')).toBe(
         'Bearer realm="OAuth", resource_metadata="https://example.com/.well-known/oauth-protected-resource/api/test", error="insufficient_scope", scope="account:read profile:read"'
       );
+      expect(response.headers.get('WWW-Authenticate')).not.toContain('baseline:read');
+      expect(response.headers.get('WWW-Authenticate')).not.toContain('offline_access');
       await expect(response.json()).resolves.toEqual({
         error: 'insufficient_scope',
         error_description: 'Account Resources: Read is required',

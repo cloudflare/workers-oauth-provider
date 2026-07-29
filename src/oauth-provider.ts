@@ -378,8 +378,9 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
   clientRegistrationTTL?: number;
 
   /**
-   * List of scopes supported by this OAuth provider.
-   * If not provided, the 'scopes_supported' field will be omitted from the OAuth metadata.
+   * Scopes supported by the authorization server.
+   * These are advertised only in authorization server metadata; configure
+   * `resourceMetadata.scopes_supported` separately for protected resource requirements.
    */
   scopesSupported?: string[];
 
@@ -526,8 +527,10 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
      */
     authorization_servers?: string[];
     /**
-     * Scopes supported by this protected resource.
-     * If not set, falls back to the top-level scopesSupported option.
+     * Minimal scopes required for basic protected resource functionality.
+     * These scopes are advertised in Protected Resource Metadata and used as
+     * baseline bearer challenge guidance. `offline_access` is omitted because
+     * refresh-token issuance is an authorization server capability.
      */
     scopes_supported?: string[];
     /**
@@ -2162,10 +2165,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     });
   }
 
-  /** Scopes that are requirements of the protected resource itself. */
+  /** Scopes that are baseline requirements of the protected resource itself. */
   private getProtectedResourceScopes(): string[] {
-    const configured = this.options.resourceMetadata?.scopes_supported ?? this.options.scopesSupported ?? [];
-    return [...new Set(configured)].filter((scope) => scope !== 'offline_access');
+    return this.normalizeProtectedResourceScopes(this.options.resourceMetadata?.scopes_supported ?? []);
+  }
+
+  /** Deduplicate resource-facing scopes and remove authorization-server-only capabilities. */
+  private normalizeProtectedResourceScopes(scopes: string[]): string[] {
+    return [...new Set(scopes)].filter((scope) => scope !== 'offline_access');
   }
 
   /**
@@ -4442,8 +4449,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     if (error) {
       header += `, error="${error}"`;
     }
-    if (requiredScopes.length > 0) {
-      header += `, scope="${requiredScopes.join(' ')}"`;
+    const challengeScopes =
+      requiredScopes.length > 0
+        ? this.normalizeProtectedResourceScopes(requiredScopes)
+        : this.getProtectedResourceScopes();
+    if (challengeScopes.length > 0) {
+      header += `, scope="${challengeScopes.join(' ')}"`;
     }
     if (errorDescription) {
       header += `, error_description="${errorDescription}"`;

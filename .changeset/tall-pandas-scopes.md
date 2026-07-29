@@ -2,4 +2,4 @@
 '@cloudflare/workers-oauth-provider': minor
 ---
 
-Include protected resource scopes in bearer challenges for MCP scope selection and omit `offline_access` from challenges and RFC 9728 `scopes_supported`, since refresh-token issuance is an authorization server capability rather than a protected resource requirement.
+Separate authorization-server and protected-resource scope configuration. Explicit `resourceMetadata.scopes_supported` values become baseline Bearer challenge guidance, operation-specific `requiredScopes` takes precedence, and `offline_access` is omitted from provider-generated resource-facing scope lists. Deployments relying on the old `scopesSupported` fallback must configure protected-resource scopes explicitly.

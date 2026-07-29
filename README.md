@@ -307,9 +307,18 @@ redirects. Intermediate identity-provider redirects and local HTML error pages d
 
 ### Protected resource scopes
 
-The provider includes configured protected resource scopes in bearer challenges so MCP clients can select initial
-scopes without guessing. `offline_access` is omitted from both challenges and Protected Resource Metadata because it
-controls authorization server refresh-token issuance rather than access to a protected resource.
+Set `resourceMetadata.scopes_supported` to the minimal scopes needed for basic resource functionality. The provider
+publishes them in Protected Resource Metadata and uses them as baseline Bearer challenge guidance. Operation-specific
+`OAuthError.requiredScopes` takes precedence. `scopesSupported` remains authorization-server metadata only, and
+`offline_access` is omitted from every provider-generated resource-facing scope list.
+
+```ts
+new OAuthProvider({
+  scopesSupported: ['files:read', 'files:write', 'offline_access'],
+  resourceMetadata: { scopes_supported: ['files:read'] },
+  // ... other options ...
+});
+```
 
 ## Token Exchange Callback
 
