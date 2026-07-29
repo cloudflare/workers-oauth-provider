@@ -305,6 +305,21 @@ RFC 9207 issuer identification is always enabled. Successful authorization respo
 `parseAuthRequest` returns the expected `issuer`; authorization handlers must include it in terminal OAuth error
 redirects. Intermediate identity-provider redirects and local HTML error pages do not need it.
 
+### Protected resource scopes
+
+Set `resourceMetadata.scopes_supported` to the minimal scopes needed for basic resource functionality. The provider
+publishes them in Protected Resource Metadata and uses them as baseline Bearer challenge guidance. Operation-specific
+`OAuthError.requiredScopes` takes precedence. `scopesSupported` remains authorization-server metadata only, and
+`offline_access` is omitted from every provider-generated resource-facing scope list.
+
+```ts
+new OAuthProvider({
+  scopesSupported: ['files:read', 'files:write', 'offline_access'],
+  resourceMetadata: { scopes_supported: ['files:read'] },
+  // ... other options ...
+});
+```
+
 ## Token Exchange Callback
 
 This library allows you to update the `props` value during token exchanges by configuring a callback function. This is useful for scenarios where the application needs to perform additional processing when tokens are issued or refreshed.

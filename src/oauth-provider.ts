@@ -378,8 +378,9 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
   clientRegistrationTTL?: number;
 
   /**
-   * List of scopes supported by this OAuth provider.
-   * If not provided, the 'scopes_supported' field will be omitted from the OAuth metadata.
+   * Scopes supported by the authorization server.
+   * These are advertised only in authorization server metadata; configure
+   * `resourceMetadata.scopes_supported` separately for protected resource requirements.
    */
   scopesSupported?: string[];
 
@@ -526,8 +527,10 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
      */
     authorization_servers?: string[];
     /**
-     * Scopes supported by this protected resource.
-     * If not set, falls back to the top-level scopesSupported option.
+     * Minimal scopes required for basic protected resource functionality.
+     * These scopes are advertised in Protected Resource Metadata and used as
+     * baseline bearer challenge guidance. `offline_access` is omitted because
+     * refresh-token issuance is an authorization server capability.
      */
     scopes_supported?: string[];
     /**
@@ -2162,6 +2165,16 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     });
   }
 
+  /** Scopes that are baseline requirements of the protected resource itself. */
+  private getProtectedResourceScopes(): string[] {
+    return this.normalizeProtectedResourceScopes(this.options.resourceMetadata?.scopes_supported ?? []);
+  }
+
+  /** Deduplicate resource-facing scopes and remove authorization-server-only capabilities. */
+  private normalizeProtectedResourceScopes(scopes: string[]): string[] {
+    return [...new Set(scopes)].filter((scope) => scope !== 'offline_access');
+  }
+
   /**
    * Handles the OAuth Protected Resource Metadata endpoint
    * Implements RFC 9728 for OAuth Protected Resource Metadata
@@ -2175,10 +2188,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const tokenEndpointUrl = this.getFullEndpointUrl(this.options.tokenEndpoint, requestUrl);
     const authServerOrigin = new URL(tokenEndpointUrl).origin;
 
+    const resourceScopes = this.getProtectedResourceScopes();
     const metadata: Record<string, unknown> = {
       resource: rm?.resource ?? this.deriveResourceIdentifier(requestUrl),
       authorization_servers: rm?.authorization_servers ?? [authServerOrigin],
-      scopes_supported: rm?.scopes_supported ?? this.options.scopesSupported,
+      ...(resourceScopes.length > 0 ? { scopes_supported: resourceScopes } : {}),
       bearer_methods_supported: rm?.bearer_methods_supported ?? ['header'],
     };
 
@@ -4435,8 +4449,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     if (error) {
       header += `, error="${error}"`;
     }
-    if (requiredScopes.length > 0) {
-      header += `, scope="${requiredScopes.join(' ')}"`;
+    const challengeScopes =
+      requiredScopes.length > 0
+        ? this.normalizeProtectedResourceScopes(requiredScopes)
+        : this.getProtectedResourceScopes();
+    if (challengeScopes.length > 0) {
+      header += `, scope="${challengeScopes.join(' ')}"`;
     }
     if (errorDescription) {
       header += `, error_description="${errorDescription}"`;
