@@ -598,6 +598,8 @@ When CIMD is not enabled (the default), URL-formatted `client_id` values fall th
 
 The OAuth metadata endpoint reports `client_id_metadata_document_supported: true` only when both the option is enabled and the compatibility flag is present.
 
+CIMD currently supports only `token_endpoint_auth_method: "none"`.
+
 ## Written using Claude
 
 This library (including the schema documentation) was largely written with the help of [Claude](https://claude.ai), the AI model by Anthropic. Claude's output was thoroughly reviewed by Cloudflare engineers with careful attention paid to security and compliance with standards. Many improvements were made on the initial output, mostly again by prompting Claude (and reviewing the results). Check out the commit history to see how Claude was prompted and what code it produced.
