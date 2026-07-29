@@ -1,5 +1,11 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
-import { OAuthError, OAuthProvider, type OAuthHelpers, type Token } from '../src/oauth-provider';
+import {
+  OAuthError,
+  OAuthProvider,
+  type OAuthHelpers,
+  type OAuthProviderOptions,
+  type Token,
+} from '../src/oauth-provider';
 import type { ExecutionContext } from '@cloudflare/workers-types';
 // We're importing WorkerEntrypoint from our mock implementation
 // The actual import is mocked in setup.ts
@@ -609,7 +615,7 @@ describe('OAuthProvider', () => {
           resource: 'https://api.example.com',
           authorization_servers: ['https://auth.example.com'],
           scopes_supported: ['custom:read', 'custom:write'],
-          bearer_methods_supported: ['header', 'body'],
+          bearer_methods_supported: ['header'],
           resource_name: 'Example API',
         },
       });
@@ -623,8 +629,53 @@ describe('OAuthProvider', () => {
       expect(metadata.resource).toBe('https://api.example.com');
       expect(metadata.authorization_servers).toEqual(['https://auth.example.com']);
       expect(metadata.scopes_supported).toEqual(['custom:read', 'custom:write']);
-      expect(metadata.bearer_methods_supported).toEqual(['header', 'body']);
+      expect(metadata.bearer_methods_supported).toEqual(['header']);
       expect(metadata.resource_name).toBe('Example API');
+    });
+
+    it.each<[string, OAuthProviderOptions['resourceMetadata'], string]>([
+      [
+        'an empty authorization server list',
+        { authorization_servers: [] },
+        'resourceMetadata.authorization_servers must contain at least one issuer',
+      ],
+      [
+        'an insecure authorization server issuer',
+        { authorization_servers: ['http://auth.example.com'] },
+        'resourceMetadata.authorization_servers must contain valid HTTPS issuer URLs',
+      ],
+      [
+        'an issuer with a query',
+        { authorization_servers: ['https://auth.example.com?tenant=a'] },
+        'resourceMetadata.authorization_servers must contain valid HTTPS issuer URLs',
+      ],
+      [
+        'an invalid resource identifier',
+        { resource: 'mcp.example.com' },
+        'resourceMetadata.resource must be an absolute HTTP(S) URI without a fragment',
+      ],
+      [
+        'an invalid scope token',
+        { scopes_supported: ['scope with spaces'] },
+        'resourceMetadata.scopes_supported must contain valid OAuth scope tokens',
+      ],
+      [
+        'an unsupported bearer method',
+        { bearer_methods_supported: ['body'] },
+        "resourceMetadata.bearer_methods_supported only supports 'header'",
+      ],
+    ])('should reject protected resource metadata with %s', (_label, resourceMetadata, message) => {
+      expect(
+        () =>
+          new OAuthProvider({
+            apiRoute: ['/api/'],
+            apiHandler: TestApiHandler,
+            defaultHandler: testDefaultHandler,
+            authorizeEndpoint: '/authorize',
+            tokenEndpoint: '/oauth/token',
+            resourceMetadata,
+          })
+      ).toThrow(message);
     });
 
     it('should fall back to top-level scopesSupported when resourceMetadata.scopes_supported is not set', async () => {
@@ -1535,6 +1586,20 @@ describe('OAuthProvider', () => {
       // Verify access token was stored in KV
       const tokenEntries = await mockEnv.OAUTH_KV.list({ prefix: 'token:' });
       expect(tokenEntries.keys.length).toBe(1);
+    });
+
+    it('should reject authorization code requests from public clients without PKCE', async () => {
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123`
+      );
+
+      await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
+        'Public clients must use PKCE with the authorization code flow.'
+      );
+
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys).toHaveLength(0);
     });
 
     it('should reject implicit flow when allowImplicitFlow is disabled', async () => {
@@ -5265,18 +5330,22 @@ describe('OAuthProvider', () => {
       await getAccessToken();
     });
 
-    it('should reject API requests without a token', async () => {
-      const apiRequest = createMockRequest('https://example.com/api/test');
+    it.each([
+      ['no authorization header', undefined],
+      ['an unsupported authorization scheme', 'Basic dXNlcjpwYXNz'],
+    ])('should challenge API requests with %s without OAuth error details', async (_label, authorization) => {
+      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
+        ...(authorization ? { Authorization: authorization } : {}),
+      });
 
       const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
 
       expect(apiResponse.status).toBe(401);
-
-      const error = await apiResponse.json<any>();
-      expect(error.error).toBe('invalid_token');
+      expect(apiResponse.headers.get('Cache-Control')).toBe('no-store');
+      expect(await apiResponse.text()).toBe('');
     });
 
-    it('should include resource_metadata in WWW-Authenticate header on 401 (RFC 9728)', async () => {
+    it('should include resource_metadata without an error code when credentials are absent', async () => {
       const apiRequest = createMockRequest('https://example.com/api/test');
 
       const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
@@ -5287,7 +5356,7 @@ describe('OAuthProvider', () => {
       // so the client can discover metadata for the specific resource
       const wwwAuth = apiResponse.headers.get('WWW-Authenticate');
       expect(wwwAuth).toBe(
-        'Bearer realm="OAuth", resource_metadata="https://example.com/.well-known/oauth-protected-resource/api/test", error="invalid_token", error_description="Missing or invalid access token"'
+        'Bearer realm="OAuth", resource_metadata="https://example.com/.well-known/oauth-protected-resource/api/test"'
       );
     });
 
@@ -6782,9 +6851,36 @@ describe('OAuthProvider', () => {
       expect(response.headers.get('Access-Control-Allow-Origin')).toBe('https://client.example.com');
       expect(response.headers.get('Access-Control-Allow-Methods')).toBe('*');
       expect(response.headers.get('Access-Control-Allow-Headers')).toBe('Authorization, *');
+      expect(response.headers.get('Access-Control-Expose-Headers')).toBe('WWW-Authenticate, Retry-After');
+      expect(await response.text()).toBe('');
+      expect(response.headers.get('WWW-Authenticate')).not.toContain('error=');
+    });
 
-      const error = await response.json<any>();
-      expect(error.error).toBe('invalid_token');
+    it('should preserve handler-supplied CORS exposed headers', async () => {
+      const provider = new OAuthProvider({
+        apiRoute: '/api/',
+        apiHandler: {
+          fetch: () =>
+            Promise.resolve(
+              new Response('ok', {
+                headers: { 'Access-Control-Expose-Headers': 'X-Request-Id, www-authenticate' },
+              })
+            ),
+        },
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        resolveExternalToken: async () => ({ props: {} }),
+      });
+      const request = createMockRequest('https://example.com/api/test', 'GET', {
+        Origin: 'https://client.example.com',
+        Authorization: 'Bearer external-token',
+      });
+
+      const response = await provider.fetch(request, mockEnv, mockCtx);
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get('Access-Control-Expose-Headers')).toBe('X-Request-Id, www-authenticate, Retry-After');
     });
 
     it('should add CORS headers to token endpoint error responses', async () => {
@@ -8833,6 +8929,187 @@ describe('OAuthProvider', () => {
       expect(externalTokenCalls[0].token).toBe('invalid-external-token');
     });
 
+    it('should convert OAuthError from external validation into a structured invalid_token response', async () => {
+      const provider = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        resolveExternalToken: async () => {
+          throw new OAuthError('invalid_token', {
+            description: 'external token expired',
+            statusCode: 401,
+          });
+        },
+      });
+      const request = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: 'Bearer expired-external-token',
+      });
+
+      const response = await provider.fetch(request, mockEnv, mockCtx);
+
+      expect(response.status).toBe(401);
+      expect(response.headers.get('Cache-Control')).toBe('no-store');
+      expect(response.headers.get('WWW-Authenticate')).toBe(
+        'Bearer realm="OAuth", resource_metadata="https://example.com/.well-known/oauth-protected-resource/api/test", error="invalid_token"'
+      );
+      await expect(response.json()).resolves.toEqual({
+        error: 'invalid_token',
+        error_description: 'external token expired',
+      });
+    });
+
+    it('should convert insufficient_scope from external validation into a structured 403 response', async () => {
+      const provider = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        resolveExternalToken: async () => {
+          throw new OAuthError('insufficient_scope', {
+            description: 'Account Resources: Read is required',
+            statusCode: 403,
+            headers: { 'X-Trace-Id': 'trace-123' },
+            requiredScopes: ['account:read', 'profile:read', 'account:read'],
+          });
+        },
+      });
+      const request = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: 'Bearer under-scoped-external-token',
+      });
+
+      const response = await provider.fetch(request, mockEnv, mockCtx);
+
+      expect(response.status).toBe(403);
+      expect(response.headers.get('X-Trace-Id')).toBe('trace-123');
+      expect(response.headers.get('WWW-Authenticate')).toBe(
+        'Bearer realm="OAuth", resource_metadata="https://example.com/.well-known/oauth-protected-resource/api/test", error="insufficient_scope", scope="account:read profile:read"'
+      );
+      await expect(response.json()).resolves.toEqual({
+        error: 'insufficient_scope',
+        error_description: 'Account Resources: Read is required',
+      });
+    });
+
+    it.each<{
+      code: string;
+      description: string;
+      status: number;
+      headers: Record<string, string>;
+    }>([
+      {
+        code: 'temporarily_unavailable',
+        description: 'external authorization server rate limited',
+        status: 429,
+        headers: { 'Retry-After': '17' },
+      },
+      {
+        code: 'server_error',
+        description: 'external authorization server unavailable',
+        status: 502,
+        headers: { 'X-Upstream-Status': '503' },
+      },
+    ])(
+      'should preserve a structured $status external validation failure',
+      async ({ code, description, status, headers }) => {
+        const provider = new OAuthProvider({
+          apiRoute: ['/api/'],
+          apiHandler: TestApiHandler,
+          defaultHandler: testDefaultHandler,
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: '/oauth/token',
+          resolveExternalToken: async () => {
+            throw new OAuthError(code, { description, statusCode: status, headers });
+          },
+        });
+        const request = createMockRequest('https://example.com/api/test', 'GET', {
+          Authorization: 'Bearer unavailable-external-token',
+        });
+
+        const response = await provider.fetch(request, mockEnv, mockCtx);
+
+        expect(response.status).toBe(status);
+        for (const [name, value] of Object.entries(headers)) {
+          expect(response.headers.get(name)).toBe(value);
+        }
+        expect(response.headers.get('WWW-Authenticate')).toBeNull();
+        await expect(response.json()).resolves.toEqual({
+          error: code,
+          error_description: description,
+        });
+      }
+    );
+
+    it('should reject invalid requiredScopes before constructing a challenge', async () => {
+      const provider = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        resolveExternalToken: async () => {
+          throw new OAuthError('insufficient_scope', {
+            description: 'invalid scope configuration',
+            statusCode: 403,
+            requiredScopes: ['scope with spaces'],
+          });
+        },
+      });
+      const request = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: 'Bearer external-token',
+      });
+
+      await expect(provider.fetch(request, mockEnv, mockCtx)).rejects.toThrow(
+        'OAuthError requiredScopes must contain valid OAuth scope tokens'
+      );
+    });
+
+    it('should preserve a caller-supplied WWW-Authenticate challenge', async () => {
+      const challenge = 'Bearer realm="external", error="invalid_token"';
+      const provider = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        resolveExternalToken: async () => {
+          throw new OAuthError('invalid_token', {
+            description: 'external token rejected',
+            statusCode: 401,
+            headers: { 'www-authenticate': challenge },
+            requiredScopes: ['ignored because the caller supplied the complete challenge'],
+          });
+        },
+      });
+      const request = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: 'Bearer rejected-external-token',
+      });
+
+      const response = await provider.fetch(request, mockEnv, mockCtx);
+
+      expect(response.headers.get('WWW-Authenticate')).toBe(challenge);
+    });
+
+    it('should rethrow non-OAuthError failures from external validation', async () => {
+      const provider = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        resolveExternalToken: async () => {
+          throw new Error('external validator bug');
+        },
+      });
+      const request = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: 'Bearer external-token',
+      });
+
+      await expect(provider.fetch(request, mockEnv, mockCtx)).rejects.toThrow('external validator bug');
+    });
+
     it('should prioritize internal tokens over external validation', async () => {
       // Mock external token validation to track if it's called
       const externalTokenCalls: any[] = [];
@@ -9365,7 +9642,7 @@ describe('OAuthProvider', () => {
         globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(createMockFetchResponse(validMetadata)));
 
         const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=plain`,
           'GET'
         );
 
@@ -9403,7 +9680,7 @@ describe('OAuthProvider', () => {
         globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(createMockFetchResponse(validMetadata)));
 
         const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=plain`,
           'GET'
         );
 
@@ -9426,7 +9703,7 @@ describe('OAuthProvider', () => {
           .mockImplementation(() => Promise.resolve(createMockFetchResponse(maliciousMetadata)));
 
         const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=plain`,
           'GET'
         );
 
@@ -9449,7 +9726,7 @@ describe('OAuthProvider', () => {
         );
 
         const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://malicious.example.com/callback')}&response_type=code&state=test-state`,
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://malicious.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=plain`,
           'GET'
         );
 
@@ -9472,7 +9749,7 @@ describe('OAuthProvider', () => {
         );
 
         const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://malicious.example.com/callback')}&response_type=code&state=test-state`,
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://malicious.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=plain`,
           'GET'
         );
 
@@ -9493,7 +9770,7 @@ describe('OAuthProvider', () => {
         globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(createMockFetchResponse(validMetadata)));
 
         const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=plain`,
           'GET'
         );
         await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
@@ -9530,7 +9807,7 @@ describe('OAuthProvider', () => {
         );
 
         const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=plain`,
           'GET'
         );
         await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
@@ -9549,7 +9826,7 @@ describe('OAuthProvider', () => {
         globalThis.fetch = vi.fn().mockResolvedValue(new Response('Not Found', { status: 404 }));
 
         const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=plain`,
           'GET'
         );
         await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
@@ -9570,7 +9847,7 @@ describe('OAuthProvider', () => {
         globalThis.fetch = vi.fn().mockResolvedValue(createMockFetchResponse(invalidMetadata));
 
         const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=plain`,
           'GET'
         );
         await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
@@ -9594,7 +9871,7 @@ describe('OAuthProvider', () => {
         );
 
         const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=plain`,
           'GET'
         );
 
@@ -9612,7 +9889,7 @@ describe('OAuthProvider', () => {
         );
 
         const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=plain`,
           'GET'
         );
 
@@ -9630,7 +9907,7 @@ describe('OAuthProvider', () => {
         );
 
         const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=plain`,
           'GET'
         );
 
@@ -9649,7 +9926,7 @@ describe('OAuthProvider', () => {
         globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(createMockFetchResponse(validMetadata)));
 
         const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=plain`,
           'GET'
         );
 
@@ -9659,7 +9936,32 @@ describe('OAuthProvider', () => {
         expect(authResponse.status).toBe(302);
       });
 
-      it('should accept private_key_jwt auth method', async () => {
+      it('should negotiate none from ChatGPT-style authentication method choices', async () => {
+        const cimdUrl = 'https://chatgpt.com/oauth/client.json';
+        const validMetadata = {
+          client_id: cimdUrl,
+          client_name: 'ChatGPT',
+          redirect_uris: ['https://chatgpt.com/connector_platform_oauth_redirect'],
+          token_endpoint_auth_methods_supported: ['none', 'private_key_jwt'],
+          grant_types: ['authorization_code', 'refresh_token'],
+          response_types: ['code'],
+        };
+
+        globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(createMockFetchResponse(validMetadata)));
+        const authRequest = createMockRequest(
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}` +
+            `&redirect_uri=${encodeURIComponent(validMetadata.redirect_uris[0])}` +
+            `&response_type=code&state=test-state` +
+            `&code_challenge=test-challenge&code_challenge_method=plain`,
+          'GET'
+        );
+
+        const response = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+
+        expect(response.status).toBe(302);
+      });
+
+      it('should reject private_key_jwt until token-endpoint assertion validation is implemented', async () => {
         const cimdUrl = 'https://client.example.com/oauth/metadata.json';
         const validMetadata = {
           client_id: cimdUrl,
@@ -9672,14 +9974,11 @@ describe('OAuthProvider', () => {
         globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(createMockFetchResponse(validMetadata)));
 
         const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=plain`,
           'GET'
         );
 
-        const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
-
-        // Should succeed with redirect
-        expect(authResponse.status).toBe(302);
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
       });
     });
 
@@ -9689,6 +9988,28 @@ describe('OAuthProvider', () => {
         const invalidMetadata = {
           client_id: 'https://different.example.com/metadata.json',
           redirect_uris: ['https://client.example.com/callback'],
+        };
+
+        globalThis.fetch = vi.fn().mockResolvedValue(createMockFetchResponse(invalidMetadata));
+
+        const authRequest = createMockRequest(
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=plain`,
+          'GET'
+        );
+
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+      });
+
+      it.each([
+        ['missing', undefined],
+        ['empty', '   '],
+      ])('should treat %s client_name as invalid client', async (_label, clientName) => {
+        const cimdUrl = 'https://client.example.com/oauth/metadata.json';
+        const invalidMetadata = {
+          client_id: cimdUrl,
+          ...(clientName === undefined ? {} : { client_name: clientName }),
+          redirect_uris: ['https://client.example.com/callback'],
+          token_endpoint_auth_method: 'none',
         };
 
         globalThis.fetch = vi.fn().mockResolvedValue(createMockFetchResponse(invalidMetadata));
@@ -9711,7 +10032,7 @@ describe('OAuthProvider', () => {
         globalThis.fetch = vi.fn().mockResolvedValue(createMockFetchResponse(invalidMetadata));
 
         const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=plain`,
           'GET'
         );
 
@@ -9729,7 +10050,7 @@ describe('OAuthProvider', () => {
         globalThis.fetch = vi.fn().mockResolvedValue(createMockFetchResponse(invalidMetadata));
 
         const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=plain`,
           'GET'
         );
 
@@ -9747,7 +10068,7 @@ describe('OAuthProvider', () => {
         );
 
         const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=plain`,
           'GET'
         );
 
@@ -9761,7 +10082,7 @@ describe('OAuthProvider', () => {
         globalThis.fetch = vi.fn();
 
         const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(httpUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          `https://example.com/authorize?client_id=${encodeURIComponent(httpUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=plain`,
           'GET'
         );
 
@@ -9774,7 +10095,7 @@ describe('OAuthProvider', () => {
         globalThis.fetch = vi.fn();
 
         const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(urlWithoutPath)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          `https://example.com/authorize?client_id=${encodeURIComponent(urlWithoutPath)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=plain`,
           'GET'
         );
 
@@ -9787,7 +10108,7 @@ describe('OAuthProvider', () => {
         globalThis.fetch = vi.fn();
 
         const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(urlWithRootPath)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          `https://example.com/authorize?client_id=${encodeURIComponent(urlWithRootPath)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=plain`,
           'GET'
         );
 
@@ -9800,7 +10121,7 @@ describe('OAuthProvider', () => {
         globalThis.fetch = vi.fn();
 
         const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(regularClientId)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          `https://example.com/authorize?client_id=${encodeURIComponent(regularClientId)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=plain`,
           'GET'
         );
 
@@ -9815,7 +10136,7 @@ describe('OAuthProvider', () => {
         globalThis.fetch = vi.fn().mockRejectedValue(new DOMException('Aborted', 'AbortError'));
 
         const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://abort.example.com/callback')}&response_type=code&state=test-state`,
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://abort.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=plain`,
           'GET'
         );
 
@@ -9834,7 +10155,7 @@ describe('OAuthProvider', () => {
         globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(createMockFetchResponse(validMetadata)));
 
         const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=plain`,
           'GET'
         );
 
@@ -9854,7 +10175,7 @@ describe('OAuthProvider', () => {
         globalThis.fetch = vi.fn().mockResolvedValue(new Response('Not Found', { status: 404 }));
 
         const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=plain`,
           'GET'
         );
 
@@ -9866,7 +10187,7 @@ describe('OAuthProvider', () => {
         globalThis.fetch = vi.fn().mockResolvedValue(new Response('Internal Server Error', { status: 500 }));
 
         const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=plain`,
           'GET'
         );
 
@@ -9878,7 +10199,7 @@ describe('OAuthProvider', () => {
         globalThis.fetch = vi.fn().mockRejectedValue(new Error('Network error'));
 
         const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://unreachable.example.com/callback')}&response_type=code&state=test-state`,
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://unreachable.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=plain`,
           'GET'
         );
 
@@ -9913,7 +10234,7 @@ describe('OAuthProvider', () => {
         globalThis.fetch = fetchSpy;
 
         const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=plain`,
           'GET'
         );
 
@@ -9933,7 +10254,7 @@ describe('OAuthProvider', () => {
         globalThis.fetch = fetchSpy;
 
         const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=plain`,
           'GET'
         );
 
@@ -9953,7 +10274,7 @@ describe('OAuthProvider', () => {
         globalThis.fetch = fetchSpy;
 
         const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=plain`,
           'GET'
         );
 
@@ -10018,7 +10339,7 @@ describe('OAuthProvider', () => {
         globalThis.fetch = fetchSpy;
 
         const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=plain`,
           'GET'
         );
 
@@ -10062,7 +10383,7 @@ describe('OAuthProvider', () => {
         globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(createMockFetchResponse(validMetadata)));
 
         const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=plain`,
           'GET'
         );
 
@@ -10081,7 +10402,7 @@ describe('OAuthProvider', () => {
         globalThis.fetch = fetchSpy;
 
         const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=plain`,
           'GET'
         );
 
@@ -10097,7 +10418,7 @@ describe('OAuthProvider', () => {
 
       function makeAuthRequest(url: string = cimdUrl) {
         return createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(url)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
+          `https://example.com/authorize?client_id=${encodeURIComponent(url)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=plain`,
           'GET'
         );
       }

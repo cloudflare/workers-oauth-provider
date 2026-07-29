@@ -450,8 +450,9 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
    * For example, if a request includes an authenticated token from a different OAuth authentication server,
    * the callback can be used to authenticate it and set the context props through it.
    *
-   * The callback can optionally return props values that will passed-through to the apiHandlers.
-   * The callback can return `null` to signal resolution failure.
+   * Return props to authenticate the request, or `null` for a generic `invalid_token` response.
+   * Throw this package's exported {@link OAuthError} to return a structured OAuth error response.
+   * Other thrown errors remain unexpected failures and are re-thrown.
    */
   resolveExternalToken?: (input: ResolveExternalTokenInput) => Promise<ResolveExternalTokenResult | null>;
 
@@ -1407,6 +1408,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       );
     }
 
+    this.validateResourceMetadataOptions(this.options.resourceMetadata);
     this.validateEmaOptions(this.options.enterpriseManagedAuthorization);
 
     if (this.options.enterpriseManagedAuthorization) {
@@ -1460,6 +1462,40 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     throw new TypeError(
       `${name} must be either an ExportedHandler object with a fetch method or a class extending WorkerEntrypoint`
     );
+  }
+
+  /** Validate configured RFC 9728 protected resource metadata. */
+  private validateResourceMetadataOptions(options: OAuthProviderOptions<Env>['resourceMetadata']): void {
+    if (!options) return;
+
+    if (options.resource && !validateResourceUri(options.resource)) {
+      throw new TypeError('resourceMetadata.resource must be an absolute HTTP(S) URI without a fragment');
+    }
+
+    if (options.authorization_servers !== undefined) {
+      if (options.authorization_servers.length === 0) {
+        throw new TypeError('resourceMetadata.authorization_servers must contain at least one issuer');
+      }
+      for (const issuer of options.authorization_servers) {
+        let parsed: URL;
+        try {
+          parsed = new URL(issuer);
+        } catch {
+          throw new TypeError('resourceMetadata.authorization_servers must contain valid HTTPS issuer URLs');
+        }
+        if (parsed.protocol !== 'https:' || parsed.search || parsed.hash) {
+          throw new TypeError('resourceMetadata.authorization_servers must contain valid HTTPS issuer URLs');
+        }
+      }
+    }
+
+    if (options.scopes_supported?.some((scope) => !isValidOAuthScopeToken(scope))) {
+      throw new TypeError('resourceMetadata.scopes_supported must contain valid OAuth scope tokens');
+    }
+
+    if (options.bearer_methods_supported?.some((method) => method !== 'header')) {
+      throw new TypeError("resourceMetadata.bearer_methods_supported only supports 'header'");
+    }
   }
 
   /**
@@ -1975,6 +2011,20 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     newResponse.headers.set('Access-Control-Allow-Methods', '*');
     // Include Authorization explicitly since it's not included in * for security reasons
     newResponse.headers.set('Access-Control-Allow-Headers', 'Authorization, *');
+
+    // Browser-based OAuth/MCP clients need these non-safelisted response
+    // headers for authorization discovery, step-up challenges, and backoff.
+    // Preserve any headers the API handler already chose to expose.
+    const exposedHeaders = (newResponse.headers.get('Access-Control-Expose-Headers') ?? '')
+      .split(',')
+      .map((name) => name.trim())
+      .filter(Boolean);
+    for (const requiredHeader of ['WWW-Authenticate', 'Retry-After']) {
+      if (!exposedHeaders.some((name) => name.toLowerCase() === requiredHeader.toLowerCase())) {
+        exposedHeaders.push(requiredHeader);
+      }
+    }
+    newResponse.headers.set('Access-Control-Expose-Headers', exposedHeaders.join(', '));
     newResponse.headers.set('Access-Control-Max-Age', '86400'); // 24 hours
 
     return newResponse;
@@ -2125,18 +2175,42 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   }
 
   /**
-   * Build a structured OAuth `/token` error response from an OAuth error.
+   * Build a structured OAuth error response from an OAuth error.
    *
    * The supported form is throwing this package's exported `OAuthError`.
    * Anything else is re-thrown so unexpected failures still surface as 500s.
    *
+   * When handling a protected resource request, standard bearer-token errors
+   * receive an RFC 6750 / RFC 9728 challenge unless the caller supplied one.
    * Use `headers['Retry-After']` for rate-limit / transient-failure backoff
    * hints (see RFC 7231 §7.1.3 — either an integer seconds value or an
    * HTTP-date is allowed).
    */
-  private createOAuthErrorResponse(error: unknown): Response | undefined {
+  private createOAuthErrorResponse(error: unknown, resourceMetadataUrl?: string): Response | undefined {
     if (!(error instanceof OAuthError)) return undefined;
-    return this.createErrorResponse(error.code, error.options);
+
+    const headers = error.options.headers ?? {};
+    const hasChallenge = Object.keys(headers).some((name) => name.toLowerCase() === 'www-authenticate');
+    const isBearerError =
+      (error.code === 'invalid_token' && error.statusCode === 401) ||
+      (error.code === 'insufficient_scope' && error.statusCode === 403);
+
+    let challengeHeaders: Record<string, string> | undefined;
+    if (resourceMetadataUrl && isBearerError && !hasChallenge) {
+      const requiredScopes = [...new Set(error.options.requiredScopes ?? [])];
+      if (requiredScopes.some((scope) => !isValidOAuthScopeToken(scope))) {
+        throw new TypeError('OAuthError requiredScopes must contain valid OAuth scope tokens');
+      }
+      challengeHeaders = {
+        ...headers,
+        'WWW-Authenticate': this.buildWwwAuthenticateHeader(resourceMetadataUrl, error.code, undefined, requiredScopes),
+      };
+    }
+
+    return this.createErrorResponse(error.code, {
+      ...error.options,
+      ...(challengeHeaders ? { headers: challengeHeaders } : {}),
+    });
   }
 
   /**
@@ -3634,15 +3708,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const authHeader = request.headers.get('Authorization');
 
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return this.createErrorResponse('invalid_token', {
-        description: 'Missing or invalid access token',
-        statusCode: 401,
+      // OAuth 2.1 §5.3.2: when authentication information is absent or uses an
+      // unsupported scheme, challenge without an error code or description.
+      return new Response(null, {
+        status: 401,
         headers: {
-          'WWW-Authenticate': this.buildWwwAuthenticateHeader(
-            resourceMetadataUrl,
-            'invalid_token',
-            'Missing or invalid access token'
-          ),
+          ...NO_CACHE_HEADERS,
+          'WWW-Authenticate': this.buildWwwAuthenticateHeader(resourceMetadataUrl),
         },
       });
     }
@@ -3721,8 +3793,17 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       // Set the decrypted props on the context object
       (ctx as MutableExecutionContext).props = decryptedProps;
     } else if (this.options.resolveExternalToken) {
-      // No token data was found, so we validate the provided token with the provided validator
-      const ext = await this.options.resolveExternalToken({ token: accessToken, request, env });
+      // No token data was found, so we validate the provided token with the provided validator.
+      // Convert only the package's exported OAuthError into a structured response;
+      // unexpected callback failures remain visible as 500s.
+      let ext: ResolveExternalTokenResult | null;
+      try {
+        ext = await this.options.resolveExternalToken({ token: accessToken, request, env });
+      } catch (error) {
+        const response = this.createOAuthErrorResponse(error, resourceMetadataUrl);
+        if (response) return response;
+        throw error;
+      }
 
       // Failed external validation
       if (!ext) {
@@ -3992,7 +4073,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * Allowed authentication methods for CIMD clients (per IETF spec)
    * CIMD clients cannot use symmetric secrets since there's no pre-shared secret
    */
-  private static readonly CIMD_ALLOWED_AUTH_METHODS = ['none', 'private_key_jwt'];
+  // private_key_jwt can be added once token-endpoint assertion validation is implemented.
+  // Accepting it in metadata before then creates clients that can authorize but never exchange a code.
+  private static readonly CIMD_ALLOWED_AUTH_METHODS = ['none'];
 
   /**
    * Validates that a field is a string or undefined
@@ -4155,32 +4238,46 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       const rawMetadata = await this.readJsonWithSizeLimit(response, OAuthProviderImpl.CIMD_MAX_SIZE_BYTES);
 
       const clientId = OAuthProviderImpl.validateStringField(rawMetadata.client_id, 'client_id');
+      const clientName = OAuthProviderImpl.validateStringField(rawMetadata.client_name, 'client_name');
       const redirectUris = OAuthProviderImpl.validateStringArray(rawMetadata.redirect_uris, 'redirect_uris');
-      const tokenEndpointAuthMethod = OAuthProviderImpl.validateStringField(
+      const declaredAuthMethod = OAuthProviderImpl.validateStringField(
         rawMetadata.token_endpoint_auth_method,
         'token_endpoint_auth_method'
       );
+      const authMethodChoices = OAuthProviderImpl.validateStringArray(
+        rawMetadata.token_endpoint_auth_methods_supported,
+        'token_endpoint_auth_methods_supported'
+      );
+      const tokenEndpointAuthMethod = declaredAuthMethod ?? (authMethodChoices?.includes('none') ? 'none' : undefined);
 
       // Validate that client_id matches the URL (required by spec)
       if (clientId !== metadataUrl) {
         throw new Error(`client_id "${clientId}" does not match metadata URL "${metadataUrl}"`);
       }
 
+      if (!clientName?.trim()) {
+        throw new Error('client_name is required and must not be empty');
+      }
+
       if (!redirectUris || redirectUris.length === 0) {
         throw new Error('redirect_uris is required and must not be empty');
       }
 
-      if (tokenEndpointAuthMethod && !OAuthProviderImpl.CIMD_ALLOWED_AUTH_METHODS.includes(tokenEndpointAuthMethod)) {
+      if (
+        (declaredAuthMethod && !OAuthProviderImpl.CIMD_ALLOWED_AUTH_METHODS.includes(declaredAuthMethod)) ||
+        (authMethodChoices &&
+          !authMethodChoices.some((method) => OAuthProviderImpl.CIMD_ALLOWED_AUTH_METHODS.includes(method)))
+      ) {
         throw new Error(
-          `token_endpoint_auth_method "${tokenEndpointAuthMethod}" is not allowed for CIMD clients. ` +
-            `Allowed methods: ${OAuthProviderImpl.CIMD_ALLOWED_AUTH_METHODS.join(', ')}`
+          `CIMD client does not support an accepted token endpoint authentication method. ` +
+            `Supported methods: ${OAuthProviderImpl.CIMD_ALLOWED_AUTH_METHODS.join(', ')}`
         );
       }
 
       return {
         clientId,
         redirectUris,
-        clientName: OAuthProviderImpl.validateStringField(rawMetadata.client_name, 'client_name'),
+        clientName,
         clientUri: OAuthProviderImpl.validateOptionalUriField(rawMetadata.client_uri, 'client_uri'),
         logoUri: OAuthProviderImpl.validateOptionalUriField(rawMetadata.logo_uri, 'logo_uri'),
         policyUri: OAuthProviderImpl.validateOptionalUriField(rawMetadata.policy_uri, 'policy_uri'),
@@ -4250,8 +4347,19 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   /**
    * Builds a WWW-Authenticate header value with resource_metadata per RFC 9728 §5.1
    */
-  private buildWwwAuthenticateHeader(resourceMetadataUrl: string, error: string, errorDescription?: string): string {
-    let header = `Bearer realm="OAuth", resource_metadata="${resourceMetadataUrl}", error="${error}"`;
+  private buildWwwAuthenticateHeader(
+    resourceMetadataUrl: string,
+    error?: string,
+    errorDescription?: string,
+    requiredScopes: string[] = []
+  ): string {
+    let header = `Bearer realm="OAuth", resource_metadata="${resourceMetadataUrl}"`;
+    if (error) {
+      header += `, error="${error}"`;
+    }
+    if (requiredScopes.length > 0) {
+      header += `, scope="${requiredScopes.join(' ')}"`;
+    }
     if (errorDescription) {
       header += `, error_description="${errorDescription}"`;
     }
@@ -4331,15 +4439,25 @@ export interface OAuthErrorOptions {
    * number of seconds or an HTTP-date.
    */
   headers?: Record<string, string>;
+
+  /**
+   * Minimum scopes needed for the protected resource operation.
+   *
+   * When `resolveExternalToken` throws a standard bearer-token error with
+   * HTTP 401 or 403, these values are serialized into the synthesized
+   * `WWW-Authenticate` challenge's `scope` parameter. This is especially
+   * useful for step-up authorization after `insufficient_scope`. Each value
+   * must use the OAuth scope-token grammar from RFC 6749 §3.3.
+   */
+  requiredScopes?: string[];
 }
 
 /**
  * Structured OAuth 2.0 error.
  *
- * Throw from a `tokenExchangeCallback` (or any code it calls — the error
- * propagates naturally up through deep call stacks) to surface a standard
- * `/token` error response (`{ error, error_description }`) instead of a
- * generic `500 Internal Server Error`.
+ * Throw from a `tokenExchangeCallback`, `resolveExternalToken`, or any code
+ * they call to surface a standard OAuth error response
+ * (`{ error, error_description }`) instead of a generic `500 Internal Server Error`.
  *
  * Anything thrown that is **not** an `OAuthError` continues to surface as
  * a 500 so unexpected failures remain visible — the provider does not
@@ -5032,6 +5150,9 @@ class OAuthHelpersImpl implements OAuthHelpers {
 
       if (!clientInfo) {
         throw new Error(`Invalid client. The clientId provided does not match to this client.`);
+      }
+      if (responseType === 'code' && clientInfo.tokenEndpointAuthMethod === 'none' && !codeChallenge) {
+        throw new Error('Public clients must use PKCE with the authorization code flow.');
       }
       // If client exists, validate the redirect URI against registered URIs
       if (clientInfo && redirectUri) {
