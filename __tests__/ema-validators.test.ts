@@ -293,12 +293,31 @@ describe('validateIdJagClaims', () => {
     expect(r).toMatchObject({ ok: false, error: { reason: 'aud_mismatch' } });
   });
 
-  it('accepts aud as an array containing the expected audience', () => {
+  it('accepts aud as a single-element array containing the expected audience', () => {
     const r = validateIdJagClaims({
-      rawClaims: { ...validClaims, aud: ['https://x.example', 'https://as.example.com'] },
+      rawClaims: { ...validClaims, aud: ['https://as.example.com'] },
       ...claimsArgs,
     });
     expect(r.ok).toBe(true);
+  });
+
+  it.each([
+    [['https://as.example.com', 'https://other.example.com'], 'invalid_claim'],
+    [['https://as.example.com', 'https://as.example.com'], 'invalid_claim'],
+    [[], 'invalid_claim'],
+    [['https://as.example.com', 42], 'invalid_claim'],
+    [['https://other.example.com'], 'aud_mismatch'],
+  ])('rejects unsupported aud array %j', (aud, reason) => {
+    const r = validateIdJagClaims({ rawClaims: { ...validClaims, aud }, ...claimsArgs });
+    expect(r).toMatchObject({ ok: false, error: { reason } });
+  });
+
+  it.each([
+    ['authorization_details', []],
+    ['cnf', { jkt: 'thumbprint' }],
+  ])('fails closed when unsupported %s is present', (claim, value) => {
+    const r = validateIdJagClaims({ rawClaims: { ...validClaims, [claim]: value }, ...claimsArgs });
+    expect(r).toMatchObject({ ok: false, error: { reason: 'unsupported_claim', claim } });
   });
 
   it('rejects client_id mismatch', () => {

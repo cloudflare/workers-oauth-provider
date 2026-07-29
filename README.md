@@ -120,7 +120,7 @@ const defaultHandler: ExportedHandler<Env> = {
     }
 
     // This parses the OAuth parameters and validates the client, redirect URI,
-    // resource indicators, and configured PKCE restrictions.
+    // response type, resource indicators, and configured PKCE restrictions.
     let oauthRequest: AuthRequest;
     try {
       oauthRequest = await env.OAUTH_PROVIDER.parseAuthRequest(request);
@@ -133,18 +133,6 @@ const defaultHandler: ExportedHandler<Env> = {
 
     if (!client) {
       return new Response('Unknown OAuth client', { status: 400 });
-    }
-
-    // MCP uses authorization code flow. Reject unsupported or client-disabled
-    // response types before completeAuthorization().
-    const responseTypeAllowed =
-      oauthRequest.responseType === 'code' && (!client.responseTypes || client.responseTypes.includes('code'));
-    if (!responseTypeAllowed) {
-      const redirect = new URL(oauthRequest.redirectUri);
-      redirect.searchParams.set('error', oauthRequest.responseType ? 'unsupported_response_type' : 'invalid_request');
-      if (oauthRequest.state) redirect.searchParams.set('state', oauthRequest.state);
-      if (oauthRequest.issuer) redirect.searchParams.set('iss', oauthRequest.issuer);
-      return Response.redirect(redirect.toString(), 302);
     }
 
     // Authenticate the user and obtain consent here. Do not automatically
@@ -279,14 +267,13 @@ The package serves RFC 8414 metadata rather than OpenID Connect discovery. MCP a
 
 ## Authorization endpoint
 
-Your `authorizeEndpoint` belongs to the application's `defaultHandler`. A typical flow has four steps:
+Your `authorizeEndpoint` belongs to the application's `defaultHandler`. A typical flow has three steps:
 
-1. Call `parseAuthRequest(request)` to parse the request and validate the client, redirect URI, resource, and PKCE restrictions.
-2. Reject response types that the deployment does not support. MCP uses `code`.
-3. Authenticate the user, show consent, and decide which scopes to grant.
-4. Call `completeAuthorization()` and redirect to its returned `redirectTo` URL.
+1. Call `parseAuthRequest(request)` to validate the client, redirect URI, response type, resource, and PKCE restrictions.
+2. Authenticate the user, show consent, and decide which scopes to grant.
+3. Call `completeAuthorization()` and redirect to its returned `redirectTo` URL.
 
-The explicit response type check is required because `completeAuthorization()` currently treats any response type other than `token` as authorization code flow.
+`completeAuthorization()` repeats response-type validation before writing a grant or revoking existing grants. The application remains responsible for rendering local authorization errors and for constructing any terminal OAuth error redirect only after client and redirect URI validation.
 
 `completeAuthorization()` stores a new grant and, by default, revokes existing grants for the same user and client after the new grant is safely stored. Set `revokeExistingGrants: false` only when the application intentionally allows concurrent grants for the same user and client.
 
@@ -361,6 +348,8 @@ clientRegistrationEndpoint: '/oauth/register';
 
 MCP 2026-07-28 deprecates DCR for new implementations in favor of CIMD. The endpoint remains useful for compatibility with clients that do not support CIMD.
 
+Registration accepts only authentication methods, grants, and response types implemented by the configured provider, and rejects inconsistent grant/response combinations before storage. Omitted metadata uses the RFC 7591 defaults: `client_secret_basic`, `grant_types: ["authorization_code"]`, and `response_types: ["code"]`.
+
 Related options:
 
 - `clientRegistrationTTL` controls the lifetime of dynamically registered clients. The default is 90 days.
@@ -396,7 +385,7 @@ Path-aware audiences use path-boundary prefix matching. A token for `https://exa
 
 ## Scopes and step-up authorization
 
-`scopesSupported` is published in authorization server metadata and is also the default for protected resource metadata. `resourceMetadata.scopes_supported` can override the protected resource value.
+`scopesSupported` is published only in authorization server metadata. Configure `resourceMetadata.scopes_supported` explicitly with the minimal scopes required for basic protected-resource functionality and baseline Bearer challenges.
 
 The application decides which requested scopes to grant through `completeAuthorization({ scope })`. Token and refresh requests can only narrow those scopes.
 

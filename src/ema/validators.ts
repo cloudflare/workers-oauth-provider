@@ -174,7 +174,8 @@ interface ValidateClaimsInput {
  *
  * Enforces (in order):
  *   - presence + type of `iss`, `sub`, `aud`, `client_id`, `jti`, `exp`, `iat`
- *   - `aud` contains the AS's expected audience
+ *   - `aud` is the AS's expected audience, as a string or single-element array
+ *   - unsupported authorization-bearing claims fail closed
  *   - `client_id` matches the authenticated client
  *   - optional `resource` is a valid RFC 8707 URI and matches the AS's configured resource
  *   - the configured resource is used when `resource` is omitted
@@ -204,6 +205,10 @@ export function validateIdJagClaims(input: ValidateClaimsInput): Result<Validate
   const aud = readAudienceClaim(rawClaims);
   if (!aud.ok) return aud;
 
+  for (const claim of ['authorization_details', 'cnf'] as const) {
+    if (rawClaims[claim] !== undefined) return err({ reason: 'unsupported_claim', claim });
+  }
+
   // The MCP EMA profile follows the core ID-JAG specification in making
   // `resource` optional. Keep tokens pinned to this provider's declared
   // resource when the IdP omits the claim; a present claim is still validated.
@@ -223,8 +228,8 @@ export function validateIdJagClaims(input: ValidateClaimsInput): Result<Validate
   const iat = readNumericDateClaim(rawClaims, 'iat');
   if (!iat.ok) return iat;
 
-  const audiences = Array.isArray(aud.value) ? aud.value : [aud.value];
-  if (!audiences.includes(expectedAudience)) {
+  const audience = Array.isArray(aud.value) ? aud.value[0] : aud.value;
+  if (audience !== expectedAudience) {
     return err({ reason: 'aud_mismatch', expected: expectedAudience, got: aud.value });
   }
 
@@ -436,7 +441,7 @@ function readAudienceClaim(claims: Record<string, unknown>): Result<string | str
   if (typeof aud === 'string' && aud.length > 0) {
     return ok(aud);
   }
-  if (Array.isArray(aud) && aud.length > 0 && aud.every((v) => typeof v === 'string' && v.length > 0)) {
+  if (Array.isArray(aud) && aud.length === 1 && typeof aud[0] === 'string' && aud[0].length > 0) {
     return ok(aud);
   }
   return err({ reason: 'invalid_claim', claim: 'aud' });

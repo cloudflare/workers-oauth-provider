@@ -1,6 +1,14 @@
 import { WorkerEntrypoint } from 'cloudflare:workers';
 
 import {
+  buildOAuthServerCapabilities,
+  isValidOAuthScopeToken,
+  validateAuthorizationResponseType,
+  validateAuthorizationServerScopes,
+  validateClientCapabilities,
+  type OAuthServerCapabilities,
+} from './oauth-capabilities';
+import {
   EMA_DEFAULT_CLOCK_SKEW_SECONDS,
   EMA_DEFAULT_MAX_ASSERTION_LIFETIME_SECONDS,
   EMA_ID_JAG_GRANT_PROFILE,
@@ -35,6 +43,7 @@ export type {
   EmaTrustedIssuerResolverInput,
 } from './ema/types';
 export type { EmaValidationError } from './ema/result';
+export { isValidOAuthScopeToken } from './oauth-capabilities';
 
 const PROTECTED_RESOURCE_WELL_KNOWN_PREFIX = '/.well-known/oauth-protected-resource';
 const NO_CACHE_HEADERS = { 'Cache-Control': 'no-store', Pragma: 'no-cache' } as const;
@@ -572,6 +581,7 @@ export interface OAuthHelpers {
    * Parses an OAuth authorization request from the HTTP request
    * @param request - The HTTP request containing OAuth parameters
    * @returns The parsed authorization request parameters
+   * @throws Error when the response type is missing, unsupported, or not registered for the client
    * @throws {@link CimdFetchError} when the client ID is a CIMD URL whose document cannot be resolved
    */
   parseAuthRequest(request: Request): Promise<AuthRequest>;
@@ -588,6 +598,7 @@ export interface OAuthHelpers {
    * Completes an authorization request by creating a grant and authorization code
    * @param options - Options specifying the grant details
    * @returns A Promise resolving to an object containing the redirect URL
+   * @throws Error when the request's response type is not permitted
    * @throws {@link CimdFetchError} when the client ID is a CIMD URL whose document cannot be resolved
    */
   completeAuthorization(options: CompleteAuthorizationOptions): Promise<{ redirectTo: string }>;
@@ -1363,6 +1374,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    */
   private typedApiHandlers: Array<[string, TypedHandler<Env>]>;
 
+  /** Capabilities shared by discovery and client metadata validation. */
+  readonly serverCapabilities: OAuthServerCapabilities;
+
   /** In-memory cached IdP JWKS fetcher; only constructed when EMA is configured. */
   private readonly jwksProvider: EmaJwksProvider | undefined;
 
@@ -1448,6 +1462,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       );
     }
 
+    this.serverCapabilities = buildOAuthServerCapabilities({
+      allowImplicitFlow: !!this.options.allowImplicitFlow,
+      allowTokenExchangeGrant: !!this.options.allowTokenExchangeGrant,
+      enterpriseManagedAuthorization: !!this.options.enterpriseManagedAuthorization,
+    });
+    validateAuthorizationServerScopes(this.options.scopesSupported);
     this.validateResourceMetadataOptions(this.options.resourceMetadata);
     this.validateEmaOptions(this.options.enterpriseManagedAuthorization);
 
@@ -1665,17 +1685,15 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Call the default handler based on its type
     // Note: We don't add CORS headers to default handler responses
     if (this.typedDefaultHandler.type === HandlerType.EXPORTED_HANDLER) {
-      // It's an object with a fetch method
       return this.typedDefaultHandler.handler.fetch(
         request as Parameters<ExportedHandlerWithFetch<Env>['fetch']>[0],
         env,
         ctx
       );
-    } else {
-      // It's a WorkerEntrypoint class - instantiate it with ctx and env in that order
-      const handler = new this.typedDefaultHandler.handler(ctx, env);
-      return handler.fetch(request);
     }
+
+    const handler = new this.typedDefaultHandler.handler(ctx, env);
+    return handler.fetch(request);
   }
 
   /**
@@ -2121,24 +2139,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       registrationEndpoint = this.getFullEndpointUrl(this.options.clientRegistrationEndpoint, requestUrl);
     }
 
-    // Determine supported response types
-    const responseTypesSupported = ['code'];
-
-    // Add token response type if implicit flow is allowed
-    if (this.options.allowImplicitFlow) {
-      responseTypesSupported.push('token');
-    }
-
-    // Determine supported grant types
-    const grantTypesSupported = [GrantType.AUTHORIZATION_CODE, GrantType.REFRESH_TOKEN];
-    if (this.options.allowTokenExchangeGrant) {
-      grantTypesSupported.push(GrantType.TOKEN_EXCHANGE);
-    }
-    const authorizationGrantProfilesSupported: string[] = [];
-    if (this.options.enterpriseManagedAuthorization) {
-      grantTypesSupported.push(GrantType.JWT_BEARER);
-      authorizationGrantProfilesSupported.push(EMA_ID_JAG_GRANT_PROFILE);
-    }
+    const responseTypesSupported = this.serverCapabilities.responseTypes;
+    const grantTypesSupported = this.serverCapabilities.grantTypes;
+    const authorizationGrantProfilesSupported = this.options.enterpriseManagedAuthorization
+      ? [EMA_ID_JAG_GRANT_PROFILE]
+      : [];
 
     const metadata = {
       issuer: new URL(tokenEndpoint).origin,
@@ -2154,8 +2159,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       ...(authorizationGrantProfilesSupported.length > 0
         ? { authorization_grant_profiles_supported: authorizationGrantProfilesSupported }
         : {}),
-      // Support "none" auth method for public clients
-      token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post', 'none'],
+      token_endpoint_auth_methods_supported: this.serverCapabilities.tokenEndpointAuthMethods,
       // not implemented: token_endpoint_auth_signing_alg_values_supported
       // not implemented: service_documentation
       // not implemented: ui_locales_supported
@@ -3586,9 +3590,28 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       return this.createErrorResponse('invalid_request', { description: 'Invalid JSON payload', statusCode: 400 });
     }
 
-    // Get token endpoint auth method, default to client_secret_basic
-    const authMethod =
-      OAuthProviderImpl.validateStringField(clientMetadata.token_endpoint_auth_method) || 'client_secret_basic';
+    let authMethod: string;
+    let grantTypes: string[];
+    let responseTypes: string[];
+    try {
+      authMethod =
+        OAuthProviderImpl.validateStringField(clientMetadata.token_endpoint_auth_method) || 'client_secret_basic';
+      grantTypes = OAuthProviderImpl.validateStringArray(clientMetadata.grant_types, 'grant_types') || [
+        GrantType.AUTHORIZATION_CODE,
+      ];
+      responseTypes = OAuthProviderImpl.validateStringArray(clientMetadata.response_types, 'response_types') || [
+        'code',
+      ];
+      validateClientCapabilities(this.serverCapabilities, {
+        tokenEndpointAuthMethod: authMethod,
+        grantTypes,
+        responseTypes,
+      });
+    } catch (error) {
+      return this.createErrorResponse('invalid_client_metadata', {
+        description: error instanceof Error ? error.message : 'Invalid client metadata',
+      });
+    }
     const isPublicClient = authMethod === 'none';
 
     // Check if public client registrations are disallowed
@@ -3634,12 +3657,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         jwksUri: OAuthProviderImpl.validateOptionalUriField(clientMetadata.jwks_uri, 'jwks_uri'),
         i18n: OAuthProviderImpl.extractI18nFields(clientMetadata),
         contacts: OAuthProviderImpl.validateStringArray(clientMetadata.contacts),
-        grantTypes: OAuthProviderImpl.validateStringArray(clientMetadata.grant_types) || [
-          GrantType.AUTHORIZATION_CODE,
-          GrantType.REFRESH_TOKEN,
-          ...(this.options.allowTokenExchangeGrant ? [GrantType.TOKEN_EXCHANGE] : []),
-        ],
-        responseTypes: OAuthProviderImpl.validateStringArray(clientMetadata.response_types) || ['code'],
+        grantTypes,
+        responseTypes,
         registrationDate: Math.floor(Date.now() / 1000),
         tokenEndpointAuthMethod: authMethod,
       };
@@ -4403,6 +4422,19 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         );
       }
 
+      const grantTypes = OAuthProviderImpl.validateStringArray(rawMetadata.grant_types, 'grant_types') || [
+        GrantType.AUTHORIZATION_CODE,
+      ];
+      const responseTypes = OAuthProviderImpl.validateStringArray(rawMetadata.response_types, 'response_types') || [
+        'code',
+      ];
+      const effectiveAuthMethod = tokenEndpointAuthMethod || 'none';
+      validateClientCapabilities(this.serverCapabilities, {
+        tokenEndpointAuthMethod: effectiveAuthMethod,
+        grantTypes,
+        responseTypes,
+      });
+
       return {
         clientId,
         redirectUris,
@@ -4414,11 +4446,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         jwksUri: OAuthProviderImpl.validateOptionalUriField(rawMetadata.jwks_uri, 'jwks_uri'),
         i18n: OAuthProviderImpl.extractI18nFields(rawMetadata),
         contacts: OAuthProviderImpl.validateStringArray(rawMetadata.contacts, 'contacts'),
-        grantTypes: OAuthProviderImpl.validateStringArray(rawMetadata.grant_types, 'grant_types') || [
-          'authorization_code',
-        ],
-        responseTypes: OAuthProviderImpl.validateStringArray(rawMetadata.response_types, 'response_types') || ['code'],
-        tokenEndpointAuthMethod: tokenEndpointAuthMethod || 'none',
+        grantTypes,
+        responseTypes,
+        tokenEndpointAuthMethod: effectiveAuthMethod,
       };
     } finally {
       clearTimeout(timeoutId);
@@ -4803,11 +4833,6 @@ function getRevokeExistingGrantsBatchSize(batchSize: number | undefined): number
  */
 const TOKEN_LENGTH = 32;
 
-/**
- * RFC 6749 Section 3.3 scope-token grammar.
- */
-const OAUTH_SCOPE_TOKEN_PATTERN = /^[\x21\x23-\x5B\x5D-\x7E]+$/;
-
 // Helper Functions
 /**
  * Validates a resource URI per RFC 8707 Section 2
@@ -5155,10 +5180,6 @@ export function parseJwtJsonPart(encoded: string): Record<string, unknown> {
   }
 }
 
-export function isValidOAuthScopeToken(scopeToken: string): boolean {
-  return OAUTH_SCOPE_TOKEN_PATTERN.test(scopeToken);
-}
-
 /**
  * Gets WebCrypto import and verify parameters for supported JOSE algorithms.
  */
@@ -5379,6 +5400,7 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
    * Parses an OAuth authorization request from the HTTP request
    * @param request - The HTTP request containing OAuth parameters
    * @returns The parsed authorization request parameters
+   * @throws Error when the response type is missing, unsupported, or not registered for the client
    * @throws CimdFetchError when the client ID is a CIMD URL whose document cannot be resolved
    */
   async parseAuthRequest(request: Request): Promise<AuthRequest> {
@@ -5415,16 +5437,6 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
     }
     resource ??= url.origin;
 
-    // Check if implicit flow is requested but not allowed
-    if (responseType === 'token' && !this.provider.options.allowImplicitFlow) {
-      throw new Error('The implicit grant flow is not enabled for this provider');
-    }
-
-    // Check if plain PKCE method is used but not allowed (OAuth 2.1 recommends S256 only)
-    if (codeChallengeMethod === 'plain' && this.provider.options.allowPlainPKCE === false) {
-      throw new Error('The plain PKCE method is not allowed. Use S256 instead.');
-    }
-
     // Validate the client ID and redirect URI
     if (clientId) {
       const clientInfo = await this.lookupClient(clientId);
@@ -5432,16 +5444,17 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
       if (!clientInfo) {
         throw new Error(`Invalid client. The clientId provided does not match to this client.`);
       }
+      if (!redirectUri || !isValidRedirectUri(redirectUri, clientInfo.redirectUris)) {
+        throw new Error(
+          `Invalid redirect URI. The redirect URI provided does not match any registered URI for this client.`
+        );
+      }
+      validateAuthorizationResponseType(this.provider.serverCapabilities, responseType, clientInfo.responseTypes);
+      if (codeChallengeMethod === 'plain' && this.provider.options.allowPlainPKCE === false) {
+        throw new Error('The plain PKCE method is not allowed. Use S256 instead.');
+      }
       if (responseType === 'code' && clientInfo.tokenEndpointAuthMethod === 'none' && !codeChallenge) {
         throw new Error('Public clients must use PKCE with the authorization code flow.');
-      }
-      // If client exists, validate the redirect URI against registered URIs
-      if (clientInfo && redirectUri) {
-        if (!isValidRedirectUri(redirectUri, clientInfo.redirectUris)) {
-          throw new Error(
-            `Invalid redirect URI. The redirect URI provided does not match any registered URI for this client.`
-          );
-        }
       }
     }
 
@@ -5479,6 +5492,7 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
    * - For implicit flow: generating an access token directly
    * @param options - Options specifying the grant details
    * @returns A Promise resolving to an object containing the redirect URL
+   * @throws Error when the request's response type is not permitted
    * @throws CimdFetchError when the client ID is a CIMD URL whose document cannot be resolved
    */
   async completeAuthorization(options: CompleteAuthorizationOptions): Promise<{ redirectTo: string }> {
@@ -5495,6 +5509,11 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
         'Invalid redirect URI. The redirect URI provided does not match any registered URI for this client.'
       );
     }
+    validateAuthorizationResponseType(
+      this.provider.serverCapabilities,
+      options.request.responseType,
+      clientInfo.responseTypes
+    );
 
     // completeAuthorization() is a public helper and callers can pass a
     // reconstructed AuthRequest rather than one returned directly by
