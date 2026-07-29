@@ -2,9 +2,9 @@
 
 ## Project overview
 
-`@cloudflare/workers-oauth-provider` is a production-grade OAuth 2.1 provider library for Cloudflare Workers. It implements authorization code flow with PKCE, dynamic client registration, token exchange, and end-to-end encryption of sensitive data stored in KV.
+`@cloudflare/workers-oauth-provider` is a production-grade OAuth 2.1 provider library for Cloudflare Workers. It implements authorization code flow with PKCE, OAuth discovery, client registration, token exchange, audience validation, and encryption of sensitive data stored in KV.
 
-**Primary use case:** This library powers authentication for **MCP (Model Context Protocol) servers**. MCP servers are OAuth Resource Servers, and this library provides the authorization server functionality needed to secure them.
+**Primary use case:** This library powers authorization for **MCP (Model Context Protocol) servers**. MCP servers are OAuth Resource Servers, and this library provides both protected-resource middleware and the authorization server functionality needed to secure them.
 
 This library was largely written with Claude AI assistance, with all code thoroughly reviewed by Cloudflare security engineers.
 
@@ -12,14 +12,19 @@ This library was largely written with Claude AI assistance, with all code thorou
 
 When modifying OAuth functionality, **always check the latest published MCP specification** (not drafts):
 
-- **Specification:** https://modelcontextprotocol.io/specification/2025-11-25
-- **Authorization section:** https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization
+- **Specification:** https://modelcontextprotocol.io/specification/2026-07-28
+- **Authorization section:** https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization
+- **Authorization server discovery:** https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/authorization-server-discovery
+- **Client registration:** https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/client-registration
+- **Security considerations:** https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/security-considerations
 
 This library must be feature-complete with the latest published MCP spec version. Key MCP auth requirements:
 
 - MCP servers are OAuth Resource Servers with protected resource metadata (RFC 9728)
-- MCP clients must support Resource Indicators (RFC 8707) for audience-scoped tokens
-- Client registration supports: out-of-band, CIMD (Client ID Metadata Documents), and DCR (Dynamic Client Registration)
+- MCP clients use Resource Indicators (RFC 8707), and servers validate token audience
+- Client registration supports pre-registration and Client ID Metadata Documents (CIMD)
+- Dynamic Client Registration (DCR) is deprecated in MCP 2026-07-28 and retained for compatibility
+- Authorization responses use issuer identification (RFC 9207)
 - Streamable HTTP transport uses OAuth 2.1 for authentication
 
 When in doubt about OAuth behavior, the MCP specification takes precedence for MCP-related use cases.
@@ -29,25 +34,27 @@ When in doubt about OAuth behavior, the MCP specification takes precedence for M
 ```
 workers-oauth-provider/
 ├── src/
-│   └── oauth-provider.ts      # Single source file (~4,600 lines)
+│   ├── oauth-provider.ts      # Core provider implementation (~5,900 lines)
+│   └── ema/                   # Enterprise-Managed Authorization pipeline
 ├── __tests__/
-│   ├── oauth-provider.test.ts # Comprehensive test suite (~9,400 lines)
+│   ├── oauth-provider.test.ts # Comprehensive test suite (~13,000 lines)
 │   ├── setup.ts               # Vitest setup and mocking
 │   └── mocks/
 │       └── cloudflare-workers.ts
 ├── dist/                      # Build output (tsdown)
-├── examples/
-│   └── typed-env-worker/      # Example worker with typed environment
+├── docs/
+│   └── advanced-configuration.md
 ├── .github/workflows/
 │   ├── ci.yml                 # PR validation
 │   ├── release.yml            # Changesets-based npm publishing
 │   └── pkg-pr-new.yml         # PR preview packages
 ├── storage-schema.md          # KV namespace data structure docs
+├── HISTORY.md                 # Kenton's original project history
 ├── SECURITY.md                # Vulnerability reporting
 └── README.md                  # Usage documentation
 ```
 
-**Single-file architecture:** All implementation is in `src/oauth-provider.ts`. This is intentional for security review — all code in one place aids auditing.
+**Audit-oriented architecture:** Core OAuth behavior remains in `src/oauth-provider.ts`. The experimental Enterprise-Managed Authorization validation pipeline is isolated in `src/ema/` so its JWT and trust-boundary code can be reviewed independently.
 
 ## Setup
 
@@ -202,12 +209,15 @@ Any change that alters the format of data stored on grants (e.g. the `resource` 
 This library implements multiple OAuth/security RFCs. When making changes, maintain compliance with:
 
 - OAuth 2.1 (draft-ietf-oauth-v2-1-13)
-- OAuth 2.0 Authorization Server Metadata (RFC 8414)
-- OAuth 2.0 Protected Resource Metadata (RFC 9728)
-- OAuth 2.0 Dynamic Client Registration (RFC 7591)
+- OAuth 2.0 Bearer Token Usage (RFC 6750)
+- OAuth 2.0 Token Revocation (RFC 7009)
+- OAuth 2.0 Dynamic Client Registration (RFC 7591, deprecated by MCP 2026-07-28)
 - PKCE (RFC 7636)
+- OAuth 2.0 Authorization Server Metadata (RFC 8414)
 - OAuth 2.0 Token Exchange (RFC 8693)
 - Resource Indicators for OAuth 2.0 (RFC 8707)
+- OAuth 2.0 Authorization Server Issuer Identification (RFC 9207)
+- OAuth 2.0 Protected Resource Metadata (RFC 9728)
 - Client ID Metadata Documents (draft spec)
 
 ### Generated files

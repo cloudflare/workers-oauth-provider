@@ -1,629 +1,79 @@
 # OAuth 2.1 Provider Framework for Cloudflare Workers
 
-This is a TypeScript library that implements the provider side of the OAuth 2.1 protocol with PKCE support. The library is intended to be used on Cloudflare Workers.
+`@cloudflare/workers-oauth-provider` adds OAuth 2.1 authorization to HTTP APIs and remote MCP servers running on Cloudflare Workers.
 
-## Benefits of this library
+It provides the authorization server and protected resource building blocks used by the stable [MCP 2026-07-28 authorization specification](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization). This includes OAuth discovery, authorization code flow with PKCE, client registration, resource indicators, token issuance, refresh, revocation, and audience validation.
 
-- The library acts as a wrapper around your Worker code, which adds authorization for your API endpoints.
-- All token management is handled automatically.
-- Authorization responses include RFC 9207 issuer identification to prevent mix-up attacks.
-- Your API handler is written like a regular fetch handler, but receives the already-authenticated user details as a parameter. No need to perform any checks of your own.
-- The library is agnostic to how you manage and authenticate users.
-- The library is agnostic to how you build your UI. Your authorization flow can be implemented using whatever UI framework you use for everything else.
-- The library's storage does not store any secrets, only hashes of them.
+Your application remains responsible for authenticating users, displaying consent, deciding which scopes to grant, and enforcing application-specific permissions. This package is not an identity provider and does not implement the MCP transport or protocol methods. It is intended for HTTP-based MCP transports; stdio servers should obtain credentials from their environment.
 
-## Usage
+## MCP support at a glance
 
-A Worker that uses the library might look like this:
+| Capability                              | Support                                                                                  |
+| --------------------------------------- | ---------------------------------------------------------------------------------------- |
+| Authorization code flow                 | Built in                                                                                 |
+| PKCE                                    | Built in; required for public clients; S256 supported                                    |
+| Bearer token protection                 | Built in for configured API routes                                                       |
+| Authorization server metadata, RFC 8414 | Served at `/.well-known/oauth-authorization-server`                                      |
+| Protected resource metadata, RFC 9728   | Served at root and path-specific well-known URLs                                         |
+| `WWW-Authenticate` discovery            | `resource_metadata` is added to protected-resource challenges                            |
+| Resource Indicators, RFC 8707           | Parsed, stored, returned, and validated                                                  |
+| Token audience validation               | Origin-bound by default; exact when `resourceMetadata.resource` is configured            |
+| Authorization response issuer, RFC 9207 | Successful responses include `iss`; application-owned error redirects must include it    |
+| Pre-registered clients                  | Supported through `OAuthHelpers`                                                         |
+| Client ID Metadata Documents, CIMD      | Opt-in; currently supports public clients using `token_endpoint_auth_method: "none"`     |
+| Dynamic Client Registration, RFC 7591   | Supported as a compatibility mechanism; deprecated by MCP 2026-07-28 for new deployments |
+| Refresh tokens                          | Built in with rotation and configurable expiry                                           |
+| Token revocation, RFC 7009              | Built in                                                                                 |
+| Token Exchange, RFC 8693                | Opt-in                                                                                   |
+| MCP Enterprise-Managed Authorization    | Experimental opt-in support for ID-JAG assertions                                        |
+| OpenID Connect discovery                | Not served; RFC 8414 satisfies the MCP requirement for authorization server discovery    |
 
-```ts
-import { OAuthProvider } from '@cloudflare/workers-oauth-provider';
-import { WorkerEntrypoint } from 'cloudflare:workers';
+Resource behavior follows deployment configuration. Without an explicit resource, omitted authorization resources default to the request origin. Setting `resourceMetadata.resource` requires that exact resource throughout authorization and token use.
 
-// We export the OAuthProvider instance as the entrypoint to our Worker. This means it
-// implements the `fetch()` handler, receiving all HTTP requests.
-export default new OAuthProvider({
-  // Configure API routes. Any requests whose URL starts with any of these prefixes will be
-  // considered API requests. The OAuth provider will check the access token on these requests,
-  // and then, if the token is valid, send the request to the API handler.
-  // You can provide:
-  // - A single route (string) or multiple routes (array)
-  // - Full URLs (which will match the hostname) or just paths (which will match any hostname)
-  apiRoute: [
-    '/api/', // Path only - will match any hostname
-    'https://api.example.com/', // Full URL - will check hostname
-  ],
+## What the library handles
 
-  // When the OAuth system receives an API request with a valid access token, it passes the request
-  // to this handler object's fetch method.
-  // You can provide either an object with a fetch method (ExportedHandler)
-  // or a class extending WorkerEntrypoint.
-  apiHandler: ApiHandler, // Using a WorkerEntrypoint class
+For routes configured with `apiRoute` or `apiHandlers`, the provider:
 
-  // For multi-handler setups, you can use apiHandlers instead of apiRoute+apiHandler.
-  // This allows you to use different handlers for different API routes.
-  // Note: You must use either apiRoute+apiHandler (single-handler) OR apiHandlers (multi-handler), not both.
-  // Example:
-  // apiHandlers: {
-  //   "/api/users/": UsersApiHandler,
-  //   "/api/documents/": DocumentsApiHandler,
-  //   "https://api.example.com/": ExternalApiHandler,
-  // },
+- Reads bearer tokens from the `Authorization` header.
+- Rejects missing, invalid, and expired tokens.
+- Validates the audience when a token has one.
+- Adds authenticated application data to `ctx.props`.
+- Sends valid requests to the configured API handler.
+- Publishes protected resource and authorization server metadata.
+- Implements token issuance, refresh, token exchange, and revocation.
+- Hashes stored tokens, authorization codes, and client secrets.
+- Encrypts application `props` stored in KV.
 
-  // Any requests which aren't API request will be passed to the default handler instead.
-  // Again, this can be either an object or a WorkerEntrypoint.
-  defaultHandler: defaultHandler, // Using an object with a fetch method
+Your application must:
 
-  // This specifies the URL of the OAuth authorization flow UI. This UI is NOT implemented by
-  // the OAuthProvider. It is up to the application to implement a UI here. The only reason why
-  // this URL is given to the OAuthProvider is so that it can implement the RFC-8414 metadata
-  // discovery endpoint, i.e. `.well-known/oauth-authorization-server`.
-  // Can also be specified as just a path (e.g., "/authorize").
-  authorizeEndpoint: 'https://example.com/authorize',
+- Authenticate the user at the authorization endpoint.
+- Render the consent UI and explain the requesting client and scopes.
+- Decide which scopes and resources the user grants.
+- Enforce operation-level permissions, ownership, tenancy, and scope policy.
+- Include the RFC 9207 issuer in terminal OAuth error redirects.
 
-  // This specifies the OAuth 2 token exchange endpoint. The OAuthProvider will implement this
-  // endpoint (by directly responding to requests with a matching URL).
-  // Can also be specified as just a path (e.g., "/oauth/token").
-  tokenEndpoint: 'https://example.com/oauth/token',
+API handlers do not need to parse or validate bearer tokens. They still need to enforce application-specific authorization.
 
-  // This specifies the RFC-7591 dynamic client registration endpoint. This setting is optional,
-  // but if provided, the OAuthProvider will implement this endpoint to allow dynamic client
-  // registration.
-  // Can also be specified as just a path (e.g., "/oauth/register").
-  clientRegistrationEndpoint: 'https://example.com/oauth/register',
+## Install
 
-  // Optional list of scopes supported by this OAuth provider.
-  // If provided, this will be included in the RFC 8414 metadata as 'scopes_supported'.
-  // If not provided, the 'scopes_supported' field will be omitted from the metadata.
-  scopesSupported: ['document.read', 'document.write', 'profile'],
-
-  // Optional: Controls whether the OAuth implicit flow is allowed.
-  // The implicit flow is discouraged in OAuth 2.1 but may be needed for some clients.
-  // Defaults to false.
-  allowImplicitFlow: false,
-
-  // Optional: Controls whether the plain PKCE code_challenge_method is allowed.
-  // OAuth 2.1 recommends using S256 exclusively as plain offers no cryptographic protection.
-  // When false, only S256 is accepted and advertised in the metadata endpoint.
-  // Defaults to true for backward compatibility.
-  allowPlainPKCE: true,
-
-  // Optional: Controls whether public clients (clients without a secret, like SPAs)
-  // can register via the dynamic client registration endpoint.
-  // When true, only confidential clients can register.
-  // Note: Creating public clients via the OAuthHelpers.createClient() method
-  // is always allowed regardless of this setting.
-  // Defaults to false.
-  disallowPublicClientRegistration: false,
-
-  // Optional: Time-to-live for refresh tokens in seconds.
-  // Defaults to 30 days (2,592,000 seconds).
-  // Set to 0 to disable refresh tokens (only access tokens will be issued).
-  // Set to `undefined` explicitly for refresh tokens that never expire.
-  refreshTokenTTL: 2592000, // 30 days (the default)
-
-  // Optional: Time-to-live for access tokens in seconds.
-  // Defaults to 1 hour (3600 seconds) if not specified.
-  accessTokenTTL: 3600,
-
-  // Optional: Time-to-live for dynamically registered clients in seconds.
-  // Defaults to 90 days (7,776,000 seconds).
-  // Clients created via OAuthHelpers.createClient() are not affected.
-  // Set to `undefined` explicitly for clients that never expire.
-  clientRegistrationTTL: 7776000, // 90 days (the default)
-
-  // Optional: Controls whether OAuth 2.0 Token Exchange (RFC 8693) is allowed.
-  // When false, the token exchange grant type will not be advertised in metadata
-  // and token exchange requests will be rejected.
-  // Defaults to false.
-  allowTokenExchangeGrant: false,
-
-  // Optional: Experimental MCP Enterprise-Managed Authorization support.
-  // When enabled, the token endpoint accepts ID-JAG JWTs with the JWT bearer grant.
-  enterpriseManagedAuthorization: undefined,
-
-  // Optional: Explicitly enable Client ID Metadata Document (CIMD) support.
-  // When true, URL-formatted client_ids will be fetched as metadata documents.
-  // Requires the 'global_fetch_strictly_public' compatibility flag.
-  // See the CIMD section below for details. Defaults to false.
-  clientIdMetadataDocumentEnabled: false,
-});
-
-// The default handler object - the OAuthProvider will pass through HTTP requests to this object's fetch method
-// if they aren't API requests or do not have a valid access token
-const defaultHandler = {
-  // This fetch method works just like a standard Cloudflare Workers fetch handler
-  //
-  // The `request`, `env`, and `ctx` parameters are the same as for a normal Cloudflare Workers fetch
-  // handler, and are exactly the objects that the `OAuthProvider` itself received from the Workers
-  // runtime.
-  //
-  // The `env.OAUTH_PROVIDER` provides an API by which the application can call back to the
-  // OAuthProvider.
-  async fetch(request: Request, env, ctx) {
-    let url = new URL(request.url);
-
-    if (url.pathname == '/authorize') {
-      // This is a request for our OAuth authorization flow UI. It is up to the application to
-      // implement this. However, the OAuthProvider library provides some helpers to assist.
-
-      // `env.OAUTH_PROVIDER.parseAuthRequest()` parses the OAuth authorization request to extract the parameters
-      // required by the OAuth 2 standard, namely response_type, client_id, redirect_uri, scope, and
-      // state. It returns an object containing all these (using idiomatic camelCase naming).
-      let oauthReqInfo = await env.OAUTH_PROVIDER.parseAuthRequest(request);
-
-      // `env.OAUTH_PROVIDER.lookupClient()` looks up metadata about the client, as definetd by RFC-7591. This
-      // includes things like redirect_uris, client_name, logo_uri, etc.
-      let clientInfo = await env.OAUTH_PROVIDER.lookupClient(oauthReqInfo.clientId);
-
-      // At this point, the application should use `oauthReqInfo` and `clientInfo` to render an
-      // authorization consent UI to the user. The details of this are up to the app so are not
-      // shown here.
-
-      // After the user has granted consent, the application calls `env.OAUTH_PROVIDER.completeAuthorization()` to
-      // grant the authorization.
-      let { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
-        // The application passes back the original OAuth request info that was returned by
-        // `parseAuthRequest()` earlier.
-        request: oauthReqInfo,
-
-        // The application must specify the user's ID, which is some sort of string. This is needed
-        // so that the application can later query the OAuthProvider to enumerate all grants
-        // belonging to a particular user, e.g. to implement an audit and revocation UI.
-        userId: '1234',
-
-        // The application can specify some arbitary metadata which describes this grant. The
-        // metadata can contain any JSON-serializable content. This metadata is not used by the
-        // OAuthProvider, but the application can read back the metadata attached to specific
-        // grants when enumerating them later, again e.g. to implement an udit and revocation UI.
-        metadata: { label: 'foo' },
-
-        // The application specifies the list of OAuth scope identifiers that were granted. This
-        // may or may not be the same as was requested in `oauthReqInfo.scope`.
-        scope: ['document.read', 'document.write'],
-
-        // `props` is an arbitrary JSON-serializable object which will be passed back to the API
-        // handler for every request authorized by this grant.
-        props: {
-          userId: 1234,
-          username: 'Bob',
-        },
-      });
-
-      // `completeAuthorization()` will have returned the URL to which the user should be redirected
-      // in order to complete the authorization flow. This is the requesting client's OAuth
-      // redirect_uri with the appropriate query parameters added to complete the flow and obtain
-      // tokens.
-      return Response.redirect(redirectTo, 302);
-    }
-
-    // ... the application can implement other non-API HTTP endpoints here ...
-
-    return new Response('Not found', { status: 404 });
-  },
-};
-
-// The API handler object - the OAuthProivder will pass authorized API requests to this object's fetch method
-// (because we provided it as the `apiHandler` setting, above). This is ONLY called for API requests
-// that had a valid access token.
-class ApiHandler extends WorkerEntrypoint {
-  // This fetch method works just like any other WorkerEntrypoint fetch method. The `request` is
-  // passed as a parameter, while `env` and `ctx` are available as `this.env` and `this.ctx`.
-  //
-  // The `this.env.OAUTH_PROVIDER` is available just like in the default handler.
-  //
-  // The `this.ctx.props` property contains the `props` value that was passed to
-  // `env.OAUTH_PROVIDER.completeAuthorization()` during the authorization flow that authorized this client.
-  fetch(request: Request) {
-    // The application can implement its API endpoints like normal. This app implements a single
-    // endpoint, `/api/whoami`, which returns the user's authenticated identity.
-
-    let url = new URL(request.url);
-    if (url.pathname == '/api/whoami') {
-      // Since the username is embedded in `ctx.props`, which came from the access token that the
-      // OAuthProivder already verified, we don't need to do any other authentication steps.
-      return new Response(`You are authenticated as: ${this.ctx.props.username}`);
-    }
-
-    return new Response('Not found', { status: 404 });
-  }
-}
+```sh
+npm install @cloudflare/workers-oauth-provider
 ```
 
-By default, `completeAuthorization()` revokes existing grants for the same user and client after storing the new
-grant. This prevents stale tokens from continuing to use old `props` after a user re-authorizes. Set
-`revokeExistingGrants: false` only if your application intentionally allows multiple concurrent grants for the same
-user and client.
+The Worker needs a KV namespace bound as `OAUTH_KV`:
 
-For users with many grants, `revokeExistingGrantsBatchSize` controls the KV page size used while scanning existing
-grants for revocation. It defaults to `50`, must be a positive integer, and is capped at Cloudflare KV's maximum page
-size of `1000`.
-
-This implementation requires that your worker is configured with a Workers KV namespace binding called `OAUTH_KV`, which is used to store token information. See the file `storage-schema.md` for details on the schema of this namespace.
-
-The `env.OAUTH_PROVIDER` object available to the fetch handlers provides some methods to query the storage, including:
-
-- Create, list, modify, and delete client_id registrations (in addition to `lookupClient()`, already shown in the example code).
-- List all active authorization grants for a particular user.
-- Revoke (delete) an authorization grant.
-- Purge expired and orphaned data from the KV namespace.
-
-Note that `deleteClient()` cascades: it revokes all grants (and their associated tokens) for the deleted client across all users.
-
-See the `OAuthHelpers` interface definition for full API details.
-
-## External Token Resolution
-
-Use `resolveExternalToken` to authenticate bearer tokens issued by another authorization server. The callback runs
-only when the token was not found in the provider's internal storage.
-
-```ts
-import { ExternalTokenError, OAuthProvider } from '@cloudflare/workers-oauth-provider';
-
-new OAuthProvider({
-  // ... other options ...
-  resolveExternalToken: async ({ token }) => {
-    const result = await validateExternalToken(token);
-
-    if (result.kind === 'invalid') return null;
-    if (result.kind === 'insufficient_scope') {
-      throw new ExternalTokenError('insufficient_scope', {
-        description: 'The external token needs the account:read scope',
-        statusCode: 403,
-        requiredScopes: ['account:read'],
-      });
-    }
-    if (result.kind === 'rate_limited') {
-      throw new ExternalTokenError('temporarily_unavailable', {
-        description: 'The external authorization server rate limited validation',
-        statusCode: 429,
-        headers: { 'Retry-After': result.retryAfter },
-      });
-    }
-
-    return { props: result.props, audience: result.audience };
-  },
-});
-```
-
-The callback has three outcomes:
-
-- Return `{ props, audience? }` to authenticate the request.
-- Return `null` for a generic `401 invalid_token` response.
-- Throw this package's exported `ExternalTokenError` for an intentional structured response. Standard `invalid_token`
-  401 and `insufficient_scope` 403 errors receive a resource-specific `WWW-Authenticate` challenge unless the error
-  supplies one. Set `requiredScopes` on `insufficient_scope` to include the operation's minimum scopes in the
-  challenge for step-up authorization.
-
-`audience` means the protected resource where the credential is accepted, not its issuer, user, upstream API, or
-permissions. A JWT may carry an audience claim. For an opaque API token or PAT, the resolver can supply the local
-resource URI as policy after successful validation. When `resourceMetadata.resource` is configured, `audience` is
-required and must match it exactly.
-
-`WWW-Authenticate` is a standard response header describing the Bearer authentication failure. For MCP it includes
-the protected resource metadata URL and may include `invalid_token`, `insufficient_scope`, and required scopes. It
-never contains the submitted token or `ctx.props`. `ExternalTokenError.description` is returned publicly as
-`error_description`, so it must not contain credentials, upstream response bodies, or private diagnostics.
-
-Other thrown values, including `OAuthError`, are re-thrown so existing callback behavior and unexpected validator
-bugs remain visible as 500s. For cross-origin requests,
-the provider exposes `WWW-Authenticate` and `Retry-After` through CORS so browser clients can read discovery,
-step-up, and backoff guidance.
-
-### Authorization response issuer
-
-RFC 9207 issuer identification is always enabled. Successful authorization responses include `iss` automatically.
-`parseAuthRequest` returns the expected `issuer`; authorization handlers must include it in terminal OAuth error
-redirects. Intermediate identity-provider redirects and local HTML error pages do not need it.
-
-### Protected resource scopes
-
-Set `resourceMetadata.scopes_supported` to the minimal scopes needed for basic resource functionality. The provider
-publishes them in Protected Resource Metadata and uses them as baseline Bearer challenge guidance. Operation-specific
-`ExternalTokenError.requiredScopes` takes precedence. `scopesSupported` remains authorization-server metadata only, and
-`offline_access` is omitted from every provider-generated resource-facing scope list.
-
-```ts
-new OAuthProvider({
-  scopesSupported: ['files:read', 'files:write', 'offline_access'],
-  resourceMetadata: { scopes_supported: ['files:read'] },
-  // ... other options ...
-});
-```
-
-## Token Exchange Callback
-
-This library allows you to update the `props` value during token exchanges by configuring a callback function. This is useful for scenarios where the application needs to perform additional processing when tokens are issued or refreshed.
-
-For example, if your application is also a client to some other OAuth API, you might want to perform an equivalent upstream token exchange and store the result in the `props`. The callback can be used to update the props for both the grant record and specific access tokens.
-
-To use this feature, provide a `tokenExchangeCallback` in your OAuthProvider options:
-
-```ts
-new OAuthProvider({
-  // ... other options ...
-  tokenExchangeCallback: async (options) => {
-    // options.grantType is either 'authorization_code' or 'refresh_token'
-    // options.props contains the current props
-    // options.clientId, options.userId, and options.scope are also available
-
-    if (options.grantType === 'authorization_code') {
-      // For authorization code exchange, might want to obtain upstream tokens
-      const upstreamTokens = await exchangeUpstreamToken(options.props.someCode);
-
-      return {
-        // Update the props stored in the access token
-        accessTokenProps: {
-          ...options.props,
-          upstreamAccessToken: upstreamTokens.access_token,
-        },
-        // Update the props stored in the grant (for future token refreshes)
-        newProps: {
-          ...options.props,
-          upstreamRefreshToken: upstreamTokens.refresh_token,
-        },
-      };
-    }
-
-    if (options.grantType === 'refresh_token') {
-      // For refresh token exchanges, might want to refresh upstream tokens too
-      const upstreamTokens = await refreshUpstreamToken(options.props.upstreamRefreshToken);
-
-      return {
-        accessTokenProps: {
-          ...options.props,
-          upstreamAccessToken: upstreamTokens.access_token,
-        },
-        newProps: {
-          ...options.props,
-          upstreamRefreshToken: upstreamTokens.refresh_token || options.props.upstreamRefreshToken,
-        },
-        // Optionally override the default access token TTL to match the upstream token
-        accessTokenTTL: upstreamTokens.expires_in,
-      };
-    }
-  },
-});
-```
-
-The callback can:
-
-- Return both `accessTokenProps` and `newProps` to update both
-- Return only `accessTokenProps` to update just the current access token
-- Return only `newProps` to update both the grant and access token (the access token inherits these props)
-- Return `accessTokenTTL` to override the default TTL for this specific access token
-- Return `refreshTokenTTL` to override the default TTL for this specific refresh token
-- Return nothing to keep the original props unchanged
-
-The `accessTokenTTL` override is particularly useful when the application is also an OAuth client to another service and wants to match its access token TTL to the upstream access token TTL. This helps prevent situations where the downstream token is still valid but the upstream token has expired.
-
-The `props` values are end-to-end encrypted, so they can safely contain sensitive information.
-
-### Reporting errors from the callback
-
-Throw `OAuthError` from `tokenExchangeCallback` to return a structured OAuth `/token` error (`{ error, error_description }`) instead of a generic 500:
-
-```ts
-import { OAuthError, OAuthProvider } from '@cloudflare/workers-oauth-provider';
-
-new OAuthProvider({
-  // …
-  tokenExchangeCallback: async (options) => {
-    if (options.grantType === 'refresh_token') {
-      return { newProps: await refreshUpstream(options.props) };
-    }
-  },
-});
-
-async function refreshUpstream(props) {
-  const res = await fetch(/* upstream token endpoint */);
-
-  if (res.status === 401) {
-    throw new OAuthError('invalid_grant', {
-      description: 'upstream refresh token is invalid',
-    });
-  }
-
-  if (res.status === 429) {
-    throw new OAuthError('temporarily_unavailable', {
-      description: 'upstream rate limited',
-      statusCode: 429,
-      headers: { 'Retry-After': res.headers.get('retry-after') ?? '60' },
-    });
-  }
-
-  return await res.json();
-}
-```
-
-`OAuthError(code, options)` takes:
-
-- `code` — OAuth error code returned in the `error` field. This may be a standard code (`OAuthTokenErrorCode`) or an application-defined string.
-- `options.description` — human-readable text returned in `error_description`.
-- `options.statusCode` — HTTP status code (default `400`).
-- `options.headers` — additional response headers, such as `Retry-After` for transient failures. There is no implicit `Retry-After` default for callback-thrown errors.
-
-Only `OAuthError` from this package is converted into a structured token-endpoint response. Plain errors, plain objects with a `code` field, `ExternalTokenError`, and app-local error classes continue to surface as 500s so unexpected failures stay visible. Import `OAuthError` from `@cloudflare/workers-oauth-provider` rather than copying or re-implementing it.
-
-## Enterprise-Managed Authorization (Experimental)
-
-Accepts ID-JAG assertions at `/token` per the [MCP Enterprise-Managed Authorization extension](https://modelcontextprotocol.io/extensions/auth/enterprise-managed-authorization). The enterprise IdP issues an ID-JAG JWT and the MCP client exchanges it here for an opaque access token.
-
-```ts
-new OAuthProvider({
-  // ... other options ...
-  resourceMetadata: { resource: 'https://mcp.example.com/mcp' },
-  enterpriseManagedAuthorization: {
-    trustedIssuers: async ({ iss }) =>
-      iss === 'https://idp.example.com'
-        ? { issuer: iss, jwksUri: 'https://idp.example.com/.well-known/jwks.json', algorithms: ['RS256'] }
-        : null,
-    async mapClaims({ claims, requestedScope }) {
-      return {
-        // Opaque tokens use ':' as a separator — encode subjects that may contain it.
-        userId: `enterprise-${claims.sub}`,
-        scope: requestedScope,
-        metadata: { enterpriseIssuer: claims.iss, enterpriseSubject: claims.sub },
-        props: { enterprise: true, subject: claims.sub, email: claims.email },
-      };
+```jsonc
+{
+  "kv_namespaces": [
+    {
+      "binding": "OAUTH_KV",
+      "id": "YOUR_KV_NAMESPACE_ID",
     },
-  },
-});
-```
-
-Setup:
-
-1. Configure your IdP as an ID-JAG issuer with a public JWKS endpoint. If it includes the optional `resource` claim, configure it with the MCP endpoint URL.
-2. Set `resourceMetadata.resource` to the MCP endpoint URL (required when EMA is enabled).
-3. Implement `trustedIssuers` as a resolver — for multi-tenant deployments it can read `env` / `clientInfo` to look up per-tenant IdP config without redeploying.
-
-The AS enforces `resolved.issuer === iss` (confused-deputy guard) and validates ID-JAG `typ`, signature, audience, client binding, any supplied resource, `exp` / `iat` / `nbf`, max lifetime, and `jti` replay. When the optional `resource` claim is omitted, the AS uses `resourceMetadata.resource`, so issued tokens remain pinned to the configured MCP resource. Refresh tokens are not issued for this grant — the ID-JAG itself is the renewable assertion.
-
-### Public clients
-
-By default the EMA grant requires client authentication, so public clients (`token_endpoint_auth_method: 'none'`) are rejected. Set `allowPublicClients: true` to also accept them:
-
-```ts
-enterpriseManagedAuthorization: {
-  allowPublicClients: true,
-  // ... trustedIssuers, mapClaims ...
+  ],
 }
 ```
 
-This is useful for clients registered via a [Client ID Metadata Document (CIMD)](https://modelcontextprotocol.io/), which are always public and therefore cannot present a client secret. With this enabled, trust rests on the IdP-issued, signature-verified, short-lived, single-use ID-JAG assertion (audience- and client-bound), together with the provider's configured resource pinning, rather than on a separately presented client secret. Leave it unset (default `false`) to keep the spec-default behavior of requiring client authentication.
-
-Experimental — the MCP extension is still a draft.
-
-## Custom Error Responses
-
-By using the `onError` option, you can emit notifications or take other actions when an error response was to be emitted:
-
-```ts
-new OAuthProvider({
-  // ... other options ...
-  onError({ code, description, status, headers }) {
-    Sentry.captureMessage(/* ... */);
-  },
-});
-```
-
-By returning a `Response` you can also override what the OAuthProvider returns to your users:
-
-```ts
-new OAuthProvider({
-  // ... other options ...
-  onError({ code, description, status, headers }) {
-    if (code === 'unsupported_grant_type') {
-      return new Response('...', { status, headers });
-    }
-    // returning undefined (i.e. void) uses the default Response generation
-  },
-});
-```
-
-By default, the `onError` callback is set to ``({ status, code, description }) => console.warn(`OAuth error response: ${status} ${code} - ${description}`)``.
-
-## KV Namespace Cleanup
-
-The library uses KV TTLs to automatically expire access tokens, refresh tokens (grants), and dynamically registered clients. As defense-in-depth, the library also provides a `purgeExpiredData()` method that cleans up orphaned and expired records. This is designed to be called from a [Cron Trigger](https://developers.cloudflare.com/workers/configuration/cron-triggers/) (scheduled handler):
-
-```ts
-const oauthProvider = new OAuthProvider({
-  // ... options ...
-});
-
-export default {
-  fetch(request, env, ctx) {
-    return oauthProvider.fetch(request, env, ctx);
-  },
-  async scheduled(event, env, ctx) {
-    const result = await oauthProvider.purgeExpiredData(env, { batchSize: 100 });
-    console.log(`Checked ${result.grantsChecked} grants, purged ${result.grantsPurged}`);
-  },
-};
-```
-
-The method processes records in configurable batches (default: 50) to stay within Cloudflare's subrequest limits. It performs two sweep phases:
-
-1. **Grant sweep**: Removes orphaned grants (whose client no longer exists) and expired grants.
-2. **Token sweep**: Removes orphaned tokens (whose grant no longer exists).
-
-Call it repeatedly via a cron trigger — deleted records disappear from KV, so subsequent invocations naturally process fresh records without needing a persisted cursor. The `result.done` field indicates whether the full key space was scanned in this invocation.
-
-## Protected Resource Metadata (RFC 9728)
-
-The library automatically serves a `/.well-known/oauth-protected-resource` endpoint. By default, it derives the resource identifier from the metadata request and the authorization server from the token endpoint.
-
-Resource policy follows the configuration:
-
-- When `resourceMetadata.resource` is configured, authorization requests and token requests must contain that one exact resource. Issued and externally resolved access tokens must have that exact audience.
-- Without an explicitly configured resource, valid RFC 8707 resource indicators are accepted. Token and refresh requests may omit `resource` and inherit it from the authorization grant. If the authorization request also omits it, the provider uses the request origin as the RFC 8707 default and issues an origin-bound token.
-
-The origin default is suitable for a co-located authorization server and resource server. Split deployments and deployments that require path-level audience isolation should configure the canonical protected resource explicitly:
-
-```ts
-new OAuthProvider({
-  // ... other options ...
-  resourceMetadata: {
-    resource: 'https://api.example.com/mcp',
-    authorization_servers: ['https://auth.example.com'],
-    scopes_supported: ['read', 'write'],
-    bearer_methods_supported: ['header'],
-    resource_name: 'My API',
-  },
-});
-```
-
-## Standards Compliance
-
-This library implements the following OAuth and MCP specifications:
-
-- [OAuth 2.1 (draft-ietf-oauth-v2-1-13)](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-v2-1-13) — Core authorization framework with PKCE
-- [OAuth 2.0 Authorization Server Metadata (RFC 8414)](https://datatracker.ietf.org/doc/html/rfc8414) — `/.well-known/oauth-authorization-server` discovery endpoint
-- [OAuth 2.0 Protected Resource Metadata (RFC 9728)](https://datatracker.ietf.org/doc/html/rfc9728) — `/.well-known/oauth-protected-resource` discovery endpoint
-- [OAuth 2.0 Dynamic Client Registration (RFC 7591)](https://datatracker.ietf.org/doc/html/rfc7591) — Dynamic client registration endpoint
-- [OAuth Client ID Metadata Documents (draft-ietf-oauth-client-id-metadata-document)](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-client-id-metadata-document) — HTTPS URLs as client IDs
-- [MCP Enterprise-Managed Authorization extension](https://modelcontextprotocol.io/extensions/auth/enterprise-managed-authorization) — experimental ID-JAG JWT bearer grant support
-
-These are the specifications required by the [MCP authorization specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization).
-
-## Implementation Notes
-
-### End-to-end encryption
-
-This library stores records about authorization tokens in KV. The storage schema is carefully designed such that a complete leak of the storage only reveals mundane metadata about what has been granted. In particular:
-
-- Secrets (including access tokens, refresh tokens, authorization codes, and client secrets) are stored only by hash. Hence, such secrets cannot be derived from the storage alone.
-- The `props` associated with a grant (which are passed back to the application when API requests are performed) are stored encrypted with the secret token as key material. Hence, the contents of `props` are impossible to derive from storage unless a valid token is provided.
-
-Note that the `userId` and the `metadata` associated with each grant are not encrypted, because the purpose of these values is to allow grants to be enumerated for audit and revocation purposes. However, these values are completely opaque to the library. An application is free to omit them or apply its own encryption to them before passing them into the library, if it desires.
-
-### Single-use refresh tokens?
-
-OAuth 2.1 requires that refresh tokens are either "cryptographically bound" to the client, or are single-use. This library currently does not implement any cryptographic binding, thus seemingly requiring single-use tokens. Under this requirement, every token refresh request invalidates the old refresh token and issues a new one.
-
-This requirement is seemingly fundamentally flawed as it assumes that every refresh request will complete with no errors. In the real world, a transient network error, machine failure, or software fault could mean that the client fails to store the new refresh token after a refresh request. In this case, the client would be permanently unable to make any further requests, as the only token it has is no longer valid.
-
-This library implements a compromise: At any particular time, a grant may have two valid refresh tokens. When the client uses one of them, the other one is invalidated, and a new one is generated and returned. Thus, if the client correctly uses the new refresh token each time, then older refresh tokens are continuously invalidated. But if a transient failure prevents the client from updating its token, it can always retry the request with the token it used previously.
-
-## Client ID Metadata Document (CIMD) Support
-
-This library supports [Client ID Metadata Documents](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-client-id-metadata-document), which allow clients to use HTTPS URLs as their `client_id`. When a client presents an HTTPS URL with a non-root path as its `client_id`, the library will fetch and validate the metadata document from that URL.
-
-### Enabling CIMD
-
-CIMD support is opt-in and requires two things:
-
-1. Set `clientIdMetadataDocumentEnabled: true` in your OAuthProvider options:
-
-```ts
-new OAuthProvider({
-  // ... other options ...
-  clientIdMetadataDocumentEnabled: true,
-});
-```
-
-2. Add the `global_fetch_strictly_public` compatibility flag to your `wrangler.jsonc`:
+To enable Client ID Metadata Documents, also add Cloudflare's SSRF protection compatibility flag:
 
 ```jsonc
 {
@@ -631,39 +81,444 @@ new OAuthProvider({
 }
 ```
 
-The compatibility flag is required for SSRF (Server-Side Request Forgery) protection. Due to a legacy quirk, `fetch()` requests to URLs within your zone's domain are sent directly to the origin server, bypassing Cloudflare. The `global_fetch_strictly_public` flag disables this behavior. See [Cloudflare's documentation](https://developers.cloudflare.com/workers/configuration/compatibility-flags/#global-fetch-strictly-public) for more details.
+See [Client registration](#client-registration) for the matching provider option.
 
-When CIMD is not enabled (the default), URL-formatted `client_id` values fall through to standard KV lookup. When enabled, if fetching or validating the metadata document fails, the token endpoint returns a generic `invalid_client` response. The `onError` callback receives `internal.category: "client-id-metadata-document"`, the stable reason `metadata_resolution_failed`, diagnostic details, and the originating request. Use request metadata for correlation, but do not log its credentials or body.
+## Quick start
 
-`OAuthHelpers.lookupClient()`, `parseAuthRequest()`, `completeAuthorization()`, and `exchangeToken()` throw `CimdFetchError` when they cannot resolve a CIMD client. `lookupClient()` returns `null` only when the client does not exist:
+The provider accepts either plain `ExportedHandler` objects or classes extending `WorkerEntrypoint`. This example uses both.
 
 ```ts
-import { CimdFetchError } from '@cloudflare/workers-oauth-provider';
+import { OAuthProvider, type AuthRequest, type OAuthHelpers } from '@cloudflare/workers-oauth-provider';
+import { WorkerEntrypoint } from 'cloudflare:workers';
 
-try {
-  const client = await env.OAUTH_PROVIDER.lookupClient(clientId);
-} catch (error) {
-  if (error instanceof CimdFetchError) {
-    console.error(error.reason, error.metadataUrl, error.detail);
+interface AuthProps {
+  userId: string;
+  displayName: string;
+}
+
+interface Env {
+  OAUTH_KV: KVNamespace;
+  OAUTH_PROVIDER: OAuthHelpers;
+}
+
+class McpApiHandler extends WorkerEntrypoint<Env, AuthProps> {
+  fetch(request: Request): Response {
+    return Response.json({
+      authenticated: true,
+      userId: this.ctx.props.userId,
+      displayName: this.ctx.props.displayName,
+    });
   }
-  throw error;
+}
+
+const defaultHandler: ExportedHandler<Env> = {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+
+    if (url.pathname !== '/authorize') {
+      return new Response('Not found', { status: 404 });
+    }
+
+    // This parses the OAuth parameters and validates the client, redirect URI,
+    // resource indicators, and configured PKCE restrictions.
+    let oauthRequest: AuthRequest;
+    try {
+      oauthRequest = await env.OAUTH_PROVIDER.parseAuthRequest(request);
+    } catch {
+      // Do not redirect until the client and redirect URI have been validated.
+      return new Response('Invalid authorization request', { status: 400 });
+    }
+
+    const client = await env.OAUTH_PROVIDER.lookupClient(oauthRequest.clientId);
+
+    if (!client) {
+      return new Response('Unknown OAuth client', { status: 400 });
+    }
+
+    // MCP uses authorization code flow. Reject unsupported or client-disabled
+    // response types before completeAuthorization().
+    const responseTypeAllowed =
+      oauthRequest.responseType === 'code' && (!client.responseTypes || client.responseTypes.includes('code'));
+    if (!responseTypeAllowed) {
+      const redirect = new URL(oauthRequest.redirectUri);
+      redirect.searchParams.set('error', oauthRequest.responseType ? 'unsupported_response_type' : 'invalid_request');
+      if (oauthRequest.state) redirect.searchParams.set('state', oauthRequest.state);
+      if (oauthRequest.issuer) redirect.searchParams.set('iss', oauthRequest.issuer);
+      return Response.redirect(redirect.toString(), 302);
+    }
+
+    // Authenticate the user and obtain consent here. Do not automatically
+    // approve a request in production. This example assumes those steps have
+    // produced the following user and scope values.
+    const user = { id: 'user-123', displayName: 'Ada' };
+    const grantedScopes = oauthRequest.scope.filter((scope) => scope === 'mcp:read');
+
+    const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
+      request: oauthRequest,
+      userId: user.id,
+      metadata: { clientName: client.clientName },
+      scope: grantedScopes,
+      props: {
+        userId: user.id,
+        displayName: user.displayName,
+      },
+    });
+
+    return Response.redirect(redirectTo, 302);
+  },
+};
+
+export default new OAuthProvider<Env>({
+  apiRoute: '/mcp',
+  apiHandler: McpApiHandler,
+  defaultHandler,
+
+  authorizeEndpoint: '/authorize',
+  tokenEndpoint: '/oauth/token',
+
+  scopesSupported: ['mcp:read'],
+  allowPlainPKCE: false,
+
+  resourceMetadata: {
+    resource: 'https://mcp.example.com/mcp',
+    authorization_servers: ['https://mcp.example.com'],
+    scopes_supported: ['mcp:read'],
+    resource_name: 'Example MCP server',
+  },
+
+  // Preferred for clients with no pre-existing relationship.
+  // Also requires global_fetch_strictly_public in wrangler.jsonc.
+  clientIdMetadataDocumentEnabled: true,
+
+  // Optional compatibility fallback. MCP 2026 deprecates DCR for new clients.
+  clientRegistrationEndpoint: '/oauth/register',
+});
+```
+
+The example deliberately leaves user authentication and consent rendering to the application. The provider does not decide who the user is or whether a requested scope should be granted.
+
+## How MCP authorization discovery works
+
+An MCP client discovers authorization in two stages, following the [MCP authorization server discovery rules](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/authorization-server-discovery).
+
+For an MCP endpoint at `https://mcp.example.com/mcp`:
+
+1. The client sends an unauthenticated request to `/mcp`.
+2. The provider returns `401 Unauthorized` with a challenge similar to:
+
+   ```http
+   WWW-Authenticate: Bearer realm="OAuth", resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource/mcp"
+   ```
+
+3. The client fetches the protected resource metadata:
+
+   ```text
+   https://mcp.example.com/.well-known/oauth-protected-resource/mcp
+   ```
+
+4. That document identifies one or more authorization server issuers through `authorization_servers`.
+5. The client fetches this provider's RFC 8414 authorization server metadata:
+
+   ```text
+   https://mcp.example.com/.well-known/oauth-authorization-server
+   ```
+
+6. The metadata tells the client where to authorize, exchange tokens, and register if registration is enabled.
+
+Protected resource metadata and authorization server metadata serve different roles:
+
+- Protected resource metadata describes the MCP server and identifies its authorization servers.
+- Authorization server metadata describes OAuth endpoints and capabilities such as PKCE and CIMD.
+
+### Protected resource metadata
+
+The provider always serves RFC 9728 metadata at:
+
+```text
+/.well-known/oauth-protected-resource
+```
+
+It also supports path-specific metadata. A request to:
+
+```text
+/.well-known/oauth-protected-resource/public/mcp
+```
+
+produces `https://example.com/public/mcp` as the derived resource unless `resourceMetadata.resource` overrides it.
+
+For MCP deployments, configure the canonical MCP endpoint explicitly:
+
+```ts
+resourceMetadata: {
+  resource: 'https://mcp.example.com/mcp',
+  authorization_servers: ['https://auth.example.com'],
+  scopes_supported: ['files:read'],
+  bearer_methods_supported: ['header'],
+  resource_name: 'Files MCP server',
 }
 ```
 
-The OAuth metadata endpoint reports `client_id_metadata_document_supported: true` only when both the option is enabled and the compatibility flag is present.
+`authorization_servers` may contain more than one issuer. The MCP client chooses an authorization server and must keep credentials and tokens separate for each issuer.
+
+### Authorization server metadata
+
+The provider publishes RFC 8414 metadata containing:
+
+- `issuer`
+- `authorization_endpoint`
+- `token_endpoint`
+- `registration_endpoint`, when DCR is enabled
+- supported response and grant types
+- token endpoint authentication methods
+- PKCE methods
+- revocation endpoint
+- RFC 9207 issuer support
+- CIMD support when it is enabled and safe to use
+
+The package serves RFC 8414 metadata rather than OpenID Connect discovery. MCP authorization servers need to provide at least one of those mechanisms, so RFC 8414 is sufficient.
+
+## Authorization endpoint
+
+Your `authorizeEndpoint` belongs to the application's `defaultHandler`. A typical flow has four steps:
+
+1. Call `parseAuthRequest(request)` to parse the request and validate the client, redirect URI, resource, and PKCE restrictions.
+2. Reject response types that the deployment does not support. MCP uses `code`.
+3. Authenticate the user, show consent, and decide which scopes to grant.
+4. Call `completeAuthorization()` and redirect to its returned `redirectTo` URL.
+
+The explicit response type check is required because `completeAuthorization()` currently treats any response type other than `token` as authorization code flow.
+
+`completeAuthorization()` stores a new grant and, by default, revokes existing grants for the same user and client after the new grant is safely stored. Set `revokeExistingGrants: false` only when the application intentionally allows concurrent grants for the same user and client.
+
+For users with many grants, `revokeExistingGrantsBatchSize` controls the KV page size used during that scan. It defaults to `50` and is capped at KV's maximum page size of `1000`.
+
+### Authorization response issuer
+
+RFC 9207 issuer identification is always enabled. Authorization server metadata advertises `authorization_response_iss_parameter_supported: true`, and successful authorization responses include `iss` automatically.
+
+`parseAuthRequest()` returns the expected `issuer`. If the application creates a terminal OAuth error redirect, include that value:
+
+```ts
+const oauthRequest = await env.OAUTH_PROVIDER.parseAuthRequest(request);
+const redirect = new URL(oauthRequest.redirectUri);
+redirect.searchParams.set('error', 'access_denied');
+redirect.searchParams.set('state', oauthRequest.state);
+if (oauthRequest.issuer) redirect.searchParams.set('iss', oauthRequest.issuer);
+return Response.redirect(redirect.toString(), 302);
+```
+
+Intermediate identity-provider redirects and local HTML error pages do not need the OAuth `iss` parameter.
+
+## Client registration
+
+[MCP client registration](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/client-registration) defines three ways for a client to obtain a client ID. Clients that support all three prefer pre-registration, then CIMD, then DCR.
+
+### Pre-registered clients
+
+Use `OAuthHelpers.createClient()` to create clients through application or administrative code. These clients are stored in KV and are not subject to `clientRegistrationTTL`.
+
+### Client ID Metadata Documents
+
+CIMD lets a client use an HTTPS URL with a non-root path as its `client_id`. That URL serves a JSON metadata document describing the client and its redirect URIs.
+
+Enable it in both places:
+
+```ts
+new OAuthProvider({
+  // Other options...
+  clientIdMetadataDocumentEnabled: true,
+});
+```
+
+```jsonc
+{
+  "compatibility_flags": ["global_fetch_strictly_public"],
+}
+```
+
+The compatibility flag prevents outbound CIMD fetches from using legacy same-zone origin routing, which is necessary for SSRF protection. The provider advertises `client_id_metadata_document_supported: true` only when both settings are present.
+
+CIMD validation includes:
+
+- HTTPS URL with a non-root path.
+- A document `client_id` exactly matching its URL.
+- Non-empty `client_name` and `redirect_uris` fields.
+- Exact authorization-request redirect URI validation, with RFC 8252 loopback port handling.
+- A 5 KB response size limit and 10 second fetch timeout.
+- Safe URI schemes for client metadata fields.
 
 CIMD currently supports only `token_endpoint_auth_method: "none"`.
 
-## Written using Claude
+When a CIMD document cannot be fetched or validated, the token endpoint returns a generic `invalid_client` response and reports diagnostics through `onError.internal`. `OAuthHelpers` methods that resolve a CIMD client throw the exported `CimdFetchError`, allowing applications to distinguish an upstream metadata failure from a client that does not exist. See [Advanced configuration](https://github.com/cloudflare/workers-oauth-provider/blob/main/docs/advanced-configuration.md#cimd-fetch-errors) for an example.
 
-This library (including the schema documentation) was largely written with the help of [Claude](https://claude.ai), the AI model by Anthropic. Claude's output was thoroughly reviewed by Cloudflare engineers with careful attention paid to security and compliance with standards. Many improvements were made on the initial output, mostly again by prompting Claude (and reviewing the results). Check out the commit history to see how Claude was prompted and what code it produced.
+### Dynamic Client Registration
 
-**"NOOOOOOOO!!!! You can't just use an LLM to write an auth library!"**
+Set `clientRegistrationEndpoint` to enable RFC 7591 Dynamic Client Registration:
 
-"haha gpus go brrr"
+```ts
+clientRegistrationEndpoint: '/oauth/register';
+```
 
-In all seriousness, two months ago (January 2025), I ([@kentonv](https://github.com/kentonv)) would have agreed. I was an AI skeptic. I thought LLMs were glorified Markov chain generators that didn't actually understand code and couldn't produce anything novel. I started this project on a lark, fully expecting the AI to produce terrible code for me to laugh at. And then, uh... the code actually looked pretty good. Not perfect, but I just told the AI to fix things, and it did. I was shocked.
+MCP 2026-07-28 deprecates DCR for new implementations in favor of CIMD. The endpoint remains useful for compatibility with clients that do not support CIMD.
 
-To emphasize, **this is not "vibe coded"**. Every line was thoroughly reviewed and cross-referenced with relevant RFCs, by security experts with previous experience with those RFCs. I was _trying_ to validate my skepticism. I ended up proving myself wrong.
+Related options:
 
-Again, please check out the commit history -- especially early commits -- to understand how this went.
+- `clientRegistrationTTL` controls the lifetime of dynamically registered clients. The default is 90 days.
+- `disallowPublicClientRegistration` rejects DCR clients using `token_endpoint_auth_method: "none"`.
+- `clientRegistrationCallback` can allow or reject registration based on application policy.
+
+Clients created by `OAuthHelpers.createClient()` are not affected by the DCR TTL or public-registration restriction.
+
+## PKCE and OAuth flows
+
+Public clients must use PKCE with authorization code flow. The provider always supports S256.
+
+For new MCP deployments, disable the legacy plain method:
+
+```ts
+allowPlainPKCE: false;
+```
+
+`allowPlainPKCE` defaults to `true` for backwards compatibility. `allowImplicitFlow` defaults to `false`; leave it disabled for MCP and other new OAuth deployments.
+
+## Resources and token audiences
+
+MCP clients must send the canonical MCP server URI as `resource` in authorization and token requests. The provider parses RFC 8707 resource indicators, stores the authorized resource on the grant, uses it as the access-token audience, and rejects resource expansion or audience mismatch.
+
+Resource policy follows `resourceMetadata.resource`:
+
+- When configured, authorization requests, token requests, and externally resolved tokens must use that one exact resource. `resourceMatchOriginOnly` cannot weaken this policy.
+- When omitted, valid resources are accepted. Token requests may inherit the authorization resource. If the authorization request also omits it, the provider uses the request origin as the default and issues an origin-bound token.
+
+Path-aware audiences use path-boundary prefix matching. A token for `https://example.com/mcp` can be used at `/mcp/tools`, but not at `/mcp-other`. Split deployments and deployments requiring path isolation should configure the canonical resource explicitly.
+
+`resourceMatchOriginOnly` remains a migration option for grants created before path-aware resources were introduced. Do not enable it for a new deployment.
+
+## Scopes and step-up authorization
+
+`scopesSupported` is published in authorization server metadata and is also the default for protected resource metadata. `resourceMetadata.scopes_supported` can override the protected resource value.
+
+The application decides which requested scopes to grant through `completeAuthorization({ scope })`. Token and refresh requests can only narrow those scopes.
+
+The provider does not expose a standard effective-token authorization context to API handlers or enforce operation-level scope policy. Protected resource metadata supplies baseline scope guidance in Bearer challenges. Advanced integrations can provide operation-specific step-up guidance through external-token validation.
+
+## Advanced features
+
+The package also supports:
+
+- External API keys and bearer credentials through `resolveExternalToken` as an advanced compatibility feature.
+- Updating encrypted props, token scope, and token lifetimes with `tokenExchangeCallback`.
+- OAuth 2.0 Token Exchange when `allowTokenExchangeGrant` is enabled.
+- Structured callback errors through the exported `OAuthError` and `ExternalTokenError` classes.
+- Custom error observation or responses through `onError`.
+- Experimental MCP Enterprise-Managed Authorization using ID-JAG assertions.
+- Multiple protected handlers through `apiHandlers`.
+- Configurable access token, refresh token, and DCR client lifetimes.
+
+See [Advanced configuration](https://github.com/cloudflare/workers-oauth-provider/blob/main/docs/advanced-configuration.md) for examples and security notes.
+
+## KV storage and cleanup
+
+Sensitive values are not stored in plaintext:
+
+- Access tokens, refresh tokens, authorization codes, and client secrets are stored only by hash.
+- `props` are encrypted with AES-GCM using key material wrapped by the corresponding secret token.
+- Grant `userId` and `metadata` are not encrypted because applications use them to enumerate and revoke grants. Treat those fields as storage-visible metadata.
+
+See [storage-schema.md](https://github.com/cloudflare/workers-oauth-provider/blob/main/storage-schema.md) for the complete KV layout.
+
+KV TTLs remove expiring records automatically. `purgeExpiredData()` provides a defense-in-depth sweep for orphaned or expired grants and tokens:
+
+```ts
+const provider = new OAuthProvider({
+  // Options...
+});
+
+export default {
+  fetch(request, env, ctx) {
+    return provider.fetch(request, env, ctx);
+  },
+  async scheduled(_event, env) {
+    const result = await provider.purgeExpiredData(env, { batchSize: 100 });
+    console.log(result);
+  },
+};
+```
+
+The default batch size is 50. `result.done` reports whether both key spaces were scanned completely during that invocation.
+
+Deleting a client through `OAuthHelpers.deleteClient()` also revokes its grants and associated tokens across users.
+
+## Configuration reference
+
+| Option                             | Purpose                                                  | Default                                     |
+| ---------------------------------- | -------------------------------------------------------- | ------------------------------------------- |
+| `apiRoute` and `apiHandler`        | Protect one or more route prefixes with one handler      | Use these or `apiHandlers`                  |
+| `apiHandlers`                      | Map protected route prefixes to different handlers       | Use this or `apiRoute` plus `apiHandler`    |
+| `defaultHandler`                   | Handle authorization UI and other unprotected routes     | Required                                    |
+| `authorizeEndpoint`                | Application-owned authorization and consent endpoint     | Required                                    |
+| `tokenEndpoint`                    | Provider-owned token and revocation endpoint             | Required                                    |
+| `clientRegistrationEndpoint`       | Enable RFC 7591 DCR                                      | Disabled                                    |
+| `scopesSupported`                  | Publish authorization server scopes                      | Omitted                                     |
+| `resourceMetadata`                 | Configure RFC 9728 metadata                              | Derived from the request and token endpoint |
+| `clientIdMetadataDocumentEnabled`  | Enable CIMD lookup and advertisement                     | `false`                                     |
+| `allowPlainPKCE`                   | Permit the legacy plain PKCE method                      | `true`                                      |
+| `allowImplicitFlow`                | Enable implicit token responses                          | `false`                                     |
+| `disallowPublicClientRegistration` | Reject public clients at DCR                             | `false`                                     |
+| `clientRegistrationCallback`       | Apply application policy before storing a DCR client     | None                                        |
+| `allowTokenExchangeGrant`          | Enable RFC 8693                                          | `false`                                     |
+| `tokenExchangeCallback`            | Update props, scopes, or lifetimes during token exchange | None                                        |
+| `resolveExternalToken`             | Validate external bearer credentials (advanced)          | None                                        |
+| `resourceMatchOriginOnly`          | Migration mode for old origin-only resource grants       | `false`                                     |
+| `enterpriseManagedAuthorization`   | Enable experimental ID-JAG grant support                 | Disabled                                    |
+| `onError`                          | Observe or replace OAuth error responses                 | Logs a warning                              |
+
+Consult the exported `OAuthProviderOptions`, callback interfaces, and JSDoc in [`src/oauth-provider.ts`](https://github.com/cloudflare/workers-oauth-provider/blob/main/src/oauth-provider.ts) for the complete typed API.
+
+## OAuth helpers
+
+Handlers receive `env.OAUTH_PROVIDER`, which implements `OAuthHelpers`. It can:
+
+- Parse authorization requests and complete authorization.
+- Look up, create, list, update, and delete clients.
+- List and revoke grants for a user.
+- Inspect internally issued tokens with `unwrapToken()`.
+- Exchange access tokens when RFC 8693 is enabled.
+- Purge expired and orphaned KV data.
+
+`getOAuthApi(options, env)` provides the same helper API outside a fetch handler, including RPC methods and other Worker entrypoints.
+
+## Standards
+
+The package implements or supports the relevant portions of:
+
+- [MCP authorization, 2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization)
+- [OAuth 2.1, draft-ietf-oauth-v2-1-13](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-v2-1-13)
+- [OAuth 2.0 Bearer Token Usage, RFC 6750](https://datatracker.ietf.org/doc/html/rfc6750)
+- [OAuth 2.0 Token Revocation, RFC 7009](https://datatracker.ietf.org/doc/html/rfc7009)
+- [OAuth 2.0 Dynamic Client Registration, RFC 7591](https://datatracker.ietf.org/doc/html/rfc7591)
+- [Proof Key for Code Exchange, RFC 7636](https://datatracker.ietf.org/doc/html/rfc7636)
+- [OAuth 2.0 Authorization Server Metadata, RFC 8414](https://datatracker.ietf.org/doc/html/rfc8414)
+- [OAuth 2.0 Token Exchange, RFC 8693](https://datatracker.ietf.org/doc/html/rfc8693)
+- [Resource Indicators for OAuth 2.0, RFC 8707](https://datatracker.ietf.org/doc/html/rfc8707)
+- [OAuth 2.0 Authorization Server Issuer Identification, RFC 9207](https://datatracker.ietf.org/doc/html/rfc9207)
+- [OAuth 2.0 Protected Resource Metadata, RFC 9728](https://datatracker.ietf.org/doc/html/rfc9728)
+- [OAuth Client ID Metadata Documents](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-client-id-metadata-document-00)
+- [MCP Enterprise-Managed Authorization](https://modelcontextprotocol.io/extensions/auth/enterprise-managed-authorization), with experimental package support
+
+## Development
+
+Node 24 or newer is required.
+
+```sh
+npm install
+npm run build
+npm run check
+npm run prettier
+```
+
+Changes that affect behavior or the public API need a Changeset. See [AGENTS.md](https://github.com/cloudflare/workers-oauth-provider/blob/main/AGENTS.md) for repository conventions and [SECURITY.md](https://github.com/cloudflare/workers-oauth-provider/blob/main/SECURITY.md) for vulnerability reporting.
+
+## Project history
+
+Kenton Varda's original account of how this library was created is preserved word for word in [HISTORY.md](https://github.com/cloudflare/workers-oauth-provider/blob/main/HISTORY.md).
