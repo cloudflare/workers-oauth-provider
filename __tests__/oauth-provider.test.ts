@@ -2043,6 +2043,35 @@ describe('OAuthProvider', () => {
       redirectUri = 'https://client.example.com/callback';
     }
 
+    async function requestRefreshTokenWithAuthorization(authorization: string): Promise<Response> {
+      const params = new URLSearchParams();
+      params.append('grant_type', 'refresh_token');
+      params.append('refresh_token', 'invalid-refresh-token');
+
+      return oauthProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            Authorization: authorization,
+          },
+          params.toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+    }
+
+    async function expectBasicClientError(response: Response, description: string): Promise<void> {
+      expect(response.status).toBe(401);
+      expect(response.headers.get('WWW-Authenticate')).toBe('Basic realm="OAuth"');
+      expect(await response.json<any>()).toEqual({
+        error: 'invalid_client',
+        error_description: description,
+      });
+    }
+
     beforeEach(async () => {
       await createTestClient();
     });
@@ -2189,33 +2218,86 @@ describe('OAuthProvider', () => {
       expect(error.error_description).toBe('Client must not use multiple authentication methods');
     });
 
+    it('should reject malformed Base64 in Basic auth credentials', async () => {
+      const response = await requestRefreshTokenWithAuthorization('Basic %');
+
+      await expectBasicClientError(response, 'Client authentication failed: invalid Basic credentials');
+    });
+
+    it('should reject Basic auth credentials without a client ID separator', async () => {
+      const response = await requestRefreshTokenWithAuthorization(`Basic ${btoa(clientId)}`);
+
+      await expectBasicClientError(response, 'Client authentication failed: invalid Basic credentials');
+    });
+
     it('should reject malformed percent-encoding in Basic auth credentials', async () => {
       const malformedCredentials = [`%ZZ:${clientSecret}`, `${encodeURIComponent(clientId)}:%ZZ`];
 
       for (const credentials of malformedCredentials) {
-        const params = new URLSearchParams();
-        params.append('grant_type', 'refresh_token');
-        params.append('refresh_token', 'invalid-refresh-token');
+        const response = await requestRefreshTokenWithAuthorization(`Basic ${btoa(credentials)}`);
 
-        const tokenRequest = createMockRequest(
+        await expectBasicClientError(response, 'Client authentication failed: invalid Basic credentials');
+      }
+    });
+
+    it('should recognize the Basic auth scheme case-insensitively', async () => {
+      const response = await requestRefreshTokenWithAuthorization(`basic ${btoa(`${clientId}:${clientSecret}`)}`);
+
+      expect(response.status).toBe(400);
+      expect(await response.json<any>()).toEqual({
+        error: 'invalid_grant',
+        error_description: 'Invalid token format',
+      });
+    });
+
+    it('should challenge empty client IDs presented through Basic auth', async () => {
+      const response = await requestRefreshTokenWithAuthorization(`Basic ${btoa(`:${clientSecret}`)}`);
+
+      await expectBasicClientError(response, 'Client ID is required');
+    });
+
+    it('should challenge an unknown client that attempts Basic auth', async () => {
+      const response = await requestRefreshTokenWithAuthorization(`Basic ${btoa('unknown-client:secret')}`);
+
+      await expectBasicClientError(response, 'Client not found');
+    });
+
+    it('should challenge missing secrets presented through Basic auth', async () => {
+      const response = await requestRefreshTokenWithAuthorization(`Basic ${btoa(`${clientId}:`)}`);
+
+      await expectBasicClientError(response, 'Client authentication failed: missing client_secret');
+    });
+
+    it('should challenge a known client with an invalid Basic auth secret', async () => {
+      const response = await requestRefreshTokenWithAuthorization(`Basic ${btoa(`${clientId}:wrong-secret`)}`);
+
+      await expectBasicClientError(response, 'Client authentication failed: invalid client_secret');
+    });
+
+    it('should not add a Basic challenge to form-post client authentication failures', async () => {
+      const params = new URLSearchParams();
+      params.append('grant_type', 'refresh_token');
+      params.append('refresh_token', 'invalid-refresh-token');
+      params.append('client_id', clientId);
+      params.append('client_secret', 'wrong-secret');
+
+      const response = await oauthProvider.fetch(
+        createMockRequest(
           'https://example.com/oauth/token',
           'POST',
-          {
-            'Content-Type': 'application/x-www-form-urlencoded',
-            Authorization: `Basic ${btoa(credentials)}`,
-          },
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
           params.toString()
-        );
+        ),
+        mockEnv,
+        mockCtx
+      );
 
-        const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
-
-        expect(tokenResponse.status).toBe(401);
-        expect(tokenResponse.headers.get('WWW-Authenticate')).toBe('Basic realm="OAuth"');
-        expect(await tokenResponse.json<any>()).toEqual({
-          error: 'invalid_client',
-          error_description: 'Client authentication failed: invalid Basic credentials',
-        });
-      }
+      expect(response.status).toBe(401);
+      expect(response.headers.get('WWW-Authenticate')).toBeNull();
+      expect(await response.json<any>()).toEqual({
+        error: 'invalid_client',
+        error_description: 'Client authentication failed: invalid client_secret',
+      });
     });
 
     it('should decode Basic auth credentials with form-url-encoding semantics', async () => {
