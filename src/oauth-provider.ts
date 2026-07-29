@@ -1407,6 +1407,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       );
     }
 
+    this.validateResourceMetadataOptions(this.options.resourceMetadata);
     this.validateEmaOptions(this.options.enterpriseManagedAuthorization);
 
     if (this.options.enterpriseManagedAuthorization) {
@@ -1460,6 +1461,40 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     throw new TypeError(
       `${name} must be either an ExportedHandler object with a fetch method or a class extending WorkerEntrypoint`
     );
+  }
+
+  /** Validate configured RFC 9728 protected resource metadata. */
+  private validateResourceMetadataOptions(options: OAuthProviderOptions<Env>['resourceMetadata']): void {
+    if (!options) return;
+
+    if (options.resource && !validateResourceUri(options.resource)) {
+      throw new TypeError('resourceMetadata.resource must be an absolute HTTP(S) URI without a fragment');
+    }
+
+    if (options.authorization_servers !== undefined) {
+      if (options.authorization_servers.length === 0) {
+        throw new TypeError('resourceMetadata.authorization_servers must contain at least one issuer');
+      }
+      for (const issuer of options.authorization_servers) {
+        let parsed: URL;
+        try {
+          parsed = new URL(issuer);
+        } catch {
+          throw new TypeError('resourceMetadata.authorization_servers must contain valid HTTPS issuer URLs');
+        }
+        if (parsed.protocol !== 'https:' || parsed.search || parsed.hash) {
+          throw new TypeError('resourceMetadata.authorization_servers must contain valid HTTPS issuer URLs');
+        }
+      }
+    }
+
+    if (options.scopes_supported?.some((scope) => !isValidOAuthScopeToken(scope))) {
+      throw new TypeError('resourceMetadata.scopes_supported must contain valid OAuth scope tokens');
+    }
+
+    if (options.bearer_methods_supported?.some((method) => method !== 'header')) {
+      throw new TypeError("resourceMetadata.bearer_methods_supported only supports 'header'");
+    }
   }
 
   /**
