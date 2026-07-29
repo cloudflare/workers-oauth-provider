@@ -398,16 +398,6 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
   allowPlainPKCE?: boolean;
 
   /**
-   * Include the RFC 9207 `iss` parameter in successful authorization responses
-   * and advertise `authorization_response_iss_parameter_supported`.
-   *
-   * Application-owned terminal authorization error responses must also include
-   * the `issuer` returned by `parseAuthRequest`. Defaults to true; set to false
-   * only for legacy handlers that cannot yet emit `iss` on error redirects.
-   */
-  authorizationResponseIssuerEnabled?: boolean;
-
-  /**
    * Controls whether OAuth 2.0 Token Exchange (RFC 8693) is allowed.
    * When false, the token exchange grant type will not be advertised in metadata
    * and token exchange requests will be rejected.
@@ -2109,9 +2099,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       // not implemented: introspection_endpoint_auth_methods_supported
       // not implemented: introspection_endpoint_auth_signing_alg_values_supported
       code_challenge_methods_supported: this.options.allowPlainPKCE !== false ? ['plain', 'S256'] : ['S256'], // PKCE support
-      ...(this.options.authorizationResponseIssuerEnabled !== false
-        ? { authorization_response_iss_parameter_supported: true }
-        : {}),
+      authorization_response_iss_parameter_supported: true,
       // MCP Client ID Metadata Document support (CIMD)
       // Only enabled when global_fetch_strictly_public compat flag is set (for SSRF protection)
       client_id_metadata_document_supported:
@@ -5327,7 +5315,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
       if (options.request.state) {
         fragment.set('state', options.request.state);
       }
-      if (this.provider.options.authorizationResponseIssuerEnabled !== false && options.request.issuer) {
+      if (options.request.issuer) {
         fragment.set('iss', options.request.issuer);
       }
 
@@ -5384,7 +5372,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
       if (options.request.state) {
         redirectUrl.searchParams.set('state', options.request.state);
       }
-      if (this.provider.options.authorizationResponseIssuerEnabled !== false && options.request.issuer) {
+      if (options.request.issuer) {
         redirectUrl.searchParams.set('iss', options.request.issuer);
       }
 

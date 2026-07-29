@@ -526,13 +526,12 @@ describe('OAuthProvider', () => {
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
         allowImplicitFlow: false,
-        authorizationResponseIssuerEnabled: false,
       });
       const request = createMockRequest('https://example.com/.well-known/oauth-authorization-server');
       const response = await providerNoImplicit.fetch(request, mockEnv, mockCtx);
       const metadata = await response.json<any>();
       expect(metadata.response_modes_supported).toEqual(['query']);
-      expect(metadata.authorization_response_iss_parameter_supported).toBeUndefined();
+      expect(metadata.authorization_response_iss_parameter_supported).toBe(true);
     });
 
     it('should not include token response type when implicit flow is disabled', async () => {
