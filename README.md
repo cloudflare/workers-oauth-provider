@@ -298,6 +298,12 @@ Other thrown values are re-thrown so unexpected validator bugs remain visible as
 the provider exposes `WWW-Authenticate` and `Retry-After` through CORS so browser clients can read discovery,
 step-up, and backoff guidance.
 
+### Authorization response issuer
+
+RFC 9207 issuer identification is enabled by default. `parseAuthRequest` returns the expected `issuer`; authorization
+handlers must include it in terminal OAuth error redirects. Set `authorizationResponseIssuerEnabled: false` only for
+legacy handlers that cannot yet include `iss` in their error responses.
+
 ## Token Exchange Callback
 
 This library allows you to update the `props` value during token exchanges by configuring a callback function. This is useful for scenarios where the application needs to perform additional processing when tokens are issued or refreshed.
