@@ -450,8 +450,9 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
    * For example, if a request includes an authenticated token from a different OAuth authentication server,
    * the callback can be used to authenticate it and set the context props through it.
    *
-   * The callback can optionally return props values that will passed-through to the apiHandlers.
-   * The callback can return `null` to signal resolution failure.
+   * Return props to authenticate the request, or `null` for a generic `invalid_token` response.
+   * Throw this package's exported {@link OAuthError} to return a structured OAuth error response.
+   * Other thrown errors remain unexpected failures and are re-thrown.
    */
   resolveExternalToken?: (input: ResolveExternalTokenInput) => Promise<ResolveExternalTokenResult | null>;
 
@@ -2125,18 +2126,37 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   }
 
   /**
-   * Build a structured OAuth `/token` error response from an OAuth error.
+   * Build a structured OAuth error response from an OAuth error.
    *
    * The supported form is throwing this package's exported `OAuthError`.
    * Anything else is re-thrown so unexpected failures still surface as 500s.
    *
+   * When handling a protected resource request, standard bearer-token errors
+   * receive an RFC 6750 / RFC 9728 challenge unless the caller supplied one.
    * Use `headers['Retry-After']` for rate-limit / transient-failure backoff
    * hints (see RFC 7231 §7.1.3 — either an integer seconds value or an
    * HTTP-date is allowed).
    */
-  private createOAuthErrorResponse(error: unknown): Response | undefined {
+  private createOAuthErrorResponse(error: unknown, resourceMetadataUrl?: string): Response | undefined {
     if (!(error instanceof OAuthError)) return undefined;
-    return this.createErrorResponse(error.code, error.options);
+
+    const headers = error.options.headers ?? {};
+    const hasChallenge = Object.keys(headers).some((name) => name.toLowerCase() === 'www-authenticate');
+    const isBearerError =
+      (error.code === 'invalid_token' && error.statusCode === 401) ||
+      (error.code === 'insufficient_scope' && error.statusCode === 403);
+
+    return this.createErrorResponse(error.code, {
+      ...error.options,
+      ...(resourceMetadataUrl && isBearerError && !hasChallenge
+        ? {
+            headers: {
+              ...headers,
+              'WWW-Authenticate': this.buildWwwAuthenticateHeader(resourceMetadataUrl, error.code),
+            },
+          }
+        : {}),
+    });
   }
 
   /**
@@ -3727,8 +3747,17 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       // Set the decrypted props on the context object
       (ctx as MutableExecutionContext).props = decryptedProps;
     } else if (this.options.resolveExternalToken) {
-      // No token data was found, so we validate the provided token with the provided validator
-      const ext = await this.options.resolveExternalToken({ token: accessToken, request, env });
+      // No token data was found, so we validate the provided token with the provided validator.
+      // Convert only the package's exported OAuthError into a structured response;
+      // unexpected callback failures remain visible as 500s.
+      let ext: ResolveExternalTokenResult | null;
+      try {
+        ext = await this.options.resolveExternalToken({ token: accessToken, request, env });
+      } catch (error) {
+        const response = this.createOAuthErrorResponse(error, resourceMetadataUrl);
+        if (response) return response;
+        throw error;
+      }
 
       // Failed external validation
       if (!ext) {
@@ -4342,10 +4371,9 @@ export interface OAuthErrorOptions {
 /**
  * Structured OAuth 2.0 error.
  *
- * Throw from a `tokenExchangeCallback` (or any code it calls — the error
- * propagates naturally up through deep call stacks) to surface a standard
- * `/token` error response (`{ error, error_description }`) instead of a
- * generic `500 Internal Server Error`.
+ * Throw from a `tokenExchangeCallback`, `resolveExternalToken`, or any code
+ * they call to surface a standard OAuth error response
+ * (`{ error, error_description }`) instead of a generic `500 Internal Server Error`.
  *
  * Anything thrown that is **not** an `OAuthError` continues to surface as
  * a 500 so unexpected failures remain visible — the provider does not

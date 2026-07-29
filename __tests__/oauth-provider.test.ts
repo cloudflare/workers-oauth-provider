@@ -8782,6 +8782,159 @@ describe('OAuthProvider', () => {
       expect(externalTokenCalls[0].token).toBe('invalid-external-token');
     });
 
+    it('should convert OAuthError from external validation into a structured invalid_token response', async () => {
+      const provider = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        resolveExternalToken: async () => {
+          throw new OAuthError('invalid_token', {
+            description: 'external token expired',
+            statusCode: 401,
+          });
+        },
+      });
+      const request = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: 'Bearer expired-external-token',
+      });
+
+      const response = await provider.fetch(request, mockEnv, mockCtx);
+
+      expect(response.status).toBe(401);
+      expect(response.headers.get('Cache-Control')).toBe('no-store');
+      expect(response.headers.get('WWW-Authenticate')).toBe(
+        'Bearer realm="OAuth", resource_metadata="https://example.com/.well-known/oauth-protected-resource/api/test", error="invalid_token"'
+      );
+      await expect(response.json()).resolves.toEqual({
+        error: 'invalid_token',
+        error_description: 'external token expired',
+      });
+    });
+
+    it('should convert insufficient_scope from external validation into a structured 403 response', async () => {
+      const provider = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        resolveExternalToken: async () => {
+          throw new OAuthError('insufficient_scope', {
+            description: 'Account Resources: Read is required',
+            statusCode: 403,
+            headers: { 'X-Trace-Id': 'trace-123' },
+          });
+        },
+      });
+      const request = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: 'Bearer under-scoped-external-token',
+      });
+
+      const response = await provider.fetch(request, mockEnv, mockCtx);
+
+      expect(response.status).toBe(403);
+      expect(response.headers.get('X-Trace-Id')).toBe('trace-123');
+      expect(response.headers.get('WWW-Authenticate')).toContain('error="insufficient_scope"');
+      await expect(response.json()).resolves.toEqual({
+        error: 'insufficient_scope',
+        error_description: 'Account Resources: Read is required',
+      });
+    });
+
+    it.each<{
+      code: string;
+      description: string;
+      status: number;
+      headers: Record<string, string>;
+    }>([
+      {
+        code: 'temporarily_unavailable',
+        description: 'external authorization server rate limited',
+        status: 429,
+        headers: { 'Retry-After': '17' },
+      },
+      {
+        code: 'server_error',
+        description: 'external authorization server unavailable',
+        status: 502,
+        headers: { 'X-Upstream-Status': '503' },
+      },
+    ])(
+      'should preserve a structured $status external validation failure',
+      async ({ code, description, status, headers }) => {
+        const provider = new OAuthProvider({
+          apiRoute: ['/api/'],
+          apiHandler: TestApiHandler,
+          defaultHandler: testDefaultHandler,
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: '/oauth/token',
+          resolveExternalToken: async () => {
+            throw new OAuthError(code, { description, statusCode: status, headers });
+          },
+        });
+        const request = createMockRequest('https://example.com/api/test', 'GET', {
+          Authorization: 'Bearer unavailable-external-token',
+        });
+
+        const response = await provider.fetch(request, mockEnv, mockCtx);
+
+        expect(response.status).toBe(status);
+        for (const [name, value] of Object.entries(headers)) {
+          expect(response.headers.get(name)).toBe(value);
+        }
+        expect(response.headers.get('WWW-Authenticate')).toBeNull();
+        await expect(response.json()).resolves.toEqual({
+          error: code,
+          error_description: description,
+        });
+      }
+    );
+
+    it('should preserve a caller-supplied WWW-Authenticate challenge', async () => {
+      const challenge = 'Bearer realm="external", error="invalid_token"';
+      const provider = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        resolveExternalToken: async () => {
+          throw new OAuthError('invalid_token', {
+            description: 'external token rejected',
+            statusCode: 401,
+            headers: { 'www-authenticate': challenge },
+          });
+        },
+      });
+      const request = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: 'Bearer rejected-external-token',
+      });
+
+      const response = await provider.fetch(request, mockEnv, mockCtx);
+
+      expect(response.headers.get('WWW-Authenticate')).toBe(challenge);
+    });
+
+    it('should rethrow non-OAuthError failures from external validation', async () => {
+      const provider = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        resolveExternalToken: async () => {
+          throw new Error('external validator bug');
+        },
+      });
+      const request = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: 'Bearer external-token',
+      });
+
+      await expect(provider.fetch(request, mockEnv, mockCtx)).rejects.toThrow('external validator bug');
+    });
+
     it('should prioritize internal tokens over external validation', async () => {
       // Mock external token validation to track if it's called
       const externalTokenCalls: any[] = [];
