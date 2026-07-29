@@ -467,6 +467,11 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
    * deliberately did NOT put on the wire — used for richer diagnostics where the public
    * response must stay generic (e.g. JWT validation failures on the EMA path). Backwards
    * compatible: existing callbacks ignoring this field continue to work unchanged.
+   *
+   * `request` (when present) is the HTTP request that produced the error response, so the
+   * callback can correlate the error with per-request state such as request-keyed telemetry.
+   * Currently populated for CIMD metadata fetch failures at the token endpoint. Backwards
+   * compatible in the same way as `internal`.
    */
   onError?: (error: {
     code: string;
@@ -474,6 +479,7 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
     status: number;
     headers: Record<string, string>;
     internal?: { category: string; reason: string; detail?: unknown };
+    request?: Request;
   }) => Response | void;
 
   /**
@@ -548,13 +554,15 @@ export interface OAuthHelpers {
    * Parses an OAuth authorization request from the HTTP request
    * @param request - The HTTP request containing OAuth parameters
    * @returns The parsed authorization request parameters
+   * @throws {@link CimdFetchError} when the client ID is a CIMD URL whose document cannot be resolved
    */
   parseAuthRequest(request: Request): Promise<AuthRequest>;
 
   /**
    * Looks up a client by its client ID
    * @param clientId - The client ID to look up
-   * @returns A Promise resolving to the client info, or null if not found
+   * @returns A Promise resolving to the client info, or null if the client does not exist
+   * @throws {@link CimdFetchError} when the client ID is a CIMD URL whose document cannot be resolved
    */
   lookupClient(clientId: string): Promise<ClientInfo | null>;
 
@@ -562,6 +570,7 @@ export interface OAuthHelpers {
    * Completes an authorization request by creating a grant and authorization code
    * @param options - Options specifying the grant details
    * @returns A Promise resolving to an object containing the redirect URL
+   * @throws {@link CimdFetchError} when the client ID is a CIMD URL whose document cannot be resolved
    */
   completeAuthorization(options: CompleteAuthorizationOptions): Promise<{ redirectTo: string }>;
 
@@ -623,6 +632,7 @@ export interface OAuthHelpers {
    * Implements OAuth 2.0 Token Exchange (RFC 8693)
    * @param options - Options for token exchange including subject token and optional modifications
    * @returns Promise resolving to token response with new access token
+   * @throws {@link CimdFetchError} when the grant's client ID is a CIMD URL whose document cannot be resolved
    */
   exchangeToken(options: ExchangeTokenOptions): Promise<TokenResponse>;
 
@@ -1773,12 +1783,22 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     return `${requestUrl.origin}${suffix}`;
   }
 
-  private createInvalidClientResponse(description: string, basicAuthenticationAttempted: boolean): Response {
-    return this.createErrorResponse('invalid_client', {
-      description,
-      statusCode: 401,
-      ...(basicAuthenticationAttempted ? { headers: { 'WWW-Authenticate': BASIC_AUTH_CHALLENGE } } : {}),
-    });
+  private createInvalidClientResponse(
+    description: string,
+    basicAuthenticationAttempted: boolean,
+    internal?: { category: string; reason: string; detail?: unknown },
+    request?: Request
+  ): Response {
+    return this.createErrorResponse(
+      'invalid_client',
+      {
+        description,
+        statusCode: 401,
+        ...(basicAuthenticationAttempted ? { headers: { 'WWW-Authenticate': BASIC_AUTH_CHALLENGE } } : {}),
+      },
+      internal,
+      request
+    );
   }
 
   /**
@@ -1881,7 +1901,29 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     // Verify client exists
-    const clientInfo = await this.getClient(env, clientId);
+    let clientInfo: ClientInfo | null;
+    try {
+      clientInfo = await this.getClient(env, clientId);
+    } catch (error) {
+      if (error instanceof CimdFetchError) {
+        // Same wire response as an unknown client — the CIMD spec prescribes no
+        // error body for metadata fetch failures — but the deployer's onError
+        // hook receives a stable reason and diagnostic details, so an upstream
+        // outage blocking the metadata URL is observable instead of masquerading
+        // as an unregistered client.
+        return this.createInvalidClientResponse(
+          'Client not found',
+          basicAuthenticationAttempted,
+          {
+            category: 'client-id-metadata-document',
+            reason: error.reason,
+            detail: { metadataUrl: error.metadataUrl, message: error.detail },
+          },
+          request
+        );
+      }
+      throw error;
+    }
     if (!clientInfo) {
       return this.createInvalidClientResponse('Client not found', basicAuthenticationAttempted);
     }
@@ -3908,7 +3950,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    *
    * @param env - Cloudflare Worker environment variables
    * @param clientId - The client ID to look up (can be a regular ID or an HTTPS URL for CIMD)
-   * @returns The client information, or null if not found
+   * @returns The client information, or null if the client does not exist. Null means
+   * definitive absence; failures to determine the answer throw instead (KV errors
+   * propagate, and a CIMD metadata fetch failure throws `CimdFetchError`), so an
+   * upstream outage is distinguishable from an unregistered client.
    */
   async getClient(env: any, clientId: string): Promise<ClientInfo | null> {
     // Check if this is a CIMD (Client ID Metadata Document) URL
@@ -3925,9 +3970,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         return await this.fetchClientMetadataDocument(clientId);
       } catch (error) {
         // CIMD fetch failed (size limit, timeout, HTTP error, invalid metadata, etc.)
-        // Return null so callers treat this as "client not found" instead of a 500
+        // Throw a tagged error rather than returning null: KV-backed lookups
+        // already let infrastructure failures propagate, and conflating a fetch
+        // failure with "client not found" hides upstream outages from deployers
+        // (e.g. a WAF blocking the metadata URL reads as an unregistered client).
         console.warn(`CIMD fetch failed for ${clientId}:`, error instanceof Error ? error.message : error);
-        return null;
+        throw new CimdFetchError(clientId, error);
       }
     }
 
@@ -4407,7 +4455,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   private createErrorResponse(
     code: string,
     options: OAuthErrorOptions,
-    internal?: { category: string; reason: string; detail?: unknown }
+    internal?: { category: string; reason: string; detail?: unknown },
+    request?: Request
   ): Response {
     const { description } = options;
     const responseStatus = options.statusCode ?? 400;
@@ -4423,6 +4472,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       status: responseStatus,
       headers: responseHeaders,
       ...(internal ? { internal } : {}),
+      ...(request ? { request } : {}),
     });
     if (customErrorResponse) return customErrorResponse;
 
@@ -4541,6 +4591,44 @@ export class OAuthError extends Error {
     this.description = this.options.description;
     this.statusCode = this.options.statusCode;
     this.headers = this.options.headers;
+  }
+}
+
+/**
+ * Thrown when fetching a Client ID Metadata Document (CIMD) fails — the
+ * server-to-server fetch errored, timed out, or returned an invalid document.
+ * Distinct from a client that simply does not exist, which is reported as a
+ * null client lookup result.
+ *
+ * At the token endpoint the provider handles this itself: the wire response
+ * stays a generic `invalid_client` / "Client not found", and the failure is
+ * reported through the `onError` hook's `internal` field (category
+ * `client-id-metadata-document`) together with the originating `request`.
+ *
+ * `OAuthHelpers` methods that look up clients (`lookupClient`, and methods
+ * built on it such as `exchangeToken`) let this error propagate to the
+ * caller. Callers that previously relied on a `null` result for these
+ * failures should catch it to preserve their error contract.
+ */
+export class CimdFetchError extends Error {
+  /** Stable reason slug suitable for telemetry and control flow. */
+  public readonly reason = 'metadata_resolution_failed' as const;
+  /** The CIMD URL whose fetch or validation failed. */
+  public readonly metadataUrl: string;
+  /** The underlying failure message (e.g. "Failed to fetch client metadata: HTTP 403"). */
+  public readonly detail: string;
+
+  /**
+   * Creates an error for a failed CIMD fetch or validation.
+   * @param metadataUrl - The CIMD URL that could not be resolved
+   * @param cause - The underlying fetch or validation failure
+   */
+  constructor(metadataUrl: string, cause: unknown) {
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    super(`CIMD fetch failed for ${metadataUrl}: ${detail}`);
+    this.name = 'CimdFetchError';
+    this.metadataUrl = metadataUrl;
+    this.detail = detail;
   }
 }
 
@@ -5187,6 +5275,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * Parses an OAuth authorization request from the HTTP request
    * @param request - The HTTP request containing OAuth parameters
    * @returns The parsed authorization request parameters
+   * @throws CimdFetchError when the client ID is a CIMD URL whose document cannot be resolved
    */
   async parseAuthRequest(request: Request): Promise<AuthRequest> {
     const url = new URL(request.url);
@@ -5268,7 +5357,13 @@ class OAuthHelpersImpl implements OAuthHelpers {
   /**
    * Looks up a client by its client ID
    * @param clientId - The client ID to look up
-   * @returns A Promise resolving to the client info, or null if not found
+   * @returns A Promise resolving to the client info, or null if the client does not
+   * exist. Null means definitive absence; failures to determine the answer throw
+   * instead (KV errors propagate, and a CIMD metadata fetch failure throws
+   * `CimdFetchError`), so an upstream outage cannot masquerade as an unregistered
+   * client.
+   * @throws CimdFetchError when the client ID is a CIMD URL and fetching or
+   * validating the metadata document fails.
    */
   async lookupClient(clientId: string): Promise<ClientInfo | null> {
     return await this.provider.getClient(this.env, clientId);
@@ -5280,6 +5375,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * - For implicit flow: generating an access token directly
    * @param options - Options specifying the grant details
    * @returns A Promise resolving to an object containing the redirect URL
+   * @throws CimdFetchError when the client ID is a CIMD URL whose document cannot be resolved
    */
   async completeAuthorization(options: CompleteAuthorizationOptions): Promise<{ redirectTo: string }> {
     const { clientId, redirectUri } = options.request;
@@ -5795,6 +5891,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
    * Implements OAuth 2.0 Token Exchange (RFC 8693)
    * @param options - Options for token exchange including subject token and optional modifications
    * @returns Promise resolving to token response with new access token
+   * @throws CimdFetchError when the grant's client ID is a CIMD URL whose document cannot be resolved
    */
   async exchangeToken(options: ExchangeTokenOptions): Promise<TokenResponse> {
     // Validate subject token first to get client info
