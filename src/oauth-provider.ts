@@ -5140,6 +5140,9 @@ class OAuthHelpersImpl implements OAuthHelpers {
       if (!clientInfo) {
         throw new Error(`Invalid client. The clientId provided does not match to this client.`);
       }
+      if (responseType === 'code' && clientInfo.tokenEndpointAuthMethod === 'none' && !codeChallenge) {
+        throw new Error('Public clients must use PKCE with the authorization code flow.');
+      }
       // If client exists, validate the redirect URI against registered URIs
       if (clientInfo && redirectUri) {
         if (!isValidRedirectUri(redirectUri, clientInfo.redirectUris)) {
