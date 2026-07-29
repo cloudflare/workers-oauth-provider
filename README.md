@@ -305,6 +305,12 @@ RFC 9207 issuer identification is always enabled. Successful authorization respo
 `parseAuthRequest` returns the expected `issuer`; authorization handlers must include it in terminal OAuth error
 redirects. Intermediate identity-provider redirects and local HTML error pages do not need it.
 
+### Protected resource scopes
+
+The provider includes configured protected resource scopes in bearer challenges so MCP clients can select initial
+scopes without guessing. `offline_access` is omitted from both challenges and Protected Resource Metadata because it
+controls authorization server refresh-token issuance rather than access to a protected resource.
+
 ## Token Exchange Callback
 
 This library allows you to update the `props` value during token exchanges by configuring a callback function. This is useful for scenarios where the application needs to perform additional processing when tokens are issued or refreshed.

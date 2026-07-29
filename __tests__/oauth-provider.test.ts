@@ -688,7 +688,7 @@ describe('OAuthProvider', () => {
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
-        scopesSupported: ['read', 'write'],
+        scopesSupported: ['read', 'offline_access', 'write', 'read'],
         resourceMetadata: {
           resource: 'https://api.example.com',
         },
@@ -701,6 +701,29 @@ describe('OAuthProvider', () => {
       expect(metadata.resource).toBe('https://api.example.com');
       expect(metadata.authorization_servers).toEqual(['https://example.com']);
       expect(metadata.scopes_supported).toEqual(['read', 'write']);
+    });
+
+    it('should include resource scopes but not offline_access in bearer challenges', async () => {
+      const provider = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        scopesSupported: ['read', 'offline_access', 'write'],
+      });
+
+      const response = await provider.fetch(
+        createMockRequest('https://example.com/api/test', 'GET', {
+          Authorization: 'Bearer invalid-token',
+        }),
+        mockEnv,
+        mockCtx
+      );
+
+      expect(response.status).toBe(401);
+      expect(response.headers.get('WWW-Authenticate')).toContain('scope="read write"');
+      expect(response.headers.get('WWW-Authenticate')).not.toContain('offline_access');
     });
 
     it('should add CORS headers to protected resource metadata endpoint', async () => {

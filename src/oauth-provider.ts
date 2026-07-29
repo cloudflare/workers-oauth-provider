@@ -2162,6 +2162,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     });
   }
 
+  /** Scopes that are requirements of the protected resource itself. */
+  private getProtectedResourceScopes(): string[] {
+    const configured = this.options.resourceMetadata?.scopes_supported ?? this.options.scopesSupported ?? [];
+    return [...new Set(configured)].filter((scope) => scope !== 'offline_access');
+  }
+
   /**
    * Handles the OAuth Protected Resource Metadata endpoint
    * Implements RFC 9728 for OAuth Protected Resource Metadata
@@ -2175,10 +2181,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const tokenEndpointUrl = this.getFullEndpointUrl(this.options.tokenEndpoint, requestUrl);
     const authServerOrigin = new URL(tokenEndpointUrl).origin;
 
+    const resourceScopes = this.getProtectedResourceScopes();
     const metadata: Record<string, unknown> = {
       resource: rm?.resource ?? this.deriveResourceIdentifier(requestUrl),
       authorization_servers: rm?.authorization_servers ?? [authServerOrigin],
-      scopes_supported: rm?.scopes_supported ?? this.options.scopesSupported,
+      ...(resourceScopes.length > 0 ? { scopes_supported: resourceScopes } : {}),
       bearer_methods_supported: rm?.bearer_methods_supported ?? ['header'],
     };
 
