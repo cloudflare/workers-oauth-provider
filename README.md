@@ -2,57 +2,7 @@
 
 `@cloudflare/workers-oauth-provider` adds OAuth 2.1 authorization to HTTP APIs and remote MCP servers running on Cloudflare Workers.
 
-It provides the authorization server and protected resource building blocks used by the stable [MCP 2026-07-28 authorization specification](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization). This includes OAuth discovery, authorization code flow with PKCE, client registration, resource indicators, token issuance, refresh, revocation, and audience validation.
-
-Your application remains responsible for authenticating users, displaying consent, deciding which scopes to grant, and enforcing application-specific permissions. This package is not an identity provider and does not implement the MCP transport or protocol methods. It is intended for HTTP-based MCP transports; stdio servers should obtain credentials from their environment.
-
-## MCP support at a glance
-
-| Capability                              | Support                                                                                  |
-| --------------------------------------- | ---------------------------------------------------------------------------------------- |
-| Authorization code flow                 | Built in                                                                                 |
-| PKCE                                    | Built in; required for public clients; S256 supported                                    |
-| Bearer token protection                 | Built in for configured API routes                                                       |
-| Authorization server metadata, RFC 8414 | Served at `/.well-known/oauth-authorization-server`                                      |
-| Protected resource metadata, RFC 9728   | Served at root and path-specific well-known URLs                                         |
-| `WWW-Authenticate` discovery            | `resource_metadata` is added to protected-resource challenges                            |
-| Resource Indicators, RFC 8707           | Parsed, stored, returned, and validated                                                  |
-| Token audience validation               | Origin-bound by default; exact when `resourceMetadata.resource` is configured            |
-| Authorization response issuer, RFC 9207 | Successful responses include `iss`; application-owned error redirects must include it    |
-| Pre-registered clients                  | Supported through `OAuthHelpers`                                                         |
-| Client ID Metadata Documents, CIMD      | Opt-in; currently supports public clients using `token_endpoint_auth_method: "none"`     |
-| Dynamic Client Registration, RFC 7591   | Supported as a compatibility mechanism; deprecated by MCP 2026-07-28 for new deployments |
-| Refresh tokens                          | Built in with rotation and configurable expiry                                           |
-| Token revocation, RFC 7009              | Built in                                                                                 |
-| Token Exchange, RFC 8693                | Opt-in                                                                                   |
-| MCP Enterprise-Managed Authorization    | Experimental opt-in support for ID-JAG assertions                                        |
-| OpenID Connect discovery                | Not served; RFC 8414 satisfies the MCP requirement for authorization server discovery    |
-
-Resource behavior follows deployment configuration. Without an explicit resource, omitted authorization resources default to the request origin. Setting `resourceMetadata.resource` requires that exact resource throughout authorization and token use.
-
-## What the library handles
-
-For routes configured with `apiRoute` or `apiHandlers`, the provider:
-
-- Reads bearer tokens from the `Authorization` header.
-- Rejects missing, invalid, and expired tokens.
-- Validates the audience when a token has one.
-- Adds authenticated application data to `ctx.props`.
-- Sends valid requests to the configured API handler.
-- Publishes protected resource and authorization server metadata.
-- Implements token issuance, refresh, token exchange, and revocation.
-- Hashes stored tokens, authorization codes, and client secrets.
-- Encrypts application `props` stored in KV.
-
-Your application must:
-
-- Authenticate the user at the authorization endpoint.
-- Render the consent UI and explain the requesting client and scopes.
-- Decide which scopes and resources the user grants.
-- Enforce operation-level permissions, ownership, tenancy, and scope policy.
-- Include the RFC 9207 issuer in terminal OAuth error redirects.
-
-API handlers do not need to parse or validate bearer tokens. They still need to enforce application-specific authorization.
+It provides the authorization server and protected resource parts required by the stable [MCP 2026-07-28 authorization specification](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization). It is intended for HTTP-based MCP transports and does not implement MCP transport or protocol methods. Stdio servers should obtain credentials from their environment.
 
 ## Install
 
@@ -183,7 +133,13 @@ export default new OAuthProvider<Env>({
 });
 ```
 
-The example deliberately leaves user authentication and consent rendering to the application. The provider does not decide who the user is or whether a requested scope should be granted.
+## Protecting routes
+
+`apiRoute` and `apiHandler` protect one or more route prefixes with a single handler. Use `apiHandlers` when different prefixes need different handlers.
+
+Before calling a protected handler, the provider reads the bearer token, rejects missing, invalid, or expired credentials, checks its audience, and exposes the authenticated application data through `ctx.props`. The handler does not need to parse or validate the token, but it must still enforce application permissions such as scope, ownership, and tenancy.
+
+Requests outside the protected route prefixes go to `defaultHandler`. In the example above, that handler owns `/authorize`.
 
 ## How MCP authorization discovery works
 
@@ -267,7 +223,9 @@ The package serves RFC 8414 metadata rather than OpenID Connect discovery. MCP a
 
 ## Authorization endpoint
 
-Your `authorizeEndpoint` belongs to the application's `defaultHandler`. A typical flow has three steps:
+Your `authorizeEndpoint` belongs to the application's `defaultHandler` because user authentication and consent are application-specific. The provider is not an identity provider.
+
+A typical flow has three steps:
 
 1. Call `parseAuthRequest(request)` to validate the client, redirect URI, response type, resource, and PKCE restrictions.
 2. Authenticate the user, show consent, and decide which scopes to grant.
@@ -358,7 +316,7 @@ Related options:
 
 Clients created by `OAuthHelpers.createClient()` are not affected by the DCR TTL or public-registration restriction.
 
-## PKCE and OAuth flows
+## PKCE and token lifecycle
 
 Public clients must use PKCE with authorization code flow. The provider always supports S256.
 
@@ -369,6 +327,8 @@ allowPlainPKCE: false;
 ```
 
 `allowPlainPKCE` defaults to `true` for backwards compatibility. `allowImplicitFlow` defaults to `false`; leave it disabled for MCP and other new OAuth deployments.
+
+The provider owns `tokenEndpoint`. It exchanges authorization codes for tokens, refreshes access tokens, and handles RFC 7009 revocation. Refresh tokens rotate on use. The immediately previous token remains valid until its replacement is first used, allowing a client to retry after losing a refresh response.
 
 ## Resources and token audiences
 
@@ -416,7 +376,7 @@ Sensitive values are not stored in plaintext:
 
 See [storage-schema.md](https://github.com/cloudflare/workers-oauth-provider/blob/main/storage-schema.md) for the complete KV layout.
 
-KV TTLs remove expiring records automatically. `purgeExpiredData()` provides a defense-in-depth sweep for orphaned or expired grants and tokens:
+KV TTLs remove expiring records automatically. `purgeExpiredData()` provides a manual sweep for orphaned or expired grants and tokens:
 
 ```ts
 const provider = new OAuthProvider({
@@ -510,4 +470,4 @@ Changes that affect behavior or the public API need a Changeset. See [AGENTS.md]
 
 ## Project history
 
-Kenton Varda's original account of how this library was created is preserved word for word in [HISTORY.md](https://github.com/cloudflare/workers-oauth-provider/blob/main/HISTORY.md).
+Kenton Varda's original account of how this library was created is preserved in [HISTORY.md](https://github.com/cloudflare/workers-oauth-provider/blob/main/HISTORY.md).
