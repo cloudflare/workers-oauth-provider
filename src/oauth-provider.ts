@@ -157,8 +157,9 @@ export interface TokenExchangeCallbackResult {
   refreshTokenTTL?: number;
 
   /**
-   * List of scopes authorized for the new access token
-   * (If undefined, the granted scopes will be used)
+   * Optional scopes for the new access token. Values outside the scope ceiling
+   * for the current grant flow are ignored. If omitted, the effective requested
+   * scopes are used.
    */
   accessTokenScope?: string[];
 }
@@ -192,13 +193,12 @@ export interface TokenExchangeCallbackOptions {
   grantId: string;
 
   /**
-   * List of scopes that were granted
+   * List of scopes on the underlying authorization grant.
    */
   scope: string[];
 
   /**
-   * List of scopes that were requested for this token by the client
-   * (Will be the same as granted scopes unless client specifically requested a downscoping)
+   * Effective scopes selected for this token before applying the callback result.
    */
   requestedScope: string[];
 
@@ -647,7 +647,7 @@ export interface ExchangeTokenOptions {
   subjectToken: string;
 
   /**
-   * Optional narrowed set of scopes for the new token (must be subset of original grant scopes)
+   * Optional requested scopes for the new token. Issued scopes are limited to the subject token's scopes.
    */
   scope?: string[];
 
@@ -2755,7 +2755,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * `OAuthProviderImpl` is not exposed outside this module, this is still effectively
    * module-private.
    * @param subjectToken - The subject token to exchange
-   * @param requestedScopes - Optional narrowed scopes (must be a subset of the subject token's scopes)
+   * @param requestedScopes - Optional requested scopes, limited to the subject token's scopes
    * @param requestedResource - Optional resource/audience (must be subset of original if original had resource)
    * @param expiresIn - Optional TTL override in seconds
    * @param clientInfo - The client making the exchange request
@@ -3944,20 +3944,19 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   }
 
   /**
-   * Downscopes requested scopes to only include those that are in the grant
-   * Filters out any requested scopes that are not in the granted scopes
+   * Restricts requested scopes to the scopes available for the current flow.
+   * If no scope is requested, all available scopes are returned.
    * @param requestedScope - The scope parameter from the request (string or array)
-   * @param grantedScopes - The scopes that were granted in the authorization
-   * @returns The filtered scopes that are a subset of the granted scopes
+   * @param allowedScopes - The maximum scopes available for the current flow
+   * @returns The requested scopes that are included in the allowed scopes
    */
-  private downscope(requestedScope: string | string[] | undefined, grantedScopes: string[]): string[] {
-    if (!requestedScope) return grantedScopes;
+  private downscope(requestedScope: string | string[] | undefined, allowedScopes: string[]): string[] {
+    if (!requestedScope) return allowedScopes;
 
     const requestedScopes: string[] =
       typeof requestedScope === 'string' ? requestedScope.split(' ').filter(Boolean) : requestedScope;
 
-    // Filter out any requested scopes that are not in the grant
-    return requestedScopes.filter((scope: string) => grantedScopes.includes(scope));
+    return requestedScopes.filter((scope: string) => allowedScopes.includes(scope));
   }
 
   /**
