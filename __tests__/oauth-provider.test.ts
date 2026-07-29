@@ -5330,18 +5330,22 @@ describe('OAuthProvider', () => {
       await getAccessToken();
     });
 
-    it('should reject API requests without a token', async () => {
-      const apiRequest = createMockRequest('https://example.com/api/test');
+    it.each([
+      ['no authorization header', undefined],
+      ['an unsupported authorization scheme', 'Basic dXNlcjpwYXNz'],
+    ])('should challenge API requests with %s without OAuth error details', async (_label, authorization) => {
+      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
+        ...(authorization ? { Authorization: authorization } : {}),
+      });
 
       const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
 
       expect(apiResponse.status).toBe(401);
-
-      const error = await apiResponse.json<any>();
-      expect(error.error).toBe('invalid_token');
+      expect(apiResponse.headers.get('Cache-Control')).toBe('no-store');
+      expect(await apiResponse.text()).toBe('');
     });
 
-    it('should include resource_metadata in WWW-Authenticate header on 401 (RFC 9728)', async () => {
+    it('should include resource_metadata without an error code when credentials are absent', async () => {
       const apiRequest = createMockRequest('https://example.com/api/test');
 
       const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
@@ -5352,7 +5356,7 @@ describe('OAuthProvider', () => {
       // so the client can discover metadata for the specific resource
       const wwwAuth = apiResponse.headers.get('WWW-Authenticate');
       expect(wwwAuth).toBe(
-        'Bearer realm="OAuth", resource_metadata="https://example.com/.well-known/oauth-protected-resource/api/test", error="invalid_token", error_description="Missing or invalid access token"'
+        'Bearer realm="OAuth", resource_metadata="https://example.com/.well-known/oauth-protected-resource/api/test"'
       );
     });
 
@@ -6797,9 +6801,8 @@ describe('OAuthProvider', () => {
       expect(response.headers.get('Access-Control-Allow-Methods')).toBe('*');
       expect(response.headers.get('Access-Control-Allow-Headers')).toBe('Authorization, *');
       expect(response.headers.get('Access-Control-Expose-Headers')).toBe('WWW-Authenticate, Retry-After');
-
-      const error = await response.json<any>();
-      expect(error.error).toBe('invalid_token');
+      expect(await response.text()).toBe('');
+      expect(response.headers.get('WWW-Authenticate')).not.toContain('error=');
     });
 
     it('should preserve handler-supplied CORS exposed headers', async () => {
