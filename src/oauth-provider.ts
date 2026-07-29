@@ -3714,15 +3714,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const authHeader = request.headers.get('Authorization');
 
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return this.createErrorResponse('invalid_token', {
-        description: 'Missing or invalid access token',
-        statusCode: 401,
+      // OAuth 2.1 §5.3.2: when authentication information is absent or uses an
+      // unsupported scheme, challenge without an error code or description.
+      return new Response(null, {
+        status: 401,
         headers: {
-          'WWW-Authenticate': this.buildWwwAuthenticateHeader(
-            resourceMetadataUrl,
-            'invalid_token',
-            'Missing or invalid access token'
-          ),
+          ...NO_CACHE_HEADERS,
+          'WWW-Authenticate': this.buildWwwAuthenticateHeader(resourceMetadataUrl),
         },
       });
     }
@@ -4341,11 +4339,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    */
   private buildWwwAuthenticateHeader(
     resourceMetadataUrl: string,
-    error: string,
+    error?: string,
     errorDescription?: string,
     requiredScopes: string[] = []
   ): string {
-    let header = `Bearer realm="OAuth", resource_metadata="${resourceMetadataUrl}", error="${error}"`;
+    let header = `Bearer realm="OAuth", resource_metadata="${resourceMetadataUrl}"`;
+    if (error) {
+      header += `, error="${error}"`;
+    }
     if (requiredScopes.length > 0) {
       header += `, scope="${requiredScopes.join(' ')}"`;
     }
