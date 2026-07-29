@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
+import { describe, it, expect, expectTypeOf, beforeEach, vi, afterEach } from 'vitest';
 import {
   CimdFetchError,
   OAuthError,
@@ -9223,6 +9223,41 @@ describe('OAuthProvider', () => {
   });
 
   describe('External Token Resolution', () => {
+    it('should thread the provider Env type through resolveExternalToken', async () => {
+      type ResolverEnv = TestEnv & { TOKEN_ISSUER: string };
+      const resolverEnv: ResolverEnv = {
+        ...createMockEnv(),
+        TOKEN_ISSUER: 'https://issuer.example.com',
+      };
+      class ResolverApiHandler extends WorkerEntrypoint<ResolverEnv> {
+        fetch() {
+          return new Response('ok');
+        }
+      }
+      const provider = new OAuthProvider<ResolverEnv>({
+        apiRoute: ['/api/'],
+        apiHandler: ResolverApiHandler,
+        defaultHandler: { fetch: () => new Response('default') },
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        resolveExternalToken: async ({ env }) => {
+          expectTypeOf(env).toEqualTypeOf<ResolverEnv>();
+          expect(env.TOKEN_ISSUER).toBe('https://issuer.example.com');
+          return { props: { source: env.TOKEN_ISSUER } };
+        },
+      });
+
+      const response = await provider.fetch(
+        createMockRequest('https://example.com/api/test', 'GET', {
+          Authorization: 'Bearer typed-external-token',
+        }),
+        resolverEnv,
+        mockCtx
+      );
+
+      expect(response.status).toBe(200);
+    });
+
     it('should reject unknown tokens when no resolveExternalToken callback is provided', async () => {
       // Create a provider without external token resolution
       const providerWithoutExternalValidation = new OAuthProvider({
