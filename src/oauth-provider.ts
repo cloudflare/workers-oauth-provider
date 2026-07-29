@@ -706,6 +706,12 @@ export interface AuthRequest {
    * Resource parameter indicating target resource(s) (RFC 8707)
    */
   resource?: string | string[];
+
+  /**
+   * Authorization server issuer recorded while parsing this request.
+   * Include it as `iss` in successful and error authorization responses.
+   */
+  issuer?: string;
 }
 
 /**
@@ -1982,7 +1988,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   /**
    * Gets the authorization server issuer using the same derivation as RFC 8414 metadata.
    */
-  private getAuthorizationServerIssuer(requestUrl: URL): string {
+  getAuthorizationServerIssuer(requestUrl: URL): string {
     const tokenEndpoint = this.getFullEndpointUrl(this.options.tokenEndpoint, requestUrl);
     return new URL(tokenEndpoint).origin;
   }
@@ -2093,6 +2099,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       // not implemented: introspection_endpoint_auth_methods_supported
       // not implemented: introspection_endpoint_auth_signing_alg_values_supported
       code_challenge_methods_supported: this.options.allowPlainPKCE !== false ? ['plain', 'S256'] : ['S256'], // PKCE support
+      authorization_response_iss_parameter_supported: true,
       // MCP Client ID Metadata Document support (CIMD)
       // Only enabled when global_fetch_strictly_public compat flag is set (for SSRF protection)
       client_id_metadata_document_supported:
@@ -5119,6 +5126,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
     const state = url.searchParams.get('state') || '';
     const codeChallenge = url.searchParams.get('code_challenge') || undefined;
     const codeChallengeMethod = url.searchParams.get('code_challenge_method') || 'plain';
+    const issuer = this.provider.getAuthorizationServerIssuer(url);
     // RFC 8707 Section 2.1: Multiple resource parameters MAY be used
     const resourceParams = url.searchParams.getAll('resource');
     const resourceParam =
@@ -5173,6 +5181,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
       codeChallenge,
       codeChallengeMethod,
       resource,
+      issuer,
     };
   }
 
@@ -5306,6 +5315,9 @@ class OAuthHelpersImpl implements OAuthHelpers {
       if (options.request.state) {
         fragment.set('state', options.request.state);
       }
+      if (options.request.issuer) {
+        fragment.set('iss', options.request.issuer);
+      }
 
       // Set the fragment (hash) part of the URL
       redirectUrl.hash = fragment.toString();
@@ -5359,6 +5371,9 @@ class OAuthHelpersImpl implements OAuthHelpers {
       redirectUrl.searchParams.set('code', authCode);
       if (options.request.state) {
         redirectUrl.searchParams.set('state', options.request.state);
+      }
+      if (options.request.issuer) {
+        redirectUrl.searchParams.set('iss', options.request.issuer);
       }
 
       // Revoke old grants AFTER the new grant is successfully stored

@@ -6,6 +6,7 @@ This is a TypeScript library that implements the provider side of the OAuth 2.1 
 
 - The library acts as a wrapper around your Worker code, which adds authorization for your API endpoints.
 - All token management is handled automatically.
+- Authorization responses include RFC 9207 issuer identification to prevent mix-up attacks.
 - Your API handler is written like a regular fetch handler, but receives the already-authenticated user details as a parameter. No need to perform any checks of your own.
 - The library is agnostic to how you manage and authenticate users.
 - The library is agnostic to how you build your UI. Your authorization flow can be implemented using whatever UI framework you use for everything else.
@@ -297,6 +298,12 @@ The callback has three outcomes:
 Other thrown values are re-thrown so unexpected validator bugs remain visible as 500s. For cross-origin requests,
 the provider exposes `WWW-Authenticate` and `Retry-After` through CORS so browser clients can read discovery,
 step-up, and backoff guidance.
+
+### Authorization response issuer
+
+RFC 9207 issuer identification is always enabled. Successful authorization responses include `iss` automatically.
+`parseAuthRequest` returns the expected `issuer`; authorization handlers must include it in terminal OAuth error
+redirects. Intermediate identity-provider redirects and local HTML error pages do not need it.
 
 ## Token Exchange Callback
 

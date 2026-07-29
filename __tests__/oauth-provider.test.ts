@@ -512,6 +512,7 @@ describe('OAuthProvider', () => {
       expect(metadata.response_types_supported).toContain('token'); // Implicit flow enabled
       expect(metadata.grant_types_supported).toContain('authorization_code');
       expect(metadata.code_challenge_methods_supported).toContain('S256');
+      expect(metadata.authorization_response_iss_parameter_supported).toBe(true);
       // Implicit flow is enabled in the default test provider, so fragment mode should be advertised
       expect(metadata.response_modes_supported).toContain('query');
       expect(metadata.response_modes_supported).toContain('fragment');
@@ -530,6 +531,7 @@ describe('OAuthProvider', () => {
       const response = await providerNoImplicit.fetch(request, mockEnv, mockCtx);
       const metadata = await response.json<any>();
       expect(metadata.response_modes_supported).toEqual(['query']);
+      expect(metadata.authorization_response_iss_parameter_supported).toBe(true);
     });
 
     it('should not include token response type when implicit flow is disabled', async () => {
@@ -1407,6 +1409,7 @@ describe('OAuthProvider', () => {
       const url = new URL(location!);
       const code = url.searchParams.get('code');
       expect(code).toBeDefined();
+      expect(url.searchParams.get('iss')).toBe('https://example.com');
 
       // Verify a grant was created in KV
       const grants = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
@@ -1578,6 +1581,7 @@ describe('OAuthProvider', () => {
       expect(fragment.get('expires_in')).toBe('3600');
       expect(fragment.get('scope')).toBe('read write');
       expect(fragment.get('state')).toBe('xyz123');
+      expect(fragment.get('iss')).toBe('https://example.com');
 
       // Verify a grant was created in KV
       const grants = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
