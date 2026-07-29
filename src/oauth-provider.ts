@@ -4079,7 +4079,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * Allowed authentication methods for CIMD clients (per IETF spec)
    * CIMD clients cannot use symmetric secrets since there's no pre-shared secret
    */
-  private static readonly CIMD_ALLOWED_AUTH_METHODS = ['none', 'private_key_jwt'];
+  // private_key_jwt can be added once token-endpoint assertion validation is implemented.
+  // Accepting it in metadata before then creates clients that can authorize but never exchange a code.
+  private static readonly CIMD_ALLOWED_AUTH_METHODS = ['none'];
 
   /**
    * Validates that a field is a string or undefined
@@ -4242,6 +4244,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       const rawMetadata = await this.readJsonWithSizeLimit(response, OAuthProviderImpl.CIMD_MAX_SIZE_BYTES);
 
       const clientId = OAuthProviderImpl.validateStringField(rawMetadata.client_id, 'client_id');
+      const clientName = OAuthProviderImpl.validateStringField(rawMetadata.client_name, 'client_name');
       const redirectUris = OAuthProviderImpl.validateStringArray(rawMetadata.redirect_uris, 'redirect_uris');
       const tokenEndpointAuthMethod = OAuthProviderImpl.validateStringField(
         rawMetadata.token_endpoint_auth_method,
@@ -4251,6 +4254,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       // Validate that client_id matches the URL (required by spec)
       if (clientId !== metadataUrl) {
         throw new Error(`client_id "${clientId}" does not match metadata URL "${metadataUrl}"`);
+      }
+
+      if (!clientName?.trim()) {
+        throw new Error('client_name is required and must not be empty');
       }
 
       if (!redirectUris || redirectUris.length === 0) {
@@ -4267,7 +4274,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       return {
         clientId,
         redirectUris,
-        clientName: OAuthProviderImpl.validateStringField(rawMetadata.client_name, 'client_name'),
+        clientName,
         clientUri: OAuthProviderImpl.validateOptionalUriField(rawMetadata.client_uri, 'client_uri'),
         logoUri: OAuthProviderImpl.validateOptionalUriField(rawMetadata.logo_uri, 'logo_uri'),
         policyUri: OAuthProviderImpl.validateOptionalUriField(rawMetadata.policy_uri, 'policy_uri'),
