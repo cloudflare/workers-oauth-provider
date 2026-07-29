@@ -496,6 +496,24 @@ describe('OAuthProvider', () => {
         });
       }).not.toThrow();
     });
+
+    it.each([
+      [[''], 'scopesSupported must contain valid OAuth scope tokens'],
+      [['scope with spaces'], 'scopesSupported must contain valid OAuth scope tokens'],
+      [['read', 'read'], 'scopesSupported must not contain duplicate values'],
+    ])('should reject invalid authorization server scopes: %j', (scopesSupported, message) => {
+      expect(
+        () =>
+          new OAuthProvider({
+            apiRoute: '/api/',
+            apiHandler: { fetch: () => Promise.resolve(new Response()) },
+            defaultHandler: testDefaultHandler,
+            authorizeEndpoint: '/authorize',
+            tokenEndpoint: '/oauth/token',
+            scopesSupported,
+          })
+      ).toThrow(message);
+    });
   });
 
   describe('OAuth Metadata Discovery', () => {
@@ -514,6 +532,7 @@ describe('OAuthProvider', () => {
       expect(metadata.response_types_supported).toContain('code');
       expect(metadata.response_types_supported).toContain('token'); // Implicit flow enabled
       expect(metadata.grant_types_supported).toContain('authorization_code');
+      expect(metadata.grant_types_supported).toContain('implicit');
       expect(metadata.code_challenge_methods_supported).toContain('S256');
       expect(metadata.authorization_response_iss_parameter_supported).toBe(true);
       // Implicit flow is enabled in the default test provider, so fragment mode should be advertised
@@ -690,7 +709,7 @@ describe('OAuthProvider', () => {
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
-        scopesSupported: ['read', 'offline_access', 'write', 'read'],
+        scopesSupported: ['read', 'offline_access', 'write'],
         resourceMetadata: {
           resource: 'https://api.example.com',
         },
@@ -712,7 +731,7 @@ describe('OAuthProvider', () => {
         mockCtx
       );
       const authorizationServerMetadata = await authorizationServerResponse.json<any>();
-      expect(authorizationServerMetadata.scopes_supported).toEqual(['read', 'offline_access', 'write', 'read']);
+      expect(authorizationServerMetadata.scopes_supported).toEqual(['read', 'offline_access', 'write']);
     });
 
     it('should include explicit resource scopes but not offline_access in bearer challenges', async () => {
@@ -893,6 +912,23 @@ describe('OAuthProvider', () => {
   });
 
   describe('Client Registration', () => {
+    function registerMetadata(metadata: Record<string, unknown> = {}): Promise<Response> {
+      return oauthProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify({
+            redirect_uris: ['https://client.example.com/callback'],
+            client_name: 'Metadata Client',
+            ...metadata,
+          })
+        ),
+        mockEnv,
+        mockCtx
+      );
+    }
+
     it('should register a new client', async () => {
       const clientData = {
         redirect_uris: ['https://client.example.com/callback'],
@@ -956,6 +992,57 @@ describe('OAuthProvider', () => {
       const savedClient = await mockEnv.OAUTH_KV.get(`client:${registeredClient.client_id}`, { type: 'json' });
       expect(savedClient).not.toBeNull();
       expect(savedClient.clientSecret).toBeUndefined(); // No secret stored
+    });
+
+    it('should apply RFC 7591 defaults and return the values actually registered', async () => {
+      const response = await registerMetadata();
+
+      expect(response.status).toBe(201);
+      const registeredClient = await response.json<any>();
+      expect(registeredClient.token_endpoint_auth_method).toBe('client_secret_basic');
+      expect(registeredClient.grant_types).toEqual(['authorization_code']);
+      expect(registeredClient.response_types).toEqual(['code']);
+
+      const savedClient = await mockEnv.OAUTH_KV.get(`client:${registeredClient.client_id}`, { type: 'json' });
+      expect(savedClient.grantTypes).toEqual(['authorization_code']);
+      expect(savedClient.responseTypes).toEqual(['code']);
+    });
+
+    it('should accept enabled extension grant and response types', async () => {
+      const response = await registerMetadata({
+        token_endpoint_auth_method: 'none',
+        grant_types: [
+          'authorization_code',
+          'refresh_token',
+          'implicit',
+          'urn:ietf:params:oauth:grant-type:token-exchange',
+        ],
+        response_types: ['code', 'token'],
+      });
+
+      expect(response.status).toBe(201);
+      const client = await response.json<any>();
+      expect(client.grant_types).toEqual([
+        'authorization_code',
+        'refresh_token',
+        'implicit',
+        'urn:ietf:params:oauth:grant-type:token-exchange',
+      ]);
+      expect(client.response_types).toEqual(['code', 'token']);
+    });
+
+    it.each([
+      ['unsupported authentication method', { token_endpoint_auth_method: 'private_key_jwt' }],
+      ['unsupported grant type', { grant_types: ['password'], response_types: [] }],
+      ['unsupported response type', { grant_types: [], response_types: ['id_token'] }],
+      ['code without authorization_code', { grant_types: ['refresh_token'], response_types: ['code'] }],
+      ['authorization_code without code', { grant_types: ['authorization_code'], response_types: [] }],
+    ])('should reject %s before storing the client', async (_label, metadata) => {
+      const response = await registerMetadata(metadata);
+
+      expect(response.status).toBe(400);
+      expect(await response.json<any>()).toMatchObject({ error: 'invalid_client_metadata' });
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'client:' })).keys).toHaveLength(0);
     });
 
     it('should accept http(s) metadata URIs and persist them', async () => {
@@ -10642,6 +10729,30 @@ describe('OAuthProvider', () => {
         };
 
         globalThis.fetch = vi.fn().mockResolvedValue(createMockFetchResponse(invalidMetadata));
+
+        const authRequest = createMockRequest(
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=plain`,
+          'GET'
+        );
+
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(CimdFetchError);
+      });
+
+      it.each([
+        ['an unsupported grant type', { grant_types: ['password'], response_types: [] }],
+        ['an unsupported response type', { grant_types: [], response_types: ['id_token'] }],
+        ['an inconsistent grant and response type', { grant_types: ['authorization_code'], response_types: [] }],
+      ])('should reject CIMD metadata with %s', async (_label, metadata) => {
+        const cimdUrl = 'https://client.example.com/oauth/metadata.json';
+        globalThis.fetch = vi.fn().mockResolvedValue(
+          createMockFetchResponse({
+            client_id: cimdUrl,
+            client_name: 'Invalid Capabilities Client',
+            redirect_uris: ['https://client.example.com/callback'],
+            token_endpoint_auth_method: 'none',
+            ...metadata,
+          })
+        );
 
         const authRequest = createMockRequest(
           `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=plain`,

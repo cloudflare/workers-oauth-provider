@@ -34,10 +34,12 @@ When in doubt about OAuth behavior, the MCP specification takes precedence for M
 ```
 workers-oauth-provider/
 ├── src/
-│   ├── oauth-provider.ts      # Core provider implementation (~5,900 lines)
+│   ├── oauth-provider.ts      # Core provider implementation
+│   ├── oauth-capabilities.ts  # Pure server/client metadata capability policy
 │   └── ema/                   # Enterprise-Managed Authorization pipeline
 ├── __tests__/
-│   ├── oauth-provider.test.ts # Comprehensive test suite (~13,000 lines)
+│   ├── oauth-provider.test.ts # Comprehensive provider integration suite
+│   ├── oauth-capabilities.test.ts # Pure capability policy tests
 │   ├── setup.ts               # Vitest setup and mocking
 │   └── mocks/
 │       └── cloudflare-workers.ts
@@ -54,7 +56,7 @@ workers-oauth-provider/
 └── README.md                  # Usage documentation
 ```
 
-**Audit-oriented architecture:** Core OAuth behavior remains in `src/oauth-provider.ts`. The experimental Enterprise-Managed Authorization validation pipeline is isolated in `src/ema/` so its JWT and trust-boundary code can be reviewed independently.
+**Audit-oriented architecture:** Request orchestration and storage-backed OAuth behavior remain in `src/oauth-provider.ts`. Pure authorization-server/client capability policy lives in `src/oauth-capabilities.ts`. The experimental Enterprise-Managed Authorization validation pipeline is isolated in `src/ema/` so its JWT and trust-boundary code can be reviewed independently.
 
 ## Setup
 

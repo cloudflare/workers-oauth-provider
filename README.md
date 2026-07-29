@@ -361,6 +361,8 @@ clientRegistrationEndpoint: '/oauth/register';
 
 MCP 2026-07-28 deprecates DCR for new implementations in favor of CIMD. The endpoint remains useful for compatibility with clients that do not support CIMD.
 
+Registration accepts only authentication methods, grants, and response types implemented by the configured provider, and rejects inconsistent grant/response combinations before storage. Omitted metadata uses the RFC 7591 defaults: `client_secret_basic`, `grant_types: ["authorization_code"]`, and `response_types: ["code"]`.
+
 Related options:
 
 - `clientRegistrationTTL` controls the lifetime of dynamically registered clients. The default is 90 days.
@@ -396,7 +398,7 @@ Path-aware audiences use path-boundary prefix matching. A token for `https://exa
 
 ## Scopes and step-up authorization
 
-`scopesSupported` is published in authorization server metadata and is also the default for protected resource metadata. `resourceMetadata.scopes_supported` can override the protected resource value.
+`scopesSupported` is published only in authorization server metadata. Configure `resourceMetadata.scopes_supported` explicitly with the minimal scopes required for basic protected-resource functionality and baseline Bearer challenges.
 
 The application decides which requested scopes to grant through `completeAuthorization({ scope })`. Token and refresh requests can only narrow those scopes.
 
