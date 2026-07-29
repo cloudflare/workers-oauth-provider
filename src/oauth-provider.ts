@@ -38,6 +38,7 @@ export type { EmaValidationError } from './ema/result';
 
 const PROTECTED_RESOURCE_WELL_KNOWN_PREFIX = '/.well-known/oauth-protected-resource';
 const NO_CACHE_HEADERS = { 'Cache-Control': 'no-store', Pragma: 'no-cache' } as const;
+const BASIC_AUTH_CHALLENGE = 'Basic realm="OAuth"';
 
 // Log CIMD status on module load
 const hasStrictlyPublicFetch =
@@ -1772,6 +1773,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     return `${requestUrl.origin}${suffix}`;
   }
 
+  private createInvalidClientResponse(description: string, basicAuthenticationAttempted: boolean): Response {
+    return this.createErrorResponse('invalid_client', {
+      description,
+      statusCode: 401,
+      ...(basicAuthenticationAttempted ? { headers: { 'WWW-Authenticate': BASIC_AUTH_CHALLENGE } } : {}),
+    });
+  }
+
   /**
    * Parses and validates a token endpoint request (used for both token exchange and revocation)
    * @param request - The HTTP request to parse
@@ -1839,12 +1848,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       body[key] = allValues.length > 1 ? allValues : value;
     }
 
-    // Get client ID from request
-    const authHeader = request.headers.get('Authorization');
+    // Get client credentials from HTTP Basic auth or form parameters.
+    const basicAuthorization = parseBasicAuthorizationHeader(request.headers.get('Authorization'));
+    const basicAuthenticationAttempted = basicAuthorization.kind !== 'not-basic';
     let clientId = '';
     let clientSecret = '';
 
-    if (authHeader && authHeader.startsWith('Basic ')) {
+    if (basicAuthenticationAttempted) {
       if (body.client_id || body.client_secret) {
         return this.createErrorResponse('invalid_request', {
           description: 'Client must not use multiple authentication methods',
@@ -1852,34 +1862,28 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         });
       }
 
-      // Basic auth
-      const credentials = atob(authHeader.substring(6));
-      const separatorIndex = credentials.indexOf(':');
-      if (separatorIndex === -1) {
-        return this.createErrorResponse('invalid_client', {
-          description: 'Client authentication failed: invalid Basic credentials',
-          statusCode: 401,
-        });
+      if (basicAuthorization.kind === 'malformed') {
+        return this.createInvalidClientResponse(
+          'Client authentication failed: invalid Basic credentials',
+          basicAuthenticationAttempted
+        );
       }
 
-      const id = credentials.substring(0, separatorIndex);
-      const secret = credentials.substring(separatorIndex + 1);
-      clientId = decodeFormUrlEncodedComponent(id);
-      clientSecret = decodeFormUrlEncodedComponent(secret);
+      clientId = basicAuthorization.clientId;
+      clientSecret = basicAuthorization.clientSecret;
     } else {
-      // Form parameters
       clientId = body.client_id;
       clientSecret = body.client_secret || '';
     }
 
     if (!clientId) {
-      return this.createErrorResponse('invalid_client', { description: 'Client ID is required', statusCode: 401 });
+      return this.createInvalidClientResponse('Client ID is required', basicAuthenticationAttempted);
     }
 
     // Verify client exists
     const clientInfo = await this.getClient(env, clientId);
     if (!clientInfo) {
-      return this.createErrorResponse('invalid_client', { description: 'Client not found', statusCode: 401 });
+      return this.createInvalidClientResponse('Client not found', basicAuthenticationAttempted);
     }
 
     // Determine authentication requirements based on token endpoint auth method
@@ -1888,26 +1892,26 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // For confidential clients, validate the secret
     if (!isPublicClient) {
       if (!clientSecret) {
-        return this.createErrorResponse('invalid_client', {
-          description: 'Client authentication failed: missing client_secret',
-          statusCode: 401,
-        });
+        return this.createInvalidClientResponse(
+          'Client authentication failed: missing client_secret',
+          basicAuthenticationAttempted
+        );
       }
 
       // Verify the client secret matches
       if (!clientInfo.clientSecret) {
-        return this.createErrorResponse('invalid_client', {
-          description: 'Client authentication failed: client has no registered secret',
-          statusCode: 401,
-        });
+        return this.createInvalidClientResponse(
+          'Client authentication failed: client has no registered secret',
+          basicAuthenticationAttempted
+        );
       }
 
       const providedSecretHash = await hashSecret(clientSecret);
       if (providedSecretHash !== clientInfo.clientSecret) {
-        return this.createErrorResponse('invalid_client', {
-          description: 'Client authentication failed: invalid client_secret',
-          statusCode: 401,
-        });
+        return this.createInvalidClientResponse(
+          'Client authentication failed: invalid client_secret',
+          basicAuthenticationAttempted
+        );
       }
     }
 
@@ -4741,6 +4745,40 @@ export function resourceMatches(requested: string, granted: string, originOnly: 
 async function hashSecret(secret: string): Promise<string> {
   // Use the same approach as generateTokenId for consistency
   return generateTokenId(secret);
+}
+
+type BasicAuthorizationResult =
+  | { kind: 'not-basic' }
+  | { kind: 'malformed' }
+  | { kind: 'credentials'; clientId: string; clientSecret: string };
+
+/**
+ * Parses RFC 6749 HTTP Basic client credentials.
+ */
+function parseBasicAuthorizationHeader(header: string | null): BasicAuthorizationResult {
+  if (!header) return { kind: 'not-basic' };
+
+  const schemeEnd = header.search(/[ \t]/);
+  const scheme = schemeEnd === -1 ? header : header.slice(0, schemeEnd);
+  if (scheme.toLowerCase() !== 'basic') return { kind: 'not-basic' };
+
+  if (schemeEnd === -1) return { kind: 'malformed' };
+  const encodedCredentials = header.slice(schemeEnd).trim();
+  if (!encodedCredentials || /[ \t]/.test(encodedCredentials)) return { kind: 'malformed' };
+
+  try {
+    const credentials = atob(encodedCredentials);
+    const separatorIndex = credentials.indexOf(':');
+    if (separatorIndex === -1) return { kind: 'malformed' };
+
+    return {
+      kind: 'credentials',
+      clientId: decodeFormUrlEncodedComponent(credentials.slice(0, separatorIndex)),
+      clientSecret: decodeFormUrlEncodedComponent(credentials.slice(separatorIndex + 1)),
+    };
+  } catch {
+    return { kind: 'malformed' };
+  }
 }
 
 /**
