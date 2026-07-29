@@ -109,7 +109,7 @@ new OAuthProvider({
 });
 ```
 
-The provider validates ID-JAG type, signature, issuer, audience, client binding, resource, timestamps, maximum lifetime, and replay identifier. The audience must be the authorization server issuer as a string or a single-element array. Refresh tokens are not issued for this grant.
+The provider validates ID-JAG type, signature, issuer, audience, client binding, resource, timestamps, maximum lifetime, and replay identifier. The audience must be the authorization server issuer as a string or a single-element array. Assertions containing `authorization_details` or `cnf` fail closed until typed authorization-detail and DPoP processing are implemented. Refresh tokens are not issued for this grant.
 
 The grant requires client authentication by default. Set `allowPublicClients: true` only when public clients, including CIMD clients, must use it and the ID-JAG trust model is appropriate for the deployment.
 

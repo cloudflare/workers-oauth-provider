@@ -175,6 +175,7 @@ interface ValidateClaimsInput {
  * Enforces (in order):
  *   - presence + type of `iss`, `sub`, `aud`, `client_id`, `jti`, `exp`, `iat`
  *   - `aud` is the AS's expected audience, as a string or single-element array
+ *   - unsupported authorization-bearing claims fail closed
  *   - `client_id` matches the authenticated client
  *   - optional `resource` is a valid RFC 8707 URI and matches the AS's configured resource
  *   - the configured resource is used when `resource` is omitted
@@ -203,6 +204,10 @@ export function validateIdJagClaims(input: ValidateClaimsInput): Result<Validate
 
   const aud = readAudienceClaim(rawClaims);
   if (!aud.ok) return aud;
+
+  for (const claim of ['authorization_details', 'cnf'] as const) {
+    if (rawClaims[claim] !== undefined) return err({ reason: 'unsupported_claim', claim });
+  }
 
   // The MCP EMA profile follows the core ID-JAG specification in making
   // `resource` optional. Keep tokens pinned to this provider's declared

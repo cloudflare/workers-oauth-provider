@@ -312,6 +312,14 @@ describe('validateIdJagClaims', () => {
     expect(r).toMatchObject({ ok: false, error: { reason } });
   });
 
+  it.each([
+    ['authorization_details', []],
+    ['cnf', { jkt: 'thumbprint' }],
+  ])('fails closed when unsupported %s is present', (claim, value) => {
+    const r = validateIdJagClaims({ rawClaims: { ...validClaims, [claim]: value }, ...claimsArgs });
+    expect(r).toMatchObject({ ok: false, error: { reason: 'unsupported_claim', claim } });
+  });
+
   it('rejects client_id mismatch', () => {
     const r = validateIdJagClaims({ rawClaims: { ...validClaims, client_id: 'other' }, ...claimsArgs });
     expect(r).toMatchObject({ ok: false, error: { reason: 'client_id_mismatch' } });

@@ -31,6 +31,7 @@ export type EmaValidationError =
   | { reason: 'jwks_fetch_failed'; status?: number }
   | { reason: 'invalid_claim'; claim: string }
   | { reason: 'aud_mismatch'; expected: string; got: string | string[] }
+  | { reason: 'unsupported_claim'; claim: 'authorization_details' | 'cnf' }
   | { reason: 'expired'; exp: number; now: number }
   | { reason: 'iat_in_future'; iat: number; now: number; skew: number }
   | { reason: 'nbf_in_future'; nbf: number; now: number; skew: number }
@@ -95,6 +96,7 @@ export function emaErrorToWire(e: EmaValidationError): EmaErrorWireResponse {
     case 'jwks_fetch_failed':
     case 'invalid_claim':
     case 'aud_mismatch':
+    case 'unsupported_claim':
     case 'expired':
     case 'iat_in_future':
     case 'nbf_in_future':
