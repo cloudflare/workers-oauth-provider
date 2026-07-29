@@ -1,10 +1,12 @@
 import { describe, it, expect, expectTypeOf, beforeEach, vi, afterEach } from 'vitest';
 import {
   CimdFetchError,
+  ExternalTokenError,
   OAuthError,
   OAuthProvider,
   type OAuthHelpers,
   type OAuthProviderOptions,
+  type OAuthTokenErrorCode,
   type Token,
 } from '../src/oauth-provider';
 import type { ExecutionContext } from '@cloudflare/workers-types';
@@ -9029,6 +9031,21 @@ describe('OAuthProvider', () => {
       });
     });
 
+    it('does not convert ExternalTokenError at the token endpoint', async () => {
+      const error = new ExternalTokenError('temporarily_unavailable', {
+        description: 'external validator only',
+        statusCode: 503,
+      });
+      const provider = buildProvider(async (options: any) => {
+        if (options.grantType === 'refresh_token') throw error;
+        return undefined;
+      });
+      await registerClient(provider);
+      const { refreshToken } = await getRefreshToken(provider);
+
+      await expect(refreshWithToken(provider, refreshToken)).rejects.toBe(error);
+    });
+
     it('lets app-local OAuthError classes surface as 500 (use the exported class)', async () => {
       class LocalOAuthError extends Error {
         name = 'OAuthError';
@@ -9457,7 +9474,7 @@ describe('OAuthProvider', () => {
       expect(externalTokenCalls[0].token).toBe('invalid-external-token');
     });
 
-    it('should convert OAuthError from external validation into a structured invalid_token response', async () => {
+    it('should convert ExternalTokenError from external validation into a structured invalid_token response', async () => {
       const provider = new OAuthProvider({
         apiRoute: ['/api/'],
         apiHandler: TestApiHandler,
@@ -9465,7 +9482,7 @@ describe('OAuthProvider', () => {
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
         resolveExternalToken: async () => {
-          throw new OAuthError('invalid_token', {
+          throw new ExternalTokenError('invalid_token', {
             description: 'external token expired',
             statusCode: 401,
           });
@@ -9499,7 +9516,7 @@ describe('OAuthProvider', () => {
           scopes_supported: ['baseline:read', 'offline_access'],
         },
         resolveExternalToken: async () => {
-          throw new OAuthError('insufficient_scope', {
+          throw new ExternalTokenError('insufficient_scope', {
             description: 'Account Resources: Read is required',
             statusCode: 403,
             headers: { 'X-Trace-Id': 'trace-123' },
@@ -9527,7 +9544,7 @@ describe('OAuthProvider', () => {
     });
 
     it.each<{
-      code: string;
+      code: OAuthTokenErrorCode;
       description: string;
       status: number;
       headers: Record<string, string>;
@@ -9554,7 +9571,7 @@ describe('OAuthProvider', () => {
           authorizeEndpoint: '/authorize',
           tokenEndpoint: '/oauth/token',
           resolveExternalToken: async () => {
-            throw new OAuthError(code, { description, statusCode: status, headers });
+            throw new ExternalTokenError(code, { description, statusCode: status, headers });
           },
         });
         const request = createMockRequest('https://example.com/api/test', 'GET', {
@@ -9583,7 +9600,7 @@ describe('OAuthProvider', () => {
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
         resolveExternalToken: async () => {
-          throw new OAuthError('insufficient_scope', {
+          throw new ExternalTokenError('insufficient_scope', {
             description: 'invalid scope configuration',
             statusCode: 403,
             requiredScopes: ['scope with spaces'],
@@ -9595,7 +9612,7 @@ describe('OAuthProvider', () => {
       });
 
       await expect(provider.fetch(request, mockEnv, mockCtx)).rejects.toThrow(
-        'OAuthError requiredScopes must contain valid OAuth scope tokens'
+        'ExternalTokenError requiredScopes must contain valid OAuth scope tokens'
       );
     });
 
@@ -9608,7 +9625,7 @@ describe('OAuthProvider', () => {
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
         resolveExternalToken: async () => {
-          throw new OAuthError('invalid_token', {
+          throw new ExternalTokenError('invalid_token', {
             description: 'external token rejected',
             statusCode: 401,
             headers: { 'www-authenticate': challenge },
@@ -9625,7 +9642,29 @@ describe('OAuthProvider', () => {
       expect(response.headers.get('WWW-Authenticate')).toBe(challenge);
     });
 
-    it('should rethrow non-OAuthError failures from external validation', async () => {
+    it('should preserve the old behavior for OAuthError from external validation', async () => {
+      const error = new OAuthError('invalid_token', {
+        description: 'shared OAuth helper failure',
+        statusCode: 401,
+      });
+      const provider = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        resolveExternalToken: async () => {
+          throw error;
+        },
+      });
+      const request = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: 'Bearer external-token',
+      });
+
+      await expect(provider.fetch(request, mockEnv, mockCtx)).rejects.toBe(error);
+    });
+
+    it('should rethrow ordinary failures from external validation', async () => {
       const provider = new OAuthProvider({
         apiRoute: ['/api/'],
         apiHandler: TestApiHandler,
@@ -9641,6 +9680,28 @@ describe('OAuthProvider', () => {
       });
 
       await expect(provider.fetch(request, mockEnv, mockCtx)).rejects.toThrow('external validator bug');
+    });
+
+    it('should not convert an app-local ExternalTokenError class', async () => {
+      class LocalExternalTokenError extends Error {
+        name = 'ExternalTokenError';
+      }
+      const error = new LocalExternalTokenError('local upstream failure');
+      const provider = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        resolveExternalToken: async () => {
+          throw error;
+        },
+      });
+      const request = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: 'Bearer external-token',
+      });
+
+      await expect(provider.fetch(request, mockEnv, mockCtx)).rejects.toBe(error);
     });
 
     it('should prioritize internal tokens over external validation', async () => {

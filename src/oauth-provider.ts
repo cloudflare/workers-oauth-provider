@@ -287,15 +287,19 @@ export interface ResolveExternalTokenInput<Env = Cloudflare.Env> {
  */
 export interface ResolveExternalTokenResult {
   /**
-   * Application-specific properties that will be passed to the API handlers
-   * These properties are set in the execution context (ctx.props) when the external token is validated
+   * Application-specific properties that will be passed to the API handlers.
+   * These properties are set in the execution context (`ctx.props`) after the
+   * external bearer credential is validated.
    */
   props: any;
 
   /**
-   * Audience claim from the external token (RFC 7519 Section 4.1.3)
-   * If provided, will be validated against the resource server identity
+   * Protected resource audience established by the external validator.
    *
+   * A JWT may carry this value as an `aud` claim. For an opaque API token or
+   * PAT, the callback can supply the local resource URI as policy after
+   * successful validation. When `resourceMetadata.resource` is configured,
+   * this value is required and must match it exactly.
    */
   audience?: string | string[];
 }
@@ -456,14 +460,16 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
   ) => Promise<TokenExchangeCallbackResult | void> | TokenExchangeCallbackResult | void;
 
   /**
-   * Optional callback function that is called when a provided token was not found in the internal KV.
-   * This allows authentication through external OAuth servers.
-   * For example, if a request includes an authenticated token from a different OAuth authentication server,
-   * the callback can be used to authenticate it and set the context props through it.
+   * Optional callback called when a provided bearer credential was not found
+   * in the internal KV. It can validate an external OAuth access token, opaque
+   * API token, personal access token (PAT), or another bearer credential and
+   * set the application props passed to the protected handler.
    *
    * Return props to authenticate the request, or `null` for a generic `invalid_token` response.
-   * Throw this package's exported {@link OAuthError} to return a structured OAuth error response.
-   * Other thrown errors remain unexpected failures and are re-thrown.
+   * Throw this package's exported {@link ExternalTokenError} to return an intentional
+   * structured error response for an upstream validation failure.
+   * All other thrown errors, including {@link OAuthError}, remain unexpected
+   * failures and are re-thrown for backwards compatibility.
    */
   resolveExternalToken?: (input: ResolveExternalTokenInput<Env>) => Promise<ResolveExternalTokenResult | null>;
 
@@ -2256,31 +2262,38 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   }
 
   /**
-   * Build a structured OAuth error response from an OAuth error.
+   * Build a structured OAuth token-endpoint response from an OAuth error.
    *
-   * The supported form is throwing this package's exported `OAuthError`.
-   * Anything else is re-thrown so unexpected failures still surface as 500s.
-   *
-   * When handling a protected resource request, standard bearer-token errors
-   * receive an RFC 6750 / RFC 9728 challenge unless the caller supplied one.
-   * Use `headers['Retry-After']` for rate-limit / transient-failure backoff
-   * hints (see RFC 7231 §7.1.3 — either an integer seconds value or an
-   * HTTP-date is allowed).
+   * The supported form is throwing this package's exported `OAuthError` from
+   * token issuance or `tokenExchangeCallback`. Anything else is re-thrown so
+   * unexpected failures still surface as 500s.
    */
-  private createOAuthErrorResponse(error: unknown, resourceMetadataUrl?: string): Response | undefined {
+  private createOAuthErrorResponse(error: unknown): Response | undefined {
     if (!(error instanceof OAuthError)) return undefined;
+    return this.createErrorResponse(error.code, error.options);
+  }
 
-    const headers = error.options.headers ?? {};
+  /**
+   * Build a structured protected-resource response from an external-token error.
+   *
+   * Only this package's exported `ExternalTokenError` is converted. Standard
+   * bearer failures receive an RFC 6750 / RFC 9728 challenge unless the caller
+   * supplied one. Other errors retain the pre-existing behavior and are re-thrown.
+   */
+  private createExternalTokenErrorResponse(error: unknown, resourceMetadataUrl: string): Response | undefined {
+    if (!(error instanceof ExternalTokenError)) return undefined;
+
+    const headers = error.headers ?? {};
     const hasChallenge = Object.keys(headers).some((name) => name.toLowerCase() === 'www-authenticate');
     const isBearerError =
       (error.code === 'invalid_token' && error.statusCode === 401) ||
       (error.code === 'insufficient_scope' && error.statusCode === 403);
 
     let challengeHeaders: Record<string, string> | undefined;
-    if (resourceMetadataUrl && isBearerError && !hasChallenge) {
-      const requiredScopes = [...new Set(error.options.requiredScopes ?? [])];
+    if (isBearerError && !hasChallenge) {
+      const requiredScopes = [...new Set(error.requiredScopes ?? [])];
       if (requiredScopes.some((scope) => !isValidOAuthScopeToken(scope))) {
-        throw new TypeError('OAuthError requiredScopes must contain valid OAuth scope tokens');
+        throw new TypeError('ExternalTokenError requiredScopes must contain valid OAuth scope tokens');
       }
       challengeHeaders = {
         ...headers,
@@ -2289,8 +2302,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     return this.createErrorResponse(error.code, {
-      ...error.options,
-      ...(challengeHeaders ? { headers: challengeHeaders } : {}),
+      description: error.description,
+      statusCode: error.statusCode,
+      headers: challengeHeaders ?? headers,
     });
   }
 
@@ -3834,13 +3848,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       (ctx as MutableExecutionContext).props = decryptedProps;
     } else if (this.options.resolveExternalToken) {
       // No token data was found, so we validate the provided token with the provided validator.
-      // Convert only the package's exported OAuthError into a structured response;
-      // unexpected callback failures remain visible as 500s.
+      // Convert only the package's exported ExternalTokenError into a structured response;
+      // every other thrown value retains the pre-existing failure behavior.
       let ext: ResolveExternalTokenResult | null;
       try {
         ext = await this.options.resolveExternalToken({ token: accessToken, request, env });
       } catch (error) {
-        const response = this.createOAuthErrorResponse(error, resourceMetadataUrl);
+        const response = this.createExternalTokenErrorResponse(error, resourceMetadataUrl);
         if (response) return response;
         throw error;
       }
@@ -4560,25 +4574,14 @@ export interface OAuthErrorOptions {
    * number of seconds or an HTTP-date.
    */
   headers?: Record<string, string>;
-
-  /**
-   * Minimum scopes needed for the protected resource operation.
-   *
-   * When `resolveExternalToken` throws a standard bearer-token error with
-   * HTTP 401 or 403, these values are serialized into the synthesized
-   * `WWW-Authenticate` challenge's `scope` parameter. This is especially
-   * useful for step-up authorization after `insufficient_scope`. Each value
-   * must use the OAuth scope-token grammar from RFC 6749 §3.3.
-   */
-  requiredScopes?: string[];
 }
 
 /**
- * Structured OAuth 2.0 error.
+ * Structured OAuth 2.0 token-endpoint error.
  *
- * Throw from a `tokenExchangeCallback`, `resolveExternalToken`, or any code
- * they call to surface a standard OAuth error response
- * (`{ error, error_description }`) instead of a generic `500 Internal Server Error`.
+ * Throw from a `tokenExchangeCallback` or any code it calls to surface a
+ * standard OAuth token response (`{ error, error_description }`) instead of a
+ * generic `500 Internal Server Error`.
  *
  * Anything thrown that is **not** an `OAuthError` continues to surface as
  * a 500 so unexpected failures remain visible — the provider does not
@@ -4632,6 +4635,66 @@ export class OAuthError extends Error {
     this.description = this.options.description;
     this.statusCode = this.options.statusCode;
     this.headers = this.options.headers;
+  }
+}
+
+/** Options accepted by the {@link ExternalTokenError} constructor. */
+export interface ExternalTokenErrorOptions {
+  /**
+   * Public description returned in the OAuth `error_description` field.
+   * Do not include credentials, upstream response bodies, or private diagnostics.
+   */
+  description: string;
+
+  /** HTTP status returned to the protected-resource client. */
+  statusCode: number;
+
+  /** Additional public response headers, such as `Retry-After`. */
+  headers?: Record<string, string>;
+
+  /**
+   * Minimum scopes needed for the protected-resource operation.
+   *
+   * For `403 insufficient_scope`, these values are validated, deduplicated,
+   * and added to the synthesized `WWW-Authenticate` challenge. Each value must
+   * use the OAuth scope-token grammar from RFC 6749 §3.3.
+   */
+  requiredScopes?: string[];
+}
+
+/**
+ * Intentional public error from an external bearer-token validator.
+ *
+ * Throw only from `resolveExternalToken` when an expected validation outcome
+ * should become a structured protected-resource response. Ordinary errors and
+ * {@link OAuthError} retain their pre-existing behavior and propagate as
+ * unexpected failures.
+ */
+export class ExternalTokenError extends Error {
+  /** OAuth error code returned in the response body and, when applicable, challenge. */
+  public readonly code: OAuthTokenErrorCode;
+  /** Public description returned as `error_description`. */
+  public readonly description: string;
+  /** HTTP status returned to the protected-resource client. */
+  public readonly statusCode: number;
+  /** Additional public response headers. */
+  public readonly headers?: Record<string, string>;
+  /** Minimum scopes for an `insufficient_scope` challenge. */
+  public readonly requiredScopes?: string[];
+
+  /**
+   * Creates an intentional external-token validation error.
+   * @param code - Standard OAuth error code to return
+   * @param options - Public response details
+   */
+  constructor(code: OAuthTokenErrorCode, options: ExternalTokenErrorOptions) {
+    super(options.description);
+    this.name = 'ExternalTokenError';
+    this.code = code;
+    this.description = options.description;
+    this.statusCode = options.statusCode;
+    this.headers = options.headers;
+    this.requiredScopes = options.requiredScopes;
   }
 }
 

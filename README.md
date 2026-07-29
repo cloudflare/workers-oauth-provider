@@ -258,7 +258,7 @@ Use `resolveExternalToken` to authenticate bearer tokens issued by another autho
 only when the token was not found in the provider's internal storage.
 
 ```ts
-import { OAuthError, OAuthProvider } from '@cloudflare/workers-oauth-provider';
+import { ExternalTokenError, OAuthProvider } from '@cloudflare/workers-oauth-provider';
 
 new OAuthProvider({
   // ... other options ...
@@ -267,14 +267,14 @@ new OAuthProvider({
 
     if (result.kind === 'invalid') return null;
     if (result.kind === 'insufficient_scope') {
-      throw new OAuthError('insufficient_scope', {
+      throw new ExternalTokenError('insufficient_scope', {
         description: 'The external token needs the account:read scope',
         statusCode: 403,
         requiredScopes: ['account:read'],
       });
     }
     if (result.kind === 'rate_limited') {
-      throw new OAuthError('temporarily_unavailable', {
+      throw new ExternalTokenError('temporarily_unavailable', {
         description: 'The external authorization server rate limited validation',
         statusCode: 429,
         headers: { 'Retry-After': result.retryAfter },
@@ -290,12 +290,23 @@ The callback has three outcomes:
 
 - Return `{ props, audience? }` to authenticate the request.
 - Return `null` for a generic `401 invalid_token` response.
-- Throw this package's exported `OAuthError` for an intentional structured response. Standard `invalid_token` 401
-  and `insufficient_scope` 403 errors receive a resource-specific `WWW-Authenticate` challenge unless the error
+- Throw this package's exported `ExternalTokenError` for an intentional structured response. Standard `invalid_token`
+  401 and `insufficient_scope` 403 errors receive a resource-specific `WWW-Authenticate` challenge unless the error
   supplies one. Set `requiredScopes` on `insufficient_scope` to include the operation's minimum scopes in the
   challenge for step-up authorization.
 
-Other thrown values are re-thrown so unexpected validator bugs remain visible as 500s. For cross-origin requests,
+`audience` means the protected resource where the credential is accepted, not its issuer, user, upstream API, or
+permissions. A JWT may carry an audience claim. For an opaque API token or PAT, the resolver can supply the local
+resource URI as policy after successful validation. When `resourceMetadata.resource` is configured, `audience` is
+required and must match it exactly.
+
+`WWW-Authenticate` is a standard response header describing the Bearer authentication failure. For MCP it includes
+the protected resource metadata URL and may include `invalid_token`, `insufficient_scope`, and required scopes. It
+never contains the submitted token or `ctx.props`. `ExternalTokenError.description` is returned publicly as
+`error_description`, so it must not contain credentials, upstream response bodies, or private diagnostics.
+
+Other thrown values, including `OAuthError`, are re-thrown so existing callback behavior and unexpected validator
+bugs remain visible as 500s. For cross-origin requests,
 the provider exposes `WWW-Authenticate` and `Retry-After` through CORS so browser clients can read discovery,
 step-up, and backoff guidance.
 
@@ -309,7 +320,7 @@ redirects. Intermediate identity-provider redirects and local HTML error pages d
 
 Set `resourceMetadata.scopes_supported` to the minimal scopes needed for basic resource functionality. The provider
 publishes them in Protected Resource Metadata and uses them as baseline Bearer challenge guidance. Operation-specific
-`OAuthError.requiredScopes` takes precedence. `scopesSupported` remains authorization-server metadata only, and
+`ExternalTokenError.requiredScopes` takes precedence. `scopesSupported` remains authorization-server metadata only, and
 `offline_access` is omitted from every provider-generated resource-facing scope list.
 
 ```ts
@@ -431,9 +442,8 @@ async function refreshUpstream(props) {
 - `options.description` — human-readable text returned in `error_description`.
 - `options.statusCode` — HTTP status code (default `400`).
 - `options.headers` — additional response headers, such as `Retry-After` for transient failures. There is no implicit `Retry-After` default for callback-thrown errors.
-- `options.requiredScopes` — minimum scopes for a protected resource operation. On a structured `403 insufficient_scope` from `resolveExternalToken`, the provider validates, deduplicates, and serializes them into the synthesized `WWW-Authenticate` challenge.
 
-Only `OAuthError` from this package is converted into a structured response. Plain errors, plain objects with a `code` field, and app-local error classes continue to surface as 500s so unexpected failures stay visible. Import `OAuthError` from `@cloudflare/workers-oauth-provider` rather than copying or re-implementing it.
+Only `OAuthError` from this package is converted into a structured token-endpoint response. Plain errors, plain objects with a `code` field, `ExternalTokenError`, and app-local error classes continue to surface as 500s so unexpected failures stay visible. Import `OAuthError` from `@cloudflare/workers-oauth-provider` rather than copying or re-implementing it.
 
 ## Enterprise-Managed Authorization (Experimental)
 
