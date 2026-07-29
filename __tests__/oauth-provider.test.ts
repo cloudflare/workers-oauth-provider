@@ -9885,7 +9885,32 @@ describe('OAuthProvider', () => {
         expect(authResponse.status).toBe(302);
       });
 
-      it('should accept private_key_jwt auth method', async () => {
+      it('should negotiate none from ChatGPT-style authentication method choices', async () => {
+        const cimdUrl = 'https://chatgpt.com/oauth/client.json';
+        const validMetadata = {
+          client_id: cimdUrl,
+          client_name: 'ChatGPT',
+          redirect_uris: ['https://chatgpt.com/connector_platform_oauth_redirect'],
+          token_endpoint_auth_methods_supported: ['none', 'private_key_jwt'],
+          grant_types: ['authorization_code', 'refresh_token'],
+          response_types: ['code'],
+        };
+
+        globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(createMockFetchResponse(validMetadata)));
+        const authRequest = createMockRequest(
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}` +
+            `&redirect_uri=${encodeURIComponent(validMetadata.redirect_uris[0])}` +
+            `&response_type=code&state=test-state` +
+            `&code_challenge=test-challenge&code_challenge_method=plain`,
+          'GET'
+        );
+
+        const response = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+
+        expect(response.status).toBe(302);
+      });
+
+      it('should reject private_key_jwt until token-endpoint assertion validation is implemented', async () => {
         const cimdUrl = 'https://client.example.com/oauth/metadata.json';
         const validMetadata = {
           client_id: cimdUrl,
@@ -9902,10 +9927,7 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
-
-        // Should succeed with redirect
-        expect(authResponse.status).toBe(302);
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
       });
     });
 
@@ -9921,6 +9943,28 @@ describe('OAuthProvider', () => {
 
         const authRequest = createMockRequest(
           `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=plain`,
+          'GET'
+        );
+
+        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+      });
+
+      it.each([
+        ['missing', undefined],
+        ['empty', '   '],
+      ])('should treat %s client_name as invalid client', async (_label, clientName) => {
+        const cimdUrl = 'https://client.example.com/oauth/metadata.json';
+        const invalidMetadata = {
+          client_id: cimdUrl,
+          ...(clientName === undefined ? {} : { client_name: clientName }),
+          redirect_uris: ['https://client.example.com/callback'],
+          token_endpoint_auth_method: 'none',
+        };
+
+        globalThis.fetch = vi.fn().mockResolvedValue(createMockFetchResponse(invalidMetadata));
+
+        const authRequest = createMockRequest(
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
           'GET'
         );
 
