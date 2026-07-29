@@ -1,5 +1,11 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
-import { OAuthError, OAuthProvider, type OAuthHelpers, type Token } from '../src/oauth-provider';
+import {
+  OAuthError,
+  OAuthProvider,
+  type OAuthHelpers,
+  type OAuthProviderOptions,
+  type Token,
+} from '../src/oauth-provider';
 import type { ExecutionContext } from '@cloudflare/workers-types';
 // We're importing WorkerEntrypoint from our mock implementation
 // The actual import is mocked in setup.ts
@@ -609,7 +615,7 @@ describe('OAuthProvider', () => {
           resource: 'https://api.example.com',
           authorization_servers: ['https://auth.example.com'],
           scopes_supported: ['custom:read', 'custom:write'],
-          bearer_methods_supported: ['header', 'body'],
+          bearer_methods_supported: ['header'],
           resource_name: 'Example API',
         },
       });
@@ -623,8 +629,53 @@ describe('OAuthProvider', () => {
       expect(metadata.resource).toBe('https://api.example.com');
       expect(metadata.authorization_servers).toEqual(['https://auth.example.com']);
       expect(metadata.scopes_supported).toEqual(['custom:read', 'custom:write']);
-      expect(metadata.bearer_methods_supported).toEqual(['header', 'body']);
+      expect(metadata.bearer_methods_supported).toEqual(['header']);
       expect(metadata.resource_name).toBe('Example API');
+    });
+
+    it.each<[string, OAuthProviderOptions['resourceMetadata'], string]>([
+      [
+        'an empty authorization server list',
+        { authorization_servers: [] },
+        'resourceMetadata.authorization_servers must contain at least one issuer',
+      ],
+      [
+        'an insecure authorization server issuer',
+        { authorization_servers: ['http://auth.example.com'] },
+        'resourceMetadata.authorization_servers must contain valid HTTPS issuer URLs',
+      ],
+      [
+        'an issuer with a query',
+        { authorization_servers: ['https://auth.example.com?tenant=a'] },
+        'resourceMetadata.authorization_servers must contain valid HTTPS issuer URLs',
+      ],
+      [
+        'an invalid resource identifier',
+        { resource: 'mcp.example.com' },
+        'resourceMetadata.resource must be an absolute HTTP(S) URI without a fragment',
+      ],
+      [
+        'an invalid scope token',
+        { scopes_supported: ['scope with spaces'] },
+        'resourceMetadata.scopes_supported must contain valid OAuth scope tokens',
+      ],
+      [
+        'an unsupported bearer method',
+        { bearer_methods_supported: ['body'] },
+        "resourceMetadata.bearer_methods_supported only supports 'header'",
+      ],
+    ])('should reject protected resource metadata with %s', (_label, resourceMetadata, message) => {
+      expect(
+        () =>
+          new OAuthProvider({
+            apiRoute: ['/api/'],
+            apiHandler: TestApiHandler,
+            defaultHandler: testDefaultHandler,
+            authorizeEndpoint: '/authorize',
+            tokenEndpoint: '/oauth/token',
+            resourceMetadata,
+          })
+      ).toThrow(message);
     });
 
     it('should fall back to top-level scopesSupported when resourceMetadata.scopes_supported is not set', async () => {
