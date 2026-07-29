@@ -4348,6 +4348,17 @@ describe('OAuthProvider', () => {
       expect(await response.json<any>()).toMatchObject({ error: 'invalid_grant' });
     });
 
+    it('should reject assertions with multiple audiences without writing authorization state', async () => {
+      const response = await exchangeAssertion(
+        await createAssertion({ aud: ['https://example.com', 'https://other.example.com'] })
+      );
+
+      expect(response.status).toBe(400);
+      expect(await response.json<any>()).toEqual({ error: 'invalid_grant', error_description: 'Invalid assertion' });
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys).toHaveLength(0);
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'token:' })).keys).toHaveLength(0);
+    });
+
     it('should reject assertions from unknown issuers', async () => {
       const response = await exchangeAssertion(await createAssertion({ iss: 'https://unknown-idp.example.com' }));
       expect(response.status).toBe(400);
