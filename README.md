@@ -6,6 +6,7 @@ This is a TypeScript library that implements the provider side of the OAuth 2.1 
 
 - The library acts as a wrapper around your Worker code, which adds authorization for your API endpoints.
 - All token management is handled automatically.
+- Authorization responses include RFC 9207 issuer identification to prevent mix-up attacks.
 - Your API handler is written like a regular fetch handler, but receives the already-authenticated user details as a parameter. No need to perform any checks of your own.
 - The library is agnostic to how you manage and authenticate users.
 - The library is agnostic to how you build your UI. Your authorization flow can be implemented using whatever UI framework you use for everything else.
@@ -251,6 +252,59 @@ Note that `deleteClient()` cascades: it revokes all grants (and their associated
 
 See the `OAuthHelpers` interface definition for full API details.
 
+## External Token Resolution
+
+Use `resolveExternalToken` to authenticate bearer tokens issued by another authorization server. The callback runs
+only when the token was not found in the provider's internal storage.
+
+```ts
+import { OAuthError, OAuthProvider } from '@cloudflare/workers-oauth-provider';
+
+new OAuthProvider({
+  // ... other options ...
+  resolveExternalToken: async ({ token }) => {
+    const result = await validateExternalToken(token);
+
+    if (result.kind === 'invalid') return null;
+    if (result.kind === 'insufficient_scope') {
+      throw new OAuthError('insufficient_scope', {
+        description: 'The external token needs the account:read scope',
+        statusCode: 403,
+        requiredScopes: ['account:read'],
+      });
+    }
+    if (result.kind === 'rate_limited') {
+      throw new OAuthError('temporarily_unavailable', {
+        description: 'The external authorization server rate limited validation',
+        statusCode: 429,
+        headers: { 'Retry-After': result.retryAfter },
+      });
+    }
+
+    return { props: result.props, audience: result.audience };
+  },
+});
+```
+
+The callback has three outcomes:
+
+- Return `{ props, audience? }` to authenticate the request.
+- Return `null` for a generic `401 invalid_token` response.
+- Throw this package's exported `OAuthError` for an intentional structured response. Standard `invalid_token` 401
+  and `insufficient_scope` 403 errors receive a resource-specific `WWW-Authenticate` challenge unless the error
+  supplies one. Set `requiredScopes` on `insufficient_scope` to include the operation's minimum scopes in the
+  challenge for step-up authorization.
+
+Other thrown values are re-thrown so unexpected validator bugs remain visible as 500s. For cross-origin requests,
+the provider exposes `WWW-Authenticate` and `Retry-After` through CORS so browser clients can read discovery,
+step-up, and backoff guidance.
+
+### Authorization response issuer
+
+RFC 9207 issuer identification is always enabled. Successful authorization responses include `iss` automatically.
+`parseAuthRequest` returns the expected `issuer`; authorization handlers must include it in terminal OAuth error
+redirects. Intermediate identity-provider redirects and local HTML error pages do not need it.
+
 ## Token Exchange Callback
 
 This library allows you to update the `props` value during token exchanges by configuring a callback function. This is useful for scenarios where the application needs to perform additional processing when tokens are issued or refreshed.
@@ -362,8 +416,9 @@ async function refreshUpstream(props) {
 - `options.description` — human-readable text returned in `error_description`.
 - `options.statusCode` — HTTP status code (default `400`).
 - `options.headers` — additional response headers, such as `Retry-After` for transient failures. There is no implicit `Retry-After` default for callback-thrown errors.
+- `options.requiredScopes` — minimum scopes for a protected resource operation. On a structured `403 insufficient_scope` from `resolveExternalToken`, the provider validates, deduplicates, and serializes them into the synthesized `WWW-Authenticate` challenge.
 
-Only `OAuthError` from this package is converted into a structured `/token` response. Plain errors, plain objects with a `code` field, and app-local error classes continue to surface as 500s so unexpected failures stay visible. Import `OAuthError` from `@cloudflare/workers-oauth-provider` rather than copying or re-implementing it.
+Only `OAuthError` from this package is converted into a structured response. Plain errors, plain objects with a `code` field, and app-local error classes continue to surface as 500s so unexpected failures stay visible. Import `OAuthError` from `@cloudflare/workers-oauth-provider` rather than copying or re-implementing it.
 
 ## Enterprise-Managed Authorization (Experimental)
 
@@ -549,6 +604,8 @@ The compatibility flag is required for SSRF (Server-Side Request Forgery) protec
 When CIMD is not enabled (the default), URL-formatted `client_id` values fall through to standard KV lookup. When enabled, if fetching the metadata document fails, the library logs a warning and returns an `invalid_client` error, allowing MCP clients to recover by falling back to Dynamic Client Registration.
 
 The OAuth metadata endpoint reports `client_id_metadata_document_supported: true` only when both the option is enabled and the compatibility flag is present.
+
+CIMD currently supports only `token_endpoint_auth_method: "none"`.
 
 ## Written using Claude
 

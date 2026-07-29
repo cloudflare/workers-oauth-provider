@@ -157,8 +157,9 @@ export interface TokenExchangeCallbackResult {
   refreshTokenTTL?: number;
 
   /**
-   * List of scopes authorized for the new access token
-   * (If undefined, the granted scopes will be used)
+   * Optional scopes for the new access token. Values outside the scope ceiling
+   * for the current grant flow are ignored. If omitted, the effective requested
+   * scopes are used.
    */
   accessTokenScope?: string[];
 }
@@ -192,13 +193,12 @@ export interface TokenExchangeCallbackOptions {
   grantId: string;
 
   /**
-   * List of scopes that were granted
+   * List of scopes on the underlying authorization grant.
    */
   scope: string[];
 
   /**
-   * List of scopes that were requested for this token by the client
-   * (Will be the same as granted scopes unless client specifically requested a downscoping)
+   * Effective scopes selected for this token before applying the callback result.
    */
   requestedScope: string[];
 
@@ -450,8 +450,9 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
    * For example, if a request includes an authenticated token from a different OAuth authentication server,
    * the callback can be used to authenticate it and set the context props through it.
    *
-   * The callback can optionally return props values that will passed-through to the apiHandlers.
-   * The callback can return `null` to signal resolution failure.
+   * Return props to authenticate the request, or `null` for a generic `invalid_token` response.
+   * Throw this package's exported {@link OAuthError} to return a structured OAuth error response.
+   * Other thrown errors remain unexpected failures and are re-thrown.
    */
   resolveExternalToken?: (input: ResolveExternalTokenInput) => Promise<ResolveExternalTokenResult | null>;
 
@@ -647,7 +648,7 @@ export interface ExchangeTokenOptions {
   subjectToken: string;
 
   /**
-   * Optional narrowed set of scopes for the new token (must be subset of original grant scopes)
+   * Optional requested scopes for the new token. Issued scopes are limited to the subject token's scopes.
    */
   scope?: string[];
 
@@ -705,6 +706,12 @@ export interface AuthRequest {
    * Resource parameter indicating target resource(s) (RFC 8707)
    */
   resource?: string | string[];
+
+  /**
+   * Authorization server issuer recorded while parsing this request.
+   * Include it as `iss` in successful and error authorization responses.
+   */
+  issuer?: string;
 }
 
 /**
@@ -1407,6 +1414,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       );
     }
 
+    this.validateResourceMetadataOptions(this.options.resourceMetadata);
     this.validateEmaOptions(this.options.enterpriseManagedAuthorization);
 
     if (this.options.enterpriseManagedAuthorization) {
@@ -1460,6 +1468,40 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     throw new TypeError(
       `${name} must be either an ExportedHandler object with a fetch method or a class extending WorkerEntrypoint`
     );
+  }
+
+  /** Validate configured RFC 9728 protected resource metadata. */
+  private validateResourceMetadataOptions(options: OAuthProviderOptions<Env>['resourceMetadata']): void {
+    if (!options) return;
+
+    if (options.resource && !validateResourceUri(options.resource)) {
+      throw new TypeError('resourceMetadata.resource must be an absolute HTTP(S) URI without a fragment');
+    }
+
+    if (options.authorization_servers !== undefined) {
+      if (options.authorization_servers.length === 0) {
+        throw new TypeError('resourceMetadata.authorization_servers must contain at least one issuer');
+      }
+      for (const issuer of options.authorization_servers) {
+        let parsed: URL;
+        try {
+          parsed = new URL(issuer);
+        } catch {
+          throw new TypeError('resourceMetadata.authorization_servers must contain valid HTTPS issuer URLs');
+        }
+        if (parsed.protocol !== 'https:' || parsed.search || parsed.hash) {
+          throw new TypeError('resourceMetadata.authorization_servers must contain valid HTTPS issuer URLs');
+        }
+      }
+    }
+
+    if (options.scopes_supported?.some((scope) => !isValidOAuthScopeToken(scope))) {
+      throw new TypeError('resourceMetadata.scopes_supported must contain valid OAuth scope tokens');
+    }
+
+    if (options.bearer_methods_supported?.some((method) => method !== 'header')) {
+      throw new TypeError("resourceMetadata.bearer_methods_supported only supports 'header'");
+    }
   }
 
   /**
@@ -1957,7 +1999,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   /**
    * Gets the authorization server issuer using the same derivation as RFC 8414 metadata.
    */
-  private getAuthorizationServerIssuer(requestUrl: URL): string {
+  getAuthorizationServerIssuer(requestUrl: URL): string {
     const tokenEndpoint = this.getFullEndpointUrl(this.options.tokenEndpoint, requestUrl);
     return new URL(tokenEndpoint).origin;
   }
@@ -1986,6 +2028,20 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     newResponse.headers.set('Access-Control-Allow-Methods', '*');
     // Include Authorization explicitly since it's not included in * for security reasons
     newResponse.headers.set('Access-Control-Allow-Headers', 'Authorization, *');
+
+    // Browser-based OAuth/MCP clients need these non-safelisted response
+    // headers for authorization discovery, step-up challenges, and backoff.
+    // Preserve any headers the API handler already chose to expose.
+    const exposedHeaders = (newResponse.headers.get('Access-Control-Expose-Headers') ?? '')
+      .split(',')
+      .map((name) => name.trim())
+      .filter(Boolean);
+    for (const requiredHeader of ['WWW-Authenticate', 'Retry-After']) {
+      if (!exposedHeaders.some((name) => name.toLowerCase() === requiredHeader.toLowerCase())) {
+        exposedHeaders.push(requiredHeader);
+      }
+    }
+    newResponse.headers.set('Access-Control-Expose-Headers', exposedHeaders.join(', '));
     newResponse.headers.set('Access-Control-Max-Age', '86400'); // 24 hours
 
     return newResponse;
@@ -2054,6 +2110,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       // not implemented: introspection_endpoint_auth_methods_supported
       // not implemented: introspection_endpoint_auth_signing_alg_values_supported
       code_challenge_methods_supported: this.options.allowPlainPKCE !== false ? ['plain', 'S256'] : ['S256'], // PKCE support
+      authorization_response_iss_parameter_supported: true,
       // MCP Client ID Metadata Document support (CIMD)
       // Only enabled when global_fetch_strictly_public compat flag is set (for SSRF protection)
       client_id_metadata_document_supported:
@@ -2136,18 +2193,42 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   }
 
   /**
-   * Build a structured OAuth `/token` error response from an OAuth error.
+   * Build a structured OAuth error response from an OAuth error.
    *
    * The supported form is throwing this package's exported `OAuthError`.
    * Anything else is re-thrown so unexpected failures still surface as 500s.
    *
+   * When handling a protected resource request, standard bearer-token errors
+   * receive an RFC 6750 / RFC 9728 challenge unless the caller supplied one.
    * Use `headers['Retry-After']` for rate-limit / transient-failure backoff
    * hints (see RFC 7231 §7.1.3 — either an integer seconds value or an
    * HTTP-date is allowed).
    */
-  private createOAuthErrorResponse(error: unknown): Response | undefined {
+  private createOAuthErrorResponse(error: unknown, resourceMetadataUrl?: string): Response | undefined {
     if (!(error instanceof OAuthError)) return undefined;
-    return this.createErrorResponse(error.code, error.options);
+
+    const headers = error.options.headers ?? {};
+    const hasChallenge = Object.keys(headers).some((name) => name.toLowerCase() === 'www-authenticate');
+    const isBearerError =
+      (error.code === 'invalid_token' && error.statusCode === 401) ||
+      (error.code === 'insufficient_scope' && error.statusCode === 403);
+
+    let challengeHeaders: Record<string, string> | undefined;
+    if (resourceMetadataUrl && isBearerError && !hasChallenge) {
+      const requiredScopes = [...new Set(error.options.requiredScopes ?? [])];
+      if (requiredScopes.some((scope) => !isValidOAuthScopeToken(scope))) {
+        throw new TypeError('OAuthError requiredScopes must contain valid OAuth scope tokens');
+      }
+      challengeHeaders = {
+        ...headers,
+        'WWW-Authenticate': this.buildWwwAuthenticateHeader(resourceMetadataUrl, error.code, undefined, requiredScopes),
+      };
+    }
+
+    return this.createErrorResponse(error.code, {
+      ...error.options,
+      ...(challengeHeaders ? { headers: challengeHeaders } : {}),
+    });
   }
 
   /**
@@ -2257,6 +2338,32 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       if (calculatedChallenge !== grantData.codeChallenge) {
         return this.createErrorResponse('invalid_grant', { description: 'Invalid PKCE code_verifier' });
       }
+    }
+
+    // Parse and validate the resource parameter before exchanging the authorization code (RFC 8707)
+    // Validate downscoping: token request resources must be a subset of grant resources
+    const originOnly = !!this.options.resourceMatchOriginOnly;
+    if (body.resource && grantData.resource) {
+      const requestedResources = Array.isArray(body.resource) ? body.resource : [body.resource];
+      const grantedResources = Array.isArray(grantData.resource) ? grantData.resource : [grantData.resource];
+
+      // Check that all requested resources are in the granted resources
+      for (const requested of requestedResources) {
+        if (!grantedResources.some((granted) => resourceMatches(requested, granted, originOnly))) {
+          return this.createErrorResponse('invalid_target', {
+            description: 'Requested resource was not included in the authorization request',
+          });
+        }
+      }
+    }
+
+    // Use resource from token request if provided, otherwise use resource from grant
+    const audience = parseResourceParameter(body.resource || grantData.resource);
+    if ((body.resource || grantData.resource) && !audience) {
+      // RFC 8707 Section 2: invalid or unacceptable resource
+      return this.createErrorResponse('invalid_target', {
+        description: 'The resource parameter must be a valid absolute URI without a fragment',
+      });
     }
 
     // Define the access token TTL, may be updated by callback if provided
@@ -2385,32 +2492,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Save the updated grant with TTL matching refresh token expiration (if any)
     await this.saveGrantWithTTL(env, grantKey, grantData, now);
 
-    // Parse and validate resource parameter (RFC 8707)
-    // Validate downscoping: token request resources must be subset of grant resources
-    const originOnly = !!this.options.resourceMatchOriginOnly;
-    if (body.resource && grantData.resource) {
-      const requestedResources = Array.isArray(body.resource) ? body.resource : [body.resource];
-      const grantedResources = Array.isArray(grantData.resource) ? grantData.resource : [grantData.resource];
-
-      // Check that all requested resources are in the granted resources
-      for (const requested of requestedResources) {
-        if (!grantedResources.some((granted) => resourceMatches(requested, granted, originOnly))) {
-          return this.createErrorResponse('invalid_target', {
-            description: 'Requested resource was not included in the authorization request',
-          });
-        }
-      }
-    }
-
-    // Use resource from token request if provided, otherwise use resource from grant
-    const audience = parseResourceParameter(body.resource || grantData.resource);
-    if ((body.resource || grantData.resource) && !audience) {
-      // RFC 8707 Section 2.1: invalid or unacceptable resource
-      return this.createErrorResponse('invalid_target', {
-        description: 'The resource parameter must be a valid absolute URI without a fragment',
-      });
-    }
-
     // Create and store access token with potentially narrowed scopes
     const accessToken = await this.createAccessToken({
       userId,
@@ -2505,6 +2586,26 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       if (grantData.expiresAt - now < KV_MIN_EXPIRATION_TTL_SECONDS) {
         return this.createErrorResponse('invalid_grant', { description: 'Refresh token has expired' });
       }
+    }
+
+    // Validate the requested resource before callbacks, token rotation, or storage writes.
+    const originOnly = !!this.options.resourceMatchOriginOnly;
+    if (body.resource && grantData.resource) {
+      const requestedResources = Array.isArray(body.resource) ? body.resource : [body.resource];
+      const grantedResources = Array.isArray(grantData.resource) ? grantData.resource : [grantData.resource];
+      for (const requested of requestedResources) {
+        if (!grantedResources.some((granted) => resourceMatches(requested, granted, originOnly))) {
+          return this.createErrorResponse('invalid_target', {
+            description: 'Requested resource was not included in the authorization request',
+          });
+        }
+      }
+    }
+    const audience = parseResourceParameter(body.resource || grantData.resource);
+    if ((body.resource || grantData.resource) && !audience) {
+      return this.createErrorResponse('invalid_target', {
+        description: 'The resource parameter must be a valid absolute URI without a fragment',
+      });
     }
 
     // Generate new access token with embedded user and grant IDs
@@ -2686,32 +2787,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Save the updated grant with TTL if applicable
     await this.saveGrantWithTTL(env, grantKey, grantData, now);
 
-    // Parse and validate resource parameter (RFC 8707)
-    // Validate downscoping: token request resources must be subset of grant resources
-    const originOnly = !!this.options.resourceMatchOriginOnly;
-    if (body.resource && grantData.resource) {
-      const requestedResources = Array.isArray(body.resource) ? body.resource : [body.resource];
-      const grantedResources = Array.isArray(grantData.resource) ? grantData.resource : [grantData.resource];
-
-      // Check that all requested resources are in the granted resources
-      for (const requested of requestedResources) {
-        if (!grantedResources.some((granted) => resourceMatches(requested, granted, originOnly))) {
-          return this.createErrorResponse('invalid_target', {
-            description: 'Requested resource was not included in the authorization request',
-          });
-        }
-      }
-    }
-
-    // Use resource from token request if provided, otherwise use resource from grant
-    const audience = parseResourceParameter(body.resource || grantData.resource);
-    if ((body.resource || grantData.resource) && !audience) {
-      // RFC 8707 Section 2.1: invalid or unacceptable resource
-      return this.createErrorResponse('invalid_target', {
-        description: 'The resource parameter must be a valid absolute URI without a fragment',
-      });
-    }
-
     // Store new access token with denormalized grant information
     const accessTokenData: Token = {
       id: accessTokenId,
@@ -2766,7 +2841,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * `OAuthProviderImpl` is not exposed outside this module, this is still effectively
    * module-private.
    * @param subjectToken - The subject token to exchange
-   * @param requestedScopes - Optional narrowed scopes (must be subset of original)
+   * @param requestedScopes - Optional requested scopes, limited to the subject token's scopes
    * @param requestedResource - Optional resource/audience (must be subset of original if original had resource)
    * @param expiresIn - Optional TTL override in seconds
    * @param clientInfo - The client making the exchange request
@@ -2795,8 +2870,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       throw new OAuthError('invalid_grant', { description: 'Grant not found' });
     }
 
-    // If scopes are requested, validate they are a subset of the original grant scopes
-    let tokenScopes: string[] = this.downscope(requestedScopes, grantData.scope);
+    // An exchanged token inherits the subject token's scopes unless a narrower subset is requested.
+    let tokenScopes: string[] = this.downscope(requestedScopes, tokenSummary.scope);
 
     // Parse and validate resource parameter (RFC 8707) if provided
     const originOnly = !!this.options.resourceMatchOriginOnly;
@@ -2913,9 +2988,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
           accessTokenEncryptionKey = tokenResult.key;
         }
 
-        // If accessTokenScope was specified, use it for this token
+        // If accessTokenScope was specified, use it for this token while preserving
+        // the subject token as the upper bound.
         if (callbackResult.accessTokenScope) {
-          tokenScopes = this.downscope(callbackResult.accessTokenScope, grantData.scope);
+          tokenScopes = this.downscope(callbackResult.accessTokenScope, tokenSummary.scope);
         }
       }
     }
@@ -3650,15 +3726,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const authHeader = request.headers.get('Authorization');
 
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return this.createErrorResponse('invalid_token', {
-        description: 'Missing or invalid access token',
-        statusCode: 401,
+      // OAuth 2.1 §5.3.2: when authentication information is absent or uses an
+      // unsupported scheme, challenge without an error code or description.
+      return new Response(null, {
+        status: 401,
         headers: {
-          'WWW-Authenticate': this.buildWwwAuthenticateHeader(
-            resourceMetadataUrl,
-            'invalid_token',
-            'Missing or invalid access token'
-          ),
+          ...NO_CACHE_HEADERS,
+          'WWW-Authenticate': this.buildWwwAuthenticateHeader(resourceMetadataUrl),
         },
       });
     }
@@ -3737,8 +3811,17 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       // Set the decrypted props on the context object
       (ctx as MutableExecutionContext).props = decryptedProps;
     } else if (this.options.resolveExternalToken) {
-      // No token data was found, so we validate the provided token with the provided validator
-      const ext = await this.options.resolveExternalToken({ token: accessToken, request, env });
+      // No token data was found, so we validate the provided token with the provided validator.
+      // Convert only the package's exported OAuthError into a structured response;
+      // unexpected callback failures remain visible as 500s.
+      let ext: ResolveExternalTokenResult | null;
+      try {
+        ext = await this.options.resolveExternalToken({ token: accessToken, request, env });
+      } catch (error) {
+        const response = this.createOAuthErrorResponse(error, resourceMetadataUrl);
+        if (response) return response;
+        throw error;
+      }
 
       // Failed external validation
       if (!ext) {
@@ -3954,20 +4037,19 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   }
 
   /**
-   * Downscopes requested scopes to only include those that are in the grant
-   * Filters out any requested scopes that are not in the granted scopes
+   * Restricts requested scopes to the scopes available for the current flow.
+   * If no scope is requested, all available scopes are returned.
    * @param requestedScope - The scope parameter from the request (string or array)
-   * @param grantedScopes - The scopes that were granted in the authorization
-   * @returns The filtered scopes that are a subset of the granted scopes
+   * @param allowedScopes - The maximum scopes available for the current flow
+   * @returns The requested scopes that are included in the allowed scopes
    */
-  private downscope(requestedScope: string | string[] | undefined, grantedScopes: string[]): string[] {
-    if (!requestedScope) return grantedScopes;
+  private downscope(requestedScope: string | string[] | undefined, allowedScopes: string[]): string[] {
+    if (!requestedScope) return allowedScopes;
 
     const requestedScopes: string[] =
       typeof requestedScope === 'string' ? requestedScope.split(' ').filter(Boolean) : requestedScope;
 
-    // Filter out any requested scopes that are not in the grant
-    return requestedScopes.filter((scope: string) => grantedScopes.includes(scope));
+    return requestedScopes.filter((scope: string) => allowedScopes.includes(scope));
   }
 
   /**
@@ -4009,7 +4091,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * Allowed authentication methods for CIMD clients (per IETF spec)
    * CIMD clients cannot use symmetric secrets since there's no pre-shared secret
    */
-  private static readonly CIMD_ALLOWED_AUTH_METHODS = ['none', 'private_key_jwt'];
+  // private_key_jwt can be added once token-endpoint assertion validation is implemented.
+  // Accepting it in metadata before then creates clients that can authorize but never exchange a code.
+  private static readonly CIMD_ALLOWED_AUTH_METHODS = ['none'];
 
   /**
    * Validates that a field is a string or undefined
@@ -4172,32 +4256,46 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       const rawMetadata = await this.readJsonWithSizeLimit(response, OAuthProviderImpl.CIMD_MAX_SIZE_BYTES);
 
       const clientId = OAuthProviderImpl.validateStringField(rawMetadata.client_id, 'client_id');
+      const clientName = OAuthProviderImpl.validateStringField(rawMetadata.client_name, 'client_name');
       const redirectUris = OAuthProviderImpl.validateStringArray(rawMetadata.redirect_uris, 'redirect_uris');
-      const tokenEndpointAuthMethod = OAuthProviderImpl.validateStringField(
+      const declaredAuthMethod = OAuthProviderImpl.validateStringField(
         rawMetadata.token_endpoint_auth_method,
         'token_endpoint_auth_method'
       );
+      const authMethodChoices = OAuthProviderImpl.validateStringArray(
+        rawMetadata.token_endpoint_auth_methods_supported,
+        'token_endpoint_auth_methods_supported'
+      );
+      const tokenEndpointAuthMethod = declaredAuthMethod ?? (authMethodChoices?.includes('none') ? 'none' : undefined);
 
       // Validate that client_id matches the URL (required by spec)
       if (clientId !== metadataUrl) {
         throw new Error(`client_id "${clientId}" does not match metadata URL "${metadataUrl}"`);
       }
 
+      if (!clientName?.trim()) {
+        throw new Error('client_name is required and must not be empty');
+      }
+
       if (!redirectUris || redirectUris.length === 0) {
         throw new Error('redirect_uris is required and must not be empty');
       }
 
-      if (tokenEndpointAuthMethod && !OAuthProviderImpl.CIMD_ALLOWED_AUTH_METHODS.includes(tokenEndpointAuthMethod)) {
+      if (
+        (declaredAuthMethod && !OAuthProviderImpl.CIMD_ALLOWED_AUTH_METHODS.includes(declaredAuthMethod)) ||
+        (authMethodChoices &&
+          !authMethodChoices.some((method) => OAuthProviderImpl.CIMD_ALLOWED_AUTH_METHODS.includes(method)))
+      ) {
         throw new Error(
-          `token_endpoint_auth_method "${tokenEndpointAuthMethod}" is not allowed for CIMD clients. ` +
-            `Allowed methods: ${OAuthProviderImpl.CIMD_ALLOWED_AUTH_METHODS.join(', ')}`
+          `CIMD client does not support an accepted token endpoint authentication method. ` +
+            `Supported methods: ${OAuthProviderImpl.CIMD_ALLOWED_AUTH_METHODS.join(', ')}`
         );
       }
 
       return {
         clientId,
         redirectUris,
-        clientName: OAuthProviderImpl.validateStringField(rawMetadata.client_name, 'client_name'),
+        clientName,
         clientUri: OAuthProviderImpl.validateOptionalUriField(rawMetadata.client_uri, 'client_uri'),
         logoUri: OAuthProviderImpl.validateOptionalUriField(rawMetadata.logo_uri, 'logo_uri'),
         policyUri: OAuthProviderImpl.validateOptionalUriField(rawMetadata.policy_uri, 'policy_uri'),
@@ -4267,8 +4365,19 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   /**
    * Builds a WWW-Authenticate header value with resource_metadata per RFC 9728 §5.1
    */
-  private buildWwwAuthenticateHeader(resourceMetadataUrl: string, error: string, errorDescription?: string): string {
-    let header = `Bearer realm="OAuth", resource_metadata="${resourceMetadataUrl}", error="${error}"`;
+  private buildWwwAuthenticateHeader(
+    resourceMetadataUrl: string,
+    error?: string,
+    errorDescription?: string,
+    requiredScopes: string[] = []
+  ): string {
+    let header = `Bearer realm="OAuth", resource_metadata="${resourceMetadataUrl}"`;
+    if (error) {
+      header += `, error="${error}"`;
+    }
+    if (requiredScopes.length > 0) {
+      header += `, scope="${requiredScopes.join(' ')}"`;
+    }
     if (errorDescription) {
       header += `, error_description="${errorDescription}"`;
     }
@@ -4348,15 +4457,25 @@ export interface OAuthErrorOptions {
    * number of seconds or an HTTP-date.
    */
   headers?: Record<string, string>;
+
+  /**
+   * Minimum scopes needed for the protected resource operation.
+   *
+   * When `resolveExternalToken` throws a standard bearer-token error with
+   * HTTP 401 or 403, these values are serialized into the synthesized
+   * `WWW-Authenticate` challenge's `scope` parameter. This is especially
+   * useful for step-up authorization after `insufficient_scope`. Each value
+   * must use the OAuth scope-token grammar from RFC 6749 §3.3.
+   */
+  requiredScopes?: string[];
 }
 
 /**
  * Structured OAuth 2.0 error.
  *
- * Throw from a `tokenExchangeCallback` (or any code it calls — the error
- * propagates naturally up through deep call stacks) to surface a standard
- * `/token` error response (`{ error, error_description }`) instead of a
- * generic `500 Internal Server Error`.
+ * Throw from a `tokenExchangeCallback`, `resolveExternalToken`, or any code
+ * they call to surface a standard OAuth error response
+ * (`{ error, error_description }`) instead of a generic `500 Internal Server Error`.
  *
  * Anything thrown that is **not** an `OAuthError` continues to surface as
  * a 500 so unexpected failures remain visible — the provider does not
@@ -5018,6 +5137,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
     const state = url.searchParams.get('state') || '';
     const codeChallenge = url.searchParams.get('code_challenge') || undefined;
     const codeChallengeMethod = url.searchParams.get('code_challenge_method') || 'plain';
+    const issuer = this.provider.getAuthorizationServerIssuer(url);
     // RFC 8707 Section 2.1: Multiple resource parameters MAY be used
     const resourceParams = url.searchParams.getAll('resource');
     const resourceParam =
@@ -5050,6 +5170,9 @@ class OAuthHelpersImpl implements OAuthHelpers {
       if (!clientInfo) {
         throw new Error(`Invalid client. The clientId provided does not match to this client.`);
       }
+      if (responseType === 'code' && clientInfo.tokenEndpointAuthMethod === 'none' && !codeChallenge) {
+        throw new Error('Public clients must use PKCE with the authorization code flow.');
+      }
       // If client exists, validate the redirect URI against registered URIs
       if (clientInfo && redirectUri) {
         if (!isValidRedirectUri(redirectUri, clientInfo.redirectUris)) {
@@ -5069,6 +5192,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
       codeChallenge,
       codeChallengeMethod,
       resource,
+      issuer,
     };
   }
 
@@ -5202,6 +5326,9 @@ class OAuthHelpersImpl implements OAuthHelpers {
       if (options.request.state) {
         fragment.set('state', options.request.state);
       }
+      if (options.request.issuer) {
+        fragment.set('iss', options.request.issuer);
+      }
 
       // Set the fragment (hash) part of the URL
       redirectUrl.hash = fragment.toString();
@@ -5255,6 +5382,9 @@ class OAuthHelpersImpl implements OAuthHelpers {
       redirectUrl.searchParams.set('code', authCode);
       if (options.request.state) {
         redirectUrl.searchParams.set('state', options.request.state);
+      }
+      if (options.request.issuer) {
+        redirectUrl.searchParams.set('iss', options.request.issuer);
       }
 
       // Revoke old grants AFTER the new grant is successfully stored
