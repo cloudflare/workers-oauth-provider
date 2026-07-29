@@ -38,6 +38,7 @@ export type { EmaValidationError } from './ema/result';
 
 const PROTECTED_RESOURCE_WELL_KNOWN_PREFIX = '/.well-known/oauth-protected-resource';
 const NO_CACHE_HEADERS = { 'Cache-Control': 'no-store', Pragma: 'no-cache' } as const;
+const BASIC_AUTH_CHALLENGE = 'Basic realm="OAuth"';
 
 // Log CIMD status on module load
 const hasStrictlyPublicFetch =
@@ -166,8 +167,9 @@ export interface TokenExchangeCallbackResult {
   refreshTokenTTL?: number;
 
   /**
-   * List of scopes authorized for the new access token
-   * (If undefined, the granted scopes will be used)
+   * Optional scopes for the new access token. Values outside the scope ceiling
+   * for the current grant flow are ignored. If omitted, the effective requested
+   * scopes are used.
    */
   accessTokenScope?: string[];
 }
@@ -201,13 +203,12 @@ export interface TokenExchangeCallbackOptions {
   grantId: string;
 
   /**
-   * List of scopes that were granted
+   * List of scopes on the underlying authorization grant.
    */
   scope: string[];
 
   /**
-   * List of scopes that were requested for this token by the client
-   * (Will be the same as granted scopes unless client specifically requested a downscoping)
+   * Effective scopes selected for this token before applying the callback result.
    */
   requestedScope: string[];
 
@@ -459,8 +460,9 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
    * For example, if a request includes an authenticated token from a different OAuth authentication server,
    * the callback can be used to authenticate it and set the context props through it.
    *
-   * The callback can optionally return props values that will passed-through to the apiHandlers.
-   * The callback can return `null` to signal resolution failure.
+   * Return props to authenticate the request, or `null` for a generic `invalid_token` response.
+   * Throw this package's exported {@link OAuthError} to return a structured OAuth error response.
+   * Other thrown errors remain unexpected failures and are re-thrown.
    */
   resolveExternalToken?: (input: ResolveExternalTokenInput<Env>) => Promise<ResolveExternalTokenResult | null>;
 
@@ -474,6 +476,11 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
    * deliberately did NOT put on the wire — used for richer diagnostics where the public
    * response must stay generic (e.g. JWT validation failures on the EMA path). Backwards
    * compatible: existing callbacks ignoring this field continue to work unchanged.
+   *
+   * `request` (when present) is the HTTP request that produced the error response, so the
+   * callback can correlate the error with per-request state such as request-keyed telemetry.
+   * Currently populated for CIMD metadata fetch failures at the token endpoint. Backwards
+   * compatible in the same way as `internal`.
    */
   onError?: (error: {
     code: string;
@@ -481,6 +488,7 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
     status: number;
     headers: Record<string, string>;
     internal?: { category: string; reason: string; detail?: unknown };
+    request?: Request;
   }) => Response | void;
 
   /**
@@ -497,6 +505,7 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
    * with an origin-only resource (e.g. `https://server.com`) to be used with
    * path-aware resource requests (e.g. `https://server.com/mcp`), enabling seamless
    * migration from pre-0.4.0 versions that stored origin-only resource URIs.
+   * Explicit `resourceMetadata.resource` configuration always uses exact matching.
    *
    * Defaults to false (strict exact matching per RFC 8707).
    */
@@ -512,7 +521,11 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
   resourceMetadata?: {
     /**
      * The protected resource identifier URL (RFC 9728 `resource` field).
-     * If not set, defaults to the request URL's origin.
+     *
+     * Configuring this value pins authorization requests, token requests, and
+     * access-token audiences to this exact resource. If omitted, the provider
+     * accepts valid RFC 8707 resource indicators and uses the authorization
+     * request origin as the default when the client does not send one.
      */
     resource?: string;
     /**
@@ -550,13 +563,15 @@ export interface OAuthHelpers {
    * Parses an OAuth authorization request from the HTTP request
    * @param request - The HTTP request containing OAuth parameters
    * @returns The parsed authorization request parameters
+   * @throws {@link CimdFetchError} when the client ID is a CIMD URL whose document cannot be resolved
    */
   parseAuthRequest(request: Request): Promise<AuthRequest>;
 
   /**
    * Looks up a client by its client ID
    * @param clientId - The client ID to look up
-   * @returns A Promise resolving to the client info, or null if not found
+   * @returns A Promise resolving to the client info, or null if the client does not exist
+   * @throws {@link CimdFetchError} when the client ID is a CIMD URL whose document cannot be resolved
    */
   lookupClient(clientId: string): Promise<ClientInfo | null>;
 
@@ -564,6 +579,7 @@ export interface OAuthHelpers {
    * Completes an authorization request by creating a grant and authorization code
    * @param options - Options specifying the grant details
    * @returns A Promise resolving to an object containing the redirect URL
+   * @throws {@link CimdFetchError} when the client ID is a CIMD URL whose document cannot be resolved
    */
   completeAuthorization(options: CompleteAuthorizationOptions): Promise<{ redirectTo: string }>;
 
@@ -625,6 +641,7 @@ export interface OAuthHelpers {
    * Implements OAuth 2.0 Token Exchange (RFC 8693)
    * @param options - Options for token exchange including subject token and optional modifications
    * @returns Promise resolving to token response with new access token
+   * @throws {@link CimdFetchError} when the grant's client ID is a CIMD URL whose document cannot be resolved
    */
   exchangeToken(options: ExchangeTokenOptions): Promise<TokenResponse>;
 
@@ -656,7 +673,7 @@ export interface ExchangeTokenOptions {
   subjectToken: string;
 
   /**
-   * Optional narrowed set of scopes for the new token (must be subset of original grant scopes)
+   * Optional requested scopes for the new token. Issued scopes are limited to the subject token's scopes.
    */
   scope?: string[];
 
@@ -714,6 +731,12 @@ export interface AuthRequest {
    * Resource parameter indicating target resource(s) (RFC 8707)
    */
   resource?: string | string[];
+
+  /**
+   * Authorization server issuer recorded while parsing this request.
+   * Include it as `iss` in successful and error authorization responses.
+   */
+  issuer?: string;
 }
 
 /**
@@ -1416,6 +1439,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       );
     }
 
+    this.validateResourceMetadataOptions(this.options.resourceMetadata);
     this.validateEmaOptions(this.options.enterpriseManagedAuthorization);
 
     if (this.options.enterpriseManagedAuthorization) {
@@ -1469,6 +1493,40 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     throw new TypeError(
       `${name} must be either an ExportedHandler object with a fetch method or a class extending WorkerEntrypoint`
     );
+  }
+
+  /** Validate configured RFC 9728 protected resource metadata. */
+  private validateResourceMetadataOptions(options: OAuthProviderOptions<Env>['resourceMetadata']): void {
+    if (!options) return;
+
+    if (options.resource && !validateResourceUri(options.resource)) {
+      throw new TypeError('resourceMetadata.resource must be an absolute HTTP(S) URI without a fragment');
+    }
+
+    if (options.authorization_servers !== undefined) {
+      if (options.authorization_servers.length === 0) {
+        throw new TypeError('resourceMetadata.authorization_servers must contain at least one issuer');
+      }
+      for (const issuer of options.authorization_servers) {
+        let parsed: URL;
+        try {
+          parsed = new URL(issuer);
+        } catch {
+          throw new TypeError('resourceMetadata.authorization_servers must contain valid HTTPS issuer URLs');
+        }
+        if (parsed.protocol !== 'https:' || parsed.search || parsed.hash) {
+          throw new TypeError('resourceMetadata.authorization_servers must contain valid HTTPS issuer URLs');
+        }
+      }
+    }
+
+    if (options.scopes_supported?.some((scope) => !isValidOAuthScopeToken(scope))) {
+      throw new TypeError('resourceMetadata.scopes_supported must contain valid OAuth scope tokens');
+    }
+
+    if (options.bearer_methods_supported?.some((method) => method !== 'header')) {
+      throw new TypeError("resourceMetadata.bearer_methods_supported only supports 'header'");
+    }
   }
 
   /**
@@ -1734,6 +1792,24 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     return `${requestUrl.origin}${suffix}`;
   }
 
+  private createInvalidClientResponse(
+    description: string,
+    basicAuthenticationAttempted: boolean,
+    internal?: { category: string; reason: string; detail?: unknown },
+    request?: Request
+  ): Response {
+    return this.createErrorResponse(
+      'invalid_client',
+      {
+        description,
+        statusCode: 401,
+        ...(basicAuthenticationAttempted ? { headers: { 'WWW-Authenticate': BASIC_AUTH_CHALLENGE } } : {}),
+      },
+      internal,
+      request
+    );
+  }
+
   /**
    * Parses and validates a token endpoint request (used for both token exchange and revocation)
    * @param request - The HTTP request to parse
@@ -1801,12 +1877,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       body[key] = allValues.length > 1 ? allValues : value;
     }
 
-    // Get client ID from request
-    const authHeader = request.headers.get('Authorization');
+    // Get client credentials from HTTP Basic auth or form parameters.
+    const basicAuthorization = parseBasicAuthorizationHeader(request.headers.get('Authorization'));
+    const basicAuthenticationAttempted = basicAuthorization.kind !== 'not-basic';
     let clientId = '';
     let clientSecret = '';
 
-    if (authHeader && authHeader.startsWith('Basic ')) {
+    if (basicAuthenticationAttempted) {
       if (body.client_id || body.client_secret) {
         return this.createErrorResponse('invalid_request', {
           description: 'Client must not use multiple authentication methods',
@@ -1814,34 +1891,50 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         });
       }
 
-      // Basic auth
-      const credentials = atob(authHeader.substring(6));
-      const separatorIndex = credentials.indexOf(':');
-      if (separatorIndex === -1) {
-        return this.createErrorResponse('invalid_client', {
-          description: 'Client authentication failed: invalid Basic credentials',
-          statusCode: 401,
-        });
+      if (basicAuthorization.kind === 'malformed') {
+        return this.createInvalidClientResponse(
+          'Client authentication failed: invalid Basic credentials',
+          basicAuthenticationAttempted
+        );
       }
 
-      const id = credentials.substring(0, separatorIndex);
-      const secret = credentials.substring(separatorIndex + 1);
-      clientId = decodeFormUrlEncodedComponent(id);
-      clientSecret = decodeFormUrlEncodedComponent(secret);
+      clientId = basicAuthorization.clientId;
+      clientSecret = basicAuthorization.clientSecret;
     } else {
-      // Form parameters
       clientId = body.client_id;
       clientSecret = body.client_secret || '';
     }
 
     if (!clientId) {
-      return this.createErrorResponse('invalid_client', { description: 'Client ID is required', statusCode: 401 });
+      return this.createInvalidClientResponse('Client ID is required', basicAuthenticationAttempted);
     }
 
     // Verify client exists
-    const clientInfo = await this.getClient(env, clientId);
+    let clientInfo: ClientInfo | null;
+    try {
+      clientInfo = await this.getClient(env, clientId);
+    } catch (error) {
+      if (error instanceof CimdFetchError) {
+        // Same wire response as an unknown client — the CIMD spec prescribes no
+        // error body for metadata fetch failures — but the deployer's onError
+        // hook receives a stable reason and diagnostic details, so an upstream
+        // outage blocking the metadata URL is observable instead of masquerading
+        // as an unregistered client.
+        return this.createInvalidClientResponse(
+          'Client not found',
+          basicAuthenticationAttempted,
+          {
+            category: 'client-id-metadata-document',
+            reason: error.reason,
+            detail: { metadataUrl: error.metadataUrl, message: error.detail },
+          },
+          request
+        );
+      }
+      throw error;
+    }
     if (!clientInfo) {
-      return this.createErrorResponse('invalid_client', { description: 'Client not found', statusCode: 401 });
+      return this.createInvalidClientResponse('Client not found', basicAuthenticationAttempted);
     }
 
     // Determine authentication requirements based on token endpoint auth method
@@ -1850,26 +1943,26 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // For confidential clients, validate the secret
     if (!isPublicClient) {
       if (!clientSecret) {
-        return this.createErrorResponse('invalid_client', {
-          description: 'Client authentication failed: missing client_secret',
-          statusCode: 401,
-        });
+        return this.createInvalidClientResponse(
+          'Client authentication failed: missing client_secret',
+          basicAuthenticationAttempted
+        );
       }
 
       // Verify the client secret matches
       if (!clientInfo.clientSecret) {
-        return this.createErrorResponse('invalid_client', {
-          description: 'Client authentication failed: client has no registered secret',
-          statusCode: 401,
-        });
+        return this.createInvalidClientResponse(
+          'Client authentication failed: client has no registered secret',
+          basicAuthenticationAttempted
+        );
       }
 
       const providedSecretHash = await hashSecret(clientSecret);
       if (providedSecretHash !== clientInfo.clientSecret) {
-        return this.createErrorResponse('invalid_client', {
-          description: 'Client authentication failed: invalid client_secret',
-          statusCode: 401,
-        });
+        return this.createInvalidClientResponse(
+          'Client authentication failed: invalid client_secret',
+          basicAuthenticationAttempted
+        );
       }
     }
 
@@ -1955,7 +2048,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   /**
    * Gets the authorization server issuer using the same derivation as RFC 8414 metadata.
    */
-  private getAuthorizationServerIssuer(requestUrl: URL): string {
+  getAuthorizationServerIssuer(requestUrl: URL): string {
     const tokenEndpoint = this.getFullEndpointUrl(this.options.tokenEndpoint, requestUrl);
     return new URL(tokenEndpoint).origin;
   }
@@ -1984,6 +2077,20 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     newResponse.headers.set('Access-Control-Allow-Methods', '*');
     // Include Authorization explicitly since it's not included in * for security reasons
     newResponse.headers.set('Access-Control-Allow-Headers', 'Authorization, *');
+
+    // Browser-based OAuth/MCP clients need these non-safelisted response
+    // headers for authorization discovery, step-up challenges, and backoff.
+    // Preserve any headers the API handler already chose to expose.
+    const exposedHeaders = (newResponse.headers.get('Access-Control-Expose-Headers') ?? '')
+      .split(',')
+      .map((name) => name.trim())
+      .filter(Boolean);
+    for (const requiredHeader of ['WWW-Authenticate', 'Retry-After']) {
+      if (!exposedHeaders.some((name) => name.toLowerCase() === requiredHeader.toLowerCase())) {
+        exposedHeaders.push(requiredHeader);
+      }
+    }
+    newResponse.headers.set('Access-Control-Expose-Headers', exposedHeaders.join(', '));
     newResponse.headers.set('Access-Control-Max-Age', '86400'); // 24 hours
 
     return newResponse;
@@ -2052,6 +2159,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       // not implemented: introspection_endpoint_auth_methods_supported
       // not implemented: introspection_endpoint_auth_signing_alg_values_supported
       code_challenge_methods_supported: this.options.allowPlainPKCE !== false ? ['plain', 'S256'] : ['S256'], // PKCE support
+      authorization_response_iss_parameter_supported: true,
       // MCP Client ID Metadata Document support (CIMD)
       // Only enabled when global_fetch_strictly_public compat flag is set (for SSRF protection)
       client_id_metadata_document_supported:
@@ -2134,18 +2242,42 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   }
 
   /**
-   * Build a structured OAuth `/token` error response from an OAuth error.
+   * Build a structured OAuth error response from an OAuth error.
    *
    * The supported form is throwing this package's exported `OAuthError`.
    * Anything else is re-thrown so unexpected failures still surface as 500s.
    *
+   * When handling a protected resource request, standard bearer-token errors
+   * receive an RFC 6750 / RFC 9728 challenge unless the caller supplied one.
    * Use `headers['Retry-After']` for rate-limit / transient-failure backoff
    * hints (see RFC 7231 §7.1.3 — either an integer seconds value or an
    * HTTP-date is allowed).
    */
-  private createOAuthErrorResponse(error: unknown): Response | undefined {
+  private createOAuthErrorResponse(error: unknown, resourceMetadataUrl?: string): Response | undefined {
     if (!(error instanceof OAuthError)) return undefined;
-    return this.createErrorResponse(error.code, error.options);
+
+    const headers = error.options.headers ?? {};
+    const hasChallenge = Object.keys(headers).some((name) => name.toLowerCase() === 'www-authenticate');
+    const isBearerError =
+      (error.code === 'invalid_token' && error.statusCode === 401) ||
+      (error.code === 'insufficient_scope' && error.statusCode === 403);
+
+    let challengeHeaders: Record<string, string> | undefined;
+    if (resourceMetadataUrl && isBearerError && !hasChallenge) {
+      const requiredScopes = [...new Set(error.options.requiredScopes ?? [])];
+      if (requiredScopes.some((scope) => !isValidOAuthScopeToken(scope))) {
+        throw new TypeError('OAuthError requiredScopes must contain valid OAuth scope tokens');
+      }
+      challengeHeaders = {
+        ...headers,
+        'WWW-Authenticate': this.buildWwwAuthenticateHeader(resourceMetadataUrl, error.code, undefined, requiredScopes),
+      };
+    }
+
+    return this.createErrorResponse(error.code, {
+      ...error.options,
+      ...(challengeHeaders ? { headers: challengeHeaders } : {}),
+    });
   }
 
   /**
@@ -2261,31 +2393,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       }
     }
 
-    // Parse and validate the resource parameter before exchanging the authorization code (RFC 8707)
-    // Validate downscoping: token request resources must be a subset of grant resources
-    const originOnly = !!this.options.resourceMatchOriginOnly;
-    if (body.resource && grantData.resource) {
-      const requestedResources = Array.isArray(body.resource) ? body.resource : [body.resource];
-      const grantedResources = Array.isArray(grantData.resource) ? grantData.resource : [grantData.resource];
-
-      // Check that all requested resources are in the granted resources
-      for (const requested of requestedResources) {
-        if (!grantedResources.some((granted) => resourceMatches(requested, granted, originOnly))) {
-          return this.createErrorResponse('invalid_target', {
-            description: 'Requested resource was not included in the authorization request',
-          });
-        }
-      }
-    }
-
-    // Use resource from token request if provided, otherwise use resource from grant
-    const audience = parseResourceParameter(body.resource || grantData.resource);
-    if ((body.resource || grantData.resource) && !audience) {
-      // RFC 8707 Section 2: invalid or unacceptable resource
-      return this.createErrorResponse('invalid_target', {
-        description: 'The resource parameter must be a valid absolute URI without a fragment',
-      });
-    }
+    // Resolve the token audience before consuming the authorization code.
+    const audience = this.resolveTokenResource(body.resource, grantData.resource);
 
     // Define the access token TTL, may be updated by callback if provided
     let accessTokenTTL = this.options.accessTokenTTL!;
@@ -2509,6 +2618,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       }
     }
 
+    // Resolve the token audience before callbacks, rotation, or storage writes.
+    const audience = this.resolveTokenResource(body.resource, grantData.resource);
+
     // Generate new access token with embedded user and grant IDs
     const accessTokenSecret = generateRandomString(TOKEN_LENGTH);
     const newAccessToken = `${userId}:${grantId}:${accessTokenSecret}`;
@@ -2688,32 +2800,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Save the updated grant with TTL if applicable
     await this.saveGrantWithTTL(env, grantKey, grantData, now);
 
-    // Parse and validate resource parameter (RFC 8707)
-    // Validate downscoping: token request resources must be subset of grant resources
-    const originOnly = !!this.options.resourceMatchOriginOnly;
-    if (body.resource && grantData.resource) {
-      const requestedResources = Array.isArray(body.resource) ? body.resource : [body.resource];
-      const grantedResources = Array.isArray(grantData.resource) ? grantData.resource : [grantData.resource];
-
-      // Check that all requested resources are in the granted resources
-      for (const requested of requestedResources) {
-        if (!grantedResources.some((granted) => resourceMatches(requested, granted, originOnly))) {
-          return this.createErrorResponse('invalid_target', {
-            description: 'Requested resource was not included in the authorization request',
-          });
-        }
-      }
-    }
-
-    // Use resource from token request if provided, otherwise use resource from grant
-    const audience = parseResourceParameter(body.resource || grantData.resource);
-    if ((body.resource || grantData.resource) && !audience) {
-      // RFC 8707 Section 2.1: invalid or unacceptable resource
-      return this.createErrorResponse('invalid_target', {
-        description: 'The resource parameter must be a valid absolute URI without a fragment',
-      });
-    }
-
     // Store new access token with denormalized grant information
     const accessTokenData: Token = {
       id: accessTokenId,
@@ -2768,7 +2854,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * `OAuthProviderImpl` is not exposed outside this module, this is still effectively
    * module-private.
    * @param subjectToken - The subject token to exchange
-   * @param requestedScopes - Optional narrowed scopes (must be subset of original)
+   * @param requestedScopes - Optional requested scopes, limited to the subject token's scopes
    * @param requestedResource - Optional resource/audience (must be subset of original if original had resource)
    * @param expiresIn - Optional TTL override in seconds
    * @param clientInfo - The client making the exchange request
@@ -2797,37 +2883,16 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       throw new OAuthError('invalid_grant', { description: 'Grant not found' });
     }
 
-    // If scopes are requested, validate they are a subset of the original grant scopes
-    let tokenScopes: string[] = this.downscope(requestedScopes, grantData.scope);
+    // An exchanged token inherits the subject token's scopes unless a narrower subset is requested.
+    let tokenScopes: string[] = this.downscope(requestedScopes, tokenSummary.scope);
 
-    // Parse and validate resource parameter (RFC 8707) if provided
-    const originOnly = !!this.options.resourceMatchOriginOnly;
-    let newAudience: string | string[] | undefined = tokenSummary.audience;
-    if (requestedResource) {
-      // Validate downscoping: requested resources must be subset of grant resources if grant had resources
-      if (grantData.resource) {
-        const requestedResources = Array.isArray(requestedResource) ? requestedResource : [requestedResource];
-        const grantedResources = Array.isArray(grantData.resource) ? grantData.resource : [grantData.resource];
-
-        // Check that all requested resources are in the granted resources
-        for (const requested of requestedResources) {
-          if (!grantedResources.some((granted) => resourceMatches(requested, granted, originOnly))) {
-            throw new OAuthError('invalid_target', {
-              description: 'Requested resource was not included in the authorization request',
-            });
-          }
-        }
-      }
-
-      // Parse and validate the resource parameter
-      const parsedResource = parseResourceParameter(requestedResource);
-      if (!parsedResource) {
-        throw new OAuthError('invalid_target', {
-          description: 'The resource parameter must be a valid absolute URI without a fragment',
-        });
-      }
-      newAudience = parsedResource;
+    const configuredResource = this.options.resourceMetadata?.resource;
+    if (configuredResource && !isExactResource(tokenSummary.audience, configuredResource)) {
+      throw new OAuthError('invalid_target', {
+        description: 'Subject token is not bound to the configured resource',
+      });
     }
+    const newAudience = this.resolveTokenResource(requestedResource, grantData.resource);
 
     // Determine TTL for new token
     const now = Math.floor(Date.now() / 1000);
@@ -2915,9 +2980,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
           accessTokenEncryptionKey = tokenResult.key;
         }
 
-        // If accessTokenScope was specified, use it for this token
+        // If accessTokenScope was specified, use it for this token while preserving
+        // the subject token as the upper bound.
         if (callbackResult.accessTokenScope) {
-          tokenScopes = this.downscope(callbackResult.accessTokenScope, grantData.scope);
+          tokenScopes = this.downscope(callbackResult.accessTokenScope, tokenSummary.scope);
         }
       }
     }
@@ -3657,15 +3723,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const authHeader = request.headers.get('Authorization');
 
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return this.createErrorResponse('invalid_token', {
-        description: 'Missing or invalid access token',
-        statusCode: 401,
+      // OAuth 2.1 §5.3.2: when authentication information is absent or uses an
+      // unsupported scheme, challenge without an error code or description.
+      return new Response(null, {
+        status: 401,
         headers: {
-          'WWW-Authenticate': this.buildWwwAuthenticateHeader(
-            resourceMetadataUrl,
-            'invalid_token',
-            'Missing or invalid access token'
-          ),
+          ...NO_CACHE_HEADERS,
+          'WWW-Authenticate': this.buildWwwAuthenticateHeader(resourceMetadataUrl),
         },
       });
     }
@@ -3698,6 +3762,17 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Internal token data was found in KV, so we check for expiration and set the context props
     if (tokenData) {
+      const configuredResource = this.options.resourceMetadata?.resource;
+      if (configuredResource && !isExactResource(tokenData.audience, configuredResource)) {
+        return this.createErrorResponse('invalid_token', {
+          description: 'Access token is not bound to the configured resource',
+          statusCode: 401,
+          headers: {
+            'WWW-Authenticate': this.buildWwwAuthenticateHeader(resourceMetadataUrl, 'invalid_token'),
+          },
+        });
+      }
+
       // Check if token is expired (should be auto-deleted by KV TTL, but double-check)
       const now = Math.floor(Date.now() / 1000);
       if (tokenData.expiresAt < now) {
@@ -3715,7 +3790,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       // 'aud' claim when this claim is present, then the JWT MUST be rejected."
       if (tokenData.audience) {
         const requestUrl = new URL(request.url);
-        const resourceServer = `${requestUrl.protocol}//${requestUrl.host}${requestUrl.pathname}`;
+        const resourceServer = `${requestUrl.protocol}//${requestUrl.host}${requestUrl.pathname}${requestUrl.search}`;
         const audiences = Array.isArray(tokenData.audience) ? tokenData.audience : [tokenData.audience];
 
         // Check if any audience matches (RFC 3986: case-insensitive hostname comparison)
@@ -3744,8 +3819,17 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       // Set the decrypted props on the context object
       (ctx as MutableExecutionContext).props = decryptedProps;
     } else if (this.options.resolveExternalToken) {
-      // No token data was found, so we validate the provided token with the provided validator
-      const ext = await this.options.resolveExternalToken({ token: accessToken, request, env });
+      // No token data was found, so we validate the provided token with the provided validator.
+      // Convert only the package's exported OAuthError into a structured response;
+      // unexpected callback failures remain visible as 500s.
+      let ext: ResolveExternalTokenResult | null;
+      try {
+        ext = await this.options.resolveExternalToken({ token: accessToken, request, env });
+      } catch (error) {
+        const response = this.createOAuthErrorResponse(error, resourceMetadataUrl);
+        if (response) return response;
+        throw error;
+      }
 
       // Failed external validation
       if (!ext) {
@@ -3758,10 +3842,21 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         });
       }
 
+      const configuredResource = this.options.resourceMetadata?.resource;
+      if (configuredResource && !isExactResource(ext.audience, configuredResource)) {
+        return this.createErrorResponse('invalid_token', {
+          description: 'External access token is not bound to the configured resource',
+          statusCode: 401,
+          headers: {
+            'WWW-Authenticate': this.buildWwwAuthenticateHeader(resourceMetadataUrl, 'invalid_token'),
+          },
+        });
+      }
+
       // Validate that tokens were issued specifically for them
       if (ext.audience) {
         const requestUrl = new URL(request.url);
-        const resourceServer = `${requestUrl.protocol}//${requestUrl.host}${requestUrl.pathname}`;
+        const resourceServer = `${requestUrl.protocol}//${requestUrl.host}${requestUrl.pathname}${requestUrl.search}`;
         const audiences = Array.isArray(ext.audience) ? ext.audience : [ext.audience];
 
         // Check if any audience matches (RFC 3986: case-insensitive hostname comparison)
@@ -3878,7 +3973,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    *
    * @param env - Cloudflare Worker environment variables
    * @param clientId - The client ID to look up (can be a regular ID or an HTTPS URL for CIMD)
-   * @returns The client information, or null if not found
+   * @returns The client information, or null if the client does not exist. Null means
+   * definitive absence; failures to determine the answer throw instead (KV errors
+   * propagate, and a CIMD metadata fetch failure throws `CimdFetchError`), so an
+   * upstream outage is distinguishable from an unregistered client.
    */
   async getClient(env: Env & ProviderEnv, clientId: string): Promise<ClientInfo | null> {
     // Check if this is a CIMD (Client ID Metadata Document) URL
@@ -3895,15 +3993,71 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         return await this.fetchClientMetadataDocument(clientId);
       } catch (error) {
         // CIMD fetch failed (size limit, timeout, HTTP error, invalid metadata, etc.)
-        // Return null so callers treat this as "client not found" instead of a 500
+        // Throw a tagged error rather than returning null: KV-backed lookups
+        // already let infrastructure failures propagate, and conflating a fetch
+        // failure with "client not found" hides upstream outages from deployers
+        // (e.g. a WAF blocking the metadata URL reads as an unregistered client).
         console.warn(`CIMD fetch failed for ${clientId}:`, error instanceof Error ? error.message : error);
-        return null;
+        throw new CimdFetchError(clientId, error);
       }
     }
 
     // Standard KV lookup
     const clientKey = `client:${clientId}`;
     return env.OAUTH_KV.get(clientKey, { type: 'json' });
+  }
+
+  /**
+   * Resolves an access-token audience from a token request and its authorization grant.
+   * Explicit resource configuration requires one exact value in both places. Without
+   * configuration, RFC 8707 downscoping is allowed and omission inherits the grant.
+   */
+  private resolveTokenResource(
+    requestedResource: string | string[] | undefined,
+    grantedResource: string | string[] | undefined
+  ): string | string[] | undefined {
+    const requestedAudience = parseResourceParameter(requestedResource);
+    if (requestedResource && !requestedAudience) {
+      throw new OAuthError('invalid_target', {
+        description: 'The resource parameter must be a valid absolute URI without a fragment',
+      });
+    }
+    const grantedAudience = parseResourceParameter(grantedResource);
+    if (grantedResource && !grantedAudience) {
+      throw new OAuthError('invalid_target', {
+        description: 'The authorization grant contains an invalid resource',
+      });
+    }
+
+    const configuredResource = this.options.resourceMetadata?.resource;
+    if (
+      configuredResource &&
+      (!isExactResource(grantedResource, configuredResource) || !isExactResource(requestedResource, configuredResource))
+    ) {
+      throw new OAuthError('invalid_target', {
+        description: `The resource parameter must exactly match ${configuredResource}`,
+      });
+    }
+    if (!configuredResource && requestedResource && !grantedResource) {
+      throw new OAuthError('invalid_target', {
+        description: 'Requested resource was not included in the authorization request',
+      });
+    }
+
+    const originOnly = configuredResource ? false : !!this.options.resourceMatchOriginOnly;
+    if (requestedResource && grantedResource) {
+      const requestedResources = Array.isArray(requestedResource) ? requestedResource : [requestedResource];
+      const grantedResources = Array.isArray(grantedResource) ? grantedResource : [grantedResource];
+      for (const requested of requestedResources) {
+        if (!grantedResources.some((granted) => resourceMatches(requested, granted, originOnly))) {
+          throw new OAuthError('invalid_target', {
+            description: 'Requested resource was not included in the authorization request',
+          });
+        }
+      }
+    }
+
+    return requestedAudience ?? grantedAudience;
   }
 
   /**
@@ -3966,20 +4120,19 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   }
 
   /**
-   * Downscopes requested scopes to only include those that are in the grant
-   * Filters out any requested scopes that are not in the granted scopes
+   * Restricts requested scopes to the scopes available for the current flow.
+   * If no scope is requested, all available scopes are returned.
    * @param requestedScope - The scope parameter from the request (string or array)
-   * @param grantedScopes - The scopes that were granted in the authorization
-   * @returns The filtered scopes that are a subset of the granted scopes
+   * @param allowedScopes - The maximum scopes available for the current flow
+   * @returns The requested scopes that are included in the allowed scopes
    */
-  private downscope(requestedScope: string | string[] | undefined, grantedScopes: string[]): string[] {
-    if (!requestedScope) return grantedScopes;
+  private downscope(requestedScope: string | string[] | undefined, allowedScopes: string[]): string[] {
+    if (!requestedScope) return allowedScopes;
 
     const requestedScopes: string[] =
       typeof requestedScope === 'string' ? requestedScope.split(' ').filter(Boolean) : requestedScope;
 
-    // Filter out any requested scopes that are not in the grant
-    return requestedScopes.filter((scope: string) => grantedScopes.includes(scope));
+    return requestedScopes.filter((scope: string) => allowedScopes.includes(scope));
   }
 
   /**
@@ -4021,7 +4174,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * Allowed authentication methods for CIMD clients (per IETF spec)
    * CIMD clients cannot use symmetric secrets since there's no pre-shared secret
    */
-  private static readonly CIMD_ALLOWED_AUTH_METHODS = ['none', 'private_key_jwt'];
+  // private_key_jwt can be added once token-endpoint assertion validation is implemented.
+  // Accepting it in metadata before then creates clients that can authorize but never exchange a code.
+  private static readonly CIMD_ALLOWED_AUTH_METHODS = ['none'];
 
   /**
    * Validates that a field is a string or undefined
@@ -4184,32 +4339,46 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       const rawMetadata = await this.readJsonWithSizeLimit(response, OAuthProviderImpl.CIMD_MAX_SIZE_BYTES);
 
       const clientId = OAuthProviderImpl.validateStringField(rawMetadata.client_id, 'client_id');
+      const clientName = OAuthProviderImpl.validateStringField(rawMetadata.client_name, 'client_name');
       const redirectUris = OAuthProviderImpl.validateStringArray(rawMetadata.redirect_uris, 'redirect_uris');
-      const tokenEndpointAuthMethod = OAuthProviderImpl.validateStringField(
+      const declaredAuthMethod = OAuthProviderImpl.validateStringField(
         rawMetadata.token_endpoint_auth_method,
         'token_endpoint_auth_method'
       );
+      const authMethodChoices = OAuthProviderImpl.validateStringArray(
+        rawMetadata.token_endpoint_auth_methods_supported,
+        'token_endpoint_auth_methods_supported'
+      );
+      const tokenEndpointAuthMethod = declaredAuthMethod ?? (authMethodChoices?.includes('none') ? 'none' : undefined);
 
       // Validate that client_id matches the URL (required by spec)
       if (clientId !== metadataUrl) {
         throw new Error(`client_id "${clientId}" does not match metadata URL "${metadataUrl}"`);
       }
 
+      if (!clientName?.trim()) {
+        throw new Error('client_name is required and must not be empty');
+      }
+
       if (!redirectUris || redirectUris.length === 0) {
         throw new Error('redirect_uris is required and must not be empty');
       }
 
-      if (tokenEndpointAuthMethod && !OAuthProviderImpl.CIMD_ALLOWED_AUTH_METHODS.includes(tokenEndpointAuthMethod)) {
+      if (
+        (declaredAuthMethod && !OAuthProviderImpl.CIMD_ALLOWED_AUTH_METHODS.includes(declaredAuthMethod)) ||
+        (authMethodChoices &&
+          !authMethodChoices.some((method) => OAuthProviderImpl.CIMD_ALLOWED_AUTH_METHODS.includes(method)))
+      ) {
         throw new Error(
-          `token_endpoint_auth_method "${tokenEndpointAuthMethod}" is not allowed for CIMD clients. ` +
-            `Allowed methods: ${OAuthProviderImpl.CIMD_ALLOWED_AUTH_METHODS.join(', ')}`
+          `CIMD client does not support an accepted token endpoint authentication method. ` +
+            `Supported methods: ${OAuthProviderImpl.CIMD_ALLOWED_AUTH_METHODS.join(', ')}`
         );
       }
 
       return {
         clientId,
         redirectUris,
-        clientName: OAuthProviderImpl.validateStringField(rawMetadata.client_name, 'client_name'),
+        clientName,
         clientUri: OAuthProviderImpl.validateOptionalUriField(rawMetadata.client_uri, 'client_uri'),
         logoUri: OAuthProviderImpl.validateOptionalUriField(rawMetadata.logo_uri, 'logo_uri'),
         policyUri: OAuthProviderImpl.validateOptionalUriField(rawMetadata.policy_uri, 'policy_uri'),
@@ -4279,8 +4448,19 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   /**
    * Builds a WWW-Authenticate header value with resource_metadata per RFC 9728 §5.1
    */
-  private buildWwwAuthenticateHeader(resourceMetadataUrl: string, error: string, errorDescription?: string): string {
-    let header = `Bearer realm="OAuth", resource_metadata="${resourceMetadataUrl}", error="${error}"`;
+  private buildWwwAuthenticateHeader(
+    resourceMetadataUrl: string,
+    error?: string,
+    errorDescription?: string,
+    requiredScopes: string[] = []
+  ): string {
+    let header = `Bearer realm="OAuth", resource_metadata="${resourceMetadataUrl}"`;
+    if (error) {
+      header += `, error="${error}"`;
+    }
+    if (requiredScopes.length > 0) {
+      header += `, scope="${requiredScopes.join(' ')}"`;
+    }
     if (errorDescription) {
       header += `, error_description="${errorDescription}"`;
     }
@@ -4298,7 +4478,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   private createErrorResponse(
     code: string,
     options: OAuthErrorOptions,
-    internal?: { category: string; reason: string; detail?: unknown }
+    internal?: { category: string; reason: string; detail?: unknown },
+    request?: Request
   ): Response {
     const { description } = options;
     const responseStatus = options.statusCode ?? 400;
@@ -4314,6 +4495,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       status: responseStatus,
       headers: responseHeaders,
       ...(internal ? { internal } : {}),
+      ...(request ? { request } : {}),
     });
     if (customErrorResponse) return customErrorResponse;
 
@@ -4360,15 +4542,25 @@ export interface OAuthErrorOptions {
    * number of seconds or an HTTP-date.
    */
   headers?: Record<string, string>;
+
+  /**
+   * Minimum scopes needed for the protected resource operation.
+   *
+   * When `resolveExternalToken` throws a standard bearer-token error with
+   * HTTP 401 or 403, these values are serialized into the synthesized
+   * `WWW-Authenticate` challenge's `scope` parameter. This is especially
+   * useful for step-up authorization after `insufficient_scope`. Each value
+   * must use the OAuth scope-token grammar from RFC 6749 §3.3.
+   */
+  requiredScopes?: string[];
 }
 
 /**
  * Structured OAuth 2.0 error.
  *
- * Throw from a `tokenExchangeCallback` (or any code it calls — the error
- * propagates naturally up through deep call stacks) to surface a standard
- * `/token` error response (`{ error, error_description }`) instead of a
- * generic `500 Internal Server Error`.
+ * Throw from a `tokenExchangeCallback`, `resolveExternalToken`, or any code
+ * they call to surface a standard OAuth error response
+ * (`{ error, error_description }`) instead of a generic `500 Internal Server Error`.
  *
  * Anything thrown that is **not** an `OAuthError` continues to surface as
  * a 500 so unexpected failures remain visible — the provider does not
@@ -4422,6 +4614,44 @@ export class OAuthError extends Error {
     this.description = this.options.description;
     this.statusCode = this.options.statusCode;
     this.headers = this.options.headers;
+  }
+}
+
+/**
+ * Thrown when fetching a Client ID Metadata Document (CIMD) fails — the
+ * server-to-server fetch errored, timed out, or returned an invalid document.
+ * Distinct from a client that simply does not exist, which is reported as a
+ * null client lookup result.
+ *
+ * At the token endpoint the provider handles this itself: the wire response
+ * stays a generic `invalid_client` / "Client not found", and the failure is
+ * reported through the `onError` hook's `internal` field (category
+ * `client-id-metadata-document`) together with the originating `request`.
+ *
+ * `OAuthHelpers` methods that look up clients (`lookupClient`, and methods
+ * built on it such as `exchangeToken`) let this error propagate to the
+ * caller. Callers that previously relied on a `null` result for these
+ * failures should catch it to preserve their error contract.
+ */
+export class CimdFetchError extends Error {
+  /** Stable reason slug suitable for telemetry and control flow. */
+  public readonly reason = 'metadata_resolution_failed' as const;
+  /** The CIMD URL whose fetch or validation failed. */
+  public readonly metadataUrl: string;
+  /** The underlying failure message (e.g. "Failed to fetch client metadata: HTTP 403"). */
+  public readonly detail: string;
+
+  /**
+   * Creates an error for a failed CIMD fetch or validation.
+   * @param metadataUrl - The CIMD URL that could not be resolved
+   * @param cause - The underlying fetch or validation failure
+   */
+  constructor(metadataUrl: string, cause: unknown) {
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    super(`CIMD fetch failed for ${metadataUrl}: ${detail}`);
+    this.name = 'CimdFetchError';
+    this.metadataUrl = metadataUrl;
+    this.detail = detail;
   }
 }
 
@@ -4551,6 +4781,13 @@ function audienceMatches(resourceServerUrl: string, audienceValue: string): bool
       return false;
     }
 
+    // A query-bearing resource identifier names a more specific resource.
+    // Requests may add a query when the audience omits one, but must preserve
+    // the configured query when it is part of the audience.
+    if (audience.search && resource.search !== audience.search) {
+      return false;
+    }
+
     // Origin-only audience matches any path (backward compatibility)
     if (audience.pathname === '/' || audience.pathname === '') {
       return true;
@@ -4588,6 +4825,13 @@ function parseResourceParameter(value: string | string[] | undefined): string | 
   return value;
 }
 
+/** Whether a request or audience names one exact configured resource. */
+function isExactResource(value: string | string[] | undefined, configuredResource: string): boolean {
+  return (
+    value === configuredResource || (Array.isArray(value) && value.length === 1 && value[0] === configuredResource)
+  );
+}
+
 /**
  * Checks if a requested resource matches a granted resource.
  * When originOnly is true, compares only the origin (scheme + host + port),
@@ -4612,6 +4856,40 @@ export function resourceMatches(requested: string, granted: string, originOnly: 
 async function hashSecret(secret: string): Promise<string> {
   // Use the same approach as generateTokenId for consistency
   return generateTokenId(secret);
+}
+
+type BasicAuthorizationResult =
+  | { kind: 'not-basic' }
+  | { kind: 'malformed' }
+  | { kind: 'credentials'; clientId: string; clientSecret: string };
+
+/**
+ * Parses RFC 6749 HTTP Basic client credentials.
+ */
+function parseBasicAuthorizationHeader(header: string | null): BasicAuthorizationResult {
+  if (!header) return { kind: 'not-basic' };
+
+  const schemeEnd = header.search(/[ \t]/);
+  const scheme = schemeEnd === -1 ? header : header.slice(0, schemeEnd);
+  if (scheme.toLowerCase() !== 'basic') return { kind: 'not-basic' };
+
+  if (schemeEnd === -1) return { kind: 'malformed' };
+  const encodedCredentials = header.slice(schemeEnd).trim();
+  if (!encodedCredentials || /[ \t]/.test(encodedCredentials)) return { kind: 'malformed' };
+
+  try {
+    const credentials = atob(encodedCredentials);
+    const separatorIndex = credentials.indexOf(':');
+    if (separatorIndex === -1) return { kind: 'malformed' };
+
+    return {
+      kind: 'credentials',
+      clientId: decodeFormUrlEncodedComponent(credentials.slice(0, separatorIndex)),
+      clientSecret: decodeFormUrlEncodedComponent(credentials.slice(separatorIndex + 1)),
+    };
+  } catch {
+    return { kind: 'malformed' };
+  }
 }
 
 /**
@@ -5020,6 +5298,7 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
    * Parses an OAuth authorization request from the HTTP request
    * @param request - The HTTP request containing OAuth parameters
    * @returns The parsed authorization request parameters
+   * @throws CimdFetchError when the client ID is a CIMD URL whose document cannot be resolved
    */
   async parseAuthRequest(request: Request): Promise<AuthRequest> {
     const url = new URL(request.url);
@@ -5030,6 +5309,7 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
     const state = url.searchParams.get('state') || '';
     const codeChallenge = url.searchParams.get('code_challenge') || undefined;
     const codeChallengeMethod = url.searchParams.get('code_challenge_method') || 'plain';
+    const issuer = this.provider.getAuthorizationServerIssuer(url);
     // RFC 8707 Section 2.1: Multiple resource parameters MAY be used
     const resourceParams = url.searchParams.getAll('resource');
     const resourceParam =
@@ -5039,11 +5319,20 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
     // Using helper function that normalizes and checks in a case-insensitive manner
     validateRedirectUriScheme(redirectUri);
 
-    // Parse and validate resource parameter (RFC 8707)
-    const resource = parseResourceParameter(resourceParam);
+    // Parse and validate the resource parameter (RFC 8707). An explicitly
+    // configured resource is deployment policy and therefore requires one
+    // exact value. Without that policy, RFC 8707 §2.1 allows the authorization
+    // server to use a predefined default; the request origin is the safest
+    // interoperable default available to a co-located AS/RS deployment.
+    let resource = parseResourceParameter(resourceParam);
     if (resourceParam && !resource) {
       throw new Error('The resource parameter must be a valid absolute URI without a fragment');
     }
+    const configuredResource = this.provider.options.resourceMetadata?.resource;
+    if (configuredResource && !isExactResource(resource, configuredResource)) {
+      throw new Error(`The resource parameter must exactly match ${configuredResource}`);
+    }
+    resource ??= url.origin;
 
     // Check if implicit flow is requested but not allowed
     if (responseType === 'token' && !this.provider.options.allowImplicitFlow) {
@@ -5061,6 +5350,9 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
 
       if (!clientInfo) {
         throw new Error(`Invalid client. The clientId provided does not match to this client.`);
+      }
+      if (responseType === 'code' && clientInfo.tokenEndpointAuthMethod === 'none' && !codeChallenge) {
+        throw new Error('Public clients must use PKCE with the authorization code flow.');
       }
       // If client exists, validate the redirect URI against registered URIs
       if (clientInfo && redirectUri) {
@@ -5081,13 +5373,20 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
       codeChallenge,
       codeChallengeMethod,
       resource,
+      issuer,
     };
   }
 
   /**
    * Looks up a client by its client ID
    * @param clientId - The client ID to look up
-   * @returns A Promise resolving to the client info, or null if not found
+   * @returns A Promise resolving to the client info, or null if the client does not
+   * exist. Null means definitive absence; failures to determine the answer throw
+   * instead (KV errors propagate, and a CIMD metadata fetch failure throws
+   * `CimdFetchError`), so an upstream outage cannot masquerade as an unregistered
+   * client.
+   * @throws CimdFetchError when the client ID is a CIMD URL and fetching or
+   * validating the metadata document fails.
    */
   async lookupClient(clientId: string): Promise<ClientInfo | null> {
     return await this.provider.getClient(this.env, clientId);
@@ -5099,6 +5398,7 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
    * - For implicit flow: generating an access token directly
    * @param options - Options specifying the grant details
    * @returns A Promise resolving to an object containing the redirect URL
+   * @throws CimdFetchError when the client ID is a CIMD URL whose document cannot be resolved
    */
   async completeAuthorization(options: CompleteAuthorizationOptions): Promise<{ redirectTo: string }> {
     const { clientId, redirectUri } = options.request;
@@ -5114,6 +5414,18 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
         'Invalid redirect URI. The redirect URI provided does not match any registered URI for this client.'
       );
     }
+
+    // completeAuthorization() is a public helper and callers can pass a
+    // reconstructed AuthRequest rather than one returned directly by
+    // parseAuthRequest(). Re-apply configured resource policy here before
+    // creating any grant. For an unconfigured provider, retain the parsed
+    // resource or use the recorded authorization-server origin as the RFC 8707
+    // default when available.
+    const configuredResource = this.provider.options.resourceMetadata?.resource;
+    if (configuredResource && !isExactResource(options.request.resource, configuredResource)) {
+      throw new Error(`The resource parameter must exactly match ${configuredResource}`);
+    }
+    const effectiveResource = options.request.resource ?? options.request.issuer;
 
     // If requested, collect existing grants for this user+client to revoke AFTER the new grant is created.
     // This avoids a data-loss window where the user has no grants if creation fails.
@@ -5158,8 +5470,8 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
       const accessTokenWrappedKey = await wrapKeyWithToken(accessToken, encryptionKey);
 
       // Parse and validate resource parameter (RFC 8707) for implicit flow
-      const audience = parseResourceParameter(options.request.resource);
-      if (options.request.resource && !audience) {
+      const audience = parseResourceParameter(effectiveResource);
+      if (effectiveResource && !audience) {
         throw new Error('The resource parameter must be a valid absolute URI without a fragment');
       }
 
@@ -5172,7 +5484,7 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
         metadata: options.metadata,
         encryptedProps: encryptedData,
         createdAt: now,
-        resource: options.request.resource,
+        resource: effectiveResource,
       };
 
       // Store the grant with a key that includes the user ID
@@ -5214,6 +5526,9 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
       if (options.request.state) {
         fragment.set('state', options.request.state);
       }
+      if (options.request.issuer) {
+        fragment.set('iss', options.request.issuer);
+      }
 
       // Set the fragment (hash) part of the URL
       redirectUrl.hash = fragment.toString();
@@ -5252,7 +5567,7 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
         // Store PKCE parameters if provided
         codeChallenge: options.request.codeChallenge,
         codeChallengeMethod: options.request.codeChallengeMethod,
-        resource: options.request.resource,
+        resource: effectiveResource,
       };
 
       // Store the grant with a key that includes the user ID
@@ -5267,6 +5582,9 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
       redirectUrl.searchParams.set('code', authCode);
       if (options.request.state) {
         redirectUrl.searchParams.set('state', options.request.state);
+      }
+      if (options.request.issuer) {
+        redirectUrl.searchParams.set('iss', options.request.issuer);
       }
 
       // Revoke old grants AFTER the new grant is successfully stored
@@ -5596,6 +5914,7 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
    * Implements OAuth 2.0 Token Exchange (RFC 8693)
    * @param options - Options for token exchange including subject token and optional modifications
    * @returns Promise resolving to token response with new access token
+   * @throws CimdFetchError when the grant's client ID is a CIMD URL whose document cannot be resolved
    */
   async exchangeToken(options: ExchangeTokenOptions): Promise<TokenResponse> {
     // Validate subject token first to get client info
