@@ -6405,6 +6405,57 @@ describe('OAuthProvider', () => {
       expect(refreshedTokens.access_token).toBeDefined();
     });
 
+    it('should reject an invalid refresh resource without rotating or mutating the grant', async () => {
+      const { clientId, clientSecret, code, redirectUri } = await registerClientAndGetCode(
+        originMatchingProvider,
+        'https://api1.example.com'
+      );
+      const exchangeParams = new URLSearchParams({
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: redirectUri,
+        client_id: clientId,
+        client_secret: clientSecret,
+        resource: 'https://api1.example.com',
+      });
+      const tokenResponse = await originMatchingProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          exchangeParams.toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+      const tokens = await tokenResponse.json<any>();
+      const grantKey = (await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys[0].name;
+      const grantBefore = await mockEnv.OAUTH_KV.get(grantKey);
+      const refreshParams = new URLSearchParams({
+        grant_type: 'refresh_token',
+        refresh_token: tokens.refresh_token,
+        client_id: clientId,
+        client_secret: clientSecret,
+        resource: 'https://evil.example.com/mcp',
+      });
+
+      const response = await originMatchingProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          refreshParams.toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+
+      expect(response.status).toBe(400);
+      await expect(response.json()).resolves.toMatchObject({ error: 'invalid_target' });
+      expect(await mockEnv.OAUTH_KV.get(grantKey)).toBe(grantBefore);
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'token:' })).keys).toHaveLength(1);
+    });
+
     it('should still reject different origins even with resourceMatchOriginOnly enabled', async () => {
       const { clientId, clientSecret, code, redirectUri } = await registerClientAndGetCode(
         originMatchingProvider,

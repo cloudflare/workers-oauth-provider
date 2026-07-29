@@ -2570,6 +2570,26 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       }
     }
 
+    // Validate the requested resource before callbacks, token rotation, or storage writes.
+    const originOnly = !!this.options.resourceMatchOriginOnly;
+    if (body.resource && grantData.resource) {
+      const requestedResources = Array.isArray(body.resource) ? body.resource : [body.resource];
+      const grantedResources = Array.isArray(grantData.resource) ? grantData.resource : [grantData.resource];
+      for (const requested of requestedResources) {
+        if (!grantedResources.some((granted) => resourceMatches(requested, granted, originOnly))) {
+          return this.createErrorResponse('invalid_target', {
+            description: 'Requested resource was not included in the authorization request',
+          });
+        }
+      }
+    }
+    const audience = parseResourceParameter(body.resource || grantData.resource);
+    if ((body.resource || grantData.resource) && !audience) {
+      return this.createErrorResponse('invalid_target', {
+        description: 'The resource parameter must be a valid absolute URI without a fragment',
+      });
+    }
+
     // Generate new access token with embedded user and grant IDs
     const accessTokenSecret = generateRandomString(TOKEN_LENGTH);
     const newAccessToken = `${userId}:${grantId}:${accessTokenSecret}`;
@@ -2748,32 +2768,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Save the updated grant with TTL if applicable
     await this.saveGrantWithTTL(env, grantKey, grantData, now);
-
-    // Parse and validate resource parameter (RFC 8707)
-    // Validate downscoping: token request resources must be subset of grant resources
-    const originOnly = !!this.options.resourceMatchOriginOnly;
-    if (body.resource && grantData.resource) {
-      const requestedResources = Array.isArray(body.resource) ? body.resource : [body.resource];
-      const grantedResources = Array.isArray(grantData.resource) ? grantData.resource : [grantData.resource];
-
-      // Check that all requested resources are in the granted resources
-      for (const requested of requestedResources) {
-        if (!grantedResources.some((granted) => resourceMatches(requested, granted, originOnly))) {
-          return this.createErrorResponse('invalid_target', {
-            description: 'Requested resource was not included in the authorization request',
-          });
-        }
-      }
-    }
-
-    // Use resource from token request if provided, otherwise use resource from grant
-    const audience = parseResourceParameter(body.resource || grantData.resource);
-    if ((body.resource || grantData.resource) && !audience) {
-      // RFC 8707 Section 2.1: invalid or unacceptable resource
-      return this.createErrorResponse('invalid_target', {
-        description: 'The resource parameter must be a valid absolute URI without a fragment',
-      });
-    }
 
     // Store new access token with denormalized grant information
     const accessTokenData: Token = {
