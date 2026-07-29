@@ -527,13 +527,20 @@ Call it repeatedly via a cron trigger — deleted records disappear from KV, so 
 
 ## Protected Resource Metadata (RFC 9728)
 
-The library automatically serves a `/.well-known/oauth-protected-resource` endpoint. By default, it uses the request origin as the resource identifier and the token endpoint's origin as the authorization server. You can customize this with the `resourceMetadata` option:
+The library automatically serves a `/.well-known/oauth-protected-resource` endpoint. By default, it derives the resource identifier from the metadata request and the authorization server from the token endpoint.
+
+Resource policy follows the configuration:
+
+- When `resourceMetadata.resource` is configured, authorization requests and token requests must contain that one exact resource. Issued and externally resolved access tokens must have that exact audience.
+- Without an explicitly configured resource, valid RFC 8707 resource indicators are accepted. Token and refresh requests may omit `resource` and inherit it from the authorization grant. If the authorization request also omits it, the provider uses the request origin as the RFC 8707 default and issues an origin-bound token.
+
+The origin default is suitable for a co-located authorization server and resource server. Split deployments and deployments that require path-level audience isolation should configure the canonical protected resource explicitly:
 
 ```ts
 new OAuthProvider({
   // ... other options ...
   resourceMetadata: {
-    resource: 'https://api.example.com',
+    resource: 'https://api.example.com/mcp',
     authorization_servers: ['https://auth.example.com'],
     scopes_supported: ['read', 'write'],
     bearer_methods_supported: ['header'],

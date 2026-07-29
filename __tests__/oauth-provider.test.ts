@@ -5576,12 +5576,20 @@ describe('OAuthProvider', () => {
       const clientSecret = client.client_secret;
       const redirectUri = 'https://client.example.com/callback';
 
-      // Get an auth code
-      const authRequest = createMockRequest(
-        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
-          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-          `&scope=read%20write&state=xyz123`
-      );
+      // Get an auth code for the same resource set that will be requested at
+      // the token endpoint. RFC 8707 does not allow a token request to add a
+      // resource that was absent from the authorization grant.
+      const authorizationUrl = new URL('https://example.com/authorize');
+      authorizationUrl.searchParams.set('response_type', 'code');
+      authorizationUrl.searchParams.set('client_id', clientId);
+      authorizationUrl.searchParams.set('redirect_uri', redirectUri);
+      authorizationUrl.searchParams.set('scope', 'read write');
+      authorizationUrl.searchParams.set('state', 'xyz123');
+      if (resource !== undefined) {
+        const resources = Array.isArray(resource) ? resource : [resource];
+        resources.forEach((value) => authorizationUrl.searchParams.append('resource', value));
+      }
+      const authRequest = createMockRequest(authorizationUrl.toString());
 
       const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
       const location = authResponse.headers.get('Location')!;
@@ -5676,7 +5684,7 @@ describe('OAuthProvider', () => {
       expect(api3Error.error).toBe('invalid_token');
     });
 
-    it('should accept token without audience claim (backward compatibility)', async () => {
+    it('should accept the origin audience default when the client omits resource', async () => {
       const accessToken = await getAccessTokenWithResource(undefined);
 
       const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
@@ -6236,6 +6244,22 @@ describe('OAuthProvider', () => {
       expect(data.success).toBe(true);
     });
 
+    it('should preserve a query component that is part of the audience', async () => {
+      const accessToken = await getAccessTokenWithResource('https://example.com/api/test?tenant=one');
+      const request = (url: string) =>
+        createMockRequest(url, 'GET', {
+          Authorization: `Bearer ${accessToken}`,
+        });
+
+      expect(
+        (await oauthProvider.fetch(request('https://example.com/api/test?tenant=one'), mockEnv, mockCtx)).status
+      ).toBe(200);
+      expect((await oauthProvider.fetch(request('https://example.com/api/test'), mockEnv, mockCtx)).status).toBe(401);
+      expect(
+        (await oauthProvider.fetch(request('https://example.com/api/test?tenant=two'), mockEnv, mockCtx)).status
+      ).toBe(401);
+    });
+
     it('should accept trailing slash as sub-path of audience (prefix matching)', async () => {
       const accessToken = await getAccessTokenWithResource('https://example.com/api/test');
 
@@ -6382,6 +6406,283 @@ describe('OAuthProvider', () => {
       const tokens = await tokenResponse.json<any>();
       expect(tokens.access_token).toBeDefined();
       expect(tokens.resource).toBe('https://api1.example.com');
+    });
+  });
+
+  describe('Configured resource policy and RFC 8707 defaults', () => {
+    const configuredResource = 'https://example.com/api';
+    const redirectUri = 'https://client.example.com/callback';
+
+    function createProvider(resource?: string, overrides: Partial<OAuthProviderOptions<TestEnv>> = {}) {
+      return new OAuthProvider<TestEnv>({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        resourceMetadata: resource ? { resource } : { resource_name: 'Test MCP Server' },
+        ...overrides,
+      });
+    }
+
+    async function registerClient(provider: OAuthProvider<TestEnv>) {
+      const response = await provider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify({
+            redirect_uris: [redirectUri],
+            client_name: 'Resource Policy Client',
+            token_endpoint_auth_method: 'client_secret_basic',
+          })
+        ),
+        mockEnv,
+        mockCtx
+      );
+      return response.json<any>();
+    }
+
+    async function authorize(
+      provider: OAuthProvider<TestEnv>,
+      clientId: string,
+      resources?: string[]
+    ): Promise<Response> {
+      const url = new URL('https://example.com/authorize');
+      url.searchParams.set('response_type', 'code');
+      url.searchParams.set('client_id', clientId);
+      url.searchParams.set('redirect_uri', redirectUri);
+      url.searchParams.set('state', 'resource-policy-state');
+      resources?.forEach((resource) => url.searchParams.append('resource', resource));
+      return provider.fetch(createMockRequest(url.toString()), mockEnv, mockCtx);
+    }
+
+    async function exchangeCode(
+      provider: OAuthProvider<TestEnv>,
+      client: any,
+      code: string,
+      resource?: string
+    ): Promise<Response> {
+      const params = new URLSearchParams({
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: redirectUri,
+        client_id: client.client_id,
+        client_secret: client.client_secret,
+      });
+      if (resource) params.set('resource', resource);
+      return provider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          params.toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+    }
+
+    it('should bind an omitted resource to the authorization origin without explicit resource configuration', async () => {
+      const provider = createProvider();
+      const client = await registerClient(provider);
+      const authorization = await authorize(provider, client.client_id);
+      const code = new URL(authorization.headers.get('Location')!).searchParams.get('code')!;
+
+      const response = await exchangeCode(provider, client, code);
+
+      expect(response.status).toBe(200);
+      const tokens = await response.json<any>();
+      expect(tokens.resource).toBe('https://example.com');
+      const apiResponse = await provider.fetch(
+        createMockRequest('https://example.com/api/test', 'GET', {
+          Authorization: `Bearer ${tokens.access_token}`,
+        }),
+        mockEnv,
+        mockCtx
+      );
+      expect(apiResponse.status).toBe(200);
+    });
+
+    it('should inherit an authorization resource when the token request omits it', async () => {
+      const provider = createProvider();
+      const client = await registerClient(provider);
+      const authorization = await authorize(provider, client.client_id, ['https://example.com/api']);
+      const code = new URL(authorization.headers.get('Location')!).searchParams.get('code')!;
+
+      const response = await exchangeCode(provider, client, code);
+
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toMatchObject({ resource: 'https://example.com/api' });
+    });
+
+    it('should not let a token request replace the authorization origin default', async () => {
+      const provider = createProvider();
+      const client = await registerClient(provider);
+      const authorization = await authorize(provider, client.client_id);
+      const code = new URL(authorization.headers.get('Location')!).searchParams.get('code')!;
+
+      const upscope = await exchangeCode(provider, client, code, 'https://other.example/resource');
+      expect(upscope.status).toBe(400);
+      await expect(upscope.json()).resolves.toMatchObject({ error: 'invalid_target' });
+
+      const retry = await exchangeCode(provider, client, code);
+      expect(retry.status).toBe(200);
+      await expect(retry.json()).resolves.toMatchObject({ resource: 'https://example.com' });
+    });
+
+    it('should require exactly one configured resource during authorization', async () => {
+      const provider = createProvider(configuredResource);
+      const client = await registerClient(provider);
+
+      await expect(authorize(provider, client.client_id)).rejects.toThrow(
+        `The resource parameter must exactly match ${configuredResource}`
+      );
+      await expect(
+        authorize(provider, client.client_id, [configuredResource, 'https://other.example/resource'])
+      ).rejects.toThrow(`The resource parameter must exactly match ${configuredResource}`);
+      expect((await authorize(provider, client.client_id, [configuredResource])).status).toBe(302);
+    });
+
+    it('should re-apply configured resource policy in completeAuthorization', async () => {
+      const provider = createProvider(configuredResource);
+      await provider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
+      const client = await mockEnv.OAUTH_PROVIDER!.createClient({
+        redirectUris: [redirectUri],
+        tokenEndpointAuthMethod: 'none',
+      });
+
+      await expect(
+        mockEnv.OAUTH_PROVIDER!.completeAuthorization({
+          request: {
+            responseType: 'code',
+            clientId: client.clientId,
+            redirectUri,
+            scope: [],
+            state: '',
+          },
+          userId: 'resource-policy-user',
+          metadata: {},
+          scope: [],
+          props: {},
+        })
+      ).rejects.toThrow(`The resource parameter must exactly match ${configuredResource}`);
+    });
+
+    it('should require the exact configured resource at the token endpoint without consuming the code', async () => {
+      const provider = createProvider(configuredResource, { resourceMatchOriginOnly: true });
+      const client = await registerClient(provider);
+      const authorization = await authorize(provider, client.client_id, [configuredResource]);
+      const code = new URL(authorization.headers.get('Location')!).searchParams.get('code')!;
+
+      const missing = await exchangeCode(provider, client, code);
+      expect(missing.status).toBe(400);
+      await expect(missing.json()).resolves.toMatchObject({ error: 'invalid_target' });
+
+      const broad = await exchangeCode(provider, client, code, 'https://example.com');
+      expect(broad.status).toBe(400);
+      await expect(broad.json()).resolves.toMatchObject({ error: 'invalid_target' });
+
+      const exact = await exchangeCode(provider, client, code, configuredResource);
+      expect(exact.status).toBe(200);
+      await expect(exact.json()).resolves.toMatchObject({ resource: configuredResource });
+    });
+
+    it('should require the exact configured resource during refresh', async () => {
+      const provider = createProvider(configuredResource);
+      const client = await registerClient(provider);
+      const authorization = await authorize(provider, client.client_id, [configuredResource]);
+      const code = new URL(authorization.headers.get('Location')!).searchParams.get('code')!;
+      const tokenResponse = await exchangeCode(provider, client, code, configuredResource);
+      const tokens = await tokenResponse.json<any>();
+      const refresh = async (resource?: string) => {
+        const params = new URLSearchParams({
+          grant_type: 'refresh_token',
+          refresh_token: tokens.refresh_token,
+          client_id: client.client_id,
+          client_secret: client.client_secret,
+        });
+        if (resource) params.set('resource', resource);
+        return provider.fetch(
+          createMockRequest(
+            'https://example.com/oauth/token',
+            'POST',
+            { 'Content-Type': 'application/x-www-form-urlencoded' },
+            params.toString()
+          ),
+          mockEnv,
+          mockCtx
+        );
+      };
+
+      expect((await refresh()).status).toBe(400);
+      expect((await refresh('https://example.com')).status).toBe(400);
+      const exact = await refresh(configuredResource);
+      expect(exact.status).toBe(200);
+      await expect(exact.json()).resolves.toMatchObject({ resource: configuredResource });
+    });
+
+    it('should require the exact configured resource during token exchange', async () => {
+      const provider = createProvider(configuredResource, { allowTokenExchangeGrant: true });
+      const client = await registerClient(provider);
+      const authorization = await authorize(provider, client.client_id, [configuredResource]);
+      const code = new URL(authorization.headers.get('Location')!).searchParams.get('code')!;
+      const tokenResponse = await exchangeCode(provider, client, code, configuredResource);
+      const tokens = await tokenResponse.json<any>();
+
+      await expect(mockEnv.OAUTH_PROVIDER!.exchangeToken({ subjectToken: tokens.access_token })).rejects.toMatchObject({
+        code: 'invalid_target',
+      });
+      const exchanged = await mockEnv.OAUTH_PROVIDER!.exchangeToken({
+        subjectToken: tokens.access_token,
+        aud: configuredResource,
+      });
+      expect(exchanged.resource).toBe(configuredResource);
+    });
+
+    it('should reject a legacy origin-wide internal audience when a path resource is configured', async () => {
+      const permissiveProvider = createProvider();
+      const client = await registerClient(permissiveProvider);
+      const authorization = await authorize(permissiveProvider, client.client_id);
+      const code = new URL(authorization.headers.get('Location')!).searchParams.get('code')!;
+      const tokenResponse = await exchangeCode(permissiveProvider, client, code);
+      const tokens = await tokenResponse.json<any>();
+      const strictProvider = createProvider(configuredResource);
+
+      const response = await strictProvider.fetch(
+        createMockRequest('https://example.com/api/test', 'GET', {
+          Authorization: `Bearer ${tokens.access_token}`,
+        }),
+        mockEnv,
+        mockCtx
+      );
+
+      expect(response.status).toBe(401);
+      await expect(response.json()).resolves.toMatchObject({
+        error: 'invalid_token',
+        error_description: 'Access token is not bound to the configured resource',
+      });
+    });
+
+    it('should reject absent and broader external audiences when a resource is configured', async () => {
+      const request = () =>
+        createMockRequest('https://example.com/api/test', 'GET', {
+          Authorization: 'Bearer external-token',
+        });
+      const withoutAudience = createProvider(configuredResource, {
+        resolveExternalToken: async () => ({ props: { external: true } }),
+      });
+      const broadAudience = createProvider(configuredResource, {
+        resolveExternalToken: async () => ({ props: { external: true }, audience: 'https://example.com' }),
+      });
+      const exactAudience = createProvider(configuredResource, {
+        resolveExternalToken: async () => ({ props: { external: true }, audience: configuredResource }),
+      });
+
+      expect((await withoutAudience.fetch(request(), mockEnv, mockCtx)).status).toBe(401);
+      expect((await broadAudience.fetch(request(), mockEnv, mockCtx)).status).toBe(401);
+      expect((await exactAudience.fetch(request(), mockEnv, mockCtx)).status).toBe(200);
     });
   });
 

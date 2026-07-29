@@ -490,6 +490,7 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
    * with an origin-only resource (e.g. `https://server.com`) to be used with
    * path-aware resource requests (e.g. `https://server.com/mcp`), enabling seamless
    * migration from pre-0.4.0 versions that stored origin-only resource URIs.
+   * Explicit `resourceMetadata.resource` configuration always uses exact matching.
    *
    * Defaults to false (strict exact matching per RFC 8707).
    */
@@ -505,7 +506,11 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
   resourceMetadata?: {
     /**
      * The protected resource identifier URL (RFC 9728 `resource` field).
-     * If not set, defaults to the request URL's origin.
+     *
+     * Configuring this value pins authorization requests, token requests, and
+     * access-token audiences to this exact resource. If omitted, the provider
+     * accepts valid RFC 8707 resource indicators and uses the authorization
+     * request origin as the default when the client does not send one.
      */
     resource?: string;
     /**
@@ -2333,31 +2338,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       }
     }
 
-    // Parse and validate the resource parameter before exchanging the authorization code (RFC 8707)
-    // Validate downscoping: token request resources must be a subset of grant resources
-    const originOnly = !!this.options.resourceMatchOriginOnly;
-    if (body.resource && grantData.resource) {
-      const requestedResources = Array.isArray(body.resource) ? body.resource : [body.resource];
-      const grantedResources = Array.isArray(grantData.resource) ? grantData.resource : [grantData.resource];
-
-      // Check that all requested resources are in the granted resources
-      for (const requested of requestedResources) {
-        if (!grantedResources.some((granted) => resourceMatches(requested, granted, originOnly))) {
-          return this.createErrorResponse('invalid_target', {
-            description: 'Requested resource was not included in the authorization request',
-          });
-        }
-      }
-    }
-
-    // Use resource from token request if provided, otherwise use resource from grant
-    const audience = parseResourceParameter(body.resource || grantData.resource);
-    if ((body.resource || grantData.resource) && !audience) {
-      // RFC 8707 Section 2: invalid or unacceptable resource
-      return this.createErrorResponse('invalid_target', {
-        description: 'The resource parameter must be a valid absolute URI without a fragment',
-      });
-    }
+    // Resolve the token audience before consuming the authorization code.
+    const audience = this.resolveTokenResource(body.resource, grantData.resource);
 
     // Define the access token TTL, may be updated by callback if provided
     let accessTokenTTL = this.options.accessTokenTTL!;
@@ -2581,25 +2563,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       }
     }
 
-    // Validate the requested resource before callbacks, token rotation, or storage writes.
-    const originOnly = !!this.options.resourceMatchOriginOnly;
-    if (body.resource && grantData.resource) {
-      const requestedResources = Array.isArray(body.resource) ? body.resource : [body.resource];
-      const grantedResources = Array.isArray(grantData.resource) ? grantData.resource : [grantData.resource];
-      for (const requested of requestedResources) {
-        if (!grantedResources.some((granted) => resourceMatches(requested, granted, originOnly))) {
-          return this.createErrorResponse('invalid_target', {
-            description: 'Requested resource was not included in the authorization request',
-          });
-        }
-      }
-    }
-    const audience = parseResourceParameter(body.resource || grantData.resource);
-    if ((body.resource || grantData.resource) && !audience) {
-      return this.createErrorResponse('invalid_target', {
-        description: 'The resource parameter must be a valid absolute URI without a fragment',
-      });
-    }
+    // Resolve the token audience before callbacks, rotation, or storage writes.
+    const audience = this.resolveTokenResource(body.resource, grantData.resource);
 
     // Generate new access token with embedded user and grant IDs
     const accessTokenSecret = generateRandomString(TOKEN_LENGTH);
@@ -2866,34 +2831,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // An exchanged token inherits the subject token's scopes unless a narrower subset is requested.
     let tokenScopes: string[] = this.downscope(requestedScopes, tokenSummary.scope);
 
-    // Parse and validate resource parameter (RFC 8707) if provided
-    const originOnly = !!this.options.resourceMatchOriginOnly;
-    let newAudience: string | string[] | undefined = tokenSummary.audience;
-    if (requestedResource) {
-      // Validate downscoping: requested resources must be subset of grant resources if grant had resources
-      if (grantData.resource) {
-        const requestedResources = Array.isArray(requestedResource) ? requestedResource : [requestedResource];
-        const grantedResources = Array.isArray(grantData.resource) ? grantData.resource : [grantData.resource];
-
-        // Check that all requested resources are in the granted resources
-        for (const requested of requestedResources) {
-          if (!grantedResources.some((granted) => resourceMatches(requested, granted, originOnly))) {
-            throw new OAuthError('invalid_target', {
-              description: 'Requested resource was not included in the authorization request',
-            });
-          }
-        }
-      }
-
-      // Parse and validate the resource parameter
-      const parsedResource = parseResourceParameter(requestedResource);
-      if (!parsedResource) {
-        throw new OAuthError('invalid_target', {
-          description: 'The resource parameter must be a valid absolute URI without a fragment',
-        });
-      }
-      newAudience = parsedResource;
+    const configuredResource = this.options.resourceMetadata?.resource;
+    if (configuredResource && !isExactResource(tokenSummary.audience, configuredResource)) {
+      throw new OAuthError('invalid_target', {
+        description: 'Subject token is not bound to the configured resource',
+      });
     }
+    const newAudience = this.resolveTokenResource(requestedResource, grantData.resource);
 
     // Determine TTL for new token
     const now = Math.floor(Date.now() / 1000);
@@ -3758,6 +3702,17 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Internal token data was found in KV, so we check for expiration and set the context props
     if (tokenData) {
+      const configuredResource = this.options.resourceMetadata?.resource;
+      if (configuredResource && !isExactResource(tokenData.audience, configuredResource)) {
+        return this.createErrorResponse('invalid_token', {
+          description: 'Access token is not bound to the configured resource',
+          statusCode: 401,
+          headers: {
+            'WWW-Authenticate': this.buildWwwAuthenticateHeader(resourceMetadataUrl, 'invalid_token'),
+          },
+        });
+      }
+
       // Check if token is expired (should be auto-deleted by KV TTL, but double-check)
       const now = Math.floor(Date.now() / 1000);
       if (tokenData.expiresAt < now) {
@@ -3775,7 +3730,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       // 'aud' claim when this claim is present, then the JWT MUST be rejected."
       if (tokenData.audience) {
         const requestUrl = new URL(request.url);
-        const resourceServer = `${requestUrl.protocol}//${requestUrl.host}${requestUrl.pathname}`;
+        const resourceServer = `${requestUrl.protocol}//${requestUrl.host}${requestUrl.pathname}${requestUrl.search}`;
         const audiences = Array.isArray(tokenData.audience) ? tokenData.audience : [tokenData.audience];
 
         // Check if any audience matches (RFC 3986: case-insensitive hostname comparison)
@@ -3827,10 +3782,21 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         });
       }
 
+      const configuredResource = this.options.resourceMetadata?.resource;
+      if (configuredResource && !isExactResource(ext.audience, configuredResource)) {
+        return this.createErrorResponse('invalid_token', {
+          description: 'External access token is not bound to the configured resource',
+          statusCode: 401,
+          headers: {
+            'WWW-Authenticate': this.buildWwwAuthenticateHeader(resourceMetadataUrl, 'invalid_token'),
+          },
+        });
+      }
+
       // Validate that tokens were issued specifically for them
       if (ext.audience) {
         const requestUrl = new URL(request.url);
-        const resourceServer = `${requestUrl.protocol}//${requestUrl.host}${requestUrl.pathname}`;
+        const resourceServer = `${requestUrl.protocol}//${requestUrl.host}${requestUrl.pathname}${requestUrl.search}`;
         const audiences = Array.isArray(ext.audience) ? ext.audience : [ext.audience];
 
         // Check if any audience matches (RFC 3986: case-insensitive hostname comparison)
@@ -3968,6 +3934,59 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Standard KV lookup
     const clientKey = `client:${clientId}`;
     return env.OAUTH_KV.get(clientKey, { type: 'json' });
+  }
+
+  /**
+   * Resolves an access-token audience from a token request and its authorization grant.
+   * Explicit resource configuration requires one exact value in both places. Without
+   * configuration, RFC 8707 downscoping is allowed and omission inherits the grant.
+   */
+  private resolveTokenResource(
+    requestedResource: string | string[] | undefined,
+    grantedResource: string | string[] | undefined
+  ): string | string[] | undefined {
+    const requestedAudience = parseResourceParameter(requestedResource);
+    if (requestedResource && !requestedAudience) {
+      throw new OAuthError('invalid_target', {
+        description: 'The resource parameter must be a valid absolute URI without a fragment',
+      });
+    }
+    const grantedAudience = parseResourceParameter(grantedResource);
+    if (grantedResource && !grantedAudience) {
+      throw new OAuthError('invalid_target', {
+        description: 'The authorization grant contains an invalid resource',
+      });
+    }
+
+    const configuredResource = this.options.resourceMetadata?.resource;
+    if (
+      configuredResource &&
+      (!isExactResource(grantedResource, configuredResource) || !isExactResource(requestedResource, configuredResource))
+    ) {
+      throw new OAuthError('invalid_target', {
+        description: `The resource parameter must exactly match ${configuredResource}`,
+      });
+    }
+    if (!configuredResource && requestedResource && !grantedResource) {
+      throw new OAuthError('invalid_target', {
+        description: 'Requested resource was not included in the authorization request',
+      });
+    }
+
+    const originOnly = configuredResource ? false : !!this.options.resourceMatchOriginOnly;
+    if (requestedResource && grantedResource) {
+      const requestedResources = Array.isArray(requestedResource) ? requestedResource : [requestedResource];
+      const grantedResources = Array.isArray(grantedResource) ? grantedResource : [grantedResource];
+      for (const requested of requestedResources) {
+        if (!grantedResources.some((granted) => resourceMatches(requested, granted, originOnly))) {
+          throw new OAuthError('invalid_target', {
+            description: 'Requested resource was not included in the authorization request',
+          });
+        }
+      }
+    }
+
+    return requestedAudience ?? grantedAudience;
   }
 
   /**
@@ -4651,6 +4670,13 @@ function audienceMatches(resourceServerUrl: string, audienceValue: string): bool
       return false;
     }
 
+    // A query-bearing resource identifier names a more specific resource.
+    // Requests may add a query when the audience omits one, but must preserve
+    // the configured query when it is part of the audience.
+    if (audience.search && resource.search !== audience.search) {
+      return false;
+    }
+
     // Origin-only audience matches any path (backward compatibility)
     if (audience.pathname === '/' || audience.pathname === '') {
       return true;
@@ -4686,6 +4712,13 @@ function parseResourceParameter(value: string | string[] | undefined): string | 
   }
 
   return value;
+}
+
+/** Whether a request or audience names one exact configured resource. */
+function isExactResource(value: string | string[] | undefined, configuredResource: string): boolean {
+  return (
+    value === configuredResource || (Array.isArray(value) && value.length === 1 && value[0] === configuredResource)
+  );
 }
 
 /**
@@ -5174,11 +5207,20 @@ class OAuthHelpersImpl implements OAuthHelpers {
     // Using helper function that normalizes and checks in a case-insensitive manner
     validateRedirectUriScheme(redirectUri);
 
-    // Parse and validate resource parameter (RFC 8707)
-    const resource = parseResourceParameter(resourceParam);
+    // Parse and validate the resource parameter (RFC 8707). An explicitly
+    // configured resource is deployment policy and therefore requires one
+    // exact value. Without that policy, RFC 8707 §2.1 allows the authorization
+    // server to use a predefined default; the request origin is the safest
+    // interoperable default available to a co-located AS/RS deployment.
+    let resource = parseResourceParameter(resourceParam);
     if (resourceParam && !resource) {
       throw new Error('The resource parameter must be a valid absolute URI without a fragment');
     }
+    const configuredResource = this.provider.options.resourceMetadata?.resource;
+    if (configuredResource && !isExactResource(resource, configuredResource)) {
+      throw new Error(`The resource parameter must exactly match ${configuredResource}`);
+    }
+    resource ??= url.origin;
 
     // Check if implicit flow is requested but not allowed
     if (responseType === 'token' && !this.provider.options.allowImplicitFlow) {
@@ -5254,6 +5296,18 @@ class OAuthHelpersImpl implements OAuthHelpers {
       );
     }
 
+    // completeAuthorization() is a public helper and callers can pass a
+    // reconstructed AuthRequest rather than one returned directly by
+    // parseAuthRequest(). Re-apply configured resource policy here before
+    // creating any grant. For an unconfigured provider, retain the parsed
+    // resource or use the recorded authorization-server origin as the RFC 8707
+    // default when available.
+    const configuredResource = this.provider.options.resourceMetadata?.resource;
+    if (configuredResource && !isExactResource(options.request.resource, configuredResource)) {
+      throw new Error(`The resource parameter must exactly match ${configuredResource}`);
+    }
+    const effectiveResource = options.request.resource ?? options.request.issuer;
+
     // If requested, collect existing grants for this user+client to revoke AFTER the new grant is created.
     // This avoids a data-loss window where the user has no grants if creation fails.
     let grantsToRevoke: string[] = [];
@@ -5297,8 +5351,8 @@ class OAuthHelpersImpl implements OAuthHelpers {
       const accessTokenWrappedKey = await wrapKeyWithToken(accessToken, encryptionKey);
 
       // Parse and validate resource parameter (RFC 8707) for implicit flow
-      const audience = parseResourceParameter(options.request.resource);
-      if (options.request.resource && !audience) {
+      const audience = parseResourceParameter(effectiveResource);
+      if (effectiveResource && !audience) {
         throw new Error('The resource parameter must be a valid absolute URI without a fragment');
       }
 
@@ -5311,7 +5365,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
         metadata: options.metadata,
         encryptedProps: encryptedData,
         createdAt: now,
-        resource: options.request.resource,
+        resource: effectiveResource,
       };
 
       // Store the grant with a key that includes the user ID
@@ -5394,7 +5448,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
         // Store PKCE parameters if provided
         codeChallenge: options.request.codeChallenge,
         codeChallengeMethod: options.request.codeChallengeMethod,
-        resource: options.request.resource,
+        resource: effectiveResource,
       };
 
       // Store the grant with a key that includes the user ID
