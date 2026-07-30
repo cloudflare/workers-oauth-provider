@@ -1,0 +1,29 @@
+conformance/README.md
+  s_1fd2f6fcd4817a::t_6da21b825e5c93 26-27,30-52,64
+conformance/authorization-server.test.ts
+  s_1fd2f6fcd4817a::t_7ace6d7c71520e 2,65,74,82,89,110,133
+conformance/client-registration.test.ts
+  s_1fd2f6fcd4817a::t_950b12a0196651 2,130,156
+conformance/protected-resource.test.ts
+  s_1fd2f6fcd4817a::t_a4399ec67568f8 2,28,35,51,54-80,110
+conformance/spec-versions.ts
+  s_1fd2f6fcd4817a::t_caee511b3a07b2 11
+conformance/token-lifecycle.test.ts
+  s_1fd2f6fcd4817a::t_71e760f9949400 23,102
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8e984ff582534c936eeec8c31d56f0e6d1a9c9cc",
+  "prompts": {},
+  "sessions": {
+    "s_1fd2f6fcd4817a": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "019faf61-5373-7c6d-87c2-3460c1e5723d",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Matt Carey <mcarey@cloudflare.com>"
+    }
+  }
+}
