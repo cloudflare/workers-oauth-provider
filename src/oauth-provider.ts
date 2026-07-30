@@ -2377,6 +2377,16 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       return this.createErrorResponse('invalid_grant', { description: 'Authorization code already used' });
     }
 
+    // Validate the stored method before deciding whether PKCE is active. Older
+    // versions could persist unknown methods; those grants must not fall back
+    // to the non-PKCE path or be interpreted as plain.
+    const codeChallengeMethod = grantData.codeChallengeMethod ?? 'plain';
+    if (!isSupportedPkceCodeChallengeMethod(codeChallengeMethod)) {
+      return this.createErrorResponse('invalid_grant', {
+        description: `Unsupported PKCE code_challenge_method: ${codeChallengeMethod}`,
+      });
+    }
+
     // Check if PKCE is being used
     const isPkceEnabled = !!grantData.codeChallenge;
 
@@ -2405,10 +2415,15 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         return this.createErrorResponse('invalid_request', { description: 'code_verifier is required for PKCE' });
       }
 
-      // Verify the code verifier against the stored code challenge
-      let calculatedChallenge: string;
+      // Verify the code verifier against the stored code challenge.
+      if (codeChallengeMethod === 'plain' && this.options.allowPlainPKCE === false) {
+        return this.createErrorResponse('invalid_grant', {
+          description: 'The plain PKCE method is not allowed. Use S256 instead.',
+        });
+      }
 
-      if (grantData.codeChallengeMethod === 'S256') {
+      let calculatedChallenge: string;
+      if (codeChallengeMethod === 'S256') {
         // SHA-256 transformation for S256 method
         const encoder = new TextEncoder();
         const data = encoder.encode(codeVerifier);
@@ -5141,6 +5156,30 @@ function isValidRedirectUri(requestUri: string, registeredUris: string[]): boole
   });
 }
 
+type PkceCodeChallengeMethod = 'plain' | 'S256';
+
+function isSupportedPkceCodeChallengeMethod(method: string): method is PkceCodeChallengeMethod {
+  return method === 'plain' || method === 'S256';
+}
+
+/** Validate PKCE policy at every public authorization-completion boundary. */
+function validateAuthorizationPkce(
+  request: Pick<AuthRequest, 'responseType' | 'codeChallenge' | 'codeChallengeMethod'>,
+  clientInfo: Pick<ClientInfo, 'tokenEndpointAuthMethod'>,
+  allowPlain: boolean
+): void {
+  const method = request.codeChallengeMethod ?? 'plain';
+  if (!isSupportedPkceCodeChallengeMethod(method)) {
+    throw new Error(`Unsupported PKCE code_challenge_method: ${method}`);
+  }
+  if (method === 'plain' && !allowPlain) {
+    throw new Error('The plain PKCE method is not allowed. Use S256 instead.');
+  }
+  if (request.responseType === 'code' && clientInfo.tokenEndpointAuthMethod === 'none' && !request.codeChallenge) {
+    throw new Error('Public clients must use PKCE with the authorization code flow.');
+  }
+}
+
 /**
  * Encodes a string as base64url (URL-safe base64)
  * @param str - The string to encode
@@ -5450,12 +5489,11 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
         );
       }
       validateAuthorizationResponseType(this.provider.serverCapabilities, responseType, clientInfo.responseTypes);
-      if (codeChallengeMethod === 'plain' && this.provider.options.allowPlainPKCE === false) {
-        throw new Error('The plain PKCE method is not allowed. Use S256 instead.');
-      }
-      if (responseType === 'code' && clientInfo.tokenEndpointAuthMethod === 'none' && !codeChallenge) {
-        throw new Error('Public clients must use PKCE with the authorization code flow.');
-      }
+      validateAuthorizationPkce(
+        { responseType, codeChallenge, codeChallengeMethod },
+        clientInfo,
+        this.provider.options.allowPlainPKCE !== false
+      );
     }
 
     return {
@@ -5526,6 +5564,11 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
       throw new Error(`The resource parameter must exactly match ${configuredResource}`);
     }
     const effectiveResource = options.request.resource ?? options.request.issuer;
+
+    // Re-apply PKCE policy after client, redirect, response-type, and resource
+    // validation, preserving their established error precedence while still
+    // rejecting before any grant lookup, revocation, or storage.
+    validateAuthorizationPkce(options.request, clientInfo, this.provider.options.allowPlainPKCE !== false);
 
     // If requested, collect existing grants for this user+client to revoke AFTER the new grant is created.
     // This avoids a data-loss window where the user has no grants if creation fails.

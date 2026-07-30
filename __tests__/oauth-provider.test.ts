@@ -1758,6 +1758,74 @@ describe('OAuthProvider', () => {
       expect((await mockEnv.OAUTH_KV.list({ prefix: 'token:' })).keys).toHaveLength(0);
     });
 
+    it('should reject unsupported PKCE methods in completeAuthorization before storage', async () => {
+      await oauthProvider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
+      const helpers = mockEnv.OAUTH_PROVIDER!;
+      const authRequest = await helpers.parseAuthRequest(
+        createMockRequest(
+          `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+            `&redirect_uri=${encodeURIComponent(redirectUri)}&scope=read&state=state-123` +
+            `&code_challenge=test-challenge&code_challenge_method=S256`
+        )
+      );
+
+      await expect(
+        helpers.completeAuthorization({
+          request: {
+            ...authRequest,
+            codeChallenge: 'attacker-controlled-plain-verifier',
+            codeChallengeMethod: 'S512',
+          },
+          userId: 'test-user-123',
+          metadata: {},
+          scope: ['read'],
+          props: {},
+        })
+      ).rejects.toThrow('Unsupported PKCE code_challenge_method');
+
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys).toHaveLength(0);
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'token:' })).keys).toHaveLength(0);
+    });
+
+    it('should re-apply public-client PKCE requirements in completeAuthorization', async () => {
+      const registration = await oauthProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify({
+            redirect_uris: [redirectUri],
+            client_name: 'Public PKCE Client',
+            token_endpoint_auth_method: 'none',
+          })
+        ),
+        mockEnv,
+        mockCtx
+      );
+      const publicClient = await registration.json<any>();
+      await oauthProvider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
+      const helpers = mockEnv.OAUTH_PROVIDER!;
+
+      await expect(
+        helpers.completeAuthorization({
+          request: {
+            responseType: 'code',
+            clientId: publicClient.client_id,
+            redirectUri,
+            scope: ['read'],
+            state: 'reconstructed-without-pkce',
+            issuer: 'https://example.com',
+          },
+          userId: 'test-user-123',
+          metadata: {},
+          scope: ['read'],
+          props: {},
+        })
+      ).rejects.toThrow('Public clients must use PKCE');
+
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys).toHaveLength(0);
+    });
+
     it('should reject completeAuthorization if redirect_uri is invalid', async () => {
       // This test ensures that completeAuthorization re-validates the redirect_uri.
       const authRequest = createMockRequest(
@@ -2399,6 +2467,52 @@ describe('OAuthProvider', () => {
       expect(grant.authCodeId).toBeDefined(); // Auth code hash should be retained
       expect(grant.authCodeWrappedKey).toBeUndefined(); // Wrapped key removed marks code as used
       expect(grant.refreshTokenId).toBeDefined(); // Refresh token should be added
+    });
+
+    it('should fail closed when a stored grant has an unsupported PKCE method', async () => {
+      const codeVerifier = generateRandomString(43);
+      const hashBuffer = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(codeVerifier));
+      const codeChallenge = base64UrlEncode(String.fromCharCode(...new Uint8Array(hashBuffer)));
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read&state=legacy-pkce` +
+          `&code_challenge=${codeChallenge}&code_challenge_method=S256`
+      );
+      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
+
+      const grantKey = (await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys[0].name;
+      const grant = await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' });
+      grant.codeChallenge = codeVerifier;
+      grant.codeChallengeMethod = 'S512';
+      await mockEnv.OAUTH_KV.put(grantKey, JSON.stringify(grant));
+
+      const params = new URLSearchParams({
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: redirectUri,
+        client_id: clientId,
+        client_secret: clientSecret,
+        code_verifier: codeVerifier,
+      });
+      const rejected = await oauthProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          params.toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+
+      expect(rejected.status).toBe(400);
+      expect(await rejected.json<any>()).toMatchObject({
+        error: 'invalid_grant',
+        error_description: expect.stringContaining('Unsupported PKCE code_challenge_method'),
+      });
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'token:' })).keys).toHaveLength(0);
     });
 
     it('should reject repeated token endpoint parameters', async () => {
