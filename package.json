@@ -28,12 +28,13 @@
   "devDependencies": {
     "@changesets/changelog-github": "^0.5.2",
     "@changesets/cli": "^2.29.8",
-    "@cloudflare/workers-types": "^4.20251218.0",
+    "@cloudflare/workers-types": "^5.20260730.1",
     "pkg-pr-new": "^0.0.62",
     "prettier": "^3.7.4",
     "tsdown": "^0.18.1",
     "typescript": "^5.9.3",
-    "vitest": "^4.1.8"
+    "vitest": "^4.1.8",
+    "wrangler": "^4.115.0"
   },
   "repository": {
     "type": "git",

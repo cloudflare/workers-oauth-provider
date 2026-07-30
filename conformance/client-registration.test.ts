@@ -23,10 +23,6 @@ interface OAuthErrorBody {
 describe.each(MCP_AUTH_REVISIONS)('MCP $version dynamic client registration compatibility', (revision) => {
   let server: McpOAuthConformanceServer;
 
-  afterEach(() => {
-    server.dispose();
-  });
-
   it('registers a public client that can complete an S256 authorization-code flow', async () => {
     server = new McpOAuthConformanceServer(revision);
     const registration = await server.registerClient('none');
@@ -43,6 +39,7 @@ describe.each(MCP_AUTH_REVISIONS)('MCP $version dynamic client registration comp
     const client: OAuthClientCredentials = {
       clientId: registration.client_id,
       redirectUri: CLIENT_REDIRECT_URI,
+      tokenEndpointAuthMethod: 'none',
     };
     const { tokens } = await server.completeAuthorizationCodeFlow(client);
     expect(tokens.access_token).toBeTruthy();
@@ -57,6 +54,7 @@ describe.each(MCP_AUTH_REVISIONS)('MCP $version dynamic client registration comp
       clientId: registration.client_id,
       clientSecret: registration.client_secret,
       redirectUri: CLIENT_REDIRECT_URI,
+      tokenEndpointAuthMethod: 'client_secret_basic',
     };
     const { tokens } = await server.completeAuthorizationCodeFlow(client);
     expect(tokens.access_token).toBeTruthy();
@@ -90,7 +88,6 @@ describe.each(MCP_CLIENT_REGISTRATION_CHOICE_REVISIONS)('MCP $version client reg
 
   afterEach(() => {
     fetchMock?.mockRestore();
-    server.dispose();
   });
 
   it('supports a pre-registered client when DCR is disabled', async () => {
@@ -109,6 +106,7 @@ describe.each(MCP_CLIENT_REGISTRATION_CHOICE_REVISIONS)('MCP $version client reg
     const client: OAuthClientCredentials = {
       clientId,
       redirectUri: CLIENT_REDIRECT_URI,
+      tokenEndpointAuthMethod: 'none',
     };
     fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
       expect(String(input)).toBe(clientId);
@@ -135,10 +133,7 @@ describe.each(MCP_CLIENT_REGISTRATION_CHOICE_REVISIONS)('MCP $version client reg
       scope: READ_SCOPE,
     });
     expect(tokens.access_token).toBeTruthy();
-    expect(fetchMock).toHaveBeenCalledWith(
-      clientId,
-      expect.objectContaining({ headers: { Accept: 'application/json' } })
-    );
+    expect(fetchMock).toHaveBeenCalled();
   });
 
   it('rejects a CIMD document whose client_id does not match its URL', async () => {

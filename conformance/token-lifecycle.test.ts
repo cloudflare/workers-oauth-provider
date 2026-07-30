@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it } from 'vitest';
 import { MCP_AUTH_REVISIONS } from './spec-versions';
 import {
   McpOAuthConformanceServer,
@@ -20,10 +20,6 @@ describe.each(MCP_AUTH_REVISIONS)('MCP $version OAuth token lifecycle conformanc
   beforeEach(async () => {
     server = new McpOAuthConformanceServer(revision);
     client = await server.createClient('client_secret_basic');
-  });
-
-  afterEach(() => {
-    server.dispose();
   });
 
   it('rotates refresh tokens while allowing one retry with the previous token', async () => {

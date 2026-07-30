@@ -1,5 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { ExternalTokenError } from '../src/oauth-provider';
+import { beforeEach, describe, expect, it } from 'vitest';
 import { MCP_PROTECTED_RESOURCE_REVISIONS, MCP_SCOPE_CHALLENGE_REVISIONS, resourceForRevision } from './spec-versions';
 import {
   CONFORMANCE_ORIGIN,
@@ -29,10 +28,6 @@ describe.each(MCP_PROTECTED_RESOURCE_REVISIONS)('MCP $version protected-resource
 
   beforeEach(() => {
     server = new McpOAuthConformanceServer(revision);
-  });
-
-  afterEach(() => {
-    server.dispose();
   });
 
   it('discovers the protected resource through its path-specific RFC 9728 URL', async () => {
@@ -110,10 +105,6 @@ describe.each(MCP_PROTECTED_RESOURCE_REVISIONS)('MCP $version protected-resource
 describe.each(MCP_SCOPE_CHALLENGE_REVISIONS)('MCP $version scope challenge conformance', (revision) => {
   let server: McpOAuthConformanceServer;
 
-  afterEach(() => {
-    server.dispose();
-  });
-
   it('publishes baseline resource scopes without offline_access', async () => {
     server = new McpOAuthConformanceServer(revision, {
       resourceScopes: [READ_SCOPE, OFFLINE_ACCESS_SCOPE, READ_SCOPE],
@@ -130,13 +121,7 @@ describe.each(MCP_SCOPE_CHALLENGE_REVISIONS)('MCP $version scope challenge confo
 
   it('returns a 403 insufficient_scope challenge with operation-specific scopes', async () => {
     server = new McpOAuthConformanceServer(revision, {
-      resolveExternalToken: async () => {
-        throw new ExternalTokenError('insufficient_scope', {
-          description: 'A write scope is required',
-          statusCode: 403,
-          requiredScopes: [READ_SCOPE, WRITE_SCOPE, WRITE_SCOPE],
-        });
-      },
+      externalTokenMode: 'insufficient-scope',
     });
 
     const response = await server.request('/mcp', {

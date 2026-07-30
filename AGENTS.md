@@ -45,7 +45,8 @@ workers-oauth-provider/
 │       └── cloudflare-workers.ts
 ├── conformance/               # Black-box MCP authorization conformance matrix
 │   ├── README.md              # Scope, revision coverage, and traceability
-│   └── support/               # Public-interface OAuth server test harness
+│   ├── support/               # OAuth client around createTestHarness()
+│   └── worker/                # Real Wrangler Worker with local KV
 ├── dist/                      # Build output (tsdown)
 ├── docs/
 │   └── advanced-configuration.md
@@ -151,7 +152,7 @@ npm run test:watch         # Watch mode
 
 **Main integration test:** `__tests__/oauth-provider.test.ts`
 
-**MCP authorization conformance:** `conformance/` contains black-box tests for every dated authorization revision represented by the official MCP conformance timeline. These tests exercise only public `OAuthProvider` and `OAuthHelpers` interfaces and include requirement traceability in `conformance/README.md`.
+**MCP authorization conformance:** `conformance/` contains black-box tests for every dated authorization revision represented by the official MCP conformance timeline. Wrangler's `createTestHarness()` runs a real Worker in Workerd with a local KV binding; tests exercise public `OAuthProvider` and `OAuthHelpers` interfaces and include requirement traceability in `conformance/README.md`.
 
 **Mock implementations:**
 

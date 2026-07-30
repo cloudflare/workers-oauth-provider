@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it } from 'vitest';
 import {
   MCP_AUTHORIZATION_RESPONSE_ISSUER_REVISIONS,
   MCP_AUTH_REVISIONS,
@@ -35,10 +35,6 @@ describe.each(MCP_AUTH_REVISIONS)('MCP $version authorization security conforman
 
   beforeEach(() => {
     server = new McpOAuthConformanceServer(revision);
-  });
-
-  afterEach(() => {
-    server.dispose();
   });
 
   it('does not redirect an authorization request with an unregistered redirect URI', async () => {
@@ -130,10 +126,6 @@ describe.each(MCP_PROTECTED_RESOURCE_REVISIONS)(
       server = new McpOAuthConformanceServer(revision);
     });
 
-    afterEach(() => {
-      server.dispose();
-    });
-
     it('requires the configured canonical resource in the authorization request', async () => {
       const client = await server.createClient('none');
       const params = new URLSearchParams({
@@ -188,10 +180,6 @@ describe.each(MCP_AUTHORIZATION_RESPONSE_ISSUER_REVISIONS)(
   (revision) => {
     let server: McpOAuthConformanceServer;
 
-    afterEach(() => {
-      server.dispose();
-    });
-
     it('advertises RFC 9207 and includes exactly one matching iss parameter', async () => {
       server = new McpOAuthConformanceServer(revision);
       const metadataResponse = await server.request('/.well-known/oauth-authorization-server');
@@ -208,10 +196,6 @@ describe.each(MCP_AUTHORIZATION_RESPONSE_ISSUER_REVISIONS)(
 
 describe.each(MCP_OFFLINE_ACCESS_GUIDANCE_REVISIONS)('MCP $version refresh-token scope guidance', (revision) => {
   let server: McpOAuthConformanceServer;
-
-  afterEach(() => {
-    server.dispose();
-  });
 
   it('advertises offline_access only as an authorization-server capability', async () => {
     server = new McpOAuthConformanceServer(revision, {

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it } from 'vitest';
 import { MCP_AUTH_REVISIONS, resourceForRevision } from './spec-versions';
 import {
   CLIENT_REDIRECT_URI,
@@ -27,10 +27,6 @@ describe.each(MCP_AUTH_REVISIONS)('MCP $version authorization server conformance
 
   beforeEach(() => {
     server = new McpOAuthConformanceServer(revision);
-  });
-
-  afterEach(() => {
-    server.dispose();
   });
 
   it('publishes RFC 8414 metadata for the configured OAuth capabilities', async () => {

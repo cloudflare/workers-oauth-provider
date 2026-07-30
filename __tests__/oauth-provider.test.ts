@@ -131,6 +131,8 @@ class MockKV {
  * Mock execution context for Cloudflare Workers
  */
 class MockExecutionContext implements ExecutionContext {
+  readonly exports = {} as Cloudflare.Exports;
+  readonly tracing = {} as Tracing;
   props: any = {};
 
   waitUntil(promise: Promise<any>): void {

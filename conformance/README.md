@@ -44,18 +44,23 @@ Requirements are enabled from the revision that introduced them. Shared OAuth be
 
 ## Test architecture
 
-`support/oauth-server.ts` constructs a real `OAuthProvider` with:
+`worker/` is a real Wrangler project started through Cloudflare's [`createTestHarness()`](https://developers.cloudflare.com/workers/testing/test-harness/) API. Wrangler builds the Worker and runs it in Workerd with:
 
-- an in-memory KV implementation;
+- a local `OAUTH_KV` namespace using the actual Workers KV binding API;
+- the `global_fetch_strictly_public` compatibility flag used by CIMD;
 - an application-owned authorization handler that grants synthetic consent;
-- a protected `/mcp` handler that exposes only authenticated props;
-- pre-registration, DCR, and mocked CIMD client paths; and
+- a protected `/mcp` handler that exposes only authenticated props; and
 - the canonical resource `https://mcp.example.com/mcp` where the revision requires Resource Indicators.
 
-Tests send standard `Request` objects through `OAuthProvider.fetch()` and assert only observable HTTP responses, redirects, metadata, challenges, and token behavior. They do not access provider internals or stored records.
+`support/oauth-server.ts` is a thin OAuth HTTP client around the test harness. It uses Worker RPC only to pre-register clients through `OAuthHelpers`; DCR and every OAuth flow run over HTTP. The harness recreates local storage after each test.
+
+Tests assert only observable HTTP responses, redirects, metadata, challenges, and token behavior. They do not access provider internals or stored records.
 
 ## Files
 
+- `worker/index.ts` — deployable Worker fixture hosting `OAuthProvider`.
+- `worker/wrangler.jsonc` — Worker configuration and local KV binding.
+- `support/oauth-server.ts` — test-harness lifecycle and OAuth HTTP client.
 - `authorization-server.test.ts` — metadata and authorization-code/PKCE flows.
 - `authorization-security.test.ts` — redirect, client authentication, Resource Indicator, issuer, and refresh-scope security.
 - `protected-resource.test.ts` — RFC 9728 discovery, Bearer challenges, scopes, and audience enforcement.
