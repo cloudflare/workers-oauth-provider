@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { mcpAuthRevisionsSince, resourceForRevision } from './spec-versions';
+import { MCP_AUTH_REVISIONS, mcpAuthRevisionsSince, clientResourceForRevision } from './spec-versions';
 import {
   CONFORMANCE_ORIGIN,
   INSUFFICIENT_SCOPE_TOKEN,
@@ -25,6 +25,34 @@ interface OAuthErrorBody {
   error_description?: string;
 }
 
+describe.each(MCP_AUTH_REVISIONS)('MCP %s bearer-token conformance', (revision) => {
+  let oauth: McpOAuthClient;
+
+  beforeEach(async () => {
+    oauth = await createMcpOAuthClient(revision);
+  });
+
+  it('returns a bare Bearer challenge when credentials are absent', async () => {
+    const response = await oauth.request('/mcp');
+    const challenge = response.headers.get('WWW-Authenticate');
+
+    expect(response.status).toBe(401);
+    expect(response.headers.get('Cache-Control')).toBe('no-store');
+    expect(challenge).toContain('Bearer ');
+    expect(challenge).not.toContain('error=');
+  });
+
+  it('returns invalid_token for a malformed bearer credential', async () => {
+    const response = await oauth.request('/mcp', {
+      headers: { Authorization: 'Bearer not-an-access-token' },
+    });
+
+    expect(response.status).toBe(401);
+    expect(response.headers.get('WWW-Authenticate')).toContain('error="invalid_token"');
+    expect(await readJson<OAuthErrorBody>(response)).toMatchObject({ error: 'invalid_token' });
+  });
+});
+
 describe.each(mcpAuthRevisionsSince('2025-06-18'))('MCP %s protected-resource conformance', (revision) => {
   let oauth: McpOAuthClient;
 
@@ -46,27 +74,9 @@ describe.each(mcpAuthRevisionsSince('2025-06-18'))('MCP %s protected-resource co
     });
   });
 
-  it('returns a discoverable Bearer challenge when credentials are absent', async () => {
-    const response = await oauth.request('/mcp');
-    const challenge = response.headers.get('WWW-Authenticate');
-
-    expect(response.status).toBe(401);
-    expect(response.headers.get('Cache-Control')).toBe('no-store');
-    expect(challenge).toContain('Bearer ');
+  it('links its path-specific metadata from Bearer challenges', async () => {
+    const challenge = (await oauth.request('/mcp')).headers.get('WWW-Authenticate');
     expect(challenge).toContain(`resource_metadata="${CONFORMANCE_ORIGIN}/.well-known/oauth-protected-resource/mcp"`);
-    expect(challenge).not.toContain('error=');
-  });
-
-  it('returns invalid_token for a malformed bearer credential', async () => {
-    const response = await oauth.request('/mcp', {
-      headers: { Authorization: 'Bearer not-an-access-token' },
-    });
-    const challenge = response.headers.get('WWW-Authenticate');
-
-    expect(response.status).toBe(401);
-    expect(challenge).toContain('error="invalid_token"');
-    expect(challenge).toContain('resource_metadata=');
-    expect(await readJson<OAuthErrorBody>(response)).toMatchObject({ error: 'invalid_token' });
   });
 
   it('rejects a valid token at a resource outside its audience', async () => {
@@ -97,7 +107,7 @@ describe.each(mcpAuthRevisionsSince('2025-06-18'))('MCP %s protected-resource co
     expect(await readJson<OAuthErrorBody>(rejected.response)).toMatchObject({ error: 'invalid_target' });
 
     const accepted = await oauth.exchangeAuthorizationCode(client, authorization, {
-      resource: resourceForRevision(revision),
+      resource: clientResourceForRevision(revision),
     });
     expect(accepted.response.status).toBe(200);
     expect(accepted.tokens?.access_token).toBeTruthy();

@@ -8,6 +8,6 @@ export function mcpAuthRevisionsSince(first: McpAuthRevision): readonly McpAuthR
   return MCP_AUTH_REVISIONS.slice(MCP_AUTH_REVISIONS.indexOf(first));
 }
 
-export function resourceForRevision(revision: McpAuthRevision): string | undefined {
+export function clientResourceForRevision(revision: McpAuthRevision): string | undefined {
   return mcpAuthRevisionsSince('2025-06-18').includes(revision) ? MCP_RESOURCE : undefined;
 }

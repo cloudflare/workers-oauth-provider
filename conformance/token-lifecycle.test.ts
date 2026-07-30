@@ -20,7 +20,7 @@ describe.each(MCP_AUTH_REVISIONS)('MCP %s OAuth token lifecycle conformance', (r
 
   beforeEach(async () => {
     oauth = await createMcpOAuthClient(revision);
-    client = await oauth.createClient('client_secret_basic');
+    client = await oauth.createClient('none');
   });
 
   it('rotates refresh tokens while allowing one retry with the previous token', async () => {
@@ -99,7 +99,7 @@ describe.each(MCP_AUTH_REVISIONS)('MCP %s OAuth token lifecycle conformance', (r
 
   it('does not let another client revoke tokens it does not own', async () => {
     const { tokens } = await oauth.completeAuthorizationCodeFlow(client);
-    const otherClient = await oauth.createClient('client_secret_basic');
+    const otherClient = await oauth.createClient('none');
 
     const revocation = await oauth.revoke(otherClient, tokens.access_token, 'access_token');
     expect(revocation.status).toBe(200);

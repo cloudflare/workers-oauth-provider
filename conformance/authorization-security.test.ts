@@ -1,8 +1,10 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { MCP_AUTH_REVISIONS, mcpAuthRevisionsSince, resourceForRevision } from './spec-versions';
+import { MCP_AUTH_REVISIONS, mcpAuthRevisionsSince, clientResourceForRevision } from './spec-versions';
 import {
   CLIENT_REDIRECT_URI,
   CONFORMANCE_ORIGIN,
+  DENIED_SCOPE,
+  MCP_RESOURCE,
   McpOAuthClient,
   createMcpOAuthClient,
   OFFLINE_ACCESS_SCOPE,
@@ -42,7 +44,7 @@ describe.each(MCP_AUTH_REVISIONS)('MCP %s authorization security conformance', (
       code_challenge: 'a-valid-looking-conformance-code-challenge',
       code_challenge_method: 'S256',
     });
-    const resource = resourceForRevision(revision);
+    const resource = clientResourceForRevision(revision);
     if (resource) params.set('resource', resource);
 
     const response = await oauth.request(`/authorize?${params}`);
@@ -64,7 +66,7 @@ describe.each(MCP_AUTH_REVISIONS)('MCP %s authorization security conformance', (
       code_challenge: 'a-valid-looking-conformance-code-challenge',
       code_challenge_method: 'S256',
     });
-    const resource = resourceForRevision(revision);
+    const resource = clientResourceForRevision(revision);
     if (resource) params.set('resource', resource);
 
     const response = await oauth.request(`/authorize?${params}`);
@@ -112,11 +114,33 @@ describe.each(MCP_AUTH_REVISIONS)('MCP %s authorization security conformance', (
   });
 });
 
+describe('strict resource policy compatibility boundary', () => {
+  it('rejects a 2025-03-26 client that cannot send resource', async () => {
+    const oauth = await createMcpOAuthClient('2025-03-26', { resourcePolicy: 'strict' });
+    const client = await oauth.createClient('none');
+    const params = new URLSearchParams({
+      response_type: 'code',
+      client_id: client.clientId,
+      redirect_uri: client.redirectUri,
+      scope: READ_SCOPE,
+      state: 'legacy-client',
+      code_challenge: 'a-valid-looking-conformance-code-challenge',
+      code_challenge_method: 'S256',
+    });
+
+    const response = await oauth.request(`/authorize?${params}`);
+    expect(response.status).toBe(400);
+    expect(await readJson<OAuthErrorBody>(response)).toMatchObject({
+      error_description: expect.stringContaining('resource parameter must exactly match'),
+    });
+  });
+});
+
 describe.each(mcpAuthRevisionsSince('2025-06-18'))('MCP %s Resource Indicator authorization security', (revision) => {
   let oauth: McpOAuthClient;
 
   beforeEach(async () => {
-    oauth = await createMcpOAuthClient(revision);
+    oauth = await createMcpOAuthClient(revision, { resourcePolicy: 'strict' });
   });
 
   it('requires the configured canonical resource in the authorization request', async () => {
@@ -160,7 +184,7 @@ describe.each(mcpAuthRevisionsSince('2025-06-18'))('MCP %s Resource Indicator au
     expect(response.headers.get('Location')).toBeNull();
   });
 
-  it('returns the canonical resource in successful token responses', async () => {
+  it('requires the canonical resource throughout authorization and token exchange', async () => {
     const client = await oauth.createClient('none');
     const { tokens } = await oauth.completeAuthorizationCodeFlow(client);
     expect(tokens.resource).toBe(`${CONFORMANCE_ORIGIN}/mcp`);
@@ -180,6 +204,29 @@ describe.each(mcpAuthRevisionsSince('2026-07-28'))('MCP %s authorization respons
     const authorization = await oauth.authorize(client);
     expect(authorization.redirect.searchParams.getAll('iss')).toEqual([metadata.issuer]);
     expect(metadata.issuer).toBe(CONFORMANCE_ORIGIN);
+  });
+
+  it('includes the matching issuer in terminal authorization errors', async () => {
+    oauth = await createMcpOAuthClient(revision);
+    const client = await oauth.createClient('none');
+    const params = new URLSearchParams({
+      response_type: 'code',
+      client_id: client.clientId,
+      redirect_uri: client.redirectUri,
+      scope: DENIED_SCOPE,
+      state: 'denied-state',
+      code_challenge: 'a-valid-looking-conformance-code-challenge',
+      code_challenge_method: 'S256',
+      resource: MCP_RESOURCE,
+    });
+
+    const response = await oauth.request(`/authorize?${params}`);
+    expect(response.status).toBe(302);
+    const redirect = new URL(response.headers.get('Location')!);
+    expect(redirect.searchParams.getAll('error')).toEqual(['access_denied']);
+    expect(redirect.searchParams.getAll('state')).toEqual(['denied-state']);
+    expect(redirect.searchParams.getAll('iss')).toEqual([CONFORMANCE_ORIGIN]);
+    expect(redirect.searchParams.has('code')).toBe(false);
   });
 });
 

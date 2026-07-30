@@ -23,24 +23,33 @@ The matrix follows every dated authorization revision represented by the officia
 
 Requirements are enabled from the revision that introduced them. Shared OAuth behavior is exercised against every revision, with the target revision sent in the `MCP-Protocol-Version` header.
 
+These are compatibility profiles, not server-side protocol negotiation. The common server profile stays fixed while client request behavior changes by revision: `2025-03-26` omits the RFC 8707 `resource` parameter, while `2025-06-18` and later include it in authorization and token requests. Exact canonical-resource pinning is tested separately because a deployment that requires `resource` cannot also accept an unmodified `2025-03-26` client.
+
 ## Coverage and traceability
 
-| Scenario                                                                                               | Applicable revisions                   | Specification                                                                                          |
-| ------------------------------------------------------------------------------------------------------ | -------------------------------------- | ------------------------------------------------------------------------------------------------------ |
-| Authorization server metadata, endpoints, grants, token authentication methods, and S256 advertisement | All                                    | [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414), MCP authorization                                  |
-| Authorization code flow for public and confidential clients                                            | All                                    | OAuth 2.1 authorization code grant                                                                     |
-| S256 PKCE enforcement; missing, plain, unsupported method, and incorrect verifier rejection            | All                                    | [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636), OAuth 2.1                                          |
-| Safe redirect URI and client validation                                                                | All                                    | OAuth 2.1 authorization endpoint security                                                              |
-| `client_secret_basic`, `client_secret_post`, and public-client token endpoint authentication           | All                                    | OAuth 2.1 token endpoint                                                                               |
-| DCR public/confidential clients and metadata validation                                                | All, retained as compatibility in 2026 | [RFC 7591](https://www.rfc-editor.org/rfc/rfc7591), MCP client registration                            |
-| Refresh rotation, retry behavior, downscoping, and RFC 7009 revocation                                 | All                                    | [RFC 6749](https://www.rfc-editor.org/rfc/rfc6749), [RFC 7009](https://www.rfc-editor.org/rfc/rfc7009) |
-| Protected Resource Metadata at the path-aware well-known URL                                           | `2025-06-18`+                          | [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728), MCP authorization server discovery                 |
-| `WWW-Authenticate` discovery and `invalid_token` behavior                                              | `2025-06-18`+                          | [RFC 6750](https://www.rfc-editor.org/rfc/rfc6750), RFC 9728                                           |
-| Resource Indicators in authorization/token responses and exact audience validation                     | `2025-06-18`+                          | [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707), MCP authorization security considerations          |
-| Baseline and operation-specific `insufficient_scope` challenges                                        | `2025-11-25`+                          | RFC 6750, MCP scope challenge handling                                                                 |
-| Pre-registered clients and Client ID Metadata Documents                                                | `2025-11-25`+                          | MCP client registration, OAuth Client ID Metadata Documents                                            |
-| Authorization response issuer advertisement and response parameter                                     | `2026-07-28`                           | [RFC 9207](https://www.rfc-editor.org/rfc/rfc9207)                                                     |
-| `offline_access` kept out of resource metadata and Bearer challenges                                   | `2026-07-28`                           | MCP refresh token guidance                                                                             |
+| Scenario                                                                                               | Applicable revisions                       | Specification                                                                                          |
+| ------------------------------------------------------------------------------------------------------ | ------------------------------------------ | ------------------------------------------------------------------------------------------------------ |
+| Authorization server metadata, endpoints, grants, token authentication methods, and S256 advertisement | `SHOULD` in 2025-03; required later        | [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414), MCP authorization                                  |
+| Authorization code flow for public and confidential clients                                            | All                                        | OAuth 2.1 authorization code grant                                                                     |
+| S256 PKCE enforcement; missing, plain, unsupported method, and incorrect verifier rejection            | All                                        | [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636), OAuth 2.1                                          |
+| Safe redirect URI and client validation                                                                | All                                        | OAuth 2.1 authorization endpoint security                                                              |
+| `client_secret_basic`, `client_secret_post`, and public-client token endpoint authentication           | All                                        | OAuth 2.1 token endpoint                                                                               |
+| DCR public/confidential clients and metadata validation                                                | `SHOULD` in 2025-03/06; `MAY` later        | [RFC 7591](https://www.rfc-editor.org/rfc/rfc7591), MCP client registration                            |
+| Public-client refresh rotation, retry behavior, downscoping, and RFC 7009 revocation                   | `SHOULD` in 2025-03; rotation `MUST` later | [RFC 6749](https://www.rfc-editor.org/rfc/rfc6749), [RFC 7009](https://www.rfc-editor.org/rfc/rfc7009) |
+| Bearer challenges and `invalid_token` responses                                                        | All                                        | [RFC 6750](https://www.rfc-editor.org/rfc/rfc6750), OAuth 2.1                                          |
+| Protected Resource Metadata at the path-aware well-known URL                                           | `2025-06-18`+                              | [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728), MCP authorization server discovery                 |
+| `resource_metadata` links in `WWW-Authenticate`                                                        | `2025-06-18`+                              | RFC 9728                                                                                               |
+| Resource Indicators in authorization/token responses and exact audience validation                     | `2025-06-18`+                              | [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707), MCP authorization security considerations          |
+| Baseline and operation-specific `insufficient_scope` challenges                                        | `2025-11-25`+                              | RFC 6750, MCP scope challenge handling                                                                 |
+| Pre-registered clients and Client ID Metadata Documents                                                | `2025-11-25`+                              | MCP client registration, OAuth Client ID Metadata Documents                                            |
+| Authorization response issuer advertisement in success and terminal error responses                    | `2026-07-28`                               | [RFC 9207](https://www.rfc-editor.org/rfc/rfc9207)                                                     |
+| `offline_access` kept out of resource metadata and Bearer challenges                                   | `2026-07-28`                               | MCP refresh token guidance                                                                             |
+
+## Relationship to the official conformance runner
+
+The upstream `@modelcontextprotocol/conformance` authorization-server mode currently exposes two scenarios—metadata and authorization code grant—and applies both to all four dates. The real Worker fixture passed both upstream scenarios for every date using upstream `0.2.0-alpha.10` (`49103de`) over a local HTTPS issuer.
+
+The upstream authorization-code scenario does not send RFC 8707 `resource`, so it cannot establish `2025-06-18+` Resource Indicator conformance against a strict server. This suite covers those upstream checks and adds the revision-specific protected-resource, audience, registration, scope, refresh, revocation, and issuer scenarios listed above.
 
 ## Test architecture
 
@@ -52,7 +61,7 @@ Requirements are enabled from the revision that introduced them. Shared OAuth be
 - a protected `/mcp` handler that exposes only authenticated props; and
 - the canonical resource `https://mcp.example.com/mcp` where the revision requires Resource Indicators.
 
-`support/oauth-client.ts` is the OAuth HTTP client around the test harness. A typed Worker RPC configures each test profile and pre-registers clients through `OAuthHelpers`; DCR and every OAuth flow run over HTTP. The harness recreates local storage after each test.
+`support/oauth-client.ts` is the OAuth HTTP client around the test harness. A typed Worker RPC selects either the fixed backwards-compatible profile or the strict canonical-resource profile and pre-registers clients through `OAuthHelpers`; DCR and every OAuth flow run over HTTP. The harness recreates local storage after each test.
 
 Tests assert only observable HTTP responses, redirects, metadata, challenges, and token behavior. They do not access provider internals or stored records.
 

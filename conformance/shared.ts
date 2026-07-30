@@ -5,11 +5,13 @@ export const READ_SCOPE = 'mcp:read';
 export const WRITE_SCOPE = 'mcp:write';
 export const OFFLINE_ACCESS_SCOPE = 'offline_access';
 export const INSUFFICIENT_SCOPE_TOKEN = 'valid-upstream-token-with-too-little-scope';
+export const DENIED_SCOPE = 'conformance:deny';
 
 export type TokenEndpointAuthMethod = 'none' | 'client_secret_basic' | 'client_secret_post';
 
 export interface WorkerConfiguration {
   dynamicClientRegistration: boolean;
+  origin: string;
   resource?: string;
   resourceScopes: string[];
 }

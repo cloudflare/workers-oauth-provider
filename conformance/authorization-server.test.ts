@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { MCP_AUTH_REVISIONS, resourceForRevision } from './spec-versions';
+import { MCP_AUTH_REVISIONS, clientResourceForRevision } from './spec-versions';
 import {
   CLIENT_REDIRECT_URI,
   CONFORMANCE_ORIGIN,
@@ -62,7 +62,7 @@ describe.each(MCP_AUTH_REVISIONS)('MCP %s authorization server conformance', (re
     expect(authorization.redirect.searchParams.getAll('code')).toHaveLength(1);
     expect(authorization.redirect.searchParams.getAll('state')).toEqual([authorization.state]);
     expect(authorization.redirect.searchParams.has('error')).toBe(false);
-    if (authorization.issuer !== null) expect(authorization.issuer).toBe(CONFORMANCE_ORIGIN);
+    expect(authorization.redirect.searchParams.getAll('iss')).toEqual([CONFORMANCE_ORIGIN]);
 
     expect(response.headers.get('Content-Type')).toMatch(/^application\/json\b/i);
     expect(response.headers.get('Cache-Control')).toBe('no-store');
@@ -71,6 +71,7 @@ describe.each(MCP_AUTH_REVISIONS)('MCP %s authorization server conformance', (re
     expect(tokens.token_type.toLowerCase()).toBe('bearer');
     expect(tokens.expires_in).toBeGreaterThan(0);
     expect(tokens.scope).toBe(READ_SCOPE);
+    expect(tokens.resource).toBe(clientResourceForRevision(revision) ?? CONFORMANCE_ORIGIN);
 
     const protectedResponse = await oauth.request('/mcp', {
       headers: { Authorization: `Bearer ${tokens.access_token}` },
@@ -78,13 +79,14 @@ describe.each(MCP_AUTH_REVISIONS)('MCP %s authorization server conformance', (re
     expect(protectedResponse.status).toBe(200);
     expect(await protectedResponse.json()).toEqual({
       authenticated: true,
+      protocolVersion: revision,
       props: { subject: 'conformance-user' },
     });
   });
 
   it('rejects public authorization-code requests that omit PKCE', async () => {
     const client = await oauth.createClient('none');
-    const resource = resourceForRevision(revision);
+    const resource = clientResourceForRevision(revision);
     const params = new URLSearchParams({
       response_type: 'code',
       client_id: client.clientId,
@@ -105,7 +107,7 @@ describe.each(MCP_AUTH_REVISIONS)('MCP %s authorization server conformance', (re
 
   it('rejects the plain PKCE method', async () => {
     const client = await oauth.createClient('none');
-    const resource = resourceForRevision(revision);
+    const resource = clientResourceForRevision(revision);
     const params = new URLSearchParams({
       response_type: 'code',
       client_id: client.clientId,
@@ -128,7 +130,7 @@ describe.each(MCP_AUTH_REVISIONS)('MCP %s authorization server conformance', (re
 
   it('rejects an unsupported PKCE method instead of treating it as plain', async () => {
     const client = await oauth.createClient('none');
-    const resource = resourceForRevision(revision);
+    const resource = clientResourceForRevision(revision);
     const params = new URLSearchParams({
       response_type: 'code',
       client_id: client.clientId,

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { MCP_AUTH_REVISIONS, mcpAuthRevisionsSince, resourceForRevision } from './spec-versions';
+import { MCP_AUTH_REVISIONS, mcpAuthRevisionsSince, clientResourceForRevision } from './spec-versions';
 import {
   CLIENT_REDIRECT_URI,
   CONFORMANCE_ORIGIN,
@@ -127,7 +127,7 @@ describe.each(mcpAuthRevisionsSince('2025-11-25'))('MCP %s client registration c
     expect(metadata.client_id_metadata_document_supported).toBe(true);
 
     const { tokens } = await oauth.completeAuthorizationCodeFlow(client, {
-      resource: resourceForRevision(revision),
+      resource: clientResourceForRevision(revision),
       scope: READ_SCOPE,
     });
     expect(tokens.access_token).toBeTruthy();
@@ -153,7 +153,7 @@ describe.each(mcpAuthRevisionsSince('2025-11-25'))('MCP %s client registration c
       state: 'cimd-mismatch',
       code_challenge: 'a-valid-looking-conformance-code-challenge',
       code_challenge_method: 'S256',
-      resource: resourceForRevision(revision) ?? `${CONFORMANCE_ORIGIN}/mcp`,
+      resource: clientResourceForRevision(revision) ?? `${CONFORMANCE_ORIGIN}/mcp`,
     });
 
     const response = await oauth.request(`/authorize?${params}`);

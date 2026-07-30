@@ -1,7 +1,8 @@
-import { resourceForRevision, type McpAuthRevision } from '../spec-versions';
+import { clientResourceForRevision, type McpAuthRevision } from '../spec-versions';
 import {
   CLIENT_REDIRECT_URI,
   CONFORMANCE_ORIGIN,
+  DENIED_SCOPE,
   INSUFFICIENT_SCOPE_TOKEN,
   MCP_RESOURCE,
   OFFLINE_ACCESS_SCOPE,
@@ -18,6 +19,7 @@ type WorkerApi = Awaited<ReturnType<typeof worker.getExport>>;
 export {
   CLIENT_REDIRECT_URI,
   CONFORMANCE_ORIGIN,
+  DENIED_SCOPE,
   INSUFFICIENT_SCOPE_TOKEN,
   MCP_RESOURCE,
   OFFLINE_ACCESS_SCOPE,
@@ -39,7 +41,6 @@ interface RequestOptions {
 
 interface AuthorizationResult {
   code: string;
-  issuer: string | null;
   redirect: URL;
   state: string;
 }
@@ -64,6 +65,7 @@ interface DcrResponse {
 
 interface ConformanceClientOptions {
   dynamicClientRegistration?: boolean;
+  resourcePolicy?: 'compatible' | 'strict';
   resourceScopes?: string[];
 }
 
@@ -76,15 +78,16 @@ export async function createMcpOAuthClient(
   revision: McpAuthRevision,
   options: ConformanceClientOptions = {}
 ): Promise<McpOAuthClient> {
-  const resource = resourceForRevision(revision);
+  const clientResource = clientResourceForRevision(revision);
   const configuration: WorkerConfiguration = {
     dynamicClientRegistration: options.dynamicClientRegistration !== false,
-    resource,
+    origin: CONFORMANCE_ORIGIN,
+    resource: options.resourcePolicy === 'strict' ? MCP_RESOURCE : undefined,
     resourceScopes: options.resourceScopes ?? [READ_SCOPE],
   };
   const api = await worker.getExport();
   await api.configure(configuration);
-  return new McpOAuthClient(revision, resource, api);
+  return new McpOAuthClient(revision, clientResource, api);
 }
 
 /** OAuth client for the real Worker started by createTestHarness(). */
@@ -156,7 +159,7 @@ class McpOAuthClient {
     const code = redirect.searchParams.get('code');
     if (!code) throw new Error(`authorization response did not include code: ${location}`);
 
-    return { code, issuer: redirect.searchParams.get('iss'), redirect, state };
+    return { code, redirect, state };
   }
 
   exchangeAuthorizationCode(
