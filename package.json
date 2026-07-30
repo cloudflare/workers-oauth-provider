@@ -20,6 +20,7 @@
     "check": "npm run typecheck && npm run test",
     "typecheck": "tsc",
     "test": "vitest run",
+    "test:conformance": "vitest run conformance",
     "test:watch": "vitest",
     "prepublishOnly": "npm run build",
     "prettier": "prettier -w ."

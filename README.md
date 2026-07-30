@@ -2,8 +2,6 @@
 
 `@cloudflare/workers-oauth-provider` adds OAuth 2.1 authorization to HTTP APIs and remote MCP servers running on Cloudflare Workers.
 
-It provides the authorization server and protected resource parts required by the stable [MCP 2026-07-28 authorization specification](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization). It is intended for HTTP-based MCP transports and does not implement MCP transport or protocol methods. Stdio servers should obtain credentials from their environment.
-
 ## Install
 
 ```sh

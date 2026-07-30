@@ -43,6 +43,9 @@ workers-oauth-provider/
 │   ├── setup.ts               # Vitest setup and mocking
 │   └── mocks/
 │       └── cloudflare-workers.ts
+├── conformance/               # Black-box MCP authorization conformance matrix
+│   ├── README.md              # Scope, revision coverage, and traceability
+│   └── support/               # Public-interface OAuth server test harness
 ├── dist/                      # Build output (tsdown)
 ├── docs/
 │   └── advanced-configuration.md
@@ -69,14 +72,15 @@ Node 24+ required.
 
 ## Commands
 
-| Command              | What it does                              |
-| -------------------- | ----------------------------------------- |
-| `npm run build`      | Builds single-file ESM bundle with tsdown |
-| `npm run check`      | Runs typecheck + tests                    |
-| `npm run typecheck`  | TypeScript type checking (no emit)        |
-| `npm run test`       | Runs vitest test suite                    |
-| `npm run test:watch` | Runs vitest in watch mode                 |
-| `npm run prettier`   | Formats all files with Prettier           |
+| Command                    | What it does                              |
+| -------------------------- | ----------------------------------------- |
+| `npm run build`            | Builds single-file ESM bundle with tsdown |
+| `npm run check`            | Runs typecheck + tests                    |
+| `npm run typecheck`        | TypeScript type checking (no emit)        |
+| `npm run test`             | Runs vitest test suite                    |
+| `npm run test:conformance` | Runs MCP auth conformance tests           |
+| `npm run test:watch`       | Runs vitest in watch mode                 |
+| `npm run prettier`         | Formats all files with Prettier           |
 
 ## Code standards
 
@@ -140,11 +144,14 @@ This is a security-critical OAuth library. All changes must consider:
 Tests use **vitest** with custom mocks for Cloudflare Workers APIs.
 
 ```bash
-npm run test          # Single run
-npm run test:watch    # Watch mode
+npm run test               # Full suite, including conformance
+npm run test:conformance   # MCP authorization conformance only
+npm run test:watch         # Watch mode
 ```
 
-**Test file:** `__tests__/oauth-provider.test.ts`
+**Main integration test:** `__tests__/oauth-provider.test.ts`
+
+**MCP authorization conformance:** `conformance/` contains black-box tests for every dated authorization revision represented by the official MCP conformance timeline. These tests exercise only public `OAuthProvider` and `OAuthHelpers` interfaces and include requirement traceability in `conformance/README.md`.
 
 **Mock implementations:**
 

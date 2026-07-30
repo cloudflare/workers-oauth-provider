@@ -11,6 +11,6 @@
     "skipLibCheck": true,
     "noEmit": true
   },
-  "include": ["src/**/*.ts", "__tests__/**/*.ts"],
+  "include": ["src/**/*.ts", "__tests__/**/*.ts", "conformance/**/*.ts"],
   "exclude": ["node_modules", "dist"]
 }
