@@ -3,10 +3,14 @@ import { WorkerEntrypoint } from 'cloudflare:workers';
 import {
   buildOAuthServerCapabilities,
   isValidOAuthScopeToken,
+  normalizePkceCodeChallengeMethod,
+  validateAuthorizationPkce,
   validateAuthorizationResponseType,
+  validatePkceCodeChallengeMethod,
   validateAuthorizationServerScopes,
   validateClientCapabilities,
   type OAuthServerCapabilities,
+  type PkceCodeChallengeMethod,
 } from './oauth-capabilities';
 import {
   EMA_DEFAULT_CLOCK_SKEW_SECONDS,
@@ -1464,6 +1468,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     this.serverCapabilities = buildOAuthServerCapabilities({
       allowImplicitFlow: !!this.options.allowImplicitFlow,
+      allowPlainPKCE: this.options.allowPlainPKCE !== false,
       allowTokenExchangeGrant: !!this.options.allowTokenExchangeGrant,
       enterpriseManagedAuthorization: !!this.options.enterpriseManagedAuthorization,
     });
@@ -2171,7 +2176,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       // not implemented: introspection_endpoint
       // not implemented: introspection_endpoint_auth_methods_supported
       // not implemented: introspection_endpoint_auth_signing_alg_values_supported
-      code_challenge_methods_supported: this.options.allowPlainPKCE !== false ? ['plain', 'S256'] : ['S256'], // PKCE support
+      code_challenge_methods_supported: this.serverCapabilities.codeChallengeMethods,
       authorization_response_iss_parameter_supported: true,
       // MCP Client ID Metadata Document support (CIMD)
       // Only enabled when global_fetch_strictly_public compat flag is set (for SSRF protection)
@@ -2377,6 +2382,20 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       return this.createErrorResponse('invalid_grant', { description: 'Authorization code already used' });
     }
 
+    // Validate the stored method before deciding whether PKCE is active. Older
+    // versions could persist unknown methods; those grants must not fall back
+    // to the non-PKCE path or be interpreted as plain.
+    let codeChallengeMethod: PkceCodeChallengeMethod;
+    try {
+      codeChallengeMethod = grantData.codeChallenge
+        ? validatePkceCodeChallengeMethod(this.serverCapabilities, grantData.codeChallengeMethod)
+        : normalizePkceCodeChallengeMethod(grantData.codeChallengeMethod);
+    } catch (error) {
+      return this.createErrorResponse('invalid_grant', {
+        description: error instanceof Error ? error.message : 'Invalid PKCE code_challenge_method',
+      });
+    }
+
     // Check if PKCE is being used
     const isPkceEnabled = !!grantData.codeChallenge;
 
@@ -2405,10 +2424,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         return this.createErrorResponse('invalid_request', { description: 'code_verifier is required for PKCE' });
       }
 
-      // Verify the code verifier against the stored code challenge
+      // Verify the code verifier against the stored code challenge.
       let calculatedChallenge: string;
-
-      if (grantData.codeChallengeMethod === 'S256') {
+      if (codeChallengeMethod === 'S256') {
         // SHA-256 transformation for S256 method
         const encoder = new TextEncoder();
         const data = encoder.encode(codeVerifier);
@@ -5450,12 +5468,15 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
         );
       }
       validateAuthorizationResponseType(this.provider.serverCapabilities, responseType, clientInfo.responseTypes);
-      if (codeChallengeMethod === 'plain' && this.provider.options.allowPlainPKCE === false) {
-        throw new Error('The plain PKCE method is not allowed. Use S256 instead.');
-      }
-      if (responseType === 'code' && clientInfo.tokenEndpointAuthMethod === 'none' && !codeChallenge) {
-        throw new Error('Public clients must use PKCE with the authorization code flow.');
-      }
+      validateAuthorizationPkce(
+        this.provider.serverCapabilities,
+        {
+          responseType,
+          codeChallenge,
+          codeChallengeMethod,
+        },
+        clientInfo
+      );
     }
 
     return {
@@ -5526,6 +5547,11 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
       throw new Error(`The resource parameter must exactly match ${configuredResource}`);
     }
     const effectiveResource = options.request.resource ?? options.request.issuer;
+
+    // Re-apply PKCE policy after client, redirect, response-type, and resource
+    // validation, preserving their established error precedence while still
+    // rejecting before any grant lookup, revocation, or storage.
+    validateAuthorizationPkce(this.provider.serverCapabilities, options.request, clientInfo);
 
     // If requested, collect existing grants for this user+client to revoke AFTER the new grant is created.
     // This avoids a data-loss window where the user has no grants if creation fails.

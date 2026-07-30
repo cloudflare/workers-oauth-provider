@@ -1,0 +1,13 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "mcp-oauth-conformance-worker",
+  "main": "index.ts",
+  "compatibility_date": "2026-07-29",
+  "compatibility_flags": ["global_fetch_strictly_public"],
+  "kv_namespaces": [
+    {
+      "binding": "OAUTH_KV",
+      "id": "mcp-oauth-conformance-kv",
+    },
+  ],
+}
