@@ -1,19 +1,14 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import {
-  MCP_AUTHORIZATION_RESPONSE_ISSUER_REVISIONS,
-  MCP_AUTH_REVISIONS,
-  MCP_OFFLINE_ACCESS_GUIDANCE_REVISIONS,
-  MCP_PROTECTED_RESOURCE_REVISIONS,
-  resourceForRevision,
-} from './spec-versions';
+import { MCP_AUTH_REVISIONS, mcpAuthRevisionsSince, resourceForRevision } from './spec-versions';
 import {
   CLIENT_REDIRECT_URI,
   CONFORMANCE_ORIGIN,
-  McpOAuthConformanceServer,
+  McpOAuthClient,
+  createMcpOAuthClient,
   OFFLINE_ACCESS_SCOPE,
   READ_SCOPE,
   readJson,
-} from './support/oauth-server';
+} from './support/oauth-client';
 
 interface OAuthErrorBody {
   error: string;
@@ -30,15 +25,15 @@ interface ProtectedResourceMetadata {
   scopes_supported?: string[];
 }
 
-describe.each(MCP_AUTH_REVISIONS)('MCP $version authorization security conformance', (revision) => {
-  let server: McpOAuthConformanceServer;
+describe.each(MCP_AUTH_REVISIONS)('MCP %s authorization security conformance', (revision) => {
+  let oauth: McpOAuthClient;
 
-  beforeEach(() => {
-    server = new McpOAuthConformanceServer(revision);
+  beforeEach(async () => {
+    oauth = await createMcpOAuthClient(revision);
   });
 
   it('does not redirect an authorization request with an unregistered redirect URI', async () => {
-    const client = await server.createClient('none');
+    const client = await oauth.createClient('none');
     const params = new URLSearchParams({
       response_type: 'code',
       client_id: client.clientId,
@@ -50,7 +45,7 @@ describe.each(MCP_AUTH_REVISIONS)('MCP $version authorization security conforman
     const resource = resourceForRevision(revision);
     if (resource) params.set('resource', resource);
 
-    const response = await server.request(`/authorize?${params}`);
+    const response = await oauth.request(`/authorize?${params}`);
 
     expect(response.status).toBe(400);
     expect(response.headers.get('Location')).toBeNull();
@@ -72,33 +67,33 @@ describe.each(MCP_AUTH_REVISIONS)('MCP $version authorization security conforman
     const resource = resourceForRevision(revision);
     if (resource) params.set('resource', resource);
 
-    const response = await server.request(`/authorize?${params}`);
+    const response = await oauth.request(`/authorize?${params}`);
 
     expect(response.status).toBe(400);
     expect(response.headers.get('Location')).toBeNull();
   });
 
   it('does not consume an authorization code when redirect_uri validation fails at the token endpoint', async () => {
-    const client = await server.createClient('none');
-    const authorization = await server.authorize(client);
+    const client = await oauth.createClient('none');
+    const authorization = await oauth.authorize(client);
 
-    const invalid = await server.exchangeAuthorizationCode(
+    const invalid = await oauth.exchangeAuthorizationCode(
       { ...client, redirectUri: 'https://attacker.example.com/callback' },
       authorization
     );
     expect(invalid.response.status).toBe(400);
     expect(await readJson<OAuthErrorBody>(invalid.response)).toMatchObject({ error: 'invalid_grant' });
 
-    const retry = await server.exchangeAuthorizationCode(client, authorization);
+    const retry = await oauth.exchangeAuthorizationCode(client, authorization);
     expect(retry.response.status).toBe(200);
     expect(retry.tokens?.access_token).toBeTruthy();
   });
 
   it('challenges invalid confidential-client credentials without consuming the code', async () => {
-    const client = await server.createClient('client_secret_basic');
-    const authorization = await server.authorize(client);
+    const client = await oauth.createClient('client_secret_basic');
+    const authorization = await oauth.authorize(client);
 
-    const invalid = await server.exchangeAuthorizationCode(
+    const invalid = await oauth.exchangeAuthorizationCode(
       { ...client, clientSecret: 'not-the-client-secret' },
       authorization
     );
@@ -106,113 +101,107 @@ describe.each(MCP_AUTH_REVISIONS)('MCP $version authorization security conforman
     expect(invalid.response.headers.get('WWW-Authenticate')).toBe('Basic realm="OAuth"');
     expect(await readJson<OAuthErrorBody>(invalid.response)).toMatchObject({ error: 'invalid_client' });
 
-    const retry = await server.exchangeAuthorizationCode(client, authorization);
+    const retry = await oauth.exchangeAuthorizationCode(client, authorization);
     expect(retry.response.status).toBe(200);
   });
 
   it('accepts client_secret_post when that is the registered client authentication method', async () => {
-    const client = await server.createClient('client_secret_post');
-    const { tokens } = await server.completeAuthorizationCodeFlow(client);
+    const client = await oauth.createClient('client_secret_post');
+    const { tokens } = await oauth.completeAuthorizationCodeFlow(client);
     expect(tokens.access_token).toBeTruthy();
   });
 });
 
-describe.each(MCP_PROTECTED_RESOURCE_REVISIONS)(
-  'MCP $version Resource Indicator authorization security',
-  (revision) => {
-    let server: McpOAuthConformanceServer;
+describe.each(mcpAuthRevisionsSince('2025-06-18'))('MCP %s Resource Indicator authorization security', (revision) => {
+  let oauth: McpOAuthClient;
 
-    beforeEach(() => {
-      server = new McpOAuthConformanceServer(revision);
+  beforeEach(async () => {
+    oauth = await createMcpOAuthClient(revision);
+  });
+
+  it('requires the configured canonical resource in the authorization request', async () => {
+    const client = await oauth.createClient('none');
+    const params = new URLSearchParams({
+      response_type: 'code',
+      client_id: client.clientId,
+      redirect_uri: client.redirectUri,
+      scope: READ_SCOPE,
+      state: 'missing-resource',
+      code_challenge: 'a-valid-looking-conformance-code-challenge',
+      code_challenge_method: 'S256',
     });
 
-    it('requires the configured canonical resource in the authorization request', async () => {
-      const client = await server.createClient('none');
-      const params = new URLSearchParams({
-        response_type: 'code',
-        client_id: client.clientId,
-        redirect_uri: client.redirectUri,
-        scope: READ_SCOPE,
-        state: 'missing-resource',
-        code_challenge: 'a-valid-looking-conformance-code-challenge',
-        code_challenge_method: 'S256',
-      });
+    const response = await oauth.request(`/authorize?${params}`);
 
-      const response = await server.request(`/authorize?${params}`);
+    expect(response.status).toBe(400);
+    expect(response.headers.get('Location')).toBeNull();
+    expect(await readJson<OAuthErrorBody>(response)).toMatchObject({
+      error: 'invalid_request',
+      error_description: expect.stringContaining('resource parameter must exactly match'),
+    });
+  });
 
-      expect(response.status).toBe(400);
-      expect(response.headers.get('Location')).toBeNull();
-      expect(await readJson<OAuthErrorBody>(response)).toMatchObject({
-        error: 'invalid_request',
-        error_description: expect.stringContaining('resource parameter must exactly match'),
-      });
+  it('rejects a resource URI containing a fragment', async () => {
+    const client = await oauth.createClient('none');
+    const params = new URLSearchParams({
+      response_type: 'code',
+      client_id: client.clientId,
+      redirect_uri: client.redirectUri,
+      scope: READ_SCOPE,
+      state: 'fragment-resource',
+      code_challenge: 'a-valid-looking-conformance-code-challenge',
+      code_challenge_method: 'S256',
+      resource: `${CONFORMANCE_ORIGIN}/mcp#fragment`,
     });
 
-    it('rejects a resource URI containing a fragment', async () => {
-      const client = await server.createClient('none');
-      const params = new URLSearchParams({
-        response_type: 'code',
-        client_id: client.clientId,
-        redirect_uri: client.redirectUri,
-        scope: READ_SCOPE,
-        state: 'fragment-resource',
-        code_challenge: 'a-valid-looking-conformance-code-challenge',
-        code_challenge_method: 'S256',
-        resource: `${CONFORMANCE_ORIGIN}/mcp#fragment`,
-      });
+    const response = await oauth.request(`/authorize?${params}`);
 
-      const response = await server.request(`/authorize?${params}`);
+    expect(response.status).toBe(400);
+    expect(response.headers.get('Location')).toBeNull();
+  });
 
-      expect(response.status).toBe(400);
-      expect(response.headers.get('Location')).toBeNull();
-    });
+  it('returns the canonical resource in successful token responses', async () => {
+    const client = await oauth.createClient('none');
+    const { tokens } = await oauth.completeAuthorizationCodeFlow(client);
+    expect(tokens.resource).toBe(`${CONFORMANCE_ORIGIN}/mcp`);
+  });
+});
 
-    it('returns the canonical resource in successful token responses', async () => {
-      const client = await server.createClient('none');
-      const { tokens } = await server.completeAuthorizationCodeFlow(client);
-      expect(tokens.resource).toBe(`${CONFORMANCE_ORIGIN}/mcp`);
-    });
-  }
-);
+describe.each(mcpAuthRevisionsSince('2026-07-28'))('MCP %s authorization response issuer conformance', (revision) => {
+  let oauth: McpOAuthClient;
 
-describe.each(MCP_AUTHORIZATION_RESPONSE_ISSUER_REVISIONS)(
-  'MCP $version authorization response issuer conformance',
-  (revision) => {
-    let server: McpOAuthConformanceServer;
+  it('advertises RFC 9207 and includes exactly one matching iss parameter', async () => {
+    oauth = await createMcpOAuthClient(revision);
+    const metadataResponse = await oauth.request('/.well-known/oauth-authorization-server');
+    const metadata = await readJson<AuthorizationServerMetadata>(metadataResponse);
+    expect(metadata.authorization_response_iss_parameter_supported).toBe(true);
 
-    it('advertises RFC 9207 and includes exactly one matching iss parameter', async () => {
-      server = new McpOAuthConformanceServer(revision);
-      const metadataResponse = await server.request('/.well-known/oauth-authorization-server');
-      const metadata = await readJson<AuthorizationServerMetadata>(metadataResponse);
-      expect(metadata.authorization_response_iss_parameter_supported).toBe(true);
+    const client = await oauth.createClient('none');
+    const authorization = await oauth.authorize(client);
+    expect(authorization.redirect.searchParams.getAll('iss')).toEqual([metadata.issuer]);
+    expect(metadata.issuer).toBe(CONFORMANCE_ORIGIN);
+  });
+});
 
-      const client = await server.createClient('none');
-      const authorization = await server.authorize(client);
-      expect(authorization.redirect.searchParams.getAll('iss')).toEqual([metadata.issuer]);
-      expect(metadata.issuer).toBe(CONFORMANCE_ORIGIN);
-    });
-  }
-);
-
-describe.each(MCP_OFFLINE_ACCESS_GUIDANCE_REVISIONS)('MCP $version refresh-token scope guidance', (revision) => {
-  let server: McpOAuthConformanceServer;
+describe.each(mcpAuthRevisionsSince('2026-07-28'))('MCP %s refresh-token scope guidance', (revision) => {
+  let oauth: McpOAuthClient;
 
   it('advertises offline_access only as an authorization-server capability', async () => {
-    server = new McpOAuthConformanceServer(revision, {
+    oauth = await createMcpOAuthClient(revision, {
       resourceScopes: [READ_SCOPE, OFFLINE_ACCESS_SCOPE],
     });
 
     const authorizationMetadata = await readJson<AuthorizationServerMetadata>(
-      await server.request('/.well-known/oauth-authorization-server')
+      await oauth.request('/.well-known/oauth-authorization-server')
     );
     expect(authorizationMetadata.scopes_supported).toContain(OFFLINE_ACCESS_SCOPE);
 
     const resourceMetadata = await readJson<ProtectedResourceMetadata>(
-      await server.request('/.well-known/oauth-protected-resource/mcp')
+      await oauth.request('/.well-known/oauth-protected-resource/mcp')
     );
     expect(resourceMetadata.scopes_supported).toEqual([READ_SCOPE]);
 
-    const challenge = (await server.request('/mcp')).headers.get('WWW-Authenticate');
+    const challenge = (await oauth.request('/mcp')).headers.get('WWW-Authenticate');
     expect(challenge).not.toContain(OFFLINE_ACCESS_SCOPE);
   });
 });

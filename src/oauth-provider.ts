@@ -3,10 +3,14 @@ import { WorkerEntrypoint } from 'cloudflare:workers';
 import {
   buildOAuthServerCapabilities,
   isValidOAuthScopeToken,
+  normalizePkceCodeChallengeMethod,
+  validateAuthorizationPkce,
   validateAuthorizationResponseType,
+  validatePkceCodeChallengeMethod,
   validateAuthorizationServerScopes,
   validateClientCapabilities,
   type OAuthServerCapabilities,
+  type PkceCodeChallengeMethod,
 } from './oauth-capabilities';
 import {
   EMA_DEFAULT_CLOCK_SKEW_SECONDS,
@@ -1464,6 +1468,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     this.serverCapabilities = buildOAuthServerCapabilities({
       allowImplicitFlow: !!this.options.allowImplicitFlow,
+      allowPlainPKCE: this.options.allowPlainPKCE !== false,
       allowTokenExchangeGrant: !!this.options.allowTokenExchangeGrant,
       enterpriseManagedAuthorization: !!this.options.enterpriseManagedAuthorization,
     });
@@ -2171,7 +2176,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       // not implemented: introspection_endpoint
       // not implemented: introspection_endpoint_auth_methods_supported
       // not implemented: introspection_endpoint_auth_signing_alg_values_supported
-      code_challenge_methods_supported: this.options.allowPlainPKCE !== false ? ['plain', 'S256'] : ['S256'], // PKCE support
+      code_challenge_methods_supported: this.serverCapabilities.codeChallengeMethods,
       authorization_response_iss_parameter_supported: true,
       // MCP Client ID Metadata Document support (CIMD)
       // Only enabled when global_fetch_strictly_public compat flag is set (for SSRF protection)
@@ -2380,10 +2385,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Validate the stored method before deciding whether PKCE is active. Older
     // versions could persist unknown methods; those grants must not fall back
     // to the non-PKCE path or be interpreted as plain.
-    const codeChallengeMethod = grantData.codeChallengeMethod ?? 'plain';
-    if (!isSupportedPkceCodeChallengeMethod(codeChallengeMethod)) {
+    let codeChallengeMethod: PkceCodeChallengeMethod;
+    try {
+      codeChallengeMethod = grantData.codeChallenge
+        ? validatePkceCodeChallengeMethod(this.serverCapabilities, grantData.codeChallengeMethod)
+        : normalizePkceCodeChallengeMethod(grantData.codeChallengeMethod);
+    } catch (error) {
       return this.createErrorResponse('invalid_grant', {
-        description: `Unsupported PKCE code_challenge_method: ${codeChallengeMethod}`,
+        description: error instanceof Error ? error.message : 'Invalid PKCE code_challenge_method',
       });
     }
 
@@ -2416,12 +2425,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       }
 
       // Verify the code verifier against the stored code challenge.
-      if (codeChallengeMethod === 'plain' && this.options.allowPlainPKCE === false) {
-        return this.createErrorResponse('invalid_grant', {
-          description: 'The plain PKCE method is not allowed. Use S256 instead.',
-        });
-      }
-
       let calculatedChallenge: string;
       if (codeChallengeMethod === 'S256') {
         // SHA-256 transformation for S256 method
@@ -5156,30 +5159,6 @@ function isValidRedirectUri(requestUri: string, registeredUris: string[]): boole
   });
 }
 
-type PkceCodeChallengeMethod = 'plain' | 'S256';
-
-function isSupportedPkceCodeChallengeMethod(method: string): method is PkceCodeChallengeMethod {
-  return method === 'plain' || method === 'S256';
-}
-
-/** Validate PKCE policy at every public authorization-completion boundary. */
-function validateAuthorizationPkce(
-  request: Pick<AuthRequest, 'responseType' | 'codeChallenge' | 'codeChallengeMethod'>,
-  clientInfo: Pick<ClientInfo, 'tokenEndpointAuthMethod'>,
-  allowPlain: boolean
-): void {
-  const method = request.codeChallengeMethod ?? 'plain';
-  if (!isSupportedPkceCodeChallengeMethod(method)) {
-    throw new Error(`Unsupported PKCE code_challenge_method: ${method}`);
-  }
-  if (method === 'plain' && !allowPlain) {
-    throw new Error('The plain PKCE method is not allowed. Use S256 instead.');
-  }
-  if (request.responseType === 'code' && clientInfo.tokenEndpointAuthMethod === 'none' && !request.codeChallenge) {
-    throw new Error('Public clients must use PKCE with the authorization code flow.');
-  }
-}
-
 /**
  * Encodes a string as base64url (URL-safe base64)
  * @param str - The string to encode
@@ -5490,9 +5469,13 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
       }
       validateAuthorizationResponseType(this.provider.serverCapabilities, responseType, clientInfo.responseTypes);
       validateAuthorizationPkce(
-        { responseType, codeChallenge, codeChallengeMethod },
-        clientInfo,
-        this.provider.options.allowPlainPKCE !== false
+        this.provider.serverCapabilities,
+        {
+          responseType,
+          codeChallenge,
+          codeChallengeMethod,
+        },
+        clientInfo
       );
     }
 
@@ -5568,7 +5551,7 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
     // Re-apply PKCE policy after client, redirect, response-type, and resource
     // validation, preserving their established error precedence while still
     // rejecting before any grant lookup, revocation, or storage.
-    validateAuthorizationPkce(options.request, clientInfo, this.provider.options.allowPlainPKCE !== false);
+    validateAuthorizationPkce(this.provider.serverCapabilities, options.request, clientInfo);
 
     // If requested, collect existing grants for this user+client to revoke AFTER the new grant is created.
     // This avoids a data-loss window where the user has no grants if creation fails.

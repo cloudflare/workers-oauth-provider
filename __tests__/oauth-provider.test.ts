@@ -1760,36 +1760,14 @@ describe('OAuthProvider', () => {
       expect((await mockEnv.OAUTH_KV.list({ prefix: 'token:' })).keys).toHaveLength(0);
     });
 
-    it('should reject unsupported PKCE methods in completeAuthorization before storage', async () => {
-      await oauthProvider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
-      const helpers = mockEnv.OAUTH_PROVIDER!;
-      const authRequest = await helpers.parseAuthRequest(
-        createMockRequest(
-          `https://example.com/authorize?response_type=code&client_id=${clientId}` +
-            `&redirect_uri=${encodeURIComponent(redirectUri)}&scope=read&state=state-123` +
-            `&code_challenge=test-challenge&code_challenge_method=S256`
-        )
-      );
-
-      await expect(
-        helpers.completeAuthorization({
-          request: {
-            ...authRequest,
-            codeChallenge: 'attacker-controlled-plain-verifier',
-            codeChallengeMethod: 'S512',
-          },
-          userId: 'test-user-123',
-          metadata: {},
-          scope: ['read'],
-          props: {},
-        })
-      ).rejects.toThrow('Unsupported PKCE code_challenge_method');
-
-      expect((await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys).toHaveLength(0);
-      expect((await mockEnv.OAUTH_KV.list({ prefix: 'token:' })).keys).toHaveLength(0);
-    });
-
-    it('should re-apply public-client PKCE requirements in completeAuthorization', async () => {
+    it.each([
+      ['missing PKCE', {}, 'Public clients must use PKCE'],
+      [
+        'an unsupported PKCE method',
+        { codeChallenge: 'attacker-controlled-plain-verifier', codeChallengeMethod: 'S512' },
+        'Unsupported PKCE code_challenge_method',
+      ],
+    ])('should reject %s in reconstructed completeAuthorization requests', async (_label, pkce, error) => {
       const registration = await oauthProvider.fetch(
         createMockRequest(
           'https://example.com/oauth/register',
@@ -1806,26 +1784,27 @@ describe('OAuthProvider', () => {
       );
       const publicClient = await registration.json<any>();
       await oauthProvider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
-      const helpers = mockEnv.OAUTH_PROVIDER!;
 
       await expect(
-        helpers.completeAuthorization({
+        mockEnv.OAUTH_PROVIDER!.completeAuthorization({
           request: {
             responseType: 'code',
             clientId: publicClient.client_id,
             redirectUri,
             scope: ['read'],
-            state: 'reconstructed-without-pkce',
+            state: 'reconstructed-pkce-request',
             issuer: 'https://example.com',
+            ...pkce,
           },
           userId: 'test-user-123',
           metadata: {},
           scope: ['read'],
           props: {},
         })
-      ).rejects.toThrow('Public clients must use PKCE');
+      ).rejects.toThrow(error);
 
       expect((await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys).toHaveLength(0);
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'token:' })).keys).toHaveLength(0);
     });
 
     it('should reject completeAuthorization if redirect_uri is invalid', async () => {

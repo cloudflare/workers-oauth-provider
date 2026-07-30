@@ -1,14 +1,16 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { MCP_PROTECTED_RESOURCE_REVISIONS, MCP_SCOPE_CHALLENGE_REVISIONS, resourceForRevision } from './spec-versions';
+import { mcpAuthRevisionsSince, resourceForRevision } from './spec-versions';
 import {
   CONFORMANCE_ORIGIN,
+  INSUFFICIENT_SCOPE_TOKEN,
   MCP_RESOURCE,
-  McpOAuthConformanceServer,
+  McpOAuthClient,
+  createMcpOAuthClient,
   OFFLINE_ACCESS_SCOPE,
   READ_SCOPE,
   WRITE_SCOPE,
   readJson,
-} from './support/oauth-server';
+} from './support/oauth-client';
 
 interface ProtectedResourceMetadata {
   resource: string;
@@ -23,15 +25,15 @@ interface OAuthErrorBody {
   error_description?: string;
 }
 
-describe.each(MCP_PROTECTED_RESOURCE_REVISIONS)('MCP $version protected-resource conformance', (revision) => {
-  let server: McpOAuthConformanceServer;
+describe.each(mcpAuthRevisionsSince('2025-06-18'))('MCP %s protected-resource conformance', (revision) => {
+  let oauth: McpOAuthClient;
 
-  beforeEach(() => {
-    server = new McpOAuthConformanceServer(revision);
+  beforeEach(async () => {
+    oauth = await createMcpOAuthClient(revision);
   });
 
   it('discovers the protected resource through its path-specific RFC 9728 URL', async () => {
-    const response = await server.request('/.well-known/oauth-protected-resource/mcp');
+    const response = await oauth.request('/.well-known/oauth-protected-resource/mcp');
 
     expect(response.status).toBe(200);
     expect(response.headers.get('Content-Type')).toMatch(/^application\/json\b/i);
@@ -45,7 +47,7 @@ describe.each(MCP_PROTECTED_RESOURCE_REVISIONS)('MCP $version protected-resource
   });
 
   it('returns a discoverable Bearer challenge when credentials are absent', async () => {
-    const response = await server.request('/mcp');
+    const response = await oauth.request('/mcp');
     const challenge = response.headers.get('WWW-Authenticate');
 
     expect(response.status).toBe(401);
@@ -56,7 +58,7 @@ describe.each(MCP_PROTECTED_RESOURCE_REVISIONS)('MCP $version protected-resource
   });
 
   it('returns invalid_token for a malformed bearer credential', async () => {
-    const response = await server.request('/mcp', {
+    const response = await oauth.request('/mcp', {
       headers: { Authorization: 'Bearer not-an-access-token' },
     });
     const challenge = response.headers.get('WWW-Authenticate');
@@ -68,10 +70,10 @@ describe.each(MCP_PROTECTED_RESOURCE_REVISIONS)('MCP $version protected-resource
   });
 
   it('rejects a valid token at a resource outside its audience', async () => {
-    const client = await server.createClient('none');
-    const { tokens } = await server.completeAuthorizationCodeFlow(client);
+    const client = await oauth.createClient('none');
+    const { tokens } = await oauth.completeAuthorizationCodeFlow(client);
 
-    const response = await server.request('/other-resource', {
+    const response = await oauth.request('/other-resource', {
       headers: { Authorization: `Bearer ${tokens.access_token}` },
     });
 
@@ -84,17 +86,17 @@ describe.each(MCP_PROTECTED_RESOURCE_REVISIONS)('MCP $version protected-resource
   });
 
   it('rejects resource expansion at the token endpoint without consuming the code', async () => {
-    const client = await server.createClient('none');
-    const authorization = await server.authorize(client);
+    const client = await oauth.createClient('none');
+    const authorization = await oauth.authorize(client);
     const expandedResource = `${CONFORMANCE_ORIGIN}/other-resource`;
 
-    const rejected = await server.exchangeAuthorizationCode(client, authorization, {
+    const rejected = await oauth.exchangeAuthorizationCode(client, authorization, {
       resource: expandedResource,
     });
     expect(rejected.response.status).toBe(400);
     expect(await readJson<OAuthErrorBody>(rejected.response)).toMatchObject({ error: 'invalid_target' });
 
-    const accepted = await server.exchangeAuthorizationCode(client, authorization, {
+    const accepted = await oauth.exchangeAuthorizationCode(client, authorization, {
       resource: resourceForRevision(revision),
     });
     expect(accepted.response.status).toBe(200);
@@ -102,30 +104,28 @@ describe.each(MCP_PROTECTED_RESOURCE_REVISIONS)('MCP $version protected-resource
   });
 });
 
-describe.each(MCP_SCOPE_CHALLENGE_REVISIONS)('MCP $version scope challenge conformance', (revision) => {
-  let server: McpOAuthConformanceServer;
+describe.each(mcpAuthRevisionsSince('2025-11-25'))('MCP %s scope challenge conformance', (revision) => {
+  let oauth: McpOAuthClient;
 
   it('publishes baseline resource scopes without offline_access', async () => {
-    server = new McpOAuthConformanceServer(revision, {
+    oauth = await createMcpOAuthClient(revision, {
       resourceScopes: [READ_SCOPE, OFFLINE_ACCESS_SCOPE, READ_SCOPE],
     });
 
-    const metadataResponse = await server.request('/.well-known/oauth-protected-resource/mcp');
+    const metadataResponse = await oauth.request('/.well-known/oauth-protected-resource/mcp');
     const metadata = await readJson<ProtectedResourceMetadata>(metadataResponse);
     expect(metadata.scopes_supported).toEqual([READ_SCOPE]);
 
-    const challengeResponse = await server.request('/mcp');
+    const challengeResponse = await oauth.request('/mcp');
     expect(challengeResponse.headers.get('WWW-Authenticate')).toContain(`scope="${READ_SCOPE}"`);
     expect(challengeResponse.headers.get('WWW-Authenticate')).not.toContain(OFFLINE_ACCESS_SCOPE);
   });
 
   it('returns a 403 insufficient_scope challenge with operation-specific scopes', async () => {
-    server = new McpOAuthConformanceServer(revision, {
-      externalTokenMode: 'insufficient-scope',
-    });
+    oauth = await createMcpOAuthClient(revision);
 
-    const response = await server.request('/mcp', {
-      headers: { Authorization: 'Bearer valid-upstream-token-with-too-little-scope' },
+    const response = await oauth.request('/mcp', {
+      headers: { Authorization: `Bearer ${INSUFFICIENT_SCOPE_TOKEN}` },
     });
     const challenge = response.headers.get('WWW-Authenticate');
 

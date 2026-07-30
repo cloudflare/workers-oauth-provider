@@ -4,9 +4,6 @@
   "main": "index.ts",
   "compatibility_date": "2026-07-29",
   "compatibility_flags": ["global_fetch_strictly_public"],
-  "vars": {
-    "PUBLIC_ORIGIN": "https://mcp.example.com",
-  },
   "kv_namespaces": [
     {
       "binding": "OAUTH_KV",

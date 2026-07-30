@@ -1,13 +1,14 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { MCP_AUTH_REVISIONS, MCP_CLIENT_REGISTRATION_CHOICE_REVISIONS, resourceForRevision } from './spec-versions';
+import { MCP_AUTH_REVISIONS, mcpAuthRevisionsSince, resourceForRevision } from './spec-versions';
 import {
   CLIENT_REDIRECT_URI,
   CONFORMANCE_ORIGIN,
-  McpOAuthConformanceServer,
+  McpOAuthClient,
+  createMcpOAuthClient,
   READ_SCOPE,
   readJson,
   type OAuthClientCredentials,
-} from './support/oauth-server';
+} from './support/oauth-client';
 
 interface AuthorizationServerMetadata {
   registration_endpoint?: string;
@@ -20,12 +21,12 @@ interface OAuthErrorBody {
   error_description?: string;
 }
 
-describe.each(MCP_AUTH_REVISIONS)('MCP $version dynamic client registration compatibility', (revision) => {
-  let server: McpOAuthConformanceServer;
+describe.each(MCP_AUTH_REVISIONS)('MCP %s dynamic client registration compatibility', (revision) => {
+  let oauth: McpOAuthClient;
 
   it('registers a public client that can complete an S256 authorization-code flow', async () => {
-    server = new McpOAuthConformanceServer(revision);
-    const registration = await server.registerClient('none');
+    oauth = await createMcpOAuthClient(revision);
+    const registration = await oauth.registerClient('none');
 
     expect(registration).toMatchObject({
       client_id: expect.any(String),
@@ -41,13 +42,13 @@ describe.each(MCP_AUTH_REVISIONS)('MCP $version dynamic client registration comp
       redirectUri: CLIENT_REDIRECT_URI,
       tokenEndpointAuthMethod: 'none',
     };
-    const { tokens } = await server.completeAuthorizationCodeFlow(client);
+    const { tokens } = await oauth.completeAuthorizationCodeFlow(client);
     expect(tokens.access_token).toBeTruthy();
   });
 
   it('registers a confidential client and accepts client_secret_basic', async () => {
-    server = new McpOAuthConformanceServer(revision);
-    const registration = await server.registerClient('client_secret_basic');
+    oauth = await createMcpOAuthClient(revision);
+    const registration = await oauth.registerClient('client_secret_basic');
 
     expect(registration.client_secret).toBeTruthy();
     const client: OAuthClientCredentials = {
@@ -56,13 +57,13 @@ describe.each(MCP_AUTH_REVISIONS)('MCP $version dynamic client registration comp
       redirectUri: CLIENT_REDIRECT_URI,
       tokenEndpointAuthMethod: 'client_secret_basic',
     };
-    const { tokens } = await server.completeAuthorizationCodeFlow(client);
+    const { tokens } = await oauth.completeAuthorizationCodeFlow(client);
     expect(tokens.access_token).toBeTruthy();
   });
 
   it('rejects unsupported client capabilities before registration', async () => {
-    server = new McpOAuthConformanceServer(revision);
-    const response = await server.request('/oauth/register', {
+    oauth = await createMcpOAuthClient(revision);
+    const response = await oauth.request('/oauth/register', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -82,8 +83,8 @@ describe.each(MCP_AUTH_REVISIONS)('MCP $version dynamic client registration comp
   });
 });
 
-describe.each(MCP_CLIENT_REGISTRATION_CHOICE_REVISIONS)('MCP $version client registration choices', (revision) => {
-  let server: McpOAuthConformanceServer;
+describe.each(mcpAuthRevisionsSince('2025-11-25'))('MCP %s client registration choices', (revision) => {
+  let oauth: McpOAuthClient;
   let fetchMock: ReturnType<typeof vi.spyOn> | undefined;
 
   afterEach(() => {
@@ -91,13 +92,13 @@ describe.each(MCP_CLIENT_REGISTRATION_CHOICE_REVISIONS)('MCP $version client reg
   });
 
   it('supports a pre-registered client when DCR is disabled', async () => {
-    server = new McpOAuthConformanceServer(revision, { clientRegistration: false });
-    const metadataResponse = await server.request('/.well-known/oauth-authorization-server');
+    oauth = await createMcpOAuthClient(revision, { dynamicClientRegistration: false });
+    const metadataResponse = await oauth.request('/.well-known/oauth-authorization-server');
     const metadata = await readJson<AuthorizationServerMetadata>(metadataResponse);
     expect(metadata.registration_endpoint).toBeUndefined();
 
-    const client = await server.createClient('client_secret_basic');
-    const { tokens } = await server.completeAuthorizationCodeFlow(client);
+    const client = await oauth.createClient('client_secret_basic');
+    const { tokens } = await oauth.completeAuthorizationCodeFlow(client);
     expect(tokens.access_token).toBeTruthy();
   });
 
@@ -119,16 +120,13 @@ describe.each(MCP_CLIENT_REGISTRATION_CHOICE_REVISIONS)('MCP $version client reg
         token_endpoint_auth_method: 'none',
       });
     });
-    server = new McpOAuthConformanceServer(revision, {
-      clientRegistration: false,
-      clientIdMetadataDocuments: true,
-    });
+    oauth = await createMcpOAuthClient(revision, { dynamicClientRegistration: false });
 
-    const metadataResponse = await server.request('/.well-known/oauth-authorization-server');
+    const metadataResponse = await oauth.request('/.well-known/oauth-authorization-server');
     const metadata = await readJson<AuthorizationServerMetadata>(metadataResponse);
     expect(metadata.client_id_metadata_document_supported).toBe(true);
 
-    const { tokens } = await server.completeAuthorizationCodeFlow(client, {
+    const { tokens } = await oauth.completeAuthorizationCodeFlow(client, {
       resource: resourceForRevision(revision),
       scope: READ_SCOPE,
     });
@@ -146,10 +144,7 @@ describe.each(MCP_CLIENT_REGISTRATION_CHOICE_REVISIONS)('MCP $version client reg
         token_endpoint_auth_method: 'none',
       })
     );
-    server = new McpOAuthConformanceServer(revision, {
-      clientRegistration: false,
-      clientIdMetadataDocuments: true,
-    });
+    oauth = await createMcpOAuthClient(revision, { dynamicClientRegistration: false });
     const params = new URLSearchParams({
       response_type: 'code',
       client_id: clientId,
@@ -161,7 +156,7 @@ describe.each(MCP_CLIENT_REGISTRATION_CHOICE_REVISIONS)('MCP $version client reg
       resource: resourceForRevision(revision) ?? `${CONFORMANCE_ORIGIN}/mcp`,
     });
 
-    const response = await server.request(`/authorize?${params}`);
+    const response = await oauth.request(`/authorize?${params}`);
 
     expect(response.status).toBe(400);
     expect(await readJson<OAuthErrorBody>(response)).toMatchObject({

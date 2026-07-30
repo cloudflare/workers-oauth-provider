@@ -3,10 +3,11 @@ import { MCP_AUTH_REVISIONS, resourceForRevision } from './spec-versions';
 import {
   CLIENT_REDIRECT_URI,
   CONFORMANCE_ORIGIN,
-  McpOAuthConformanceServer,
+  McpOAuthClient,
+  createMcpOAuthClient,
   READ_SCOPE,
   readJson,
-} from './support/oauth-server';
+} from './support/oauth-client';
 
 interface AuthorizationServerMetadata {
   issuer: string;
@@ -22,15 +23,15 @@ interface AuthorizationServerMetadata {
   client_id_metadata_document_supported?: boolean;
 }
 
-describe.each(MCP_AUTH_REVISIONS)('MCP $version authorization server conformance', (revision) => {
-  let server: McpOAuthConformanceServer;
+describe.each(MCP_AUTH_REVISIONS)('MCP %s authorization server conformance', (revision) => {
+  let oauth: McpOAuthClient;
 
-  beforeEach(() => {
-    server = new McpOAuthConformanceServer(revision);
+  beforeEach(async () => {
+    oauth = await createMcpOAuthClient(revision);
   });
 
   it('publishes RFC 8414 metadata for the configured OAuth capabilities', async () => {
-    const response = await server.request('/.well-known/oauth-authorization-server');
+    const response = await oauth.request('/.well-known/oauth-authorization-server');
 
     expect(response.status).toBe(200);
     expect(response.headers.get('Content-Type')).toMatch(/^application\/json\b/i);
@@ -54,8 +55,8 @@ describe.each(MCP_AUTH_REVISIONS)('MCP $version authorization server conformance
   });
 
   it('completes a public-client authorization code flow with S256 PKCE', async () => {
-    const client = await server.createClient('none');
-    const { authorization, response, tokens } = await server.completeAuthorizationCodeFlow(client);
+    const client = await oauth.createClient('none');
+    const { authorization, response, tokens } = await oauth.completeAuthorizationCodeFlow(client);
 
     expect(authorization.redirect.origin + authorization.redirect.pathname).toBe(CLIENT_REDIRECT_URI);
     expect(authorization.redirect.searchParams.getAll('code')).toHaveLength(1);
@@ -71,7 +72,7 @@ describe.each(MCP_AUTH_REVISIONS)('MCP $version authorization server conformance
     expect(tokens.expires_in).toBeGreaterThan(0);
     expect(tokens.scope).toBe(READ_SCOPE);
 
-    const protectedResponse = await server.request('/mcp', {
+    const protectedResponse = await oauth.request('/mcp', {
       headers: { Authorization: `Bearer ${tokens.access_token}` },
     });
     expect(protectedResponse.status).toBe(200);
@@ -82,7 +83,7 @@ describe.each(MCP_AUTH_REVISIONS)('MCP $version authorization server conformance
   });
 
   it('rejects public authorization-code requests that omit PKCE', async () => {
-    const client = await server.createClient('none');
+    const client = await oauth.createClient('none');
     const resource = resourceForRevision(revision);
     const params = new URLSearchParams({
       response_type: 'code',
@@ -93,7 +94,7 @@ describe.each(MCP_AUTH_REVISIONS)('MCP $version authorization server conformance
     });
     if (resource) params.set('resource', resource);
 
-    const response = await server.request(`/authorize?${params}`);
+    const response = await oauth.request(`/authorize?${params}`);
 
     expect(response.status).toBe(400);
     expect(await response.json()).toMatchObject({
@@ -103,7 +104,7 @@ describe.each(MCP_AUTH_REVISIONS)('MCP $version authorization server conformance
   });
 
   it('rejects the plain PKCE method', async () => {
-    const client = await server.createClient('none');
+    const client = await oauth.createClient('none');
     const resource = resourceForRevision(revision);
     const params = new URLSearchParams({
       response_type: 'code',
@@ -116,7 +117,7 @@ describe.each(MCP_AUTH_REVISIONS)('MCP $version authorization server conformance
     });
     if (resource) params.set('resource', resource);
 
-    const response = await server.request(`/authorize?${params}`);
+    const response = await oauth.request(`/authorize?${params}`);
 
     expect(response.status).toBe(400);
     expect(await response.json()).toMatchObject({
@@ -126,7 +127,7 @@ describe.each(MCP_AUTH_REVISIONS)('MCP $version authorization server conformance
   });
 
   it('rejects an unsupported PKCE method instead of treating it as plain', async () => {
-    const client = await server.createClient('none');
+    const client = await oauth.createClient('none');
     const resource = resourceForRevision(revision);
     const params = new URLSearchParams({
       response_type: 'code',
@@ -139,7 +140,7 @@ describe.each(MCP_AUTH_REVISIONS)('MCP $version authorization server conformance
     });
     if (resource) params.set('resource', resource);
 
-    const response = await server.request(`/authorize?${params}`);
+    const response = await oauth.request(`/authorize?${params}`);
 
     expect(response.status).toBe(400);
     expect(response.headers.get('Location')).toBeNull();
@@ -150,9 +151,9 @@ describe.each(MCP_AUTH_REVISIONS)('MCP $version authorization server conformance
   });
 
   it('rejects an invalid PKCE verifier at the token endpoint', async () => {
-    const client = await server.createClient('none');
-    const authorization = await server.authorize(client);
-    const { response } = await server.exchangeAuthorizationCode(client, authorization, {
+    const client = await oauth.createClient('none');
+    const authorization = await oauth.authorize(client);
+    const { response } = await oauth.exchangeAuthorizationCode(client, authorization, {
       codeVerifier: 'a-different-code-verifier-that-is-at-least-43-characters',
     });
 

@@ -45,7 +45,9 @@ workers-oauth-provider/
 │       └── cloudflare-workers.ts
 ├── conformance/               # Black-box MCP authorization conformance matrix
 │   ├── README.md              # Scope, revision coverage, and traceability
-│   ├── support/               # OAuth client around createTestHarness()
+│   ├── shared.ts              # Typed Worker RPC contract and fixture constants
+│   ├── spec-versions.ts       # Ordered MCP authorization revision timeline
+│   ├── support/               # Workerd lifecycle and OAuth client
 │   └── worker/                # Real Wrangler Worker with local KV
 ├── dist/                      # Build output (tsdown)
 ├── docs/

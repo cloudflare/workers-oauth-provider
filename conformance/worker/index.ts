@@ -6,32 +6,21 @@ import {
   type OAuthHelpers,
   type OAuthProviderOptions,
 } from '../../src/oauth-provider';
-
-const CONFIG_HEADER = 'x-mcp-conformance-config';
-const CLIENT_REDIRECT_URI = 'https://client.example.com/callback';
-const READ_SCOPE = 'mcp:read';
-const WRITE_SCOPE = 'mcp:write';
-const OFFLINE_ACCESS_SCOPE = 'offline_access';
+import {
+  CLIENT_REDIRECT_URI,
+  CONFORMANCE_ORIGIN,
+  INSUFFICIENT_SCOPE_TOKEN,
+  OFFLINE_ACCESS_SCOPE,
+  READ_SCOPE,
+  WRITE_SCOPE,
+  type OAuthClientCredentials,
+  type TokenEndpointAuthMethod,
+  type WorkerConfiguration,
+} from '../shared';
 
 export interface ConformanceWorkerEnv {
   OAUTH_KV: KVNamespace;
   OAUTH_PROVIDER?: OAuthHelpers;
-  PUBLIC_ORIGIN: string;
-}
-
-export interface WorkerConfiguration {
-  clientRegistration: boolean;
-  clientIdMetadataDocuments: boolean;
-  resource?: string;
-  resourceScopes: string[];
-  externalTokenMode?: 'insufficient-scope';
-}
-
-export interface WorkerClientCredentials {
-  clientId: string;
-  clientSecret?: string;
-  redirectUri: string;
-  tokenEndpointAuthMethod: 'none' | 'client_secret_basic' | 'client_secret_post';
 }
 
 const apiHandler = {
@@ -39,21 +28,13 @@ const apiHandler = {
     Response.json({ authenticated: true, props: ctx.props }),
 };
 
-function decodeConfiguration(request: Request): WorkerConfiguration {
-  const encoded = request.headers.get(CONFIG_HEADER);
-  if (!encoded) throw new Error(`Missing ${CONFIG_HEADER} header`);
-  return JSON.parse(atob(encoded)) as WorkerConfiguration;
-}
-
 function createProviderOptions(configuration: WorkerConfiguration): OAuthProviderOptions<ConformanceWorkerEnv> {
   return {
     apiRoute: ['/mcp', '/other-resource'],
     apiHandler,
     defaultHandler: {
       fetch: async (request, env) => {
-        if (new URL(request.url).pathname !== '/authorize') {
-          return new Response('Not found', { status: 404 });
-        }
+        if (new URL(request.url).pathname !== '/authorize') return new Response('Not found', { status: 404 });
 
         try {
           if (!env.OAUTH_PROVIDER) throw new Error('OAuth helpers were not injected');
@@ -79,50 +60,62 @@ function createProviderOptions(configuration: WorkerConfiguration): OAuthProvide
     },
     authorizeEndpoint: '/authorize',
     tokenEndpoint: '/oauth/token',
-    clientRegistrationEndpoint: configuration.clientRegistration ? '/oauth/register' : undefined,
+    clientRegistrationEndpoint: configuration.dynamicClientRegistration ? '/oauth/register' : undefined,
     scopesSupported: [READ_SCOPE, WRITE_SCOPE, OFFLINE_ACCESS_SCOPE],
     allowPlainPKCE: false,
-    clientIdMetadataDocumentEnabled: configuration.clientIdMetadataDocuments,
+    clientIdMetadataDocumentEnabled: true,
     ...(configuration.resource
       ? {
           resourceMetadata: {
             resource: configuration.resource,
-            authorization_servers: ['https://mcp.example.com'],
+            authorization_servers: [CONFORMANCE_ORIGIN],
             scopes_supported: configuration.resourceScopes,
             bearer_methods_supported: ['header'],
             resource_name: 'MCP auth conformance server',
           },
         }
       : {}),
-    ...(configuration.externalTokenMode === 'insufficient-scope'
-      ? {
-          resolveExternalToken: async () => {
-            throw new ExternalTokenError('insufficient_scope', {
-              description: 'A write scope is required',
-              statusCode: 403,
-              requiredScopes: [READ_SCOPE, WRITE_SCOPE, WRITE_SCOPE],
-            });
-          },
-        }
-      : {}),
+    resolveExternalToken: async ({ token }) => {
+      if (token !== INSUFFICIENT_SCOPE_TOKEN) return null;
+      throw new ExternalTokenError('insufficient_scope', {
+        description: 'A write scope is required',
+        statusCode: 403,
+        requiredScopes: [READ_SCOPE, WRITE_SCOPE, WRITE_SCOPE],
+      });
+    },
   };
 }
 
+let configuration: WorkerConfiguration | undefined;
+let provider: OAuthProvider<ConformanceWorkerEnv> | undefined;
+
+function requireConfiguration(): WorkerConfiguration {
+  if (!configuration) throw new Error('Configure the conformance Worker before use');
+  return configuration;
+}
+
+function requireProvider(): OAuthProvider<ConformanceWorkerEnv> {
+  if (!provider) throw new Error('Configure the conformance Worker before use');
+  return provider;
+}
+
 export default class McpOAuthConformanceWorker extends WorkerEntrypoint<ConformanceWorkerEnv> {
+  configure(nextConfiguration: WorkerConfiguration): void {
+    configuration = nextConfiguration;
+    provider = new OAuthProvider(createProviderOptions(nextConfiguration));
+    this.env.OAUTH_PROVIDER = undefined;
+  }
+
   async fetch(request: Request): Promise<Response> {
-    const configuration = decodeConfiguration(request);
     // The harness listens over local HTTP. Normalize requests to the public
     // HTTPS origin so metadata matches a deployed Worker.
     const incomingUrl = new URL(request.url);
-    const publicRequest = new Request(`${this.env.PUBLIC_ORIGIN}${incomingUrl.pathname}${incomingUrl.search}`, request);
-    return new OAuthProvider(createProviderOptions(configuration)).fetch(publicRequest, this.env, this.ctx);
+    const publicRequest = new Request(`${CONFORMANCE_ORIGIN}${incomingUrl.pathname}${incomingUrl.search}`, request);
+    return requireProvider().fetch(publicRequest, this.env, this.ctx);
   }
 
-  async createClient(
-    configuration: WorkerConfiguration,
-    tokenEndpointAuthMethod: WorkerClientCredentials['tokenEndpointAuthMethod']
-  ): Promise<WorkerClientCredentials> {
-    const client = await getOAuthApi(createProviderOptions(configuration), this.env).createClient({
+  async createClient(tokenEndpointAuthMethod: TokenEndpointAuthMethod): Promise<OAuthClientCredentials> {
+    const client = await getOAuthApi(createProviderOptions(requireConfiguration()), this.env).createClient({
       clientName: 'MCP conformance client',
       redirectUris: [CLIENT_REDIRECT_URI],
       grantTypes: ['authorization_code', 'refresh_token'],

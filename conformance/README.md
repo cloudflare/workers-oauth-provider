@@ -21,7 +21,7 @@ The matrix follows every dated authorization revision represented by the officia
 - [`2025-11-25`](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization)
 - [`2026-07-28`](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization)
 
-Requirements are enabled from the revision that introduced them. Shared OAuth behavior is exercised against every revision.
+Requirements are enabled from the revision that introduced them. Shared OAuth behavior is exercised against every revision, with the target revision sent in the `MCP-Protocol-Version` header.
 
 ## Coverage and traceability
 
@@ -52,7 +52,7 @@ Requirements are enabled from the revision that introduced them. Shared OAuth be
 - a protected `/mcp` handler that exposes only authenticated props; and
 - the canonical resource `https://mcp.example.com/mcp` where the revision requires Resource Indicators.
 
-`support/oauth-server.ts` is a thin OAuth HTTP client around the test harness. It uses Worker RPC only to pre-register clients through `OAuthHelpers`; DCR and every OAuth flow run over HTTP. The harness recreates local storage after each test.
+`support/oauth-client.ts` is the OAuth HTTP client around the test harness. A typed Worker RPC configures each test profile and pre-registers clients through `OAuthHelpers`; DCR and every OAuth flow run over HTTP. The harness recreates local storage after each test.
 
 Tests assert only observable HTTP responses, redirects, metadata, challenges, and token behavior. They do not access provider internals or stored records.
 
@@ -60,7 +60,9 @@ Tests assert only observable HTTP responses, redirects, metadata, challenges, an
 
 - `worker/index.ts` — deployable Worker fixture hosting `OAuthProvider`.
 - `worker/wrangler.jsonc` — Worker configuration and local KV binding.
-- `support/oauth-server.ts` — test-harness lifecycle and OAuth HTTP client.
+- `shared.ts` — explicit RPC configuration, credential types, and fixture constants.
+- `support/harness.ts` — Workerd lifecycle and per-test storage reset.
+- `support/oauth-client.ts` — OAuth HTTP client.
 - `authorization-server.test.ts` — metadata and authorization-code/PKCE flows.
 - `authorization-security.test.ts` — redirect, client authentication, Resource Indicator, issuer, and refresh-scope security.
 - `protected-resource.test.ts` — RFC 9728 discovery, Bearer challenges, scopes, and audience enforcement.

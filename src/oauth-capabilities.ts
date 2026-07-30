@@ -1,9 +1,13 @@
 const OAUTH_SCOPE_TOKEN_PATTERN = /^[\x21\x23-\x5B\x5D-\x7E]+$/;
 
+/** PKCE transformation methods implemented by the authorization server. */
+export type PkceCodeChallengeMethod = 'plain' | 'S256';
+
 export interface OAuthServerCapabilities {
   readonly grantTypes: readonly string[];
   readonly responseTypes: readonly string[];
   readonly tokenEndpointAuthMethods: readonly string[];
+  readonly codeChallengeMethods: readonly PkceCodeChallengeMethod[];
 }
 
 export interface ClientCapabilities {
@@ -14,6 +18,7 @@ export interface ClientCapabilities {
 
 export function buildOAuthServerCapabilities(options: {
   allowImplicitFlow: boolean;
+  allowPlainPKCE: boolean;
   allowTokenExchangeGrant: boolean;
   enterpriseManagedAuthorization: boolean;
 }): OAuthServerCapabilities {
@@ -27,6 +32,7 @@ export function buildOAuthServerCapabilities(options: {
     ],
     responseTypes: options.allowImplicitFlow ? ['code', 'token'] : ['code'],
     tokenEndpointAuthMethods: ['client_secret_basic', 'client_secret_post', 'none'],
+    codeChallengeMethods: options.allowPlainPKCE ? ['plain', 'S256'] : ['S256'],
   };
 }
 
@@ -60,6 +66,43 @@ export function validateAuthorizationResponseType(
   }
   if (!(clientResponseTypes ?? ['code']).includes(responseType)) {
     throw new Error(`unauthorized_client: the client is not registered for response_type ${responseType}`);
+  }
+}
+
+/** Parse a PKCE method, applying RFC 7636's default of `plain`. */
+export function normalizePkceCodeChallengeMethod(method: string | undefined): PkceCodeChallengeMethod {
+  const effectiveMethod = method ?? 'plain';
+  if (effectiveMethod !== 'plain' && effectiveMethod !== 'S256') {
+    throw new Error(`Unsupported PKCE code_challenge_method: ${effectiveMethod}`);
+  }
+  return effectiveMethod;
+}
+
+/** Require a syntactically valid PKCE method that the server advertises. */
+export function validatePkceCodeChallengeMethod(
+  server: OAuthServerCapabilities,
+  method: string | undefined
+): PkceCodeChallengeMethod {
+  const effectiveMethod = normalizePkceCodeChallengeMethod(method);
+  if (!server.codeChallengeMethods.includes(effectiveMethod)) {
+    throw new Error('The plain PKCE method is not allowed. Use S256 instead.');
+  }
+  return effectiveMethod;
+}
+
+/** Validate authorization-request PKCE against server and client capabilities. */
+export function validateAuthorizationPkce(
+  server: OAuthServerCapabilities,
+  request: {
+    readonly responseType: string;
+    readonly codeChallenge?: string;
+    readonly codeChallengeMethod?: string;
+  },
+  client: Pick<ClientCapabilities, 'tokenEndpointAuthMethod'>
+): void {
+  validatePkceCodeChallengeMethod(server, request.codeChallengeMethod);
+  if (request.responseType === 'code' && client.tokenEndpointAuthMethod === 'none' && !request.codeChallenge) {
+    throw new Error('Public clients must use PKCE with the authorization code flow.');
   }
 }
 
