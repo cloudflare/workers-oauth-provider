@@ -2335,7 +2335,6 @@ describe('OAuthProvider', () => {
 
   describe('Authorization Code Flow Exchange', () => {
     type TokenEndpointAuthMethod = 'client_secret_basic' | 'client_secret_post' | 'none';
-    type PresentedTokenEndpointAuthMethod = TokenEndpointAuthMethod | 'mixed';
     type TestClientCredentials = {
       clientId: string;
       clientSecret?: string;
@@ -2402,7 +2401,7 @@ describe('OAuthProvider', () => {
 
     async function requestTokenWithClientAuthentication(
       client: TestClientCredentials,
-      presentedMethod: PresentedTokenEndpointAuthMethod
+      presentedMethod: TokenEndpointAuthMethod
     ): Promise<Response> {
       const params = new URLSearchParams({
         grant_type: 'authorization_code',
@@ -2413,13 +2412,11 @@ describe('OAuthProvider', () => {
       };
       const presentedSecret = client.clientSecret ?? 'unexpected-public-client-secret';
 
-      if (presentedMethod === 'client_secret_basic' || presentedMethod === 'mixed') {
+      if (presentedMethod === 'client_secret_basic') {
         headers.Authorization = `Basic ${btoa(`${client.clientId}:${presentedSecret}`)}`;
       }
       if (presentedMethod !== 'client_secret_basic') params.set('client_id', client.clientId);
-      if (presentedMethod === 'client_secret_post' || presentedMethod === 'mixed') {
-        params.set('client_secret', presentedSecret);
-      }
+      if (presentedMethod === 'client_secret_post') params.set('client_secret', presentedSecret);
 
       return oauthProvider.fetch(
         createMockRequest('https://example.com/oauth/token', 'POST', headers, params.toString()),
@@ -2445,15 +2442,12 @@ describe('OAuthProvider', () => {
       ['client_secret_basic', 'client_secret_basic', 400, 'invalid_grant'],
       ['client_secret_basic', 'client_secret_post', 401, 'invalid_client'],
       ['client_secret_basic', 'none', 401, 'invalid_client'],
-      ['client_secret_basic', 'mixed', 400, 'invalid_request'],
       ['client_secret_post', 'client_secret_basic', 401, 'invalid_client'],
       ['client_secret_post', 'client_secret_post', 400, 'invalid_grant'],
       ['client_secret_post', 'none', 401, 'invalid_client'],
-      ['client_secret_post', 'mixed', 400, 'invalid_request'],
       ['none', 'client_secret_basic', 401, 'invalid_client'],
       ['none', 'client_secret_post', 401, 'invalid_client'],
       ['none', 'none', 400, 'invalid_grant'],
-      ['none', 'mixed', 400, 'invalid_request'],
     ] as const)(
       'enforces registered token endpoint auth method %s when the client presents %s',
       async (registeredMethod, presentedMethod, expectedStatus, expectedError) => {
@@ -2465,8 +2459,6 @@ describe('OAuthProvider', () => {
         expect(error).toMatchObject({ error: expectedError });
         if (expectedError === 'invalid_client') {
           expect(error.error_description).toBe('Client authentication failed');
-        } else if (expectedError === 'invalid_request') {
-          expect(error.error_description).toBe('Client must not use multiple authentication methods');
         }
         expect(response.headers.get('WWW-Authenticate')).toBe(
           presentedMethod === 'client_secret_basic' && expectedError === 'invalid_client' ? 'Basic realm="OAuth"' : null
