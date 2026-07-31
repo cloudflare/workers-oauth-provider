@@ -418,10 +418,9 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
   allowImplicitFlow?: boolean;
 
   /**
-   * Controls whether the plain PKCE method is allowed.
-   * OAuth 2.1 recommends using S256 exclusively as plain offers no cryptographic protection.
-   * When set to false, only the S256 code_challenge_method will be accepted.
-   * Defaults to true for backward compatibility.
+   * Controls whether the legacy plain PKCE method is allowed.
+   * Defaults to false so PKCE challenges use S256 exclusively.
+   * Set to true only for compatibility with clients that cannot use S256.
    */
   allowPlainPKCE?: boolean;
 
@@ -1468,7 +1467,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     this.serverCapabilities = buildOAuthServerCapabilities({
       allowImplicitFlow: !!this.options.allowImplicitFlow,
-      allowPlainPKCE: this.options.allowPlainPKCE !== false,
+      allowPlainPKCE: this.options.allowPlainPKCE === true,
       allowTokenExchangeGrant: !!this.options.allowTokenExchangeGrant,
       enterpriseManagedAuthorization: !!this.options.enterpriseManagedAuthorization,
     });
@@ -5437,7 +5436,7 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
     const scope = (url.searchParams.get('scope') || '').split(' ').filter(Boolean);
     const state = url.searchParams.get('state') || '';
     const codeChallenge = url.searchParams.get('code_challenge') || undefined;
-    const codeChallengeMethod = url.searchParams.get('code_challenge_method') || 'plain';
+    const codeChallengeMethod = url.searchParams.get('code_challenge_method') || undefined;
     const issuer = this.provider.getAuthorizationServerIssuer(url);
     // RFC 8707 Section 2.1: Multiple resource parameters MAY be used
     const resourceParams = url.searchParams.getAll('resource');

@@ -128,6 +128,28 @@ describe.each(MCP_AUTH_REVISIONS)('MCP %s authorization server conformance', (re
     });
   });
 
+  it('rejects a PKCE challenge that omits its method because RFC 7636 defaults it to plain', async () => {
+    const client = await oauth.createClient('none');
+    const resource = clientResourceForRevision(revision);
+    const params = new URLSearchParams({
+      response_type: 'code',
+      client_id: client.clientId,
+      redirect_uri: client.redirectUri,
+      scope: READ_SCOPE,
+      state: 'implicit-plain-pkce',
+      code_challenge: 'plain-code-verifier',
+    });
+    if (resource) params.set('resource', resource);
+
+    const response = await oauth.request(`/authorize?${params}`);
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({
+      error: 'invalid_request',
+      error_description: expect.stringContaining('plain PKCE method is not allowed'),
+    });
+  });
+
   it('rejects an unsupported PKCE method instead of treating it as plain', async () => {
     const client = await oauth.createClient('none');
     const resource = clientResourceForRevision(revision);

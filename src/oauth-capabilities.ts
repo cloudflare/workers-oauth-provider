@@ -100,8 +100,14 @@ export function validateAuthorizationPkce(
   },
   client: Pick<ClientCapabilities, 'tokenEndpointAuthMethod'>
 ): void {
-  validatePkceCodeChallengeMethod(server, request.codeChallengeMethod);
-  if (request.responseType === 'code' && client.tokenEndpointAuthMethod === 'none' && !request.codeChallenge) {
+  if (request.codeChallenge) {
+    validatePkceCodeChallengeMethod(server, request.codeChallengeMethod);
+    return;
+  }
+  if (request.codeChallengeMethod) {
+    throw new Error('PKCE code_challenge is required when code_challenge_method is provided.');
+  }
+  if (request.responseType === 'code' && client.tokenEndpointAuthMethod === 'none') {
     throw new Error('Public clients must use PKCE with the authorization code flow.');
   }
 }

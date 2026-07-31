@@ -102,12 +102,76 @@ describe('PKCE capabilities', () => {
 
   it('requires PKCE for public authorization-code clients', () => {
     expect(() =>
+      validateAuthorizationPkce(defaults, { responseType: 'code' }, { tokenEndpointAuthMethod: 'none' })
+    ).toThrow('Public clients must use PKCE');
+  });
+
+  it('allows confidential clients to omit PKCE', () => {
+    expect(() =>
+      validateAuthorizationPkce(defaults, { responseType: 'code' }, { tokenEndpointAuthMethod: 'client_secret_basic' })
+    ).not.toThrow();
+  });
+
+  it('allows non-code response types to omit PKCE', () => {
+    expect(() =>
+      validateAuthorizationPkce(defaults, { responseType: 'token' }, { tokenEndpointAuthMethod: 'none' })
+    ).not.toThrow();
+  });
+
+  it('rejects plain PKCE by default when a challenge is supplied', () => {
+    expect(() =>
+      validateAuthorizationPkce(
+        defaults,
+        { responseType: 'code', codeChallenge: 'legacy-verifier', codeChallengeMethod: 'plain' },
+        { tokenEndpointAuthMethod: 'client_secret_basic' }
+      )
+    ).toThrow('plain PKCE method is not allowed');
+  });
+
+  it('applies the RFC 7636 plain default when a challenge omits its method', () => {
+    expect(() =>
+      validateAuthorizationPkce(
+        defaults,
+        { responseType: 'code', codeChallenge: 'legacy-verifier' },
+        { tokenEndpointAuthMethod: 'client_secret_basic' }
+      )
+    ).toThrow('plain PKCE method is not allowed');
+  });
+
+  it.each([
+    ['S256-only', defaults],
+    ['plain-compatible', withPlainPkce],
+  ])('accepts S256 under the %s policy', (_label, server) => {
+    expect(() =>
+      validateAuthorizationPkce(
+        server,
+        { responseType: 'code', codeChallenge: 's256-challenge', codeChallengeMethod: 'S256' },
+        { tokenEndpointAuthMethod: 'client_secret_basic' }
+      )
+    ).not.toThrow();
+  });
+
+  it.each([
+    ['an explicit plain method', { codeChallenge: 'legacy-verifier', codeChallengeMethod: 'plain' }],
+    ['an omitted method', { codeChallenge: 'legacy-verifier' }],
+  ])('accepts legacy plain PKCE with %s only when advertised', (_label, request) => {
+    expect(() =>
+      validateAuthorizationPkce(
+        withPlainPkce,
+        { responseType: 'code', ...request },
+        { tokenEndpointAuthMethod: 'client_secret_basic' }
+      )
+    ).not.toThrow();
+  });
+
+  it('rejects a method without a challenge', () => {
+    expect(() =>
       validateAuthorizationPkce(
         defaults,
         { responseType: 'code', codeChallengeMethod: 'S256' },
-        { tokenEndpointAuthMethod: 'none' }
+        { tokenEndpointAuthMethod: 'client_secret_basic' }
       )
-    ).toThrow('Public clients must use PKCE');
+    ).toThrow('code_challenge is required');
   });
 });
 

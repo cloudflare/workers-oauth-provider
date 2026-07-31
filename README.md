@@ -113,7 +113,6 @@ export default new OAuthProvider<Env>({
   tokenEndpoint: '/oauth/token',
 
   scopesSupported: ['mcp:read'],
-  allowPlainPKCE: false,
 
   resourceMetadata: {
     resource: 'https://mcp.example.com/mcp',
@@ -316,15 +315,15 @@ Clients created by `OAuthHelpers.createClient()` are not affected by the DCR TTL
 
 ## PKCE and token lifecycle
 
-Public clients must use PKCE with authorization code flow. The provider always supports S256.
+Public clients must use PKCE with authorization code flow. PKCE challenges use only S256 by default. Confidential clients may still omit PKCE.
 
-For new MCP deployments, disable the legacy plain method:
+Legacy deployments with clients that cannot use S256 can opt back into plain PKCE:
 
 ```ts
-allowPlainPKCE: false;
+allowPlainPKCE: true;
 ```
 
-`allowPlainPKCE` defaults to `true` for backwards compatibility. `allowImplicitFlow` defaults to `false`; leave it disabled for MCP and other new OAuth deployments.
+`allowImplicitFlow` defaults to `false`; leave it disabled for MCP and other new OAuth deployments.
 
 The provider owns `tokenEndpoint`. It exchanges authorization codes for tokens, refreshes access tokens, and handles RFC 7009 revocation. Refresh tokens rotate on use. The immediately previous token remains valid until its replacement is first used, allowing a client to retry after losing a refresh response.
 
@@ -409,7 +408,7 @@ Deleting a client through `OAuthHelpers.deleteClient()` also revokes its grants 
 | `scopesSupported`                  | Publish authorization server scopes                      | Omitted                                     |
 | `resourceMetadata`                 | Configure RFC 9728 metadata                              | Derived from the request and token endpoint |
 | `clientIdMetadataDocumentEnabled`  | Enable CIMD lookup and advertisement                     | `false`                                     |
-| `allowPlainPKCE`                   | Permit the legacy plain PKCE method                      | `true`                                      |
+| `allowPlainPKCE`                   | Permit the legacy plain PKCE method                      | `false`                                     |
 | `allowImplicitFlow`                | Enable implicit token responses                          | `false`                                     |
 | `disallowPublicClientRegistration` | Reject public clients at DCR                             | `false`                                     |
 | `clientRegistrationCallback`       | Apply application policy before storing a DCR client     | None                                        |
