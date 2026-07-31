@@ -1,0 +1,19 @@
+__tests__/oauth-capabilities.test.ts
+  s_1fd2f6fcd4817a::t_6607d776c5f739 104-167,172,174
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3d33506f77249f8f9bf61b396a8941769c45e128",
+  "prompts": {},
+  "sessions": {
+    "s_1fd2f6fcd4817a": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "019faf61-5373-7c6d-87c2-3460c1e5723d",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Matt Carey <mcarey@cloudflare.com>"
+    }
+  }
+}
