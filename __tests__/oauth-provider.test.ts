@@ -187,7 +187,15 @@ const testDefaultHandler = {
     if (url.pathname === '/authorize') {
       // Mock authorize endpoint
       const oauthReqInfo = await env.OAUTH_PROVIDER!.parseAuthRequest(request);
-      await env.OAUTH_PROVIDER!.lookupClient(oauthReqInfo.clientId);
+      const clientInfo = await env.OAUTH_PROVIDER!.lookupClient(oauthReqInfo.clientId);
+      // Generic flow fixtures historically submit credentials in the form body.
+      // Keep those fixtures aligned with their transport; auth-method behavior has
+      // dedicated coverage below.
+      if (clientInfo?.tokenEndpointAuthMethod === 'client_secret_basic') {
+        await env.OAUTH_PROVIDER!.updateClient(oauthReqInfo.clientId, {
+          tokenEndpointAuthMethod: 'client_secret_post',
+        });
+      }
 
       // Mock user consent flow - automatically grant consent
       const { redirectTo } = await env.OAUTH_PROVIDER!.completeAuthorization({
@@ -2751,6 +2759,10 @@ describe('OAuthProvider', () => {
     });
 
     it('should not add a Basic challenge to form-post client authentication failures', async () => {
+      await oauthProvider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
+      await mockEnv.OAUTH_PROVIDER!.updateClient(clientId, {
+        tokenEndpointAuthMethod: 'client_secret_post',
+      });
       const params = new URLSearchParams();
       params.append('grant_type', 'refresh_token');
       params.append('refresh_token', 'invalid-refresh-token');
@@ -2795,6 +2807,9 @@ describe('OAuthProvider', () => {
       const location = authResponse.headers.get('Location')!;
       const url = new URL(location);
       const code = url.searchParams.get('code')!;
+      await mockEnv.OAUTH_PROVIDER!.updateClient(clientId, {
+        tokenEndpointAuthMethod: 'client_secret_basic',
+      });
 
       const formEncode = (value: string) => encodeURIComponent(value).replace(/%20/g, '+');
       const params = new URLSearchParams();
@@ -2932,7 +2947,7 @@ describe('OAuthProvider', () => {
       const otherClientData = {
         redirect_uris: ['https://other.example.com/callback'],
         client_name: 'Other Client',
-        token_endpoint_auth_method: 'client_secret_basic',
+        token_endpoint_auth_method: 'client_secret_post',
       };
       const otherRegisterRequest = createMockRequest(
         'https://example.com/oauth/register',
@@ -10415,6 +10430,9 @@ describe('OAuthProvider', () => {
 
       const authResponse = await oauthProvider.fetch(createMockRequest(authUrl.toString()), mockEnv, mockCtx);
       const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
+      await mockEnv.OAUTH_PROVIDER!.updateClient(clientId, {
+        tokenEndpointAuthMethod: 'client_secret_basic',
+      });
 
       const tokenResponse = await oauthProvider.fetch(
         createMockRequest(
@@ -13479,7 +13497,7 @@ describe('OAuthProvider', () => {
         JSON.stringify({
           redirect_uris: [redirectUri],
           client_name: 'Cascade Test Client',
-          token_endpoint_auth_method: 'client_secret_basic',
+          token_endpoint_auth_method: 'client_secret_post',
         })
       );
       const response = await provider.fetch(request, mockEnv, mockCtx);
@@ -13685,7 +13703,7 @@ describe('OAuthProvider', () => {
         JSON.stringify({
           redirect_uris: [redirectUri],
           client_name: 'Purge Test Client',
-          token_endpoint_auth_method: 'client_secret_basic',
+          token_endpoint_auth_method: 'client_secret_post',
         })
       );
       const response = await provider.fetch(request, mockEnv, mockCtx);
