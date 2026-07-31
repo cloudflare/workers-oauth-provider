@@ -187,7 +187,7 @@ const testDefaultHandler = {
     if (url.pathname === '/authorize') {
       // Mock authorize endpoint
       const oauthReqInfo = await env.OAUTH_PROVIDER!.parseAuthRequest(request);
-      const clientInfo = await env.OAUTH_PROVIDER!.lookupClient(oauthReqInfo.clientId);
+      await env.OAUTH_PROVIDER!.lookupClient(oauthReqInfo.clientId);
 
       // Mock user consent flow - automatically grant consent
       const { redirectTo } = await env.OAUTH_PROVIDER!.completeAuthorization({
@@ -2560,29 +2560,139 @@ describe('OAuthProvider', () => {
       expect(error.error_description).not.toBe('Content-Type must be application/x-www-form-urlencoded');
     });
 
-    it('should reject requests that combine Basic auth with form client credentials', async () => {
-      const params = new URLSearchParams();
-      params.append('grant_type', 'refresh_token');
-      params.append('refresh_token', 'invalid-refresh-token');
-      params.append('client_id', clientId);
+    it.each<{
+      registeredMethod: 'client_secret_basic' | 'client_secret_post' | 'none';
+      presentedMethod: 'client_secret_basic' | 'client_secret_post' | 'none' | 'mixed';
+      expectedStatus: number;
+      expectedError: 'invalid_client' | 'invalid_grant' | 'invalid_request';
+    }>([
+      {
+        registeredMethod: 'client_secret_basic',
+        presentedMethod: 'client_secret_basic',
+        expectedStatus: 400,
+        expectedError: 'invalid_grant',
+      },
+      {
+        registeredMethod: 'client_secret_basic',
+        presentedMethod: 'client_secret_post',
+        expectedStatus: 401,
+        expectedError: 'invalid_client',
+      },
+      {
+        registeredMethod: 'client_secret_basic',
+        presentedMethod: 'none',
+        expectedStatus: 401,
+        expectedError: 'invalid_client',
+      },
+      {
+        registeredMethod: 'client_secret_basic',
+        presentedMethod: 'mixed',
+        expectedStatus: 400,
+        expectedError: 'invalid_request',
+      },
+      {
+        registeredMethod: 'client_secret_post',
+        presentedMethod: 'client_secret_basic',
+        expectedStatus: 401,
+        expectedError: 'invalid_client',
+      },
+      {
+        registeredMethod: 'client_secret_post',
+        presentedMethod: 'client_secret_post',
+        expectedStatus: 400,
+        expectedError: 'invalid_grant',
+      },
+      {
+        registeredMethod: 'client_secret_post',
+        presentedMethod: 'none',
+        expectedStatus: 401,
+        expectedError: 'invalid_client',
+      },
+      {
+        registeredMethod: 'client_secret_post',
+        presentedMethod: 'mixed',
+        expectedStatus: 400,
+        expectedError: 'invalid_request',
+      },
+      {
+        registeredMethod: 'none',
+        presentedMethod: 'client_secret_basic',
+        expectedStatus: 401,
+        expectedError: 'invalid_client',
+      },
+      {
+        registeredMethod: 'none',
+        presentedMethod: 'client_secret_post',
+        expectedStatus: 401,
+        expectedError: 'invalid_client',
+      },
+      {
+        registeredMethod: 'none',
+        presentedMethod: 'none',
+        expectedStatus: 400,
+        expectedError: 'invalid_grant',
+      },
+      {
+        registeredMethod: 'none',
+        presentedMethod: 'mixed',
+        expectedStatus: 400,
+        expectedError: 'invalid_request',
+      },
+    ])(
+      'enforces $registeredMethod when the client presents $presentedMethod authentication',
+      async ({ registeredMethod, presentedMethod, expectedStatus, expectedError }) => {
+        const registrationResponse = await oauthProvider.fetch(
+          createMockRequest(
+            'https://example.com/oauth/register',
+            'POST',
+            { 'Content-Type': 'application/json' },
+            JSON.stringify({
+              redirect_uris: ['https://client.example.com/callback'],
+              client_name: `Test ${registeredMethod} client`,
+              token_endpoint_auth_method: registeredMethod,
+            })
+          ),
+          mockEnv,
+          mockCtx
+        );
+        expect(registrationResponse.status).toBe(201);
+        const client = await registrationResponse.json<any>();
+        const presentedSecret = client.client_secret || 'presented-secret';
 
-      const tokenRequest = createMockRequest(
-        'https://example.com/oauth/token',
-        'POST',
-        {
+        const params = new URLSearchParams({
+          grant_type: 'refresh_token',
+          refresh_token: 'invalid-refresh-token',
+        });
+        const headers: Record<string, string> = {
           'Content-Type': 'application/x-www-form-urlencoded',
-          Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
-        },
-        params.toString()
-      );
+        };
 
-      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+        if (presentedMethod === 'client_secret_basic' || presentedMethod === 'mixed') {
+          headers.Authorization = `Basic ${btoa(`${client.client_id}:${presentedSecret}`)}`;
+        }
+        if (presentedMethod !== 'client_secret_basic') {
+          params.set('client_id', client.client_id);
+        }
+        if (presentedMethod === 'client_secret_post' || presentedMethod === 'mixed') {
+          params.set('client_secret', presentedSecret);
+        }
 
-      expect(tokenResponse.status).toBe(400);
-      const error = await tokenResponse.json<any>();
-      expect(error.error).toBe('invalid_request');
-      expect(error.error_description).toBe('Client must not use multiple authentication methods');
-    });
+        const response = await oauthProvider.fetch(
+          createMockRequest('https://example.com/oauth/token', 'POST', headers, params.toString()),
+          mockEnv,
+          mockCtx
+        );
+
+        expect(response.status).toBe(expectedStatus);
+        const error = await response.json<any>();
+        expect(error.error).toBe(expectedError);
+        if (expectedError === 'invalid_client') {
+          expect(error.error_description).toBe('Client authentication failed');
+        } else if (expectedError === 'invalid_request') {
+          expect(error.error_description).toBe('Client must not use multiple authentication methods');
+        }
+      }
+    );
 
     it('should reject malformed Base64 in Basic auth credentials', async () => {
       const response = await requestRefreshTokenWithAuthorization('Basic %');

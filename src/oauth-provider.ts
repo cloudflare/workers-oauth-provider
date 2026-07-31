@@ -1914,6 +1914,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const basicAuthenticationAttempted = basicAuthorization.kind !== 'not-basic';
     let clientId = '';
     let clientSecret = '';
+    let presentedAuthMethod: 'client_secret_basic' | 'client_secret_post' | 'none';
 
     if (basicAuthenticationAttempted) {
       if (body.client_id || body.client_secret) {
@@ -1932,9 +1933,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
       clientId = basicAuthorization.clientId;
       clientSecret = basicAuthorization.clientSecret;
+      presentedAuthMethod = 'client_secret_basic';
     } else {
       clientId = body.client_id;
       clientSecret = body.client_secret || '';
+      presentedAuthMethod = Object.prototype.hasOwnProperty.call(body, 'client_secret') ? 'client_secret_post' : 'none';
     }
 
     if (!clientId) {
@@ -1969,8 +1972,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       return this.createInvalidClientResponse('Client not found', basicAuthenticationAttempted);
     }
 
-    // Determine authentication requirements based on token endpoint auth method
-    const isPublicClient = clientInfo.tokenEndpointAuthMethod === 'none';
+    // Enforce the authentication method the client registered for this endpoint.
+    const tokenEndpointAuthMethod = clientInfo.tokenEndpointAuthMethod || 'client_secret_basic';
+    if (presentedAuthMethod !== tokenEndpointAuthMethod) {
+      return this.createInvalidClientResponse('Client authentication failed', basicAuthenticationAttempted);
+    }
+
+    const isPublicClient = tokenEndpointAuthMethod === 'none';
 
     // For confidential clients, validate the secret
     if (!isPublicClient) {
