@@ -74,7 +74,6 @@ function createProviderOptions(configuration: WorkerConfiguration): OAuthProvide
     tokenEndpoint: '/oauth/token',
     clientRegistrationEndpoint: configuration.dynamicClientRegistration ? '/oauth/register' : undefined,
     scopesSupported: [READ_SCOPE, WRITE_SCOPE, OFFLINE_ACCESS_SCOPE],
-    allowPlainPKCE: false,
     clientIdMetadataDocumentEnabled: true,
     resourceMetadata: {
       ...(configuration.resource ? { resource: configuration.resource } : {}),
