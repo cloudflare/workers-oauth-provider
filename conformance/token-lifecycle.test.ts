@@ -84,6 +84,11 @@ describe.each(MCP_AUTH_REVISIONS)('MCP %s OAuth token lifecycle conformance', (r
 
     const revoked = await oauth.revoke(confidentialClient, tokens.access_token, 'access_token');
     expect(revoked.status).toBe(200);
+
+    const noLongerValid = await oauth.request('/mcp', {
+      headers: { Authorization: `Bearer ${tokens.access_token}` },
+    });
+    expect(noLongerValid.status).toBe(401);
   });
 
   it('revokes an access token without revoking its refresh token', async () => {
