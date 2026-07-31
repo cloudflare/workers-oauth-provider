@@ -188,14 +188,6 @@ const testDefaultHandler = {
       // Mock authorize endpoint
       const oauthReqInfo = await env.OAUTH_PROVIDER!.parseAuthRequest(request);
       const clientInfo = await env.OAUTH_PROVIDER!.lookupClient(oauthReqInfo.clientId);
-      // Generic flow fixtures historically submit credentials in the form body.
-      // Keep those fixtures aligned with their transport; auth-method behavior has
-      // dedicated coverage below.
-      if (clientInfo?.tokenEndpointAuthMethod === 'client_secret_basic') {
-        await env.OAUTH_PROVIDER!.updateClient(oauthReqInfo.clientId, {
-          tokenEndpointAuthMethod: 'client_secret_post',
-        });
-      }
 
       // Mock user consent flow - automatically grant consent
       const { redirectTo } = await env.OAUTH_PROVIDER!.completeAuthorization({
@@ -385,7 +377,7 @@ describe('OAuthProvider', () => {
       const clientData = {
         redirect_uris: ['https://client.example.com/callback'],
         client_name: 'Test Client',
-        token_endpoint_auth_method: 'client_secret_basic',
+        token_endpoint_auth_method: 'client_secret_post',
       };
 
       const registerRequest = createMockRequest(
@@ -2342,16 +2334,25 @@ describe('OAuthProvider', () => {
   });
 
   describe('Authorization Code Flow Exchange', () => {
+    type TokenEndpointAuthMethod = 'client_secret_basic' | 'client_secret_post' | 'none';
+    type PresentedTokenEndpointAuthMethod = TokenEndpointAuthMethod | 'mixed';
+    type TestClientCredentials = {
+      clientId: string;
+      clientSecret?: string;
+      tokenEndpointAuthMethod: TokenEndpointAuthMethod;
+    };
+
     let clientId: string;
     let clientSecret: string;
     let redirectUri: string;
 
-    // Helper to create a test client before authorization tests
-    async function createTestClient() {
+    async function registerTestClient(
+      tokenEndpointAuthMethod: TokenEndpointAuthMethod = 'client_secret_basic'
+    ): Promise<TestClientCredentials> {
       const clientData = {
         redirect_uris: ['https://client.example.com/callback'],
         client_name: 'Test Client',
-        token_endpoint_auth_method: 'client_secret_basic',
+        token_endpoint_auth_method: tokenEndpointAuthMethod,
       };
 
       const request = createMockRequest(
@@ -2364,8 +2365,18 @@ describe('OAuthProvider', () => {
       const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
       const client = await response.json<any>();
 
-      clientId = client.client_id;
-      clientSecret = client.client_secret;
+      return {
+        clientId: client.client_id,
+        clientSecret: client.client_secret,
+        tokenEndpointAuthMethod,
+      };
+    }
+
+    // Helper to create a test client before authorization tests
+    async function createTestClient(tokenEndpointAuthMethod: TokenEndpointAuthMethod = 'client_secret_post') {
+      const client = await registerTestClient(tokenEndpointAuthMethod);
+      clientId = client.clientId;
+      clientSecret = client.clientSecret!;
       redirectUri = 'https://client.example.com/callback';
     }
 
@@ -2389,6 +2400,34 @@ describe('OAuthProvider', () => {
       );
     }
 
+    async function requestTokenWithClientAuthentication(
+      client: TestClientCredentials,
+      presentedMethod: PresentedTokenEndpointAuthMethod
+    ): Promise<Response> {
+      const params = new URLSearchParams({
+        grant_type: 'authorization_code',
+        code: 'invalid-authorization-code',
+      });
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/x-www-form-urlencoded',
+      };
+      const presentedSecret = client.clientSecret ?? 'unexpected-public-client-secret';
+
+      if (presentedMethod === 'client_secret_basic' || presentedMethod === 'mixed') {
+        headers.Authorization = `Basic ${btoa(`${client.clientId}:${presentedSecret}`)}`;
+      }
+      if (presentedMethod !== 'client_secret_basic') params.set('client_id', client.clientId);
+      if (presentedMethod === 'client_secret_post' || presentedMethod === 'mixed') {
+        params.set('client_secret', presentedSecret);
+      }
+
+      return oauthProvider.fetch(
+        createMockRequest('https://example.com/oauth/token', 'POST', headers, params.toString()),
+        mockEnv,
+        mockCtx
+      );
+    }
+
     async function expectBasicClientError(response: Response, description: string): Promise<void> {
       expect(response.status).toBe(401);
       expect(response.headers.get('WWW-Authenticate')).toBe('Basic realm="OAuth"');
@@ -2401,6 +2440,39 @@ describe('OAuthProvider', () => {
     beforeEach(async () => {
       await createTestClient();
     });
+
+    it.each([
+      ['client_secret_basic', 'client_secret_basic', 400, 'invalid_grant'],
+      ['client_secret_basic', 'client_secret_post', 401, 'invalid_client'],
+      ['client_secret_basic', 'none', 401, 'invalid_client'],
+      ['client_secret_basic', 'mixed', 400, 'invalid_request'],
+      ['client_secret_post', 'client_secret_basic', 401, 'invalid_client'],
+      ['client_secret_post', 'client_secret_post', 400, 'invalid_grant'],
+      ['client_secret_post', 'none', 401, 'invalid_client'],
+      ['client_secret_post', 'mixed', 400, 'invalid_request'],
+      ['none', 'client_secret_basic', 401, 'invalid_client'],
+      ['none', 'client_secret_post', 401, 'invalid_client'],
+      ['none', 'none', 400, 'invalid_grant'],
+      ['none', 'mixed', 400, 'invalid_request'],
+    ] as const)(
+      'enforces registered token endpoint auth method %s when the client presents %s',
+      async (registeredMethod, presentedMethod, expectedStatus, expectedError) => {
+        const client = await registerTestClient(registeredMethod);
+        const response = await requestTokenWithClientAuthentication(client, presentedMethod);
+        const error = await response.json<any>();
+
+        expect(response.status).toBe(expectedStatus);
+        expect(error).toMatchObject({ error: expectedError });
+        if (expectedError === 'invalid_client') {
+          expect(error.error_description).toBe('Client authentication failed');
+        } else if (expectedError === 'invalid_request') {
+          expect(error.error_description).toBe('Client must not use multiple authentication methods');
+        }
+        expect(response.headers.get('WWW-Authenticate')).toBe(
+          presentedMethod === 'client_secret_basic' && expectedError === 'invalid_client' ? 'Basic realm="OAuth"' : null
+        );
+      }
+    );
 
     it('should exchange auth code for tokens', async () => {
       // First get an auth code
@@ -2566,139 +2638,34 @@ describe('OAuthProvider', () => {
       expect(error.error_description).not.toBe('Content-Type must be application/x-www-form-urlencoded');
     });
 
-    it.each<{
-      registeredMethod: 'client_secret_basic' | 'client_secret_post' | 'none';
-      presentedMethod: 'client_secret_basic' | 'client_secret_post' | 'none' | 'mixed';
-      expectedStatus: number;
-      expectedError: 'invalid_client' | 'invalid_grant' | 'invalid_request';
-    }>([
-      {
-        registeredMethod: 'client_secret_basic',
-        presentedMethod: 'client_secret_basic',
-        expectedStatus: 400,
-        expectedError: 'invalid_grant',
-      },
-      {
-        registeredMethod: 'client_secret_basic',
-        presentedMethod: 'client_secret_post',
-        expectedStatus: 401,
-        expectedError: 'invalid_client',
-      },
-      {
-        registeredMethod: 'client_secret_basic',
-        presentedMethod: 'none',
-        expectedStatus: 401,
-        expectedError: 'invalid_client',
-      },
-      {
-        registeredMethod: 'client_secret_basic',
-        presentedMethod: 'mixed',
-        expectedStatus: 400,
-        expectedError: 'invalid_request',
-      },
-      {
-        registeredMethod: 'client_secret_post',
-        presentedMethod: 'client_secret_basic',
-        expectedStatus: 401,
-        expectedError: 'invalid_client',
-      },
-      {
-        registeredMethod: 'client_secret_post',
-        presentedMethod: 'client_secret_post',
-        expectedStatus: 400,
-        expectedError: 'invalid_grant',
-      },
-      {
-        registeredMethod: 'client_secret_post',
-        presentedMethod: 'none',
-        expectedStatus: 401,
-        expectedError: 'invalid_client',
-      },
-      {
-        registeredMethod: 'client_secret_post',
-        presentedMethod: 'mixed',
-        expectedStatus: 400,
-        expectedError: 'invalid_request',
-      },
-      {
-        registeredMethod: 'none',
-        presentedMethod: 'client_secret_basic',
-        expectedStatus: 401,
-        expectedError: 'invalid_client',
-      },
-      {
-        registeredMethod: 'none',
-        presentedMethod: 'client_secret_post',
-        expectedStatus: 401,
-        expectedError: 'invalid_client',
-      },
-      {
-        registeredMethod: 'none',
-        presentedMethod: 'none',
-        expectedStatus: 400,
-        expectedError: 'invalid_grant',
-      },
-      {
-        registeredMethod: 'none',
-        presentedMethod: 'mixed',
-        expectedStatus: 400,
-        expectedError: 'invalid_request',
-      },
-    ])(
-      'enforces $registeredMethod when the client presents $presentedMethod authentication',
-      async ({ registeredMethod, presentedMethod, expectedStatus, expectedError }) => {
-        const registrationResponse = await oauthProvider.fetch(
-          createMockRequest(
-            'https://example.com/oauth/register',
-            'POST',
-            { 'Content-Type': 'application/json' },
-            JSON.stringify({
-              redirect_uris: ['https://client.example.com/callback'],
-              client_name: `Test ${registeredMethod} client`,
-              token_endpoint_auth_method: registeredMethod,
-            })
-          ),
-          mockEnv,
-          mockCtx
-        );
-        expect(registrationResponse.status).toBe(201);
-        const client = await registrationResponse.json<any>();
-        const presentedSecret = client.client_secret || 'presented-secret';
+    it.each([
+      ['client_id', ''],
+      ['client_secret', ''],
+      ['client_id', 'form-client-id'],
+      ['client_secret', 'form-client-secret'],
+    ])('should reject Basic auth combined with a present %s form parameter', async (parameter, value) => {
+      const params = new URLSearchParams();
+      params.append('grant_type', 'refresh_token');
+      params.append('refresh_token', 'invalid-refresh-token');
+      params.append(parameter, value);
 
-        const params = new URLSearchParams({
-          grant_type: 'refresh_token',
-          refresh_token: 'invalid-refresh-token',
-        });
-        const headers: Record<string, string> = {
+      const tokenRequest = createMockRequest(
+        'https://example.com/oauth/token',
+        'POST',
+        {
           'Content-Type': 'application/x-www-form-urlencoded',
-        };
+          Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+        },
+        params.toString()
+      );
 
-        if (presentedMethod === 'client_secret_basic' || presentedMethod === 'mixed') {
-          headers.Authorization = `Basic ${btoa(`${client.client_id}:${presentedSecret}`)}`;
-        }
-        if (presentedMethod !== 'client_secret_basic') {
-          params.set('client_id', client.client_id);
-        }
-        if (presentedMethod === 'client_secret_post' || presentedMethod === 'mixed') {
-          params.set('client_secret', presentedSecret);
-        }
+      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
 
-        const response = await oauthProvider.fetch(
-          createMockRequest('https://example.com/oauth/token', 'POST', headers, params.toString()),
-          mockEnv,
-          mockCtx
-        );
-
-        expect(response.status).toBe(expectedStatus);
-        const error = await response.json<any>();
-        expect(error.error).toBe(expectedError);
-        if (expectedError === 'invalid_client') {
-          expect(error.error_description).toBe('Client authentication failed');
-        } else if (expectedError === 'invalid_request') {
-          expect(error.error_description).toBe('Client must not use multiple authentication methods');
-        }
-      }
-    );
+      expect(tokenResponse.status).toBe(400);
+      const error = await tokenResponse.json<any>();
+      expect(error.error).toBe('invalid_request');
+      expect(error.error_description).toBe('Client must not use multiple authentication methods');
+    });
 
     it('should reject malformed Base64 in Basic auth credentials', async () => {
       const response = await requestRefreshTokenWithAuthorization('Basic %');
@@ -2723,6 +2690,7 @@ describe('OAuthProvider', () => {
     });
 
     it('should recognize the Basic auth scheme case-insensitively', async () => {
+      await createTestClient('client_secret_basic');
       const response = await requestRefreshTokenWithAuthorization(`basic ${btoa(`${clientId}:${clientSecret}`)}`);
 
       expect(response.status).toBe(400);
@@ -2745,22 +2713,20 @@ describe('OAuthProvider', () => {
     });
 
     it('should challenge missing secrets presented through Basic auth', async () => {
+      await createTestClient('client_secret_basic');
       const response = await requestRefreshTokenWithAuthorization(`Basic ${btoa(`${clientId}:`)}`);
 
       await expectBasicClientError(response, 'Client authentication failed: missing client_secret');
     });
 
     it('should challenge a known client with an invalid Basic auth secret', async () => {
+      await createTestClient('client_secret_basic');
       const response = await requestRefreshTokenWithAuthorization(`Basic ${btoa(`${clientId}:wrong-secret`)}`);
 
       await expectBasicClientError(response, 'Client authentication failed: invalid client_secret');
     });
 
     it('should not add a Basic challenge to form-post client authentication failures', async () => {
-      await oauthProvider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
-      await mockEnv.OAUTH_PROVIDER!.updateClient(clientId, {
-        tokenEndpointAuthMethod: 'client_secret_post',
-      });
       const params = new URLSearchParams();
       params.append('grant_type', 'refresh_token');
       params.append('refresh_token', 'invalid-refresh-token');
@@ -2787,6 +2753,7 @@ describe('OAuthProvider', () => {
     });
 
     it('should decode Basic auth credentials with form-url-encoding semantics', async () => {
+      await createTestClient('client_secret_basic');
       const secretWithReservedCharacters = 'secret with spaces:and:colons';
       await oauthProvider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
       const updatedClient = await mockEnv.OAUTH_PROVIDER!.updateClient(clientId, {
@@ -2805,9 +2772,6 @@ describe('OAuthProvider', () => {
       const location = authResponse.headers.get('Location')!;
       const url = new URL(location);
       const code = url.searchParams.get('code')!;
-      await mockEnv.OAUTH_PROVIDER!.updateClient(clientId, {
-        tokenEndpointAuthMethod: 'client_secret_basic',
-      });
 
       const formEncode = (value: string) => encodeURIComponent(value).replace(/%20/g, '+');
       const params = new URLSearchParams();
@@ -3283,7 +3247,7 @@ describe('OAuthProvider', () => {
       const clientData = {
         redirect_uris: ['https://client.example.com/callback'],
         client_name: 'Test Client',
-        token_endpoint_auth_method: 'client_secret_basic',
+        token_endpoint_auth_method: 'client_secret_post',
       };
 
       const registerRequest = createMockRequest(
@@ -3570,7 +3534,7 @@ describe('OAuthProvider', () => {
       const originalClientData = {
         redirect_uris: ['https://original.example.com/callback'],
         client_name: 'Original Client',
-        token_endpoint_auth_method: 'client_secret_basic',
+        token_endpoint_auth_method: 'client_secret_post',
       };
 
       const registerRequest1 = createMockRequest(
@@ -5177,7 +5141,7 @@ describe('OAuthProvider', () => {
       const clientData = {
         redirect_uris: ['https://client.example.com/callback'],
         client_name: 'Test Client',
-        token_endpoint_auth_method: 'client_secret_basic',
+        token_endpoint_auth_method: 'client_secret_post',
       };
 
       const registerRequest = createMockRequest(
@@ -5906,7 +5870,7 @@ describe('OAuthProvider', () => {
       const clientData = {
         redirect_uris: ['https://client.example.com/callback'],
         client_name: 'Test Client',
-        token_endpoint_auth_method: 'client_secret_basic',
+        token_endpoint_auth_method: 'client_secret_post',
       };
 
       const registerRequest = createMockRequest(
@@ -6072,7 +6036,7 @@ describe('OAuthProvider', () => {
       const clientData = {
         redirect_uris: ['https://client.example.com/callback'],
         client_name: 'Test Client',
-        token_endpoint_auth_method: 'client_secret_basic',
+        token_endpoint_auth_method: 'client_secret_post',
       };
 
       const registerRequest = createMockRequest(
@@ -6328,7 +6292,7 @@ describe('OAuthProvider', () => {
       const clientData = {
         redirect_uris: ['https://client.example.com/callback'],
         client_name: 'Test Client',
-        token_endpoint_auth_method: 'client_secret_basic',
+        token_endpoint_auth_method: 'client_secret_post',
       };
 
       const registerRequest = createMockRequest(
@@ -6384,7 +6348,7 @@ describe('OAuthProvider', () => {
       const clientData = {
         redirect_uris: ['https://client.example.com/callback'],
         client_name: 'Test Client',
-        token_endpoint_auth_method: 'client_secret_basic',
+        token_endpoint_auth_method: 'client_secret_post',
       };
 
       const registerRequest = createMockRequest(
@@ -6439,7 +6403,7 @@ describe('OAuthProvider', () => {
       const clientData = {
         redirect_uris: ['https://client.example.com/callback'],
         client_name: 'Test Client',
-        token_endpoint_auth_method: 'client_secret_basic',
+        token_endpoint_auth_method: 'client_secret_post',
       };
 
       const registerRequest = createMockRequest(
@@ -6494,7 +6458,7 @@ describe('OAuthProvider', () => {
       const clientData = {
         redirect_uris: ['https://client.example.com/callback'],
         client_name: 'Test Client',
-        token_endpoint_auth_method: 'client_secret_basic',
+        token_endpoint_auth_method: 'client_secret_post',
       };
 
       const registerRequest = createMockRequest(
@@ -6793,7 +6757,7 @@ describe('OAuthProvider', () => {
       const clientData = {
         redirect_uris: ['https://client.example.com/callback'],
         client_name: 'Test Client',
-        token_endpoint_auth_method: 'client_secret_basic',
+        token_endpoint_auth_method: 'client_secret_post',
       };
 
       const registerRequest = createMockRequest(
@@ -6868,7 +6832,7 @@ describe('OAuthProvider', () => {
       const clientData = {
         redirect_uris: ['https://client.example.com/callback'],
         client_name: 'Test Client',
-        token_endpoint_auth_method: 'client_secret_basic',
+        token_endpoint_auth_method: 'client_secret_post',
       };
 
       const registerRequest = createMockRequest(
@@ -6947,7 +6911,7 @@ describe('OAuthProvider', () => {
           JSON.stringify({
             redirect_uris: [redirectUri],
             client_name: 'Resource Policy Client',
-            token_endpoint_auth_method: 'client_secret_basic',
+            token_endpoint_auth_method: 'client_secret_post',
           })
         ),
         mockEnv,
@@ -7222,7 +7186,7 @@ describe('OAuthProvider', () => {
       const clientData = {
         redirect_uris: ['https://client.example.com/callback'],
         client_name: 'Test Client',
-        token_endpoint_auth_method: 'client_secret_basic',
+        token_endpoint_auth_method: 'client_secret_post',
       };
       const registerResponse = await provider.fetch(
         createMockRequest(
@@ -7458,7 +7422,7 @@ describe('OAuthProvider', () => {
           JSON.stringify({
             redirect_uris: ['https://client.example.com/callback'],
             client_name: 'Cache Header Test Client',
-            token_endpoint_auth_method: 'client_secret_basic',
+            token_endpoint_auth_method: 'client_secret_post',
           })
         ),
         mockEnv,
@@ -7648,7 +7612,7 @@ describe('OAuthProvider', () => {
       const clientData = {
         redirect_uris: ['https://client.example.com/callback'],
         client_name: 'CORS Test Client',
-        token_endpoint_auth_method: 'client_secret_basic',
+        token_endpoint_auth_method: 'client_secret_post',
       };
 
       const registerRequest = createMockRequest(
@@ -7917,7 +7881,7 @@ describe('OAuthProvider', () => {
       const clientData = {
         redirect_uris: ['https://client.example.com/callback'],
         client_name: 'Test Client',
-        token_endpoint_auth_method: 'client_secret_basic',
+        token_endpoint_auth_method: 'client_secret_post',
       };
 
       const request = createMockRequest(
@@ -8228,7 +8192,7 @@ describe('OAuthProvider', () => {
       const clientData = {
         redirect_uris: ['https://client.example.com/callback'],
         client_name: 'Refresh Props Test',
-        token_endpoint_auth_method: 'client_secret_basic',
+        token_endpoint_auth_method: 'client_secret_post',
       };
 
       const registerRequest = createMockRequest(
@@ -8335,7 +8299,7 @@ describe('OAuthProvider', () => {
       const clientData = {
         redirect_uris: ['https://client.example.com/callback'],
         client_name: 'Token Props Only Test',
-        token_endpoint_auth_method: 'client_secret_basic',
+        token_endpoint_auth_method: 'client_secret_post',
       };
 
       const registerRequest = createMockRequest(
@@ -8451,7 +8415,7 @@ describe('OAuthProvider', () => {
       const clientData = {
         redirect_uris: ['https://client.example.com/callback'],
         client_name: 'Custom TTL Test',
-        token_endpoint_auth_method: 'client_secret_basic',
+        token_endpoint_auth_method: 'client_secret_post',
       };
 
       const registerRequest = createMockRequest(
@@ -8547,7 +8511,7 @@ describe('OAuthProvider', () => {
       const clientData = {
         redirect_uris: ['https://client.example.com/callback'],
         client_name: 'Noop Callback Test',
-        token_endpoint_auth_method: 'client_secret_basic',
+        token_endpoint_auth_method: 'client_secret_post',
       };
 
       const registerRequest = createMockRequest(
@@ -8641,7 +8605,7 @@ describe('OAuthProvider', () => {
       const clientData = {
         redirect_uris: ['https://client.example.com/callback'],
         client_name: 'Key-Rewrapping Test',
-        token_endpoint_auth_method: 'client_secret_basic',
+        token_endpoint_auth_method: 'client_secret_post',
       };
 
       const registerRequest = createMockRequest(
@@ -8791,7 +8755,7 @@ describe('OAuthProvider', () => {
         JSON.stringify({
           redirect_uris: ['https://client.example.com/callback'],
           client_name: 'Scope Test',
-          token_endpoint_auth_method: 'client_secret_basic',
+          token_endpoint_auth_method: 'client_secret_post',
         })
       );
       const regRes = await scopeProvider.fetch(regReq, mockEnv, mockCtx);
@@ -8859,7 +8823,7 @@ describe('OAuthProvider', () => {
         JSON.stringify({
           redirect_uris: ['https://client.example.com/callback'],
           client_name: 'Refresh Scope Test',
-          token_endpoint_auth_method: 'client_secret_basic',
+          token_endpoint_auth_method: 'client_secret_post',
         })
       );
       const regRes = await scopeProvider.fetch(regReq, mockEnv, mockCtx);
@@ -8949,7 +8913,7 @@ describe('OAuthProvider', () => {
         JSON.stringify({
           redirect_uris: ['https://original.example.com/callback'],
           client_name: 'Original',
-          token_endpoint_auth_method: 'client_secret_basic',
+          token_endpoint_auth_method: 'client_secret_post',
         })
       );
       const regRes1 = await scopeProvider.fetch(regReq1, mockEnv, mockCtx);
@@ -9075,7 +9039,7 @@ describe('OAuthProvider', () => {
         JSON.stringify({
           redirect_uris: ['https://client.example.com/callback'],
           client_name: 'Clamp Test',
-          token_endpoint_auth_method: 'client_secret_basic',
+          token_endpoint_auth_method: 'client_secret_post',
         })
       );
       const regRes = await scopeProvider.fetch(regReq, mockEnv, mockCtx);
@@ -9151,7 +9115,7 @@ describe('OAuthProvider', () => {
         JSON.stringify({
           redirect_uris: [redirectUri],
           client_name: 'Test Client',
-          token_endpoint_auth_method: 'client_secret_basic',
+          token_endpoint_auth_method: 'client_secret_post',
         })
       );
       const response = await provider.fetch(registerRequest, mockEnv, mockCtx);
@@ -10162,7 +10126,7 @@ describe('OAuthProvider', () => {
       const clientData = {
         redirect_uris: ['https://client.example.com/callback'],
         client_name: 'Internal Token Test',
-        token_endpoint_auth_method: 'client_secret_basic',
+        token_endpoint_auth_method: 'client_secret_post',
       };
 
       const registerRequest = createMockRequest(
@@ -10428,9 +10392,6 @@ describe('OAuthProvider', () => {
 
       const authResponse = await oauthProvider.fetch(createMockRequest(authUrl.toString()), mockEnv, mockCtx);
       const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
-      await mockEnv.OAUTH_PROVIDER!.updateClient(clientId, {
-        tokenEndpointAuthMethod: 'client_secret_basic',
-      });
 
       const tokenResponse = await oauthProvider.fetch(
         createMockRequest(
@@ -11632,7 +11593,7 @@ describe('OAuthProvider', () => {
     let clientSecret: string;
 
     // Helper to register a client with given redirect URIs
-    async function registerClient(redirectUris: string[], authMethod = 'client_secret_basic') {
+    async function registerClient(redirectUris: string[], authMethod = 'client_secret_post') {
       const clientData = {
         redirect_uris: redirectUris,
         client_name: 'Loopback Test Client',
@@ -12715,7 +12676,7 @@ describe('OAuthProvider', () => {
     let clientSecret: string;
 
     // Helper to register a client with given redirect URIs
-    async function registerClient(redirectUris: string[], authMethod = 'client_secret_basic') {
+    async function registerClient(redirectUris: string[], authMethod = 'client_secret_post') {
       const clientData = {
         redirect_uris: redirectUris,
         client_name: 'Loopback Test Client',
@@ -13116,7 +13077,7 @@ describe('OAuthProvider', () => {
         JSON.stringify({
           redirect_uris: [redirectUri],
           client_name: 'TTL Test Client',
-          token_endpoint_auth_method: 'client_secret_basic',
+          token_endpoint_auth_method: 'client_secret_post',
         })
       );
       const response = await provider.fetch(request, mockEnv, mockCtx);
@@ -13609,7 +13570,7 @@ describe('OAuthProvider', () => {
         JSON.stringify({
           redirect_uris: ['https://other.example.com/callback'],
           client_name: 'Other Client',
-          token_endpoint_auth_method: 'client_secret_basic',
+          token_endpoint_auth_method: 'client_secret_post',
         })
       );
       const response2 = await provider.fetch(request2, mockEnv, mockCtx);

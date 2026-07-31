@@ -1913,10 +1913,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const basicAuthenticationAttempted = basicAuthorization.kind !== 'not-basic';
     let clientId = '';
     let clientSecret = '';
-    let presentedAuthMethod: 'client_secret_basic' | 'client_secret_post' | 'none';
 
     if (basicAuthenticationAttempted) {
-      if (body.client_id || body.client_secret) {
+      if (formData.has('client_id') || formData.has('client_secret')) {
         return this.createErrorResponse('invalid_request', {
           description: 'Client must not use multiple authentication methods',
           statusCode: 400,
@@ -1932,11 +1931,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
       clientId = basicAuthorization.clientId;
       clientSecret = basicAuthorization.clientSecret;
-      presentedAuthMethod = 'client_secret_basic';
     } else {
       clientId = body.client_id;
       clientSecret = body.client_secret || '';
-      presentedAuthMethod = Object.prototype.hasOwnProperty.call(body, 'client_secret') ? 'client_secret_post' : 'none';
     }
 
     if (!clientId) {
@@ -1971,16 +1968,19 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       return this.createInvalidClientResponse('Client not found', basicAuthenticationAttempted);
     }
 
-    // Enforce the authentication method the client registered for this endpoint.
-    const tokenEndpointAuthMethod = clientInfo.tokenEndpointAuthMethod || 'client_secret_basic';
-    if (presentedAuthMethod !== tokenEndpointAuthMethod) {
+    // RFC 7591 methods identify the credential transport. Check form-parameter
+    // presence rather than truthiness so an empty secret still counts as a POST attempt.
+    const presentedAuthMethod = basicAuthenticationAttempted
+      ? 'client_secret_basic'
+      : formData.has('client_secret')
+        ? 'client_secret_post'
+        : 'none';
+    if (presentedAuthMethod !== clientInfo.tokenEndpointAuthMethod) {
       return this.createInvalidClientResponse('Client authentication failed', basicAuthenticationAttempted);
     }
 
-    const isPublicClient = tokenEndpointAuthMethod === 'none';
-
     // For confidential clients, validate the secret
-    if (!isPublicClient) {
+    if (presentedAuthMethod !== 'none') {
       if (!clientSecret) {
         return this.createInvalidClientResponse(
           'Client authentication failed: missing client_secret',

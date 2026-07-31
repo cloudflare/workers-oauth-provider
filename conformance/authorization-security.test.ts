@@ -112,6 +112,37 @@ describe.each(MCP_AUTH_REVISIONS)('MCP %s authorization security conformance', (
     const { tokens } = await oauth.completeAuthorizationCodeFlow(client);
     expect(tokens.access_token).toBeTruthy();
   });
+
+  it.each([
+    ['client_secret_basic', 'client_secret_post'],
+    ['client_secret_post', 'client_secret_basic'],
+    ['none', 'client_secret_basic'],
+    ['none', 'client_secret_post'],
+  ] as const)(
+    'rejects %s clients that authenticate using %s without consuming the code',
+    async (registeredMethod, presentedMethod) => {
+      const client = await oauth.createClient(registeredMethod);
+      const authorization = await oauth.authorize(client);
+      const mismatchedClient = {
+        ...client,
+        clientSecret: client.clientSecret ?? 'unexpected-public-client-secret',
+        tokenEndpointAuthMethod: presentedMethod,
+      };
+
+      const invalid = await oauth.exchangeAuthorizationCode(mismatchedClient, authorization);
+      expect(invalid.response.status).toBe(401);
+      expect(await readJson<OAuthErrorBody>(invalid.response)).toEqual({
+        error: 'invalid_client',
+        error_description: 'Client authentication failed',
+      });
+      expect(invalid.response.headers.get('WWW-Authenticate')).toBe(
+        presentedMethod === 'client_secret_basic' ? 'Basic realm="OAuth"' : null
+      );
+
+      const retry = await oauth.exchangeAuthorizationCode(client, authorization);
+      expect(retry.response.status).toBe(200);
+    }
+  );
 });
 
 describe('strict resource policy compatibility boundary', () => {
