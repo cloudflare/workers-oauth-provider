@@ -234,7 +234,7 @@ function authenticateClient(body: URLSearchParams, client: OAuthClientCredential
   if (client.tokenEndpointAuthMethod === 'client_secret_post') {
     body.set('client_id', client.clientId);
     if (client.clientSecret) body.set('client_secret', client.clientSecret);
-  } else if (client.clientSecret) {
+  } else if (client.tokenEndpointAuthMethod === 'client_secret_basic' && client.clientSecret) {
     headers.Authorization = `Basic ${btoa(`${client.clientId}:${client.clientSecret}`)}`;
   } else {
     body.set('client_id', client.clientId);

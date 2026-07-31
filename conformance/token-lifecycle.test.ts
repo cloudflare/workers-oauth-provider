@@ -62,6 +62,35 @@ describe.each(MCP_AUTH_REVISIONS)('MCP %s OAuth token lifecycle conformance', (r
     expect(exchange.tokens?.scope).toBe(READ_SCOPE);
   });
 
+  it('rejects a mismatched registered authentication method before revocation', async () => {
+    const confidentialClient = await oauth.createClient('client_secret_basic');
+    const { tokens } = await oauth.completeAuthorizationCodeFlow(confidentialClient);
+    const mismatchedClient: OAuthClientCredentials = {
+      ...confidentialClient,
+      tokenEndpointAuthMethod: 'client_secret_post',
+    };
+
+    const rejected = await oauth.revoke(mismatchedClient, tokens.access_token, 'access_token');
+    expect(rejected.status).toBe(401);
+    expect(await readJson<OAuthErrorBody>(rejected)).toEqual({
+      error: 'invalid_client',
+      error_description: 'Client authentication failed',
+    });
+
+    const stillValid = await oauth.request('/mcp', {
+      headers: { Authorization: `Bearer ${tokens.access_token}` },
+    });
+    expect(stillValid.status).toBe(200);
+
+    const revoked = await oauth.revoke(confidentialClient, tokens.access_token, 'access_token');
+    expect(revoked.status).toBe(200);
+
+    const noLongerValid = await oauth.request('/mcp', {
+      headers: { Authorization: `Bearer ${tokens.access_token}` },
+    });
+    expect(noLongerValid.status).toBe(401);
+  });
+
   it('revokes an access token without revoking its refresh token', async () => {
     const { tokens } = await oauth.completeAuthorizationCodeFlow(client);
     expect(tokens.refresh_token).toBeTruthy();
