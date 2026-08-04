@@ -3747,7 +3747,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       grant_types: clientInfo.grantTypes,
       response_types: clientInfo.responseTypes,
       token_endpoint_auth_method: clientInfo.tokenEndpointAuthMethod,
-      registration_client_uri: `${this.options.clientRegistrationEndpoint}/${clientId}`,
       client_id_issued_at: clientInfo.registrationDate,
     };
 

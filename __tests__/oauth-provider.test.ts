@@ -947,7 +947,6 @@ describe('OAuthProvider', () => {
       expect(registeredClient.client_secret_issued_at).toEqual(expect.any(Number));
       expect(registeredClient.redirect_uris).toEqual(['https://client.example.com/callback']);
       expect(registeredClient.client_name).toBe('Test Client');
-
       // Verify the client was saved to KV
       const savedClient = await mockEnv.OAUTH_KV.get(`client:${registeredClient.client_id}`, { type: 'json' });
       expect(savedClient).not.toBeNull();
