@@ -3733,12 +3733,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
     await env.OAUTH_KV.put(`client:${clientId}`, JSON.stringify(clientInfo), clientKvOptions);
 
-    // RFC 7592 §3 and Appendix B require a fully qualified client configuration URL.
-    const registrationClientUrl = new URL(
-      this.getFullEndpointUrl(this.options.clientRegistrationEndpoint, new URL(request.url))
-    );
-    registrationClientUrl.pathname = `${registrationClientUrl.pathname.replace(/\/$/, '')}/${encodeURIComponent(clientId)}`;
-
     // Return client information with the original unhashed secret
     const response: Record<string, any> = {
       client_id: clientInfo.clientId,
@@ -3753,7 +3747,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       grant_types: clientInfo.grantTypes,
       response_types: clientInfo.responseTypes,
       token_endpoint_auth_method: clientInfo.tokenEndpointAuthMethod,
-      registration_client_uri: registrationClientUrl.href,
       client_id_issued_at: clientInfo.registrationDate,
     };
 
