@@ -36,7 +36,12 @@ See [Client registration](#client-registration) for the matching provider option
 The provider accepts either plain `ExportedHandler` objects or classes extending `WorkerEntrypoint`. This example uses both.
 
 ```ts
-import { OAuthProvider, type AuthRequest, type OAuthHelpers } from '@cloudflare/workers-oauth-provider';
+import {
+  AuthorizationError,
+  OAuthProvider,
+  type AuthRequest,
+  type OAuthHelpers,
+} from '@cloudflare/workers-oauth-provider';
 import { WorkerEntrypoint } from 'cloudflare:workers';
 
 interface AuthProps {
@@ -72,9 +77,18 @@ const defaultHandler: ExportedHandler<Env> = {
     let oauthRequest: AuthRequest;
     try {
       oauthRequest = await env.OAUTH_PROVIDER.parseAuthRequest(request);
-    } catch {
-      // Do not redirect until the client and redirect URI have been validated.
-      return new Response('Invalid authorization request', { status: 400 });
+    } catch (error) {
+      if (!(error instanceof AuthorizationError)) throw error;
+      if (!error.redirectUri) {
+        // Unknown clients and invalid redirects must be rendered locally.
+        return new Response(error.description, { status: 400 });
+      }
+      const redirect = new URL(error.redirectUri);
+      redirect.searchParams.set('error', error.code);
+      redirect.searchParams.set('error_description', error.description);
+      if (error.state) redirect.searchParams.set('state', error.state);
+      if (error.issuer) redirect.searchParams.set('iss', error.issuer);
+      return Response.redirect(redirect, 302);
     }
 
     const client = await env.OAUTH_PROVIDER.lookupClient(oauthRequest.clientId);
@@ -228,7 +242,9 @@ A typical flow has three steps:
 2. Authenticate the user, show consent, and decide which scopes to grant.
 3. Call `completeAuthorization()` and redirect to its returned `redirectTo` URL.
 
-`completeAuthorization()` repeats response-type validation before writing a grant or revoking existing grants. The application remains responsible for rendering local authorization errors and for constructing any terminal OAuth error redirect only after client and redirect URI validation.
+`parseAuthRequest()` throws an exported `AuthorizationError` for expected request validation failures. Its optional `redirectUri` is present only after the client and exact registered redirect URI have been validated. Without it, render the error locally and never redirect. With it, the application can safely construct an OAuth error redirect using the error's `code`, `description`, original `state`, and RFC 9207 `issuer`, as shown in the quick start.
+
+`completeAuthorization()` repeats response-type validation before writing a grant or revoking existing grants. Validation errors from reconstructed requests are also typed as `AuthorizationError`, but applications should not construct redirects from untrusted reconstructed values; the redirect context is attached only by `parseAuthRequest()`.
 
 `completeAuthorization()` stores a new grant and, by default, revokes existing grants for the same user and client after the new grant is safely stored. Set `revokeExistingGrants: false` only when the application intentionally allows concurrent grants for the same user and client.
 

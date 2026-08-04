@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  AuthorizationError,
   buildOAuthServerCapabilities,
   normalizePkceCodeChallengeMethod,
   validateAuthorizationPkce,
@@ -69,8 +70,14 @@ describe('OAuth server capabilities', () => {
     ['', ['code'], 'invalid_request'],
     ['token', ['code', 'token'], 'unsupported_response_type'],
     ['code', ['token'], 'unauthorized_client'],
-  ])('rejects response type %j against client %j', (responseType, clientResponseTypes, error) => {
-    expect(() => validateAuthorizationResponseType(defaults, responseType, clientResponseTypes)).toThrow(error);
+  ])('rejects response type %j against client %j', (responseType, clientResponseTypes, code) => {
+    try {
+      validateAuthorizationResponseType(defaults, responseType, clientResponseTypes);
+      throw new Error('Expected AuthorizationError');
+    } catch (error) {
+      expect(error).toBeInstanceOf(AuthorizationError);
+      expect(error).toMatchObject({ code });
+    }
   });
 
   it('accepts capabilities that the server advertises', () => {

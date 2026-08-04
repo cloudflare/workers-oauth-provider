@@ -1,6 +1,7 @@
 import { WorkerEntrypoint } from 'cloudflare:workers';
 
 import {
+  AuthorizationError,
   buildOAuthServerCapabilities,
   isValidOAuthScopeToken,
   normalizePkceCodeChallengeMethod,
@@ -9,6 +10,7 @@ import {
   validatePkceCodeChallengeMethod,
   validateAuthorizationServerScopes,
   validateClientCapabilities,
+  withAuthorizationRedirect,
   type OAuthServerCapabilities,
   type PkceCodeChallengeMethod,
 } from './oauth-capabilities';
@@ -35,6 +37,9 @@ import {
   validateIdJagClaims,
   validateIdJagHeader,
 } from './ema/validators';
+
+export { AuthorizationError } from './oauth-capabilities';
+export type { AuthorizationErrorCode, AuthorizationErrorOptions } from './oauth-capabilities';
 
 export type {
   EmaClaimsMapper,
@@ -5424,7 +5429,7 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
    * Parses an OAuth authorization request from the HTTP request
    * @param request - The HTTP request containing OAuth parameters
    * @returns The parsed authorization request parameters
-   * @throws Error when the response type is missing, unsupported, or not registered for the client
+   * @throws AuthorizationError for expected authorization-request validation failures
    * @throws CimdFetchError when the client ID is a CIMD URL whose document cannot be resolved
    */
   async parseAuthRequest(request: Request): Promise<AuthRequest> {
@@ -5442,47 +5447,58 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
     const resourceParam =
       resourceParams.length > 0 ? (resourceParams.length === 1 ? resourceParams[0] : resourceParams) : undefined;
 
-    // Validate redirect URI to prevent javascript: URIs / XSS attacks
-    // Using helper function that normalizes and checks in a case-insensitive manner
-    validateRedirectUriScheme(redirectUri);
+    if (!clientId) {
+      throw new AuthorizationError('invalid_request', { description: 'client_id is required' });
+    }
 
-    // Parse and validate the resource parameter (RFC 8707). An explicitly
-    // configured resource is deployment policy and therefore requires one
-    // exact value. Without that policy, RFC 8707 §2.1 allows the authorization
-    // server to use a predefined default; the request origin is the safest
-    // interoperable default available to a co-located AS/RS deployment.
+    const clientInfo = await this.lookupClient(clientId);
+    if (!clientInfo) {
+      throw new AuthorizationError('invalid_request', { description: 'Invalid client_id' });
+    }
+
+    try {
+      validateRedirectUriScheme(redirectUri);
+    } catch {
+      throw new AuthorizationError('invalid_request', { description: 'Invalid redirect URI' });
+    }
+    if (!redirectUri || !isValidRedirectUri(redirectUri, clientInfo.redirectUris)) {
+      throw new AuthorizationError('invalid_request', { description: 'Invalid redirect URI' });
+    }
+
+    const withRedirect = (error: AuthorizationError): never => {
+      throw withAuthorizationRedirect(error, redirectUri, state || undefined, issuer);
+    };
+
+    // Resource, response type, and PKCE errors are redirectable only after the
+    // exact client redirect URI above has been validated.
     let resource = parseResourceParameter(resourceParam);
     if (resourceParam && !resource) {
-      throw new Error('The resource parameter must be a valid absolute URI without a fragment');
+      withRedirect(
+        new AuthorizationError('invalid_request', {
+          description: 'The resource parameter must be a valid absolute URI without a fragment',
+        })
+      );
     }
     const configuredResource = this.provider.options.resourceMetadata?.resource;
     if (configuredResource && !isExactResource(resource, configuredResource)) {
-      throw new Error(`The resource parameter must exactly match ${configuredResource}`);
+      withRedirect(
+        new AuthorizationError('invalid_request', {
+          description: `The resource parameter must exactly match ${configuredResource}`,
+        })
+      );
     }
     resource ??= url.origin;
 
-    // Validate the client ID and redirect URI
-    if (clientId) {
-      const clientInfo = await this.lookupClient(clientId);
-
-      if (!clientInfo) {
-        throw new Error(`Invalid client. The clientId provided does not match to this client.`);
-      }
-      if (!redirectUri || !isValidRedirectUri(redirectUri, clientInfo.redirectUris)) {
-        throw new Error(
-          `Invalid redirect URI. The redirect URI provided does not match any registered URI for this client.`
-        );
-      }
+    try {
       validateAuthorizationResponseType(this.provider.serverCapabilities, responseType, clientInfo.responseTypes);
       validateAuthorizationPkce(
         this.provider.serverCapabilities,
-        {
-          responseType,
-          codeChallenge,
-          codeChallengeMethod,
-        },
+        { responseType, codeChallenge, codeChallengeMethod },
         clientInfo
       );
+    } catch (error) {
+      if (error instanceof AuthorizationError) withRedirect(error);
+      throw error;
     }
 
     return {
