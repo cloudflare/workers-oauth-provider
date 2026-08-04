@@ -1,0 +1,23 @@
+.changeset/fuzzy-pandas-registration-uri.md
+  s_18771482f66ccd::t_7313b22b5ed7b4 1-5
+__tests__/oauth-provider.test.ts
+  s_18771482f66ccd::t_2feca062411f80 950-953,963-990
+src/oauth-provider.ts
+  s_18771482f66ccd::t_e01c8293488f4d 3736-3741,3756
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "83f6086ba0ab9786b7905ce66f7db9926c8493e1",
+  "prompts": {},
+  "sessions": {
+    "s_18771482f66ccd": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "019fcc1b-4631-7ee0-a93c-11da7f8499f2",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Matt Carey <mcarey@cloudflare.com>"
+    }
+  }
+}
