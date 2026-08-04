@@ -1,5 +1,6 @@
 import { describe, it, expect, expectTypeOf, beforeEach, vi, afterEach } from 'vitest';
 import {
+  AuthorizationError,
   CimdFetchError,
   ExternalTokenError,
   OAuthError,
@@ -1577,16 +1578,45 @@ describe('OAuthProvider', () => {
     it.each([
       ['missing response_type', '', 'invalid_request'],
       ['unsupported response_type', '&response_type=unsupported', 'unsupported_response_type'],
-    ])('should reject %s without creating authorization state', async (_label, responseType, code) => {
+    ])('tags redirectable %s with validated response context', async (_label, responseType, code) => {
       const authRequest = createMockRequest(
         `https://example.com/authorize?client_id=${clientId}` +
           `&redirect_uri=${encodeURIComponent(redirectUri)}` +
           `&scope=read&state=state-123${responseType}`
       );
 
-      await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(code);
+      await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toMatchObject({
+        name: 'AuthorizationError',
+        code,
+        redirectUri,
+        state: 'state-123',
+        issuer: 'https://example.com',
+      });
       expect((await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys).toHaveLength(0);
       expect((await mockEnv.OAUTH_KV.list({ prefix: 'token:' })).keys).toHaveLength(0);
+    });
+
+    it('keeps unknown clients and invalid redirects local', async () => {
+      const unknownClient = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=unknown` +
+          `&redirect_uri=${encodeURIComponent('https://attacker.example/callback')}&state=secret`
+      );
+      const badRedirect = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent('https://attacker.example/callback')}&state=secret`
+      );
+
+      for (const request of [unknownClient, badRedirect]) {
+        try {
+          await oauthProvider.fetch(request, mockEnv, mockCtx);
+          throw new Error('Expected AuthorizationError');
+        } catch (error) {
+          expect(error).toBeInstanceOf(AuthorizationError);
+          expect(error).toMatchObject({ name: 'AuthorizationError', code: 'invalid_request' });
+          expect((error as AuthorizationError).redirectUri).toBeUndefined();
+          expect((error as AuthorizationError).state).toBeUndefined();
+        }
+      }
     });
 
     it('should prioritize a missing response_type over later PKCE validation', async () => {
@@ -1595,7 +1625,9 @@ describe('OAuthProvider', () => {
           `&redirect_uri=${encodeURIComponent(redirectUri)}&state=state-123`
       );
 
-      await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('invalid_request');
+      await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toMatchObject({
+        code: 'invalid_request',
+      });
     });
 
     it('should reject a response type excluded by registered client metadata', async () => {
@@ -1622,7 +1654,9 @@ describe('OAuthProvider', () => {
           `&code_challenge=test-challenge&code_challenge_method=plain`
       );
 
-      await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('unauthorized_client');
+      await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toMatchObject({
+        code: 'unauthorized_client',
+      });
       expect((await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys).toHaveLength(0);
     });
 
@@ -1734,7 +1768,7 @@ describe('OAuthProvider', () => {
           scope: ['read'],
           props: {},
         })
-      ).rejects.toThrow('unsupported_response_type');
+      ).rejects.toMatchObject({ code: 'unsupported_response_type' });
 
       expect((await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys.map((key) => key.name)).toEqual(
         originalGrantKeys
@@ -1931,9 +1965,9 @@ describe('OAuthProvider', () => {
           `&scope=read%20write&state=xyz123`
       );
 
-      await expect(providerWithoutImplicit.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
-        'unsupported_response_type'
-      );
+      await expect(providerWithoutImplicit.fetch(authRequest, mockEnv, mockCtx)).rejects.toMatchObject({
+        code: 'unsupported_response_type',
+      });
       expect((await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys).toHaveLength(0);
       expect((await mockEnv.OAUTH_KV.list({ prefix: 'token:' })).keys).toHaveLength(0);
     });

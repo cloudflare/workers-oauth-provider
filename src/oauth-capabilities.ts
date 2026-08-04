@@ -1,5 +1,62 @@
 const OAUTH_SCOPE_TOKEN_PATTERN = /^[\x21\x23-\x5B\x5D-\x7E]+$/;
 
+export type AuthorizationErrorCode =
+  | 'invalid_request'
+  | 'unauthorized_client'
+  | 'access_denied'
+  | 'unsupported_response_type'
+  | 'invalid_scope'
+  | 'server_error'
+  | 'temporarily_unavailable';
+
+export interface AuthorizationErrorOptions {
+  /** Wire-safe OAuth authorization error description. */
+  description: string;
+  /** Exact registered redirect URI. Present only after client and redirect validation. */
+  redirectUri?: string;
+  /** Original client state, when supplied. */
+  state?: string;
+  /** Authorization server issuer for RFC 9207 error responses. */
+  issuer?: string;
+}
+
+/**
+ * Expected authorization-request validation failure. Absence of `redirectUri`
+ * means a caller MUST render locally and MUST NOT redirect.
+ */
+export class AuthorizationError extends Error {
+  public readonly code: AuthorizationErrorCode;
+  public readonly description: string;
+  public readonly redirectUri?: string;
+  public readonly state?: string;
+  public readonly issuer?: string;
+
+  constructor(code: AuthorizationErrorCode, options: AuthorizationErrorOptions) {
+    super(options.description);
+    this.name = 'AuthorizationError';
+    this.code = code;
+    this.description = options.description;
+    this.redirectUri = options.redirectUri;
+    this.state = options.state;
+    this.issuer = options.issuer;
+  }
+}
+
+/** @internal Attach context after exact client redirect validation succeeds. */
+export function withAuthorizationRedirect(
+  error: AuthorizationError,
+  redirectUri: string,
+  state: string | undefined,
+  issuer: string
+): AuthorizationError {
+  return new AuthorizationError(error.code, {
+    description: error.description,
+    redirectUri,
+    state,
+    issuer,
+  });
+}
+
 /** PKCE transformation methods implemented by the authorization server. */
 export type PkceCodeChallengeMethod = 'plain' | 'S256';
 
@@ -60,12 +117,18 @@ export function validateAuthorizationResponseType(
   responseType: string,
   clientResponseTypes: readonly string[] | undefined
 ): void {
-  if (!responseType) throw new Error('invalid_request: response_type is required');
+  if (!responseType) {
+    throw new AuthorizationError('invalid_request', { description: 'response_type is required' });
+  }
   if (!server.responseTypes.includes(responseType)) {
-    throw new Error(`unsupported_response_type: the authorization server does not support ${responseType}`);
+    throw new AuthorizationError('unsupported_response_type', {
+      description: `The authorization server does not support response_type ${responseType}`,
+    });
   }
   if (!(clientResponseTypes ?? ['code']).includes(responseType)) {
-    throw new Error(`unauthorized_client: the client is not registered for response_type ${responseType}`);
+    throw new AuthorizationError('unauthorized_client', {
+      description: `The client is not registered for response_type ${responseType}`,
+    });
   }
 }
 
@@ -73,7 +136,9 @@ export function validateAuthorizationResponseType(
 export function normalizePkceCodeChallengeMethod(method: string | undefined): PkceCodeChallengeMethod {
   const effectiveMethod = method ?? 'plain';
   if (effectiveMethod !== 'plain' && effectiveMethod !== 'S256') {
-    throw new Error(`Unsupported PKCE code_challenge_method: ${effectiveMethod}`);
+    throw new AuthorizationError('invalid_request', {
+      description: `Unsupported PKCE code_challenge_method: ${effectiveMethod}`,
+    });
   }
   return effectiveMethod;
 }
@@ -85,7 +150,9 @@ export function validatePkceCodeChallengeMethod(
 ): PkceCodeChallengeMethod {
   const effectiveMethod = normalizePkceCodeChallengeMethod(method);
   if (!server.codeChallengeMethods.includes(effectiveMethod)) {
-    throw new Error('The plain PKCE method is not allowed. Use S256 instead.');
+    throw new AuthorizationError('invalid_request', {
+      description: 'The plain PKCE method is not allowed. Use S256 instead.',
+    });
   }
   return effectiveMethod;
 }
@@ -105,10 +172,14 @@ export function validateAuthorizationPkce(
     return;
   }
   if (request.codeChallengeMethod) {
-    throw new Error('PKCE code_challenge is required when code_challenge_method is provided.');
+    throw new AuthorizationError('invalid_request', {
+      description: 'PKCE code_challenge is required when code_challenge_method is provided.',
+    });
   }
   if (request.responseType === 'code' && client.tokenEndpointAuthMethod === 'none') {
-    throw new Error('Public clients must use PKCE with the authorization code flow.');
+    throw new AuthorizationError('invalid_request', {
+      description: 'Public clients must use PKCE with the authorization code flow.',
+    });
   }
 }
 
