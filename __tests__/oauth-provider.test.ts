@@ -947,6 +947,10 @@ describe('OAuthProvider', () => {
       expect(registeredClient.client_secret_issued_at).toEqual(expect.any(Number));
       expect(registeredClient.redirect_uris).toEqual(['https://client.example.com/callback']);
       expect(registeredClient.client_name).toBe('Test Client');
+      // RFC 7592 §3 requires the client configuration endpoint to be a fully qualified URL.
+      expect(registeredClient.registration_client_uri).toBe(
+        `https://example.com/oauth/register/${registeredClient.client_id}`
+      );
 
       // Verify the client was saved to KV
       const savedClient = await mockEnv.OAUTH_KV.get(`client:${registeredClient.client_id}`, { type: 'json' });
@@ -954,6 +958,34 @@ describe('OAuthProvider', () => {
       expect(savedClient.clientId).toBe(registeredClient.client_id);
       // Secret should be stored as a hash
       expect(savedClient.clientSecret).not.toBe(registeredClient.client_secret);
+    });
+
+    it('should preserve an absolute registration endpoint when building the client configuration URL', async () => {
+      const provider = new OAuthProvider({
+        apiRoute: '/api/',
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: 'https://auth.example.com/oauth/register',
+      });
+      const request = createMockRequest(
+        'https://auth.example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify({
+          redirect_uris: ['https://client.example.com/callback'],
+          client_name: 'Test Client',
+        })
+      );
+
+      const response = await provider.fetch(request, mockEnv, mockCtx);
+
+      expect(response.status).toBe(201);
+      const registeredClient = await response.json<any>();
+      expect(registeredClient.registration_client_uri).toBe(
+        `https://auth.example.com/oauth/register/${registeredClient.client_id}`
+      );
     });
 
     it('should register a public client', async () => {
