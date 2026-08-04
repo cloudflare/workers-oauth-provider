@@ -1,5 +1,11 @@
 # @cloudflare/workers-oauth-provider
 
+## 0.9.1
+
+### Patch Changes
+
+- [#280](https://github.com/cloudflare/workers-oauth-provider/pull/280) [`43b9fa4`](https://github.com/cloudflare/workers-oauth-provider/commit/43b9fa49b37777c0264db4cd8cd0469fe01ff13c) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Stop returning `registration_client_uri` from dynamic client registration. The provider implements RFC 7591 registration but not the RFC 7592 client configuration endpoint previously advertised by this field.
+
 ## 0.9.0
 
 ### Minor Changes
