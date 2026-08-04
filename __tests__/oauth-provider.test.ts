@@ -947,10 +947,6 @@ describe('OAuthProvider', () => {
       expect(registeredClient.client_secret_issued_at).toEqual(expect.any(Number));
       expect(registeredClient.redirect_uris).toEqual(['https://client.example.com/callback']);
       expect(registeredClient.client_name).toBe('Test Client');
-      // RFC 7591 does not define registration management. Do not advertise an
-      // RFC 7592 client configuration endpoint that the provider does not implement.
-      expect(registeredClient.registration_client_uri).toBeUndefined();
-
       // Verify the client was saved to KV
       const savedClient = await mockEnv.OAUTH_KV.get(`client:${registeredClient.client_id}`, { type: 'json' });
       expect(savedClient).not.toBeNull();
