@@ -1,0 +1,19 @@
+src/oauth-capabilities.ts
+  s_41e4d933b7aacf::t_44c0ba43909ff1 3-59,120-122,124-126,129-131,139-141,153-155,175-177,180-182
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "7174afca51f3a71b6797ee8418b89c979aad645f",
+  "prompts": {},
+  "sessions": {
+    "s_41e4d933b7aacf": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "019fcc52-11a9-76d0-8c10-984266179b16",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Matt Carey <mcarey@cloudflare.com>"
+    }
+  }
+}
