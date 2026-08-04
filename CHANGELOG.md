@@ -1,5 +1,11 @@
 # @cloudflare/workers-oauth-provider
 
+## 0.10.0
+
+### Minor Changes
+
+- [#283](https://github.com/cloudflare/workers-oauth-provider/pull/283) [`b36f841`](https://github.com/cloudflare/workers-oauth-provider/commit/b36f841fb4d94de55c50ae73a70c1bb549275ae6) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Export `AuthorizationError` and throw it from `parseAuthRequest()` for expected authorization-request validation failures. Errors carry a validated redirect URI, original state, and issuer only after exact client redirect validation succeeds, allowing applications to distinguish safe OAuth error redirects from failures that must be rendered locally.
+
 ## 0.9.1
 
 ### Patch Changes
