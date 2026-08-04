@@ -1,5 +1,61 @@
 # @cloudflare/workers-oauth-provider
 
+## 0.9.0
+
+### Minor Changes
+
+- [#253](https://github.com/cloudflare/workers-oauth-provider/pull/253) [`f4e026c`](https://github.com/cloudflare/workers-oauth-provider/commit/f4e026c3aba40f4c3cfad0576d3fb2b5489d8ee1) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Reject authorization-code requests from public clients that omit PKCE. OAuth 2.1 requires authorization servers to enforce `code_challenge` for clients that cannot authenticate at the token endpoint.
+
+- [#248](https://github.com/cloudflare/workers-oauth-provider/pull/248) [`194154e`](https://github.com/cloudflare/workers-oauth-provider/commit/194154e2429d3dafb77617638fb9faa6daa2a331) Thanks [@ksinder](https://github.com/ksinder)! - Report CIMD metadata fetch failures instead of treating them as unknown clients.
+  A failed Client ID Metadata Document fetch previously became a `null` client
+  lookup, so a network problem (timeout, WAF block, upstream outage) was
+  indistinguishable from an unregistered client — at the token endpoint, in the
+  `onError` hook, and for `OAuthHelpers` callers. The fetch failure now throws a
+  new exported `CimdFetchError` carrying the metadata URL, stable
+  `metadata_resolution_failed` reason, and underlying diagnostic detail. The
+  token endpoint still returns the same generic `invalid_client` / "Client not
+  found" response, but reports the failure through the `onError` hook's
+  `internal` field (category `client-id-metadata-document`) together with a new
+  optional `request` field. Breaking for callers of `OAuthHelpers.lookupClient`
+  (and methods built on it) that relied on `null` for CIMD fetch failures: catch
+  `CimdFetchError` to restore the old behavior.
+
+- [#259](https://github.com/cloudflare/workers-oauth-provider/pull/259) [`71ec864`](https://github.com/cloudflare/workers-oauth-provider/commit/71ec86465217725e76b2f57271719dd50aaaad7a) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Enable RFC 9207 authorization response issuer identification. Authorization server metadata advertises support, parsed requests carry the expected issuer for application-owned terminal error responses, and successful code and implicit redirects include `iss`.
+
+- [#255](https://github.com/cloudflare/workers-oauth-provider/pull/255) [`5cc336c`](https://github.com/cloudflare/workers-oauth-provider/commit/5cc336c36b1170eab45378ca2e74e5520604ba38) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Validate protected resource metadata at construction time. Reject empty or invalid authorization server issuer lists, invalid resource and scope values, and bearer presentation methods the provider does not implement instead of publishing unusable or misleading RFC 9728 metadata.
+
+- [#277](https://github.com/cloudflare/workers-oauth-provider/pull/277) [`9e88aa4`](https://github.com/cloudflare/workers-oauth-provider/commit/9e88aa4e625cdeda40de4ca56aadc22575d37e1a) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Require S256 PKCE by default. Authorization servers now advertise only `S256` and reject PKCE challenges that use `plain` or omit `code_challenge_method` unless `allowPlainPKCE: true` is configured for legacy compatibility. Confidential clients may continue to omit PKCE entirely.
+
+- [#260](https://github.com/cloudflare/workers-oauth-provider/pull/260) [`248a9e7`](https://github.com/cloudflare/workers-oauth-provider/commit/248a9e76707804a9cd39b02870c7eb809062dbcd) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Separate authorization-server and protected-resource scope configuration. Explicit `resourceMetadata.scopes_supported` values become baseline Bearer challenge guidance, operation-specific `requiredScopes` takes precedence, and `offline_access` is omitted from provider-generated resource-facing scope lists. Deployments relying on the old `scopesSupported` fallback must configure protected-resource scopes explicitly.
+
+- [#251](https://github.com/cloudflare/workers-oauth-provider/pull/251) [`98d642f`](https://github.com/cloudflare/workers-oauth-provider/commit/98d642f1d2f866663aba6b2a935727bbcca0b6d3) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Add an exported `ExternalTokenError` for intentional structured errors from `resolveExternalToken`. Existing callbacks keep their previous behavior: returning `{ props, audience? }` authenticates, returning `null` returns a generic `401 invalid_token`, and every other thrown value, including `OAuthError`, propagates as an unexpected failure. Standard bearer-token `ExternalTokenError` failures receive `WWW-Authenticate` challenges, `requiredScopes` supplies step-up guidance, callback headers are preserved, and browser clients can read `WWW-Authenticate` and `Retry-After` through CORS.
+
+- [#256](https://github.com/cloudflare/workers-oauth-provider/pull/256) [`510b20c`](https://github.com/cloudflare/workers-oauth-provider/commit/510b20c66a7b9679c73a249ef5e7117aecd9a41a) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Use `resourceMetadata.resource` as the strict RFC 8707 resource policy. Configured deployments now require that exact resource throughout authorization, token issuance, and access-token validation. Unconfigured deployments remain interoperable by inheriting requested resources and defaulting omitted authorization resources to the request origin.
+
+- [#273](https://github.com/cloudflare/workers-oauth-provider/pull/273) [`cd5e96a`](https://github.com/cloudflare/workers-oauth-provider/commit/cd5e96a08e4cae3eff1f0f35572e5ca895a3e064) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Validate configured scopes and registered OAuth client capabilities. Dynamic registration now applies RFC 7591 defaults, rejects unsupported or inconsistent authentication, grant, and response types before storage, and applies the same capability checks to CIMD metadata.
+
+### Patch Changes
+
+- [#254](https://github.com/cloudflare/workers-oauth-provider/pull/254) [`79270da`](https://github.com/cloudflare/workers-oauth-provider/commit/79270dacb1b006b4ec0b4ebb68f61cd2dd22e60f) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Tighten Client ID Metadata Document validation by requiring a non-empty `client_name` and accepting only the currently implemented public-client authentication method, `none`. Support OpenID RP Metadata Choices by selecting `none` from `token_endpoint_auth_methods_supported`, including ChatGPT-style documents that also advertise `private_key_jwt`.
+
+- [#273](https://github.com/cloudflare/workers-oauth-provider/pull/273) [`cd5e96a`](https://github.com/cloudflare/workers-oauth-provider/commit/cd5e96a08e4cae3eff1f0f35572e5ca895a3e064) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Fail closed when ID-JAG assertions contain unsupported `authorization_details` or `cnf` authorization constraints. These claims now produce a generic `invalid_grant` response before replay reservation, mapping, or token storage.
+
+- [#258](https://github.com/cloudflare/workers-oauth-provider/pull/258) [`8883c0a`](https://github.com/cloudflare/workers-oauth-provider/commit/8883c0ab9dedada1ebd10d198e7c2a657519dd5e) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Validate refresh-token `resource` parameters before invoking callbacks, rotating refresh tokens, or writing grant state. Invalid or out-of-grant resource requests now return `invalid_target` without mutating the authorization grant.
+
+- [#247](https://github.com/cloudflare/workers-oauth-provider/pull/247) [`9d045d2`](https://github.com/cloudflare/workers-oauth-provider/commit/9d045d2f4feb0693bd5917fcc620f7527b935d94) Thanks [@agent-think](https://github.com/apps/agent-think)! - Return RFC-compliant `401 invalid_client` responses for malformed HTTP Basic client credentials, recognize the Basic scheme case-insensitively, and include the required Basic challenge on authentication failures.
+
+- [#252](https://github.com/cloudflare/workers-oauth-provider/pull/252) [`fdba134`](https://github.com/cloudflare/workers-oauth-provider/commit/fdba1340c9331f1e8dbe1533e66ec6cbc125ac44) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Return a bare RFC 6750 bearer challenge when protected resource requests omit credentials or use an unsupported authorization scheme. These responses no longer mislabel absent credentials as `invalid_token` or include OAuth error details.
+
+- [#273](https://github.com/cloudflare/workers-oauth-provider/pull/273) [`cd5e96a`](https://github.com/cloudflare/workers-oauth-provider/commit/cd5e96a08e4cae3eff1f0f35572e5ca895a3e064) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Require ID-JAG assertions to identify exactly one authorization server audience. Multi-element, duplicate, empty, malformed, and mismatched audience arrays are now rejected before authorization state is written.
+
+- [#275](https://github.com/cloudflare/workers-oauth-provider/pull/275) [`ee5b487`](https://github.com/cloudflare/workers-oauth-provider/commit/ee5b487d356872cf9872e0caaa857c48dc58b2bc) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Reject unsupported PKCE `code_challenge_method` values instead of treating them as `plain`. Discovery and request validation now share one PKCE capability policy, `completeAuthorization()` revalidates reconstructed requests, and token exchange fails closed for malformed grants created by older versions.
+
+- [#276](https://github.com/cloudflare/workers-oauth-provider/pull/276) [`94cc3db`](https://github.com/cloudflare/workers-oauth-provider/commit/94cc3dbd9fb97eab79af8cad10db539af8396aea) Thanks [@agent-think](https://github.com/apps/agent-think)! - Enforce each client's registered `token_endpoint_auth_method` when authenticating token and revocation endpoint requests.
+
+- [#271](https://github.com/cloudflare/workers-oauth-provider/pull/271) [`0fa9bd5`](https://github.com/cloudflare/workers-oauth-provider/commit/0fa9bd5b4fca287fa1be6f7e4d53f0f397953637) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Replace internal `env: any` parameters with typed shapes. Internal provider methods now take `Env & ProviderEnv` (where `ProviderEnv` declares the required `OAUTH_KV: KVNamespace` binding), `ResolveExternalTokenInput` threads the `Env` generic through to the `resolveExternalToken` callback, and `OAuthHelpersImpl` is generic over `Env`. No runtime behavior change.
+
+- [#273](https://github.com/cloudflare/workers-oauth-provider/pull/273) [`cd5e96a`](https://github.com/cloudflare/workers-oauth-provider/commit/cd5e96a08e4cae3eff1f0f35572e5ca895a3e064) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Validate authorization response types in both `parseAuthRequest()` and `completeAuthorization()`. Missing, unsupported, and client-disallowed values are rejected after client and redirect URI validation but before grant creation or existing-grant revocation.
+
 ## 0.8.3
 
 ### Patch Changes
