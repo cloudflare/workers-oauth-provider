@@ -145,25 +145,13 @@ describe.each(MCP_AUTH_REVISIONS)('MCP %s authorization security conformance', (
   );
 });
 
-describe('strict resource policy compatibility boundary', () => {
-  it('rejects a 2025-03-26 client that cannot send resource', async () => {
-    const oauth = await createMcpOAuthClient('2025-03-26', { resourcePolicy: 'strict' });
+describe('canonical resource policy compatibility boundary', () => {
+  it('defaults and inherits the canonical resource for a 2025-03-26 client that omits it', async () => {
+    const oauth = await createMcpOAuthClient('2025-03-26', { resourcePolicy: 'canonical' });
     const client = await oauth.createClient('none');
-    const params = new URLSearchParams({
-      response_type: 'code',
-      client_id: client.clientId,
-      redirect_uri: client.redirectUri,
-      scope: READ_SCOPE,
-      state: 'legacy-client',
-      code_challenge: 'a-valid-looking-conformance-code-challenge',
-      code_challenge_method: 'S256',
-    });
+    const { tokens } = await oauth.completeAuthorizationCodeFlow(client);
 
-    const response = await oauth.request(`/authorize?${params}`);
-    expect(response.status).toBe(400);
-    expect(await readJson<OAuthErrorBody>(response)).toMatchObject({
-      error_description: expect.stringContaining('resource parameter must exactly match'),
-    });
+    expect(tokens.resource).toBe(MCP_RESOURCE);
   });
 });
 
@@ -171,10 +159,10 @@ describe.each(mcpAuthRevisionsSince('2025-06-18'))('MCP %s Resource Indicator au
   let oauth: McpOAuthClient;
 
   beforeEach(async () => {
-    oauth = await createMcpOAuthClient(revision, { resourcePolicy: 'strict' });
+    oauth = await createMcpOAuthClient(revision, { resourcePolicy: 'canonical' });
   });
 
-  it('requires the configured canonical resource in the authorization request', async () => {
+  it('defaults an omitted authorization resource to the configured canonical resource', async () => {
     const client = await oauth.createClient('none');
     const params = new URLSearchParams({
       response_type: 'code',
@@ -188,12 +176,8 @@ describe.each(mcpAuthRevisionsSince('2025-06-18'))('MCP %s Resource Indicator au
 
     const response = await oauth.request(`/authorize?${params}`);
 
-    expect(response.status).toBe(400);
-    expect(response.headers.get('Location')).toBeNull();
-    expect(await readJson<OAuthErrorBody>(response)).toMatchObject({
-      error: 'invalid_request',
-      error_description: expect.stringContaining('resource parameter must exactly match'),
-    });
+    expect(response.status).toBe(302);
+    expect(response.headers.get('Location')).not.toBeNull();
   });
 
   it('rejects a resource URI containing a fragment', async () => {
@@ -213,9 +197,29 @@ describe.each(mcpAuthRevisionsSince('2025-06-18'))('MCP %s Resource Indicator au
 
     expect(response.status).toBe(400);
     expect(response.headers.get('Location')).toBeNull();
+    expect(await readJson<OAuthErrorBody>(response)).toMatchObject({ error: 'invalid_target' });
   });
 
-  it('requires the canonical resource throughout authorization and token exchange', async () => {
+  it('rejects an explicit resource that does not match the configured canonical resource', async () => {
+    const client = await oauth.createClient('none');
+    const params = new URLSearchParams({
+      response_type: 'code',
+      client_id: client.clientId,
+      redirect_uri: client.redirectUri,
+      scope: READ_SCOPE,
+      state: 'mismatched-resource',
+      code_challenge: 'a-valid-looking-conformance-code-challenge',
+      code_challenge_method: 'S256',
+      resource: `${CONFORMANCE_ORIGIN}/other`,
+    });
+
+    const response = await oauth.request(`/authorize?${params}`);
+
+    expect(response.status).toBe(400);
+    expect(await readJson<OAuthErrorBody>(response)).toMatchObject({ error: 'invalid_target' });
+  });
+
+  it('accepts the canonical resource throughout authorization and token exchange', async () => {
     const client = await oauth.createClient('none');
     const { tokens } = await oauth.completeAuthorizationCodeFlow(client);
     expect(tokens.resource).toBe(`${CONFORMANCE_ORIGIN}/mcp`);

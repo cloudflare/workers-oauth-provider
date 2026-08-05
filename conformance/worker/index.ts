@@ -1,5 +1,6 @@
 import { WorkerEntrypoint } from 'cloudflare:workers';
 import {
+  AuthorizationError,
   ExternalTokenError,
   OAuthProvider,
   getOAuthApi,
@@ -62,7 +63,7 @@ function createProviderOptions(configuration: WorkerConfiguration): OAuthProvide
         } catch (error) {
           return Response.json(
             {
-              error: 'invalid_request',
+              error: error instanceof AuthorizationError ? error.code : 'invalid_request',
               error_description: error instanceof Error ? error.message : String(error),
             },
             { status: 400 }

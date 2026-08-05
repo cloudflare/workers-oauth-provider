@@ -65,7 +65,7 @@ interface DcrResponse {
 
 interface ConformanceClientOptions {
   dynamicClientRegistration?: boolean;
-  resourcePolicy?: 'compatible' | 'strict';
+  resourcePolicy?: 'compatible' | 'canonical';
   resourceScopes?: string[];
 }
 
@@ -82,7 +82,7 @@ export async function createMcpOAuthClient(
   const configuration: WorkerConfiguration = {
     dynamicClientRegistration: options.dynamicClientRegistration !== false,
     origin: CONFORMANCE_ORIGIN,
-    resource: options.resourcePolicy === 'strict' ? MCP_RESOURCE : undefined,
+    resource: options.resourcePolicy === 'canonical' ? MCP_RESOURCE : undefined,
     resourceScopes: options.resourceScopes ?? [READ_SCOPE],
   };
   const api = await worker.getExport();

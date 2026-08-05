@@ -71,7 +71,7 @@ describe.each(MCP_AUTH_REVISIONS)('MCP %s authorization server conformance', (re
     expect(tokens.token_type.toLowerCase()).toBe('bearer');
     expect(tokens.expires_in).toBeGreaterThan(0);
     expect(tokens.scope).toBe(READ_SCOPE);
-    expect(tokens.resource).toBe(clientResourceForRevision(revision) ?? CONFORMANCE_ORIGIN);
+    expect(tokens.resource).toBe(clientResourceForRevision(revision));
 
     const protectedResponse = await oauth.request('/mcp', {
       headers: { Authorization: `Bearer ${tokens.access_token}` },
