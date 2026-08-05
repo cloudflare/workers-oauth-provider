@@ -525,14 +525,16 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
   clientIdMetadataDocumentEnabled?: boolean;
 
   /**
-   * When true, resource validation during token exchange compares origins only
-   * (scheme + host + port) instead of exact URI matching. This allows grants issued
-   * with an origin-only resource (e.g. `https://server.com`) to be used with
-   * path-aware resource requests (e.g. `https://server.com/mcp`), enabling seamless
-   * migration from pre-0.4.0 versions that stored origin-only resource URIs.
-   * Explicit `resourceMetadata.resource` configuration always uses exact matching.
+   * When true, requested-vs-granted resource validation compares origins only
+   * (scheme + host + port) instead of exact URIs. This allows an origin-only
+   * grant such as `https://server.com` to accept `https://server.com/mcp`, but
+   * also ignores path and query differences. Configured canonical resources
+   * always use exact matching.
    *
    * Defaults to false (strict exact matching per RFC 8707).
+   *
+   * @deprecated This comparison is unsafe for shared-origin multi-path or
+   * multi-tenant deployments. Prefer configuring `resourceMetadata.resource`.
    */
   resourceMatchOriginOnly?: boolean;
 
@@ -547,10 +549,11 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
     /**
      * The protected resource identifier URL (RFC 9728 `resource` field).
      *
-     * Configuring this value pins authorization requests, token requests, and
-     * access-token audiences to this exact resource. If omitted, the provider
-     * accepts valid RFC 8707 resource indicators and uses the authorization
-     * request origin as the default when the client does not send one.
+     * Configuring this value pins grants and access-token audiences to this
+     * exact resource. An omitted authorization resource defaults to this value,
+     * and an omitted token-request resource inherits it from the grant. Without
+     * configuration, explicit RFC 8707 resource indicators are accepted and
+     * omission remains unbound for backwards compatibility.
      */
     resource?: string;
     /**
@@ -1574,7 +1577,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   private validateResourceMetadataOptions(options: OAuthProviderOptions<Env>['resourceMetadata']): void {
     if (!options) return;
 
-    if (options.resource && !validateResourceUri(options.resource)) {
+    if (options.resource !== undefined && !validateResourceUri(options.resource)) {
       throw new TypeError('resourceMetadata.resource must be an absolute HTTP(S) URI without a fragment');
     }
 
@@ -3008,7 +3011,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         description: 'Subject token is not bound to the configured resource',
       });
     }
-    const newAudience = this.resolveTokenResource(requestedResource, grantData.resource);
+    // v0.8.2 inherited the subject token's audience when token exchange omitted
+    // `resource`. Re-resolving omission from the backing grant can drop an
+    // audience carried only by a legacy token, or expand a downscoped subject
+    // back to the grant's broader resource set.
+    const newAudience =
+      requestedResource === undefined
+        ? tokenSummary.audience
+        : this.resolveTokenResource(requestedResource, grantData.resource);
 
     // Determine TTL for new token
     const now = Math.floor(Date.now() / 1000);
@@ -4142,43 +4152,49 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
   /**
    * Resolves an access-token audience from a token request and its authorization grant.
-   * Explicit resource configuration requires one exact value in both places. Without
-   * configuration, RFC 8707 downscoping is allowed and omission inherits the grant.
+   * A configured canonical resource is inherited when omitted but cannot be overridden.
+   * Without configuration, RFC 8707 downscoping is allowed, omission inherits a
+   * bound grant, and a legacy unbound grant retains the v0.8.2 behavior.
    */
   private resolveTokenResource(
     requestedResource: string | string[] | undefined,
     grantedResource: string | string[] | undefined
   ): string | string[] | undefined {
+    const resourceWasProvided = requestedResource !== undefined;
     const requestedAudience = parseResourceParameter(requestedResource);
-    if (requestedResource && !requestedAudience) {
+    if (resourceWasProvided && !requestedAudience) {
       throw new OAuthError('invalid_target', {
         description: 'The resource parameter must be a valid absolute URI without a fragment',
       });
     }
+    const grantResourceWasStored = grantedResource !== undefined;
     const grantedAudience = parseResourceParameter(grantedResource);
-    if (grantedResource && !grantedAudience) {
+    if (grantResourceWasStored && !grantedAudience) {
       throw new OAuthError('invalid_target', {
         description: 'The authorization grant contains an invalid resource',
       });
     }
 
     const configuredResource = this.options.resourceMetadata?.resource;
-    if (
-      configuredResource &&
-      (!isExactResource(grantedResource, configuredResource) || !isExactResource(requestedResource, configuredResource))
-    ) {
+    if (configuredResource) {
+      if (resourceWasProvided && !isExactResource(requestedResource, configuredResource)) {
+        throw new OAuthError('invalid_target', {
+          description: `The resource parameter must exactly match ${configuredResource}`,
+        });
+      }
+      if (isExactResource(grantedResource, configuredResource)) {
+        return configuredResource;
+      }
+      if (!grantResourceWasStored) {
+        return configuredResource;
+      }
       throw new OAuthError('invalid_target', {
-        description: `The resource parameter must exactly match ${configuredResource}`,
-      });
-    }
-    if (!configuredResource && requestedResource && !grantedResource) {
-      throw new OAuthError('invalid_target', {
-        description: 'Requested resource was not included in the authorization request',
+        description: 'The authorization grant is not bound to the configured resource',
       });
     }
 
-    const originOnly = configuredResource ? false : !!this.options.resourceMatchOriginOnly;
-    if (requestedResource && grantedResource) {
+    const originOnly = !!this.options.resourceMatchOriginOnly;
+    if (resourceWasProvided && grantResourceWasStored) {
       const requestedResources = Array.isArray(requestedResource) ? requestedResource : [requestedResource];
       const grantedResources = Array.isArray(grantedResource) ? grantedResource : [grantedResource];
       for (const requested of requestedResources) {
@@ -5008,6 +5024,9 @@ function parseResourceParameter(value: string | string[] | undefined): string | 
 
   // Validate all URIs (RFC 8707 Section 2)
   const uris = Array.isArray(value) ? value : [value];
+  if (uris.length === 0) {
+    return undefined;
+  }
   for (const uri of uris) {
     if (typeof uri !== 'string' || !validateResourceUri(uri)) {
       // Invalid resource URI - return undefined to trigger error
@@ -5529,23 +5548,26 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
 
     // Resource, response type, and PKCE errors are redirectable only after the
     // exact client redirect URI above has been validated.
+    const resourceWasProvided = resourceParam !== undefined;
     let resource = parseResourceParameter(resourceParam);
-    if (resourceParam && !resource) {
+    if (resourceWasProvided && !resource) {
       withRedirect(
-        new AuthorizationError('invalid_request', {
+        new AuthorizationError('invalid_target', {
           description: 'The resource parameter must be a valid absolute URI without a fragment',
         })
       );
     }
     const configuredResource = this.provider.options.resourceMetadata?.resource;
-    if (configuredResource && !isExactResource(resource, configuredResource)) {
-      withRedirect(
-        new AuthorizationError('invalid_request', {
-          description: `The resource parameter must exactly match ${configuredResource}`,
-        })
-      );
+    if (configuredResource) {
+      if (resourceWasProvided && !isExactResource(resource, configuredResource)) {
+        withRedirect(
+          new AuthorizationError('invalid_target', {
+            description: `The resource parameter must exactly match ${configuredResource}`,
+          })
+        );
+      }
+      resource = configuredResource;
     }
-    resource ??= url.origin;
 
     try {
       validateAuthorizationResponseType(this.provider.serverCapabilities, responseType, clientInfo.responseTypes);
@@ -5620,14 +5642,24 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
     // completeAuthorization() is a public helper and callers can pass a
     // reconstructed AuthRequest rather than one returned directly by
     // parseAuthRequest(). Re-apply configured resource policy here before
-    // creating any grant. For an unconfigured provider, retain the parsed
-    // resource or use the recorded authorization-server origin as the RFC 8707
-    // default when available.
+    // creating any grant. A configured canonical resource is the RFC 8707
+    // default when the caller omitted the wire parameter. For an unconfigured
+    // provider, retain an explicit resource and preserve omission for backwards
+    // compatibility with v0.8.2 grants and callers.
     const configuredResource = this.provider.options.resourceMetadata?.resource;
-    if (configuredResource && !isExactResource(options.request.resource, configuredResource)) {
-      throw new Error(`The resource parameter must exactly match ${configuredResource}`);
+    const resourceWasProvided = options.request.resource !== undefined;
+    const parsedResource = parseResourceParameter(options.request.resource);
+    if (resourceWasProvided && !parsedResource) {
+      throw new AuthorizationError('invalid_target', {
+        description: 'The resource parameter must be a valid absolute URI without a fragment',
+      });
     }
-    const effectiveResource = options.request.resource ?? options.request.issuer;
+    if (configuredResource && resourceWasProvided && !isExactResource(parsedResource, configuredResource)) {
+      throw new AuthorizationError('invalid_target', {
+        description: `The resource parameter must exactly match ${configuredResource}`,
+      });
+    }
+    const effectiveResource = configuredResource ?? parsedResource;
 
     // Re-apply PKCE policy after client, redirect, response-type, and resource
     // validation, preserving their established error precedence while still

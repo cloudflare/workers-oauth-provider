@@ -80,6 +80,7 @@ Grant records store information about permissions a user has granted to an appli
   },
   "encryptedProps": "AES-GCM encrypted base64-encoded string",
   "createdAt": 1644256123,
+  "resource": "https://example.com/mcp",
   "authCodeId": "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8",
   "authCodeWrappedKey": "base64-encoded wrapped encryption key",
   "codeChallenge": "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
@@ -101,6 +102,7 @@ Grant records store information about permissions a user has granted to an appli
   },
   "encryptedProps": "AES-GCM encrypted base64-encoded string",
   "createdAt": 1644256123,
+  "resource": "https://example.com/mcp",
   "authCodeId": "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8",
   "refreshTokenId": "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8",
   "refreshTokenWrappedKey": "base64-encoded wrapped encryption key"
@@ -121,6 +123,7 @@ Grant records store information about permissions a user has granted to an appli
   },
   "encryptedProps": "AES-GCM encrypted base64-encoded string",
   "createdAt": 1644256123,
+  "resource": "https://example.com/mcp",
   "refreshTokenId": "7f2ab876c546a9e9f988ba7645af78239cfe980a4231ab38fcb895cb244a0a12",
   "refreshTokenWrappedKey": "base64-encoded wrapped encryption key",
   "previousRefreshTokenId": "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8",
@@ -134,6 +137,8 @@ Grant records store information about permissions a user has granted to an appli
 - After code exchange, TTL matches the refresh token expiration (defaults to 30 days, configurable via `refreshTokenTTL`)
 
 > **Note:** The grant record includes the hash of the authorization code initially, which is replaced by the hash of the refresh token after the code is exchanged. The record has a 10-minute TTL during authorization, which is replaced by the refresh token TTL when the code is exchanged.
+
+> **Note:** The optional `resource` field stores the RFC 8707 resource authorized for the grant. Grants created by older releases may not contain it. When neither the grant nor provider configuration supplies a resource, the grant remains unbound.
 
 ### Tokens
 
@@ -150,6 +155,7 @@ Token records store metadata about issued access tokens, including denormalized 
   "userId": "user123",
   "createdAt": 1644256123,
   "expiresAt": 1644259723,
+  "audience": "https://example.com/mcp",
   "wrappedEncryptionKey": "base64-encoded wrapped encryption key",
   "grant": {
     "clientId": "abc123",
@@ -160,6 +166,8 @@ Token records store metadata about issued access tokens, including denormalized 
 ```
 
 > **Note:** The token format is `{userId}:{grantId}:{random-secret}` which embeds the identifiers needed for efficient lookups. The token key format includes the user ID and grant ID to enable efficient revocation of all tokens for a specific grant. The token record contains denormalized grant information to eliminate the need for a separate grant lookup during token validation. The token also carries a wrapped encryption key that can only be unwrapped using the actual token string, allowing decryption of the encrypted props.
+
+> **Note:** The optional `audience` field records the resource restriction for an access token. It may be absent when a legacy grant has no stored resource, no canonical resource is configured, and the token request omits `resource`.
 
 **TTL:** Access tokens typically have a 1 hour (3600 seconds) TTL by default
 

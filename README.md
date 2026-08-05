@@ -349,16 +349,11 @@ The provider owns `tokenEndpoint`. It exchanges authorization codes for tokens, 
 
 ## Resources and token audiences
 
-MCP clients must send the canonical MCP server URI as `resource` in authorization and token requests. The provider parses RFC 8707 resource indicators, stores the authorized resource on the grant, uses it as the access-token audience, and rejects resource expansion or audience mismatch.
+MCP clients are required to send the canonical MCP server URI as `resource` in authorization and token requests. The provider tolerates omission for compatibility: when `resourceMetadata.resource` is configured, it is used as the canonical default and inherited by later token requests; otherwise a token request inherits any resource already stored on the grant. An explicit resource that does not match a bound grant is rejected with `invalid_target`.
 
-Resource policy follows `resourceMetadata.resource`:
+Legacy grants may have no stored resource. With no configured canonical resource, omitting `resource` preserves that unbound state. If a client supplies a resource during code exchange or refresh, it applies to that issued token but is not persisted as a new grant binding. Path-aware audiences use path-boundary prefix matching, so a token for `https://example.com/mcp` can be used at `/mcp/tools`, but not at `/mcp-other`.
 
-- When configured, authorization requests, token requests, and externally resolved tokens must use that one exact resource. `resourceMatchOriginOnly` cannot weaken this policy.
-- When omitted, valid resources are accepted. Token requests may inherit the authorization resource. If the authorization request also omits it, the provider uses the request origin as the default and issues an origin-bound token.
-
-Path-aware audiences use path-boundary prefix matching. A token for `https://example.com/mcp` can be used at `/mcp/tools`, but not at `/mcp-other`. Split deployments and deployments requiring path isolation should configure the canonical resource explicitly.
-
-`resourceMatchOriginOnly` remains a migration option for grants created before path-aware resources were introduced. Do not enable it for a new deployment.
+`resourceMatchOriginOnly` is deprecated; its existing behavior is unchanged. Prefer `resourceMetadata.resource` for new deployments.
 
 ## Scopes and step-up authorization
 
@@ -435,7 +430,7 @@ Deleting a client through `OAuthHelpers.deleteClient()` also revokes its grants 
 | `allowTokenExchangeGrant`          | Enable RFC 8693                                          | `false`                                     |
 | `tokenExchangeCallback`            | Update props, scopes, or lifetimes during token exchange | None                                        |
 | `resolveExternalToken`             | Validate external bearer credentials (advanced)          | None                                        |
-| `resourceMatchOriginOnly`          | Migration mode for old origin-only resource grants       | `false`                                     |
+| `resourceMatchOriginOnly`          | Deprecated origin-only resource comparison               | `false`                                     |
 | `enterpriseManagedAuthorization`   | Enable experimental ID-JAG grant support                 | Disabled                                    |
 | `onError`                          | Observe or replace OAuth error responses                 | Logs a warning                              |
 

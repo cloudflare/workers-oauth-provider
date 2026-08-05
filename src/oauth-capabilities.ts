@@ -2,6 +2,7 @@ const OAUTH_SCOPE_TOKEN_PATTERN = /^[\x21\x23-\x5B\x5D-\x7E]+$/;
 
 export type AuthorizationErrorCode =
   | 'invalid_request'
+  | 'invalid_target'
   | 'unauthorized_client'
   | 'access_denied'
   | 'unsupported_response_type'

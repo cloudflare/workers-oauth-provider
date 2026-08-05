@@ -23,7 +23,7 @@ The matrix follows every dated authorization revision represented by the officia
 
 Requirements are enabled from the revision that introduced them. Shared OAuth behavior is exercised against every revision, with the target revision sent in the `MCP-Protocol-Version` header.
 
-These are compatibility profiles, not server-side protocol negotiation. The common server profile stays fixed while client request behavior changes by revision: `2025-03-26` omits the RFC 8707 `resource` parameter, while `2025-06-18` and later include it in authorization and token requests. Exact canonical-resource pinning is tested separately because a deployment that requires `resource` cannot also accept an unmodified `2025-03-26` client.
+These are compatibility profiles, not server-side protocol negotiation. The common server profile stays fixed while client request behavior changes by revision: `2025-03-26` omits the RFC 8707 `resource` parameter, while `2025-06-18` and later include it in authorization and token requests. Canonical-resource pinning is tested separately: omission defaults to or inherits the configured canonical value, while explicit malformed or mismatched values fail with `invalid_target`.
 
 ## Coverage and traceability
 
@@ -58,7 +58,7 @@ The official [`latest` specification](https://modelcontextprotocol.io/specificat
 | Scope accumulation during step-up (SEP-2350)           | Primarily MCP client; resource server supplies current-operation scopes | `insufficient_scope` challenge includes all scopes required for the current operation                        |
 | OAuth well-known discovery suffix rules (SEP-2351)     | MCP client discovers; AS/RS publish metadata                            | RFC 8414 authorization-server metadata plus root and path-specific RFC 9728 metadata/challenges              |
 | DCR deprecation in favor of CIMD                       | Authorization server                                                    | CIMD advertisement, document validation, pre-registration, and optional DCR compatibility                    |
-| RFC 8707 Resource Indicators and audience restriction  | Authorization server and protected resource                             | Resource in both OAuth stages, exact strict-profile pinning, token response resource, and audience rejection |
+| RFC 8707 Resource Indicators and audience restriction  | Authorization server and protected resource                             | Canonical default/inheritance, exact explicit-value pinning, token response resource, and audience rejection |
 
 The broader `2026-07-28` protocol changes—stateless request `_meta`, `server/discover`, MCP method headers, tools, and transport lifecycle—are intentionally out of scope because this package does not implement MCP transport or protocol methods.
 
@@ -68,7 +68,7 @@ Authorization extensions are versioned separately from the core release. Stable 
 
 The upstream `@modelcontextprotocol/conformance` authorization-server mode currently exposes two scenarios—metadata and authorization code grant—and applies both to all four dates. The real Worker fixture passed both upstream scenarios for every date using upstream `0.2.0-alpha.10` (`49103de`) over a local HTTPS issuer.
 
-The upstream authorization-code scenario does not send RFC 8707 `resource`, so it cannot establish `2025-06-18+` Resource Indicator conformance against a strict server. This suite covers those upstream checks and adds the revision-specific protected-resource, audience, registration, scope, refresh, revocation, and issuer scenarios listed above.
+The upstream authorization-code scenario does not send RFC 8707 `resource`. The provider safely defaults a configured canonical resource at authorization and inherits it at code exchange, so that compatibility scenario remains audience-bound. This suite also tests explicit Resource Indicators and adds the revision-specific protected-resource, audience, registration, scope, refresh, revocation, and issuer scenarios listed above.
 
 ## Test architecture
 
@@ -80,7 +80,7 @@ The upstream authorization-code scenario does not send RFC 8707 `resource`, so i
 - a protected `/mcp` handler that exposes only authenticated props; and
 - the canonical resource `https://mcp.example.com/mcp` where the revision requires Resource Indicators.
 
-`support/oauth-client.ts` is the OAuth HTTP client around the test harness. A typed Worker RPC selects either the fixed backwards-compatible profile or the strict canonical-resource profile and pre-registers clients through `OAuthHelpers`; DCR and every OAuth flow run over HTTP. The harness recreates local storage after each test.
+`support/oauth-client.ts` is the OAuth HTTP client around the test harness. A typed Worker RPC selects either the fixed backwards-compatible profile or the canonical-resource profile and pre-registers clients through `OAuthHelpers`; DCR and every OAuth flow run over HTTP. The harness recreates local storage after each test.
 
 Tests assert only observable HTTP responses, redirects, metadata, challenges, and token behavior. They do not access provider internals or stored records.
 
