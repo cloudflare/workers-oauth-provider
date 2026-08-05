@@ -317,10 +317,10 @@ export interface ResolveExternalTokenResult {
    *
    * A JWT may carry this value as an `aud` claim. For an opaque API token or
    * PAT, the callback can supply the local resource URI as policy after
-   * successful validation. When `resourceMetadata.resource` is configured,
-   * this value is required and must match it exactly.
+   * successful validation. This value is required and must exactly match the
+   * provider's configured `resourceMetadata.resource`.
    */
-  audience?: string | string[];
+  audience: string;
 }
 
 export interface OAuthProviderOptions<Env = Cloudflare.Env> {
@@ -525,41 +525,26 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
   clientIdMetadataDocumentEnabled?: boolean;
 
   /**
-   * When true, requested-vs-granted resource validation compares origins only
-   * (scheme + host + port) instead of exact URIs. This allows an origin-only
-   * grant such as `https://server.com` to accept `https://server.com/mcp`, but
-   * also ignores path and query differences. Configured canonical resources
-   * always use exact matching.
-   *
-   * Defaults to false (strict exact matching per RFC 8707).
-   *
-   * @deprecated This comparison is unsafe for shared-origin multi-path or
-   * multi-tenant deployments. Prefer configuring `resourceMetadata.resource`.
-   */
-  resourceMatchOriginOnly?: boolean;
-
-  /**
-   * Optional metadata for RFC 9728 OAuth 2.0 Protected Resource Metadata.
+   * Metadata for RFC 9728 OAuth 2.0 Protected Resource Metadata.
    * Controls the response served at /.well-known/oauth-protected-resource.
-   *
-   * If not provided, the endpoint will be automatically generated using the request origin
-   * as the resource identifier, and the token endpoint's origin as the authorization server.
    */
-  resourceMetadata?: {
+  resourceMetadata: {
     /**
-     * The protected resource identifier URL (RFC 9728 `resource` field).
+     * The protected resource identifier HTTPS URL (RFC 9728 `resource` field).
      *
-     * Configuring this value pins grants and access-token audiences to this
-     * exact resource. An omitted authorization resource defaults to this value,
-     * and an omitted token-request resource inherits it from the grant. Without
-     * configuration, explicit RFC 8707 resource indicators are accepted and
-     * omission remains unbound for backwards compatibility.
+     * Every grant and access-token audience is pinned to this exact resource.
+     * Clients may omit the RFC 8707 `resource` parameter; an explicit value
+     * must match this canonical identifier. Configure an RFC 3986-safe HTTPS
+     * producer URL with lowercase scheme/host and no userinfo, default port,
+     * fragment, or dot segments.
      */
-    resource?: string;
+    resource: string;
     /**
      * List of authorization server issuer URLs that can issue tokens for this resource.
      * If not set, defaults to the token endpoint's origin (consistent with the issuer
-     * in authorization server metadata).
+     * in authorization server metadata). Values must use canonical HTTPS issuer
+     * spelling with lowercase scheme/host and no userinfo, default port, dot
+     * segments, query, or fragment.
      */
     authorization_servers?: string[];
     /**
@@ -710,9 +695,11 @@ export interface ExchangeTokenOptions {
   scope?: string[];
 
   /**
-   * Optional target audience/resource for the new token (maps to resource parameter per RFC 8707)
+   * Optional canonical target audience/resource for the new token (maps to the
+   * resource parameter per RFC 8707). When present, it must match the
+   * provider's configured resource.
    */
-  aud?: string | string[];
+  aud?: string;
 
   /**
    * Optional TTL override for the new token in seconds (must not exceed subject token's remaining lifetime)
@@ -760,9 +747,10 @@ export interface AuthRequest {
   codeChallengeMethod?: string;
 
   /**
-   * Resource parameter indicating target resource(s) (RFC 8707)
+   * Canonical target resource (RFC 8707). Parsed authorization requests
+   * always contain the provider's configured resource.
    */
-  resource?: string | string[];
+  resource?: string;
 
   /**
    * Authorization server issuer recorded while parsing this request.
@@ -1053,7 +1041,7 @@ interface TokenResponse {
    * Resource indicator(s) for the issued access token (RFC 8707 Section 2.2)
    * SHOULD be included to indicate the resource server(s) for which the token is valid
    */
-  resource?: string | string[];
+  resource: string;
 }
 
 /**
@@ -1325,9 +1313,9 @@ interface CreateAccessTokenOptions {
   expiresIn: number;
 
   /**
-   * Optional audience/resource
+   * Canonical audience/resource
    */
-  audience?: string | string[];
+  audience: string;
 
   /**
    * Cloudflare Worker environment variables
@@ -1492,10 +1480,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Cloudflare KV rejects token writes whose expiration is less than 60 seconds in the
     // future, so an access token TTL below that would make every token issuance fail with
     // an opaque KV 400 at runtime. Reject it at construction with a clear, actionable error.
-    if (
-      !Number.isInteger(this.options.accessTokenTTL) ||
-      this.options.accessTokenTTL! < KV_MIN_EXPIRATION_TTL_SECONDS
-    ) {
+    if (!isValidAccessTokenTTL(this.options.accessTokenTTL!)) {
       throw new TypeError(
         `accessTokenTTL must be an integer of at least ${KV_MIN_EXPIRATION_TTL_SECONDS} seconds (Cloudflare KV's minimum expiration window).`
       );
@@ -1566,10 +1551,21 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
   /** Validate configured RFC 9728 protected resource metadata. */
   private validateResourceMetadataOptions(options: OAuthProviderOptions<Env>['resourceMetadata']): void {
-    if (!options) return;
-
-    if (options.resource !== undefined && !validateResourceUri(options.resource)) {
-      throw new TypeError('resourceMetadata.resource must be an absolute HTTP(S) URI without a fragment');
+    if (!options || !validateResourceUri(options.resource) || new URL(options.resource).protocol !== 'https:') {
+      throw new TypeError('resourceMetadata.resource is required and must be an absolute HTTPS URI without a fragment');
+    }
+    if (foldResourceSchemeAndHost(options.resource) !== options.resource) {
+      throw new TypeError('resourceMetadata.resource must use a lowercase HTTPS scheme and lowercase host');
+    }
+    const parsedResource = new URL(options.resource);
+    if (
+      parsedResource.username ||
+      parsedResource.password ||
+      (parsedResource.href !== options.resource && parsedResource.origin !== options.resource)
+    ) {
+      throw new TypeError(
+        'resourceMetadata.resource must use canonical URL serialization without userinfo, a default port, or dot segments'
+      );
     }
 
     if (options.authorization_servers !== undefined) {
@@ -1583,7 +1579,16 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         } catch {
           throw new TypeError('resourceMetadata.authorization_servers must contain valid HTTPS issuer URLs');
         }
-        if (parsed.protocol !== 'https:' || parsed.search || parsed.hash) {
+        if (
+          !validateResourceUri(issuer) ||
+          parsed.protocol !== 'https:' ||
+          parsed.username ||
+          parsed.password ||
+          foldResourceSchemeAndHost(issuer) !== issuer ||
+          (parsed.href !== issuer && parsed.origin !== issuer) ||
+          issuer.includes('?') ||
+          issuer.includes('#')
+        ) {
           throw new TypeError('resourceMetadata.authorization_servers must contain valid HTTPS issuer URLs');
         }
       }
@@ -1619,13 +1624,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     if (typeof options.mapClaims !== 'function') {
       throw new TypeError('enterpriseManagedAuthorization.mapClaims must be a function');
-    }
-
-    // Defense-in-depth: an EMA-configured provider without a declared
-    // resource would accept any RFC-8707-shaped `resource` claim, sidestepping
-    // the AS-side resource pinning. Require it explicitly.
-    if (!this.options.resourceMetadata?.resource) {
-      throw new TypeError('enterpriseManagedAuthorization requires resourceMetadata.resource to be configured');
     }
 
     if (options.jwksCacheTtlSeconds !== undefined && options.jwksCacheTtlSeconds <= 0) {
@@ -1679,9 +1677,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       return this.addCorsHeaders(response, request);
     }
 
-    // Handle .well-known/oauth-protected-resource (RFC 9728)
-    // Supports both root resource (no path suffix) and path-based resources per RFC 9728 §3.1
-    if (this.isProtectedResourceMetadataRequest(url)) {
+    // Handle .well-known/oauth-protected-resource (RFC 9728). A document at
+    // any alias would identify a different resource than the URL used to fetch
+    // it, so reserve the namespace and return 404 for noncanonical variants.
+    if (this.isProtectedResourceMetadataPath(url)) {
+      if (!this.isProtectedResourceMetadataRequest(url)) {
+        return this.addCorsHeaders(new Response(null, { status: 404 }), request);
+      }
       const response = this.handleProtectedResourceMetadata(url);
       return this.addCorsHeaders(response, request);
     }
@@ -1833,30 +1835,19 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
   /**
    * Checks if a URL is a request for OAuth Protected Resource Metadata (RFC 9728).
-   * Matches both the root well-known path and path-suffixed variants per RFC 9728 §3.1.
+   * Only the well-known URL constructed from the configured canonical resource
+   * may return its document; aliases would violate RFC 9728 §3.3.
    */
   private isProtectedResourceMetadataRequest(url: URL): boolean {
+    return isExactResource(url.href, this.getConfiguredResourceMetadataUrl());
+  }
+
+  /** Whether a URL is in the RFC 9728 protected-resource metadata namespace. */
+  private isProtectedResourceMetadataPath(url: URL): boolean {
     return (
       url.pathname === PROTECTED_RESOURCE_WELL_KNOWN_PREFIX ||
       url.pathname.startsWith(PROTECTED_RESOURCE_WELL_KNOWN_PREFIX + '/')
     );
-  }
-
-  /**
-   * Derives the resource identifier from a protected resource metadata well-known URL.
-   * Per RFC 9728 §3.1, the well-known URI is inserted after the authority and before the path,
-   * so the resource identifier is reconstructed by removing the well-known prefix.
-   *
-   * Examples:
-   *   /.well-known/oauth-protected-resource       → origin (e.g. https://example.com)
-   *   /.well-known/oauth-protected-resource/mcp   → origin + /mcp (e.g. https://example.com/mcp)
-   */
-  private deriveResourceIdentifier(requestUrl: URL): string {
-    const suffix = requestUrl.pathname.slice(PROTECTED_RESOURCE_WELL_KNOWN_PREFIX.length);
-    if (!suffix || suffix === '/') {
-      return requestUrl.origin;
-    }
-    return `${requestUrl.origin}${suffix}`;
   }
 
   private createInvalidClientResponse(
@@ -2249,7 +2240,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
   /** Scopes that are baseline requirements of the protected resource itself. */
   private getProtectedResourceScopes(): string[] {
-    return this.normalizeProtectedResourceScopes(this.options.resourceMetadata?.scopes_supported ?? []);
+    return this.normalizeProtectedResourceScopes(this.options.resourceMetadata.scopes_supported ?? []);
   }
 
   /** Deduplicate resource-facing scopes and remove authorization-server-only capabilities. */
@@ -2272,13 +2263,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     const resourceScopes = this.getProtectedResourceScopes();
     const metadata: Record<string, unknown> = {
-      resource: rm?.resource ?? this.deriveResourceIdentifier(requestUrl),
-      authorization_servers: rm?.authorization_servers ?? [authServerOrigin],
+      resource: rm.resource,
+      authorization_servers: rm.authorization_servers ?? [authServerOrigin],
       ...(resourceScopes.length > 0 ? { scopes_supported: resourceScopes } : {}),
-      bearer_methods_supported: rm?.bearer_methods_supported ?? ['header'],
+      bearer_methods_supported: rm.bearer_methods_supported ?? ['header'],
     };
 
-    if (rm?.resource_name) {
+    if (rm.resource_name) {
       metadata.resource_name = rm.resource_name;
     }
 
@@ -2309,6 +2300,19 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // surface as `500 Internal Server Error` and stay visible.
     try {
       const grantType = body.grant_type;
+      const supportedGrant =
+        grantType === GrantType.AUTHORIZATION_CODE ||
+        grantType === GrantType.REFRESH_TOKEN ||
+        (grantType === GrantType.TOKEN_EXCHANGE && !!this.options.allowTokenExchangeGrant) ||
+        (grantType === GrantType.JWT_BEARER && !!this.options.enterpriseManagedAuthorization);
+
+      if (!supportedGrant) {
+        return this.createErrorResponse('unsupported_grant_type', { description: 'Grant type not supported' });
+      }
+
+      // Validate an explicit resource before any grant-specific callbacks or
+      // mutations. Omission remains valid and inherits the configured resource.
+      this.validateTokenRequestResourceIndicator(body.resource);
 
       if (grantType === GrantType.AUTHORIZATION_CODE) {
         return await this.handleAuthorizationCodeGrant(body, clientInfo, env);
@@ -2318,9 +2322,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         return await this.handleTokenExchangeGrant(body, clientInfo, env);
       } else if (grantType === GrantType.JWT_BEARER) {
         return await this.handleJwtBearerGrant(body, clientInfo, env, requestUrl, request);
-      } else {
-        return this.createErrorResponse('unsupported_grant_type', { description: 'Grant type not supported' });
       }
+
+      // Exhaustive at runtime because unsupported grants returned above.
+      throw new Error('Unreachable supported grant type');
     } catch (error) {
       const response = this.createOAuthErrorResponse(error);
       if (response) return response;
@@ -2347,7 +2352,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * bearer failures receive an RFC 6750 / RFC 9728 challenge unless the caller
    * supplied one. Other errors retain the pre-existing behavior and are re-thrown.
    */
-  private createExternalTokenErrorResponse(error: unknown, resourceMetadataUrl: string): Response | undefined {
+  private createExternalTokenErrorResponse(
+    error: unknown,
+    resourceMetadataUrl: string | undefined
+  ): Response | undefined {
     if (!(error instanceof ExternalTokenError)) return undefined;
 
     const headers = error.headers ?? {};
@@ -2502,7 +2510,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     // Resolve the token audience before consuming the authorization code.
-    const audience = this.resolveTokenResource(body.resource, grantData.resource);
+    const resourceResolution = this.resolveTokenResource(body.resource, grantData);
+    const audience = resourceResolution.audience;
 
     // Define the access token TTL, may be updated by callback if provided
     let accessTokenTTL = this.options.accessTokenTTL!;
@@ -2592,6 +2601,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       }
     }
 
+    // Reject callback-provided TTLs before consuming the authorization code,
+    // backfilling its grant resource, or writing any grant/token state.
+    if (!isValidAccessTokenTTL(accessTokenTTL)) {
+      return this.createErrorResponse('invalid_request', {
+        description: 'Requested token lifetime must be at least 60 seconds',
+      });
+    }
+
     // Calculate the access token expiration time (after callback might have updated TTL)
     const now = Math.floor(Date.now() / 1000);
 
@@ -2627,6 +2644,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       grantData.expiresAt = expiresAt;
     }
 
+    if (resourceResolution.grantResourceBackfill) {
+      grantData.resource = resourceResolution.grantResourceBackfill;
+    }
+
     // Save the updated grant with TTL matching refresh token expiration (if any)
     await this.saveGrantWithTTL(env, grantKey, grantData, now);
 
@@ -2649,15 +2670,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       token_type: 'bearer',
       expires_in: accessTokenTTL,
       scope: tokenScopes.join(' '),
+      resource: audience,
     };
 
     if (refreshToken) {
       tokenResponse.refresh_token = refreshToken;
-    }
-
-    // RFC 8707 Section 2.2: SHOULD return resource parameter in response
-    if (audience) {
-      tokenResponse.resource = audience;
     }
 
     // RFC 6749 §5.1 — responses containing tokens must not be cached.
@@ -2727,7 +2744,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     // Resolve the token audience before callbacks, rotation, or storage writes.
-    const audience = this.resolveTokenResource(body.resource, grantData.resource);
+    const resourceResolution = this.resolveTokenResource(body.resource, grantData);
+    const audience = resourceResolution.audience;
 
     // Generate new access token with embedded user and grant IDs
     const accessTokenSecret = generateRandomString(TOKEN_LENGTH);
@@ -2870,7 +2888,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // when under 60 seconds. With the re-check above the grant has >=60s remaining, so the
     // only way to land here is a tokenExchangeCallback returning an `accessTokenTTL` below
     // the minimum. Reject before rotating/saving the grant rather than crashing on the write.
-    if (accessTokenTTL < KV_MIN_EXPIRATION_TTL_SECONDS) {
+    if (!isValidAccessTokenTTL(accessTokenTTL)) {
       return this.createErrorResponse('invalid_request', {
         description: 'Requested token lifetime must be at least 60 seconds',
       });
@@ -2904,6 +2922,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // The newly-generated token becomes the new "current" token.
     grantData.refreshTokenId = newRefreshTokenId;
     grantData.refreshTokenWrappedKey = newRefreshTokenWrappedKey;
+
+    if (resourceResolution.grantResourceBackfill) {
+      grantData.resource = resourceResolution.grantResourceBackfill;
+    }
 
     // Save the updated grant with TTL if applicable
     await this.saveGrantWithTTL(env, grantKey, grantData, now);
@@ -2942,12 +2964,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       expires_in: accessTokenTTL,
       refresh_token: newRefreshToken,
       scope: tokenScopes.join(' '),
+      resource: audience,
     };
-
-    // RFC 8707 Section 2.2: SHOULD return resource parameter in response
-    if (audience) {
-      tokenResponse.resource = audience;
-    }
 
     // RFC 6749 §5.1 — responses containing tokens must not be cached.
     return new Response(JSON.stringify(tokenResponse), {
@@ -2963,7 +2981,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * module-private.
    * @param subjectToken - The subject token to exchange
    * @param requestedScopes - Optional requested scopes, limited to the subject token's scopes
-   * @param requestedResource - Optional resource/audience (must be subset of original if original had resource)
+   * @param requestedResource - Optional resource/audience; when present, it must match the configured canonical resource
    * @param expiresIn - Optional TTL override in seconds
    * @param clientInfo - The client making the exchange request
    * @param env - Cloudflare Worker environment variables
@@ -2994,20 +3012,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // An exchanged token inherits the subject token's scopes unless a narrower subset is requested.
     let tokenScopes: string[] = this.downscope(requestedScopes, tokenSummary.scope);
 
-    const configuredResource = this.options.resourceMetadata?.resource;
-    if (configuredResource && !isExactResource(tokenSummary.audience, configuredResource)) {
-      throw new OAuthError('invalid_target', {
-        description: 'Subject token is not bound to the configured resource',
-      });
-    }
-    // v0.8.2 inherited the subject token's audience when token exchange omitted
-    // `resource`. Re-resolving omission from the backing grant can drop an
-    // audience carried only by a legacy token, or expand a downscoped subject
-    // back to the grant's broader resource set.
-    const newAudience =
-      requestedResource === undefined
-        ? tokenSummary.audience
-        : this.resolveTokenResource(requestedResource, grantData.resource);
+    const newAudience = this.resolveTokenExchangeResource(requestedResource, tokenSummary.audience);
 
     // Determine TTL for new token
     const now = Math.floor(Date.now() / 1000);
@@ -3106,7 +3111,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // A client-requested `expires_in` (or a callback-supplied `accessTokenTTL`) may be
     // below KV's 60-second minimum even when the subject token has ample life remaining.
     // Reject rather than attempting an unstorable write that KV would reject with a 400.
-    if (accessTokenTTL < KV_MIN_EXPIRATION_TTL_SECONDS) {
+    if (!isValidAccessTokenTTL(accessTokenTTL)) {
       throw new OAuthError('invalid_request', {
         description: 'Requested token lifetime must be at least 60 seconds',
       });
@@ -3132,12 +3137,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       token_type: 'bearer',
       expires_in: accessTokenTTL,
       scope: tokenScopes.join(' '),
+      resource: newAudience,
     };
-
-    // RFC 8707 Section 2.2: SHOULD return resource parameter in response
-    if (newAudience) {
-      tokenResponse.resource = newAudience;
-    }
 
     return tokenResponse;
   }
@@ -3297,10 +3298,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   }): Promise<Result<TokenResponse, EmaValidationError>> {
     const { body, clientInfo, env, requestUrl, request, enterpriseOptions } = args;
     const { jwksProvider, jtiStore } = this;
-    const configuredResource = this.options.resourceMetadata?.resource;
-    // Unreachable: handleJwtBearerGrant short-circuits when enterpriseOptions is absent,
-    // and validateEmaOptions enforces these invariants at construction time.
-    if (!jwksProvider || !jtiStore || !configuredResource) {
+    const configuredResource = this.options.resourceMetadata.resource;
+    // Unreachable: handleJwtBearerGrant short-circuits when enterpriseOptions is absent.
+    if (!jwksProvider || !jtiStore) {
       throw new Error('EMA pipeline invoked without configured adapters');
     }
     const now = Math.floor(Date.now() / 1000);
@@ -3337,7 +3337,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       expectedAudience: trustedIssuer.value.audience ?? this.getAuthorizationServerIssuer(requestUrl),
       clientId: clientInfo.clientId,
       configuredResource,
-      matchOriginOnly: !!this.options.resourceMatchOriginOnly,
+      // The signed resource claim must always match the configured canonical
+      // identifier exactly.
+      matchOriginOnly: false,
       now,
       clockSkewSeconds: enterpriseOptions.clockSkewSeconds ?? EMA_DEFAULT_CLOCK_SKEW_SECONDS,
       maxAssertionLifetimeSeconds:
@@ -3366,7 +3368,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       mapperOutput = await enterpriseOptions.mapClaims({
         claims: claims.value.claims,
         clientInfo,
-        resource: claims.value.resource,
+        resource: configuredResource,
         requestedScope: requestedScope.value,
         request: args.request,
         env,
@@ -3399,7 +3401,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         mapperProps: mapped.value.props,
         mapperMetadata: mapped.value.metadata,
         assertionScopes: claims.value.assertionScopes,
-        resource: claims.value.resource,
+        resource: configuredResource,
         accessTokenTTLSeconds: ttl.value,
         env,
         now: issueNow,
@@ -3847,9 +3849,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    */
   private async handleApiRequest(request: Request, env: Env & ProviderEnv, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
-    // Per RFC 9728 §5.1, include the request path so the resource_metadata URL
-    // points to the correct path-suffixed well-known endpoint (RFC 9728 §3.1)
-    const resourceMetadataUrl = `${url.origin}/.well-known/oauth-protected-resource${url.pathname}`;
+    const resourceMetadataUrl = this.getResourceMetadataUrlForRequest(url);
 
     // Get access token from Authorization header
     const authHeader = request.headers.get('Authorization');
@@ -3894,8 +3894,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Internal token data was found in KV, so we check for expiration and set the context props
     if (tokenData) {
-      const configuredResource = this.options.resourceMetadata?.resource;
-      if (configuredResource && !isExactResource(tokenData.audience, configuredResource)) {
+      const configuredResource = this.options.resourceMetadata.resource;
+      if (!isExactResource(tokenData.audience, configuredResource)) {
         return this.createErrorResponse('invalid_token', {
           description: 'Access token is not bound to the configured resource',
           statusCode: 401,
@@ -3974,8 +3974,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         });
       }
 
-      const configuredResource = this.options.resourceMetadata?.resource;
-      if (configuredResource && !isExactResource(ext.audience, configuredResource)) {
+      const configuredResource = this.options.resourceMetadata.resource;
+      if (!isExactResource(ext.audience, configuredResource)) {
         return this.createErrorResponse('invalid_token', {
           description: 'External access token is not bound to the configured resource',
           statusCode: 401,
@@ -4139,16 +4139,36 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     return env.OAUTH_KV.get(clientKey, { type: 'json' });
   }
 
-  /**
-   * Resolves an access-token audience from a token request and its authorization grant.
-   * A configured canonical resource is inherited when omitted but cannot be overridden.
-   * Without configuration, RFC 8707 downscoping is allowed, omission inherits a
-   * bound grant, and a legacy unbound grant retains the v0.8.2 behavior.
-   */
-  private resolveTokenResource(
+  /** Validate explicit resource syntax and configured-resource policy. */
+  private validateTokenRequestResourceIndicator(requestedResource: string | string[] | undefined): void {
+    if (requestedResource === undefined) return;
+
+    if (!parseResourceParameter(requestedResource)) {
+      throw new OAuthError('invalid_target', {
+        description: 'The resource parameter must be a valid absolute URI without a fragment',
+      });
+    }
+
+    const configuredResource = this.options.resourceMetadata.resource;
+    if (!isExactResource(requestedResource, configuredResource)) {
+      throw new OAuthError('invalid_target', {
+        description: `The resource parameter must exactly match ${configuredResource}`,
+      });
+    }
+  }
+
+  /** Resolve token exchange strictly within the subject token's audience ceiling. */
+  private resolveTokenExchangeResource(
     requestedResource: string | string[] | undefined,
-    grantedResource: string | string[] | undefined
-  ): string | string[] | undefined {
+    subjectResource: string | string[] | undefined
+  ): string {
+    const subjectAudience = parseResourceParameter(subjectResource);
+    if (!subjectAudience) {
+      throw new OAuthError('invalid_target', {
+        description: 'Subject token is not bound to a valid resource',
+      });
+    }
+
     const resourceWasProvided = requestedResource !== undefined;
     const requestedAudience = parseResourceParameter(requestedResource);
     if (resourceWasProvided && !requestedAudience) {
@@ -4156,46 +4176,65 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         description: 'The resource parameter must be a valid absolute URI without a fragment',
       });
     }
+
+    const configuredResource = this.options.resourceMetadata.resource;
+    if (
+      !isExactResource(subjectAudience, configuredResource) ||
+      (resourceWasProvided && !isExactResource(requestedAudience, configuredResource))
+    ) {
+      throw new OAuthError('invalid_target', {
+        description: `The subject and requested resources must exactly match ${configuredResource}`,
+      });
+    }
+    return configuredResource;
+  }
+
+  /**
+   * Resolves an access-token audience from a token request and its authorization grant.
+   * The configured canonical resource is inherited when omitted and cannot be overridden.
+   */
+  private resolveTokenResource(
+    requestedResource: string | string[] | undefined,
+    grant: Pick<Grant, 'resource'>
+  ): {
+    audience: string;
+    grantResourceBackfill?: string;
+  } {
+    const grantedResource = grant.resource;
+    const resourceWasProvided = requestedResource !== undefined;
+    if (resourceWasProvided && !parseResourceParameter(requestedResource)) {
+      throw new OAuthError('invalid_target', {
+        description: 'The resource parameter must be a valid absolute URI without a fragment',
+      });
+    }
     const grantResourceWasStored = grantedResource !== undefined;
-    const grantedAudience = parseResourceParameter(grantedResource);
-    if (grantResourceWasStored && !grantedAudience) {
+    if (grantResourceWasStored && !parseResourceParameter(grantedResource)) {
       throw new OAuthError('invalid_target', {
         description: 'The authorization grant contains an invalid resource',
       });
     }
 
-    const configuredResource = this.options.resourceMetadata?.resource;
-    if (configuredResource) {
-      if (resourceWasProvided && !isExactResource(requestedResource, configuredResource)) {
-        throw new OAuthError('invalid_target', {
-          description: `The resource parameter must exactly match ${configuredResource}`,
-        });
-      }
-      if (isExactResource(grantedResource, configuredResource)) {
-        return configuredResource;
-      }
-      if (!grantResourceWasStored) {
-        return configuredResource;
-      }
+    const configuredResource = this.options.resourceMetadata.resource;
+    if (resourceWasProvided && !isExactResource(requestedResource, configuredResource)) {
       throw new OAuthError('invalid_target', {
-        description: 'The authorization grant is not bound to the configured resource',
+        description: `The resource parameter must exactly match ${configuredResource}`,
       });
     }
-
-    const originOnly = !!this.options.resourceMatchOriginOnly;
-    if (resourceWasProvided && grantResourceWasStored) {
-      const requestedResources = Array.isArray(requestedResource) ? requestedResource : [requestedResource];
-      const grantedResources = Array.isArray(grantedResource) ? grantedResource : [grantedResource];
-      for (const requested of requestedResources) {
-        if (!grantedResources.some((granted) => resourceMatches(requested, granted, originOnly))) {
-          throw new OAuthError('invalid_target', {
-            description: 'Requested resource was not included in the authorization request',
-          });
-        }
-      }
+    if (isExactResource(grantedResource, configuredResource)) {
+      return {
+        audience: configuredResource,
+        ...(grantedResource === configuredResource ? {} : { grantResourceBackfill: configuredResource }),
+      };
     }
-
-    return requestedAudience ?? grantedAudience;
+    if (!grantResourceWasStored) {
+      return {
+        audience: configuredResource,
+        grantResourceBackfill: configuredResource,
+      };
+    }
+    throw new OAuthError('invalid_target', {
+      description: 'The authorization grant is not bound to the configured resource',
+    });
   }
 
   /**
@@ -4210,7 +4249,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // below 60 seconds, so a TTL derived from a callback override or a near-expiry source
     // must not reach the write. Callers that clamp to a source's remaining lifetime should
     // already have rejected this case with a more specific error; this is the backstop.
-    if (expiresIn < KV_MIN_EXPIRATION_TTL_SECONDS) {
+    if (!isValidAccessTokenTTL(expiresIn)) {
       throw new OAuthError('invalid_request', {
         description: 'Requested token lifetime must be at least 60 seconds',
       });
@@ -4599,12 +4638,15 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * Builds a WWW-Authenticate header value with resource_metadata per RFC 9728 §5.1
    */
   private buildWwwAuthenticateHeader(
-    resourceMetadataUrl: string,
+    resourceMetadataUrl: string | undefined,
     error?: string,
     errorDescription?: string,
     requiredScopes: string[] = []
   ): string {
-    let header = `Bearer realm="OAuth", resource_metadata="${resourceMetadataUrl}"`;
+    let header = 'Bearer realm="OAuth"';
+    if (resourceMetadataUrl) {
+      header += `, resource_metadata="${resourceMetadataUrl}"`;
+    }
     if (error) {
       header += `, error="${error}"`;
     }
@@ -4619,6 +4661,39 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       header += `, error_description="${errorDescription}"`;
     }
     return header;
+  }
+
+  /** Build the RFC 9728 well-known URL for the configured canonical resource. */
+  private getConfiguredResourceMetadataUrl(): string {
+    const resource = this.options.resourceMetadata.resource;
+    const authorityStart = resource.indexOf('://') + 3;
+    const suffixOffset = resource.slice(authorityStart).search(/[/?]/);
+    const suffixStart = suffixOffset === -1 ? resource.length : authorityStart + suffixOffset;
+    let suffix = resource.slice(suffixStart);
+    if (suffix === '/') suffix = '';
+    if (suffix.startsWith('/?')) suffix = suffix.slice(1);
+    return resource.slice(0, suffixStart) + PROTECTED_RESOURCE_WELL_KNOWN_PREFIX + suffix;
+  }
+
+  /**
+   * RFC 9728 §3.3 requires metadata fetched from a challenge to identify the
+   * original protected-resource URL. Descendant and alias routes can still use
+   * a base audience, but must not advertise a document for a different URL.
+   */
+  private getResourceMetadataUrlForRequest(requestUrl: URL): string | undefined {
+    const configuredResource = this.options.resourceMetadata.resource;
+    if (isExactResource(requestUrl.href, configuredResource)) {
+      return this.getConfiguredResourceMetadataUrl();
+    }
+
+    // HTTP serializes an origin request with `/` even when the configured root
+    // resource was written without it. This is the one unavoidable spelling
+    // equivalence for matching an actual Request URL.
+    if (configuredResource === requestUrl.origin && requestUrl.pathname === '/' && requestUrl.search === '') {
+      return this.getConfiguredResourceMetadataUrl();
+    }
+
+    return undefined;
   }
 
   /**
@@ -4882,6 +4957,10 @@ const DEFAULT_CLIENT_REGISTRATION_TTL = 90 * 24 * 60 * 60;
  */
 const KV_MIN_EXPIRATION_TTL_SECONDS = 60;
 
+function isValidAccessTokenTTL(value: number): boolean {
+  return Number.isInteger(value) && value >= KV_MIN_EXPIRATION_TTL_SECONDS;
+}
+
 /**
  * Safety margin (seconds) added on top of `KV_MIN_EXPIRATION_TTL_SECONDS` when clamping an
  * absolute KV expiration. Absolute expirations are validated against KV's clock at the
@@ -4936,16 +5015,25 @@ export function validateResourceUri(uri: string): boolean {
     return false;
   }
 
+  // Require an RFC 3986-safe, hierarchical HTTP(S) serialization. WHATWG URL
+  // otherwise repairs inputs such as `https:example.com`, backslashes, raw
+  // spaces, and controls; retaining the repaired input as the audience would
+  // disagree with strict comparison and could break quoted challenge headers.
+  if (
+    !/^[\x21-\x7e]+$/.test(uri) ||
+    /["\\#]/.test(uri) ||
+    !/^[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/?#]+(?:\/[^?#]*)?(?:\?[^#]*)?$/.test(uri) ||
+    /%(?![0-9A-Fa-f]{2})/.test(uri) ||
+    !/^[A-Za-z0-9:/?@!$&'()*+,;=._~%\[\]-]+$/.test(uri)
+  ) {
+    return false;
+  }
+
   try {
     const parsed = new URL(uri);
 
     // RFC 8707: MUST be absolute URI (has protocol)
     if (!parsed.protocol) {
-      return false;
-    }
-
-    // RFC 8707: MUST NOT include a fragment component
-    if (parsed.hash) {
       return false;
     }
 
@@ -4994,7 +5082,8 @@ function audienceMatches(resourceServerUrl: string, audienceValue: string): bool
     // Path-aware audience: prefix match on path boundary (RFC 8707)
     // e.g. audience "/api" matches request "/api", "/api/", "/api/users"
     // but does NOT match "/api-v2" or "/apiary"
-    return resource.pathname === audience.pathname || resource.pathname.startsWith(audience.pathname + '/');
+    const descendantPrefix = audience.pathname.endsWith('/') ? audience.pathname : audience.pathname + '/';
+    return resource.pathname === audience.pathname || resource.pathname.startsWith(descendantPrefix);
   } catch {
     return false;
   }
@@ -5026,27 +5115,63 @@ function parseResourceParameter(value: string | string[] | undefined): string | 
   return value;
 }
 
-/** Whether a request or audience names one exact configured resource. */
+/** Whether a request or audience names one canonical configured resource. */
 function isExactResource(value: string | string[] | undefined, configuredResource: string): boolean {
-  return (
-    value === configuredResource || (Array.isArray(value) && value.length === 1 && value[0] === configuredResource)
-  );
+  const resource = Array.isArray(value) ? (value.length === 1 ? value[0] : undefined) : value;
+  return typeof resource === 'string' && resourceMatches(resource, configuredResource, false);
 }
 
 /**
  * Checks if a requested resource matches a granted resource.
  * When originOnly is true, compares only the origin (scheme + host + port),
  * allowing path-aware resources to match origin-only grants.
+ * Otherwise only ASCII case in the URI scheme and host is ignored. Port,
+ * path, query, trailing slash, user information, and all other bytes remain
+ * significant.
  */
 export function resourceMatches(requested: string, granted: string, originOnly: boolean): boolean {
   if (!originOnly) {
-    return requested === granted;
+    const foldedRequested = foldResourceSchemeAndHost(requested);
+    return foldedRequested !== undefined && foldedRequested === foldResourceSchemeAndHost(granted);
   }
   try {
     return new URL(requested).origin === new URL(granted).origin;
   } catch {
     return requested === granted;
   }
+}
+
+/** Fold only the URI components whose comparison is ASCII case-insensitive. */
+function foldResourceSchemeAndHost(resource: string): string | undefined {
+  const schemeSeparator = resource.indexOf('://');
+  if (schemeSeparator <= 0) return undefined;
+
+  const authorityStart = schemeSeparator + 3;
+  const authorityEndOffset = resource.slice(authorityStart).search(/[/?#]/);
+  const authorityEnd = authorityEndOffset === -1 ? resource.length : authorityStart + authorityEndOffset;
+  const authority = resource.slice(authorityStart, authorityEnd);
+  const userInfoEnd = authority.lastIndexOf('@');
+  const hostStart = userInfoEnd + 1;
+
+  let hostEnd: number;
+  if (authority[hostStart] === '[') {
+    const closingBracket = authority.indexOf(']', hostStart + 1);
+    if (closingBracket === -1) return undefined;
+    hostEnd = closingBracket + 1;
+  } else {
+    const portSeparator = authority.indexOf(':', hostStart);
+    hostEnd = portSeparator === -1 ? authority.length : portSeparator;
+  }
+
+  const asciiLower = (value: string) => value.replace(/[A-Z]/g, (character) => character.toLowerCase());
+  return (
+    asciiLower(resource.slice(0, schemeSeparator)) +
+    '://' +
+    authority.slice(0, hostStart) +
+    asciiLower(authority.slice(hostStart, hostEnd)) +
+    authority.slice(hostEnd) +
+    resource.slice(authorityEnd)
+  );
 }
 
 /**
@@ -5546,17 +5671,15 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
         })
       );
     }
-    const configuredResource = this.provider.options.resourceMetadata?.resource;
-    if (configuredResource) {
-      if (resourceWasProvided && !isExactResource(resource, configuredResource)) {
-        withRedirect(
-          new AuthorizationError('invalid_target', {
-            description: `The resource parameter must exactly match ${configuredResource}`,
-          })
-        );
-      }
-      resource = configuredResource;
+    const configuredResource = this.provider.options.resourceMetadata.resource;
+    if (resourceWasProvided && !isExactResource(resource, configuredResource)) {
+      withRedirect(
+        new AuthorizationError('invalid_target', {
+          description: `The resource parameter must exactly match ${configuredResource}`,
+        })
+      );
     }
+    resource = configuredResource;
 
     try {
       validateAuthorizationResponseType(this.provider.serverCapabilities, responseType, clientInfo.responseTypes);
@@ -5630,12 +5753,9 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
 
     // completeAuthorization() is a public helper and callers can pass a
     // reconstructed AuthRequest rather than one returned directly by
-    // parseAuthRequest(). Re-apply configured resource policy here before
-    // creating any grant. A configured canonical resource is the RFC 8707
-    // default when the caller omitted the wire parameter. For an unconfigured
-    // provider, retain an explicit resource and preserve omission for backwards
-    // compatibility with v0.8.2 grants and callers.
-    const configuredResource = this.provider.options.resourceMetadata?.resource;
+    // parseAuthRequest(). Re-apply canonical resource policy here before
+    // creating any grant.
+    const configuredResource = this.provider.options.resourceMetadata.resource;
     const resourceWasProvided = options.request.resource !== undefined;
     const parsedResource = parseResourceParameter(options.request.resource);
     if (resourceWasProvided && !parsedResource) {
@@ -5643,12 +5763,12 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
         description: 'The resource parameter must be a valid absolute URI without a fragment',
       });
     }
-    if (configuredResource && resourceWasProvided && !isExactResource(parsedResource, configuredResource)) {
+    if (resourceWasProvided && !isExactResource(parsedResource, configuredResource)) {
       throw new AuthorizationError('invalid_target', {
         description: `The resource parameter must exactly match ${configuredResource}`,
       });
     }
-    const effectiveResource = configuredResource ?? parsedResource;
+    const effectiveResource = configuredResource;
 
     // Re-apply PKCE policy after client, redirect, response-type, and resource
     // validation, preserving their established error precedence while still
@@ -5750,6 +5870,7 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
       fragment.set('token_type', 'bearer');
       fragment.set('expires_in', accessTokenTTL.toString());
       fragment.set('scope', options.scope.join(' '));
+      fragment.set('resource', effectiveResource);
 
       if (options.request.state) {
         fragment.set('state', options.request.state);

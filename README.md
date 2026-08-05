@@ -187,21 +187,7 @@ Protected resource metadata and authorization server metadata serve different ro
 
 ### Protected resource metadata
 
-The provider always serves RFC 9728 metadata at:
-
-```text
-/.well-known/oauth-protected-resource
-```
-
-It also supports path-specific metadata. A request to:
-
-```text
-/.well-known/oauth-protected-resource/public/mcp
-```
-
-produces `https://example.com/public/mcp` as the derived resource unless `resourceMetadata.resource` overrides it.
-
-For MCP deployments, configure the canonical MCP endpoint explicitly:
+`resourceMetadata.resource` is required. Configure one canonical HTTPS protected-resource identifier with a lowercase scheme and host:
 
 ```ts
 resourceMetadata: {
@@ -213,7 +199,17 @@ resourceMetadata: {
 }
 ```
 
-`authorization_servers` may contain more than one issuer. The MCP client chooses an authorization server and must keep credentials and tokens separate for each issuer.
+For the example above, an unauthenticated request to the exact canonical URL receives a Bearer challenge pointing to:
+
+```text
+https://mcp.example.com/.well-known/oauth-protected-resource/mcp
+```
+
+That document returns the configured canonical `resource`. The discovery URL is built from the canonical resource: an origin uses `/.well-known/oauth-protected-resource`, and a path and query are inserted after the well-known prefix.
+
+RFC 9728 requires challenge-discovered metadata to identify the original requested resource URL. The provider therefore includes `resource_metadata` only when the protected request URL is the canonical resource itself. A canonical path may still be a base audience for descendants: a token for `https://mcp.example.com/mcp` is accepted at `/mcp/tools`, but a request to that descendant does not advertise a mismatched metadata document. If clients must discover authorization from multiple entry paths, expose an exact canonical MCP endpoint for discovery or use separate provider instances and canonical resources.
+
+`authorization_servers` may contain more than one issuer. Each value must use canonical HTTPS issuer spelling: lowercase scheme and host, with no userinfo, default port, dot segments, query, or fragment. OAuth issuer comparison is exact. The MCP client chooses an authorization server and must keep credentials and tokens separate for each issuer.
 
 ### Authorization server metadata
 
@@ -349,11 +345,25 @@ The provider owns `tokenEndpoint`. It exchanges authorization codes for tokens, 
 
 ## Resources and token audiences
 
-MCP clients are required to send the canonical MCP server URI as `resource` in authorization and token requests. The provider tolerates omission for compatibility: when `resourceMetadata.resource` is configured, it is used as the canonical default and inherited by later token requests; otherwise a token request inherits any resource already stored on the grant. An explicit resource that does not match a bound grant is rejected with `invalid_target`.
+Every provider has one required canonical `resourceMetadata.resource`. It must be an absolute HTTPS URI without a fragment, use lowercase `https` and a lowercase host, and contain an RFC 3986-safe producer serialization. Userinfo, default ports, dot-segment paths, and an empty path before a query are rejected because `Request` would rewrite them before RFC 9728 comparison. A bare origin is the only empty-path exception; use `/` before a query. Query components are supported but discouraged by RFC 9728.
 
-Legacy grants may have no stored resource. With no configured canonical resource, omitting `resource` preserves that unbound state. If a client supplies a resource during code exchange or refresh, it applies to that issued token but is not persisted as a new grant binding. Path-aware audiences use path-boundary prefix matching, so a token for `https://example.com/mcp` can be used at `/mcp/tools`, but not at `/mcp-other`.
+Clients may omit `resource` at authorization, code exchange, and refresh. The provider always defaults or inherits the configured canonical value, stores it on the grant, returns it in token responses, and uses it as the access-token audience. Older clients therefore keep working without receiving unbound tokens.
 
-`resourceMatchOriginOnly` is deprecated; its existing behavior is unchanged. Prefer `resourceMetadata.resource` for new deployments.
+An explicit client value must identify the same canonical resource. ASCII case differences in the URI scheme and host are accepted, but port, path, query, trailing slash, and array cardinality remain strict. The provider always stores and returns its configured lowercase scheme-and-host spelling. Malformed, multi-valued, or mismatched input returns `invalid_target` before code consumption, callbacks, refresh rotation, or storage writes.
+
+Token exchange cannot change the resource. Both the subject-token audience and any explicit requested resource must match the configured canonical value. Internal and externally validated tokens are accepted at protected routes only when their audience matches that value.
+
+Path-aware API validation uses path-boundary prefix matching. A canonical audience for `https://example.com/mcp` covers `/mcp` and `/mcp/tools`, but not `/mcp-other`. A canonical trailing slash remains significant.
+
+### Upgrading to 1.0
+
+Choose the one canonical `resourceMetadata.resource` that is authoritative for every grant in the provider's KV namespace. When processing the next valid code exchange or refresh, a grant with no stored resource is bound to that configured value. A matching stored resource is inherited (and normalized to the configured scheme-and-host spelling); a different stored resource is rejected and requires reconnecting.
+
+Clients do not need to add a resource parameter. Previously issued access tokens with no audience are rejected by 1.0's protected-resource check, but their refresh grants can acquire the configured resource on refresh.
+
+Use one provider and KV namespace per canonical resource. A shared namespace containing ambiguous grants for multiple protected resources or tenants cannot be migrated safely to one audience.
+
+The 1.0 API removes `resourceMatchOriginOnly`. Canonical matching with scheme/host case tolerance replaces it.
 
 ## Scopes and step-up authorization
 
@@ -412,27 +422,26 @@ Deleting a client through `OAuthHelpers.deleteClient()` also revokes its grants 
 
 ## Configuration reference
 
-| Option                             | Purpose                                                  | Default                                     |
-| ---------------------------------- | -------------------------------------------------------- | ------------------------------------------- |
-| `apiRoute` and `apiHandler`        | Protect one or more route prefixes with one handler      | Use these or `apiHandlers`                  |
-| `apiHandlers`                      | Map protected route prefixes to different handlers       | Use this or `apiRoute` plus `apiHandler`    |
-| `defaultHandler`                   | Handle authorization UI and other unprotected routes     | Required                                    |
-| `authorizeEndpoint`                | Application-owned authorization and consent endpoint     | Required                                    |
-| `tokenEndpoint`                    | Provider-owned token and revocation endpoint             | Required                                    |
-| `clientRegistrationEndpoint`       | Enable RFC 7591 DCR                                      | Disabled                                    |
-| `scopesSupported`                  | Publish authorization server scopes                      | Omitted                                     |
-| `resourceMetadata`                 | Configure RFC 9728 metadata                              | Derived from the request and token endpoint |
-| `clientIdMetadataDocumentEnabled`  | Enable CIMD lookup and advertisement                     | `false`                                     |
-| `allowPlainPKCE`                   | Permit the legacy plain PKCE method                      | `false`                                     |
-| `allowImplicitFlow`                | Enable implicit token responses                          | `false`                                     |
-| `disallowPublicClientRegistration` | Reject public clients at DCR                             | `false`                                     |
-| `clientRegistrationCallback`       | Apply application policy before storing a DCR client     | None                                        |
-| `allowTokenExchangeGrant`          | Enable RFC 8693                                          | `false`                                     |
-| `tokenExchangeCallback`            | Update props, scopes, or lifetimes during token exchange | None                                        |
-| `resolveExternalToken`             | Validate external bearer credentials (advanced)          | None                                        |
-| `resourceMatchOriginOnly`          | Deprecated origin-only resource comparison               | `false`                                     |
-| `enterpriseManagedAuthorization`   | Enable experimental ID-JAG grant support                 | Disabled                                    |
-| `onError`                          | Observe or replace OAuth error responses                 | Logs a warning                              |
+| Option                             | Purpose                                                  | Default                                  |
+| ---------------------------------- | -------------------------------------------------------- | ---------------------------------------- |
+| `apiRoute` and `apiHandler`        | Protect one or more route prefixes with one handler      | Use these or `apiHandlers`               |
+| `apiHandlers`                      | Map protected route prefixes to different handlers       | Use this or `apiRoute` plus `apiHandler` |
+| `defaultHandler`                   | Handle authorization UI and other unprotected routes     | Required                                 |
+| `authorizeEndpoint`                | Application-owned authorization and consent endpoint     | Required                                 |
+| `tokenEndpoint`                    | Provider-owned token and revocation endpoint             | Required                                 |
+| `clientRegistrationEndpoint`       | Enable RFC 7591 DCR                                      | Disabled                                 |
+| `scopesSupported`                  | Publish authorization server scopes                      | Omitted                                  |
+| `resourceMetadata.resource`        | Canonical HTTPS resource and token audience              | Required                                 |
+| `clientIdMetadataDocumentEnabled`  | Enable CIMD lookup and advertisement                     | `false`                                  |
+| `allowPlainPKCE`                   | Permit the legacy plain PKCE method                      | `false`                                  |
+| `allowImplicitFlow`                | Enable implicit token responses                          | `false`                                  |
+| `disallowPublicClientRegistration` | Reject public clients at DCR                             | `false`                                  |
+| `clientRegistrationCallback`       | Apply application policy before storing a DCR client     | None                                     |
+| `allowTokenExchangeGrant`          | Enable RFC 8693                                          | `false`                                  |
+| `tokenExchangeCallback`            | Update props, scopes, or lifetimes during token exchange | None                                     |
+| `resolveExternalToken`             | Validate external bearer credentials (advanced)          | None                                     |
+| `enterpriseManagedAuthorization`   | Enable experimental ID-JAG grant support                 | Disabled                                 |
+| `onError`                          | Observe or replace OAuth error responses                 | Logs a warning                           |
 
 Consult the exported `OAuthProviderOptions`, callback interfaces, and JSDoc in [`src/oauth-provider.ts`](https://github.com/cloudflare/workers-oauth-provider/blob/main/src/oauth-provider.ts) for the complete typed API.
 

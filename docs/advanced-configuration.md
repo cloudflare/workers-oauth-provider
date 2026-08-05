@@ -67,7 +67,7 @@ Plain errors continue to surface as 500 responses.
 
 ## OAuth 2.0 Token Exchange
 
-Set `allowTokenExchangeGrant: true` to enable RFC 8693. Clients can exchange an existing access token for a token with narrower scopes, a permitted resource, or a shorter lifetime.
+Set `allowTokenExchangeGrant: true` to enable RFC 8693. Clients can exchange an existing access token for a token with narrower scopes or a shorter lifetime. Token exchange cannot change the required canonical resource audience.
 
 Application code can also call:
 
@@ -75,12 +75,12 @@ Application code can also call:
 await env.OAUTH_PROVIDER.exchangeToken({
   subjectToken,
   scope: ['documents:read'],
-  aud: 'https://api.example.com/documents',
+  aud: 'https://mcp.example.com/mcp', // Must match resourceMetadata.resource
   expiresIn: 900,
 });
 ```
 
-The new token cannot exceed the subject token's scope ceiling, permitted resources, or remaining lifetime.
+The new token cannot exceed the subject token's scope ceiling or remaining lifetime. Its subject audience and any `aud` request value must match `resourceMetadata.resource`.
 
 ## Enterprise-managed authorization
 
@@ -298,8 +298,7 @@ new OAuthProvider({
 
 The callback can:
 
-- Return `{ props, audience }` to authenticate. If `resourceMetadata.resource` is configured, the audience is required and must exactly match it.
-- Return `{ props }` when no explicit resource is configured. The provider applies its origin-bound default resource policy.
+- Return `{ props, audience }` to authenticate. The audience is required and must identify the configured canonical `resourceMetadata.resource`; scheme and host comparisons are ASCII case-insensitive, while port, path, query, trailing slash, and array cardinality are strict.
 - Return `null` for a generic `401 invalid_token` response.
 - Throw the exported `ExternalTokenError` for an intentional structured response.
 

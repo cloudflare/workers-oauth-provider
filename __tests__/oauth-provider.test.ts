@@ -4,10 +4,11 @@ import {
   CimdFetchError,
   ExternalTokenError,
   OAuthError,
-  OAuthProvider,
+  OAuthProvider as BaseOAuthProvider,
   type OAuthHelpers,
   type OAuthProviderOptions,
   type OAuthTokenErrorCode,
+  type ResolveExternalTokenResult,
   type Grant,
   type Token,
 } from '../src/oauth-provider';
@@ -151,6 +152,26 @@ type TestEnv = {
   OAUTH_KV: MockKV;
   OAUTH_PROVIDER: OAuthHelpers | null;
 };
+
+const TEST_RESOURCE = 'https://example.com';
+
+type TestProviderOptions<Env> = Omit<OAuthProviderOptions<Env>, 'resourceMetadata'> & {
+  resourceMetadata?: Partial<OAuthProviderOptions<Env>['resourceMetadata']>;
+};
+
+/** Supply the canonical resource required by 1.0 unless a test overrides it. */
+class OAuthProvider<Env = Cloudflare.Env> extends BaseOAuthProvider<Env> {
+  constructor(options: TestProviderOptions<Env>) {
+    const { resourceMetadata, ...providerOptions } = options;
+    super({
+      ...providerOptions,
+      resourceMetadata: {
+        resource: TEST_RESOURCE,
+        ...resourceMetadata,
+      },
+    });
+  }
+}
 
 type TestJsonWebKey = JsonWebKey & {
   kid?: string;
@@ -608,7 +629,7 @@ describe('OAuthProvider', () => {
   });
 
   describe('Protected Resource Metadata (RFC 9728)', () => {
-    it('should return default metadata at .well-known/oauth-protected-resource', async () => {
+    it('should return configured canonical metadata at .well-known/oauth-protected-resource', async () => {
       const request = createMockRequest('https://example.com/.well-known/oauth-protected-resource');
       const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
 
@@ -639,7 +660,7 @@ describe('OAuthProvider', () => {
         },
       });
 
-      const request = createMockRequest('https://example.com/.well-known/oauth-protected-resource');
+      const request = createMockRequest('https://api.example.com/.well-known/oauth-protected-resource');
       const response = await customProvider.fetch(request, mockEnv, mockCtx);
 
       expect(response.status).toBe(200);
@@ -652,7 +673,63 @@ describe('OAuthProvider', () => {
       expect(metadata.resource_name).toBe('Example API');
     });
 
-    it.each<[string, OAuthProviderOptions['resourceMetadata'], string]>([
+    it('should require canonical lowercase scheme and host spelling', () => {
+      expect(
+        () =>
+          new OAuthProvider({
+            apiRoute: ['/api/'],
+            apiHandler: TestApiHandler,
+            defaultHandler: testDefaultHandler,
+            authorizeEndpoint: '/authorize',
+            tokenEndpoint: '/oauth/token',
+            resourceMetadata: { resource: 'HTTPS://RESOURCE.EXAMPLE.COM:8443/Mcp?Tenant=A' },
+          })
+      ).toThrow('resourceMetadata.resource must use a lowercase HTTPS scheme and lowercase host');
+    });
+
+    it('should preserve case in the configured path and query', async () => {
+      const resource = 'https://resource.example.com/Mcp?Tenant=A';
+      const provider = new OAuthProvider({
+        apiRoute: ['/Mcp'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        resourceMetadata: { resource },
+      });
+      const metadata = await provider.fetch(
+        createMockRequest('https://resource.example.com/.well-known/oauth-protected-resource/Mcp?Tenant=A'),
+        mockEnv,
+        mockCtx
+      );
+
+      await expect(metadata.json()).resolves.toMatchObject({ resource });
+    });
+
+    it('should return protected resource metadata only at its canonical well-known URL', async () => {
+      const resource = 'https://resource.example.com/mcp?tenant=a';
+      const provider = new OAuthProvider({
+        apiRoute: ['/mcp'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        resourceMetadata: { resource },
+      });
+      const canonical = 'https://resource.example.com/.well-known/oauth-protected-resource/mcp?tenant=a';
+
+      expect((await provider.fetch(createMockRequest(canonical), mockEnv, mockCtx)).status).toBe(200);
+      for (const alias of [
+        'https://alias.example.com/.well-known/oauth-protected-resource/mcp?tenant=a',
+        'https://resource.example.com/.well-known/oauth-protected-resource/other?tenant=a',
+        'https://resource.example.com/.well-known/oauth-protected-resource/mcp',
+        'https://resource.example.com/.well-known/oauth-protected-resource/mcp?tenant=b',
+      ]) {
+        expect((await provider.fetch(createMockRequest(alias), mockEnv, mockCtx)).status).toBe(404);
+      }
+    });
+
+    it.each<[string, Partial<OAuthProviderOptions['resourceMetadata']>, string]>([
       [
         'an empty authorization server list',
         { authorization_servers: [] },
@@ -669,14 +746,94 @@ describe('OAuthProvider', () => {
         'resourceMetadata.authorization_servers must contain valid HTTPS issuer URLs',
       ],
       [
+        'an issuer with an empty fragment',
+        { authorization_servers: ['https://auth.example.com/#'] },
+        'resourceMetadata.authorization_servers must contain valid HTTPS issuer URLs',
+      ],
+      [
+        'an issuer with userinfo',
+        { authorization_servers: ['https://user:password@auth.example.com'] },
+        'resourceMetadata.authorization_servers must contain valid HTTPS issuer URLs',
+      ],
+      [
+        'an issuer with an explicit default port',
+        { authorization_servers: ['https://auth.example.com:443'] },
+        'resourceMetadata.authorization_servers must contain valid HTTPS issuer URLs',
+      ],
+      [
+        'an issuer with dot segments',
+        { authorization_servers: ['https://auth.example.com/a/../issuer'] },
+        'resourceMetadata.authorization_servers must contain valid HTTPS issuer URLs',
+      ],
+      [
+        'an issuer with uppercase scheme or host',
+        { authorization_servers: ['HTTPS://AUTH.EXAMPLE.COM'] },
+        'resourceMetadata.authorization_servers must contain valid HTTPS issuer URLs',
+      ],
+      [
         'an invalid resource identifier',
         { resource: 'mcp.example.com' },
-        'resourceMetadata.resource must be an absolute HTTP(S) URI without a fragment',
+        'resourceMetadata.resource is required and must be an absolute HTTPS URI without a fragment',
       ],
       [
         'an empty resource identifier',
         { resource: '' },
-        'resourceMetadata.resource must be an absolute HTTP(S) URI without a fragment',
+        'resourceMetadata.resource is required and must be an absolute HTTPS URI without a fragment',
+      ],
+      [
+        'an insecure HTTP resource identifier',
+        { resource: 'http://resource.example.com' },
+        'resourceMetadata.resource is required and must be an absolute HTTPS URI without a fragment',
+      ],
+      [
+        'a resource identifier with an empty fragment',
+        { resource: 'https://resource.example.com/#' },
+        'resourceMetadata.resource is required and must be an absolute HTTPS URI without a fragment',
+      ],
+      [
+        'a repaired missing-slashes resource identifier',
+        { resource: 'https:resource.example.com/mcp' },
+        'resourceMetadata.resource is required and must be an absolute HTTPS URI without a fragment',
+      ],
+      [
+        'a backslash resource identifier',
+        { resource: 'https://resource.example.com\\mcp' },
+        'resourceMetadata.resource is required and must be an absolute HTTPS URI without a fragment',
+      ],
+      [
+        'a quote in the resource identifier',
+        { resource: 'https://resource.example.com/"mcp' },
+        'resourceMetadata.resource is required and must be an absolute HTTPS URI without a fragment',
+      ],
+      [
+        'a control character in the resource identifier',
+        { resource: 'https://resource.example.com/mcp\n' },
+        'resourceMetadata.resource is required and must be an absolute HTTPS URI without a fragment',
+      ],
+      [
+        'dot segments in the resource identifier',
+        { resource: 'https://resource.example.com/a/../mcp' },
+        'resourceMetadata.resource must use canonical URL serialization',
+      ],
+      [
+        'encoded dot segments in the resource identifier',
+        { resource: 'https://resource.example.com/%2e%2e/mcp' },
+        'resourceMetadata.resource must use canonical URL serialization',
+      ],
+      [
+        'an explicit default port in the resource identifier',
+        { resource: 'https://resource.example.com:443/mcp' },
+        'resourceMetadata.resource must use canonical URL serialization',
+      ],
+      [
+        'an empty path before the resource query',
+        { resource: 'https://resource.example.com?tenant=a' },
+        'resourceMetadata.resource must use canonical URL serialization',
+      ],
+      [
+        'userinfo in the resource identifier',
+        { resource: 'https://user:password@resource.example.com/mcp' },
+        'resourceMetadata.resource must use canonical URL serialization',
       ],
       [
         'an invalid scope token',
@@ -702,6 +859,39 @@ describe('OAuthProvider', () => {
       ).toThrow(message);
     });
 
+    it('should require resourceMetadata.resource at type and runtime', () => {
+      const optionsWithoutResource = {
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        resourceMetadata: {},
+      };
+
+      // @ts-expect-error resourceMetadata.resource is required in the public 1.0 options type.
+      const invalidTypedOptions: OAuthProviderOptions<TestEnv> = optionsWithoutResource;
+      expect(() => new BaseOAuthProvider(invalidTypedOptions)).toThrow(
+        'resourceMetadata.resource is required and must be an absolute HTTPS URI without a fragment'
+      );
+    });
+
+    it('should require the top-level resourceMetadata object at type and runtime', () => {
+      const optionsWithoutMetadata = {
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+      };
+
+      // @ts-expect-error resourceMetadata is required in the public 1.0 options type.
+      const invalidTypedOptions: OAuthProviderOptions<TestEnv> = optionsWithoutMetadata;
+      expect(() => new BaseOAuthProvider(invalidTypedOptions)).toThrow(
+        'resourceMetadata.resource is required and must be an absolute HTTPS URI without a fragment'
+      );
+    });
+
     it('should not infer protected resource requirements from authorization server scopes', async () => {
       const providerWithPartialMetadata = new OAuthProvider({
         apiRoute: ['/api/'],
@@ -716,13 +906,13 @@ describe('OAuthProvider', () => {
       });
 
       const resourceResponse = await providerWithPartialMetadata.fetch(
-        createMockRequest('https://example.com/.well-known/oauth-protected-resource'),
+        createMockRequest('https://api.example.com/.well-known/oauth-protected-resource'),
         mockEnv,
         mockCtx
       );
       const resourceMetadata = await resourceResponse.json<any>();
       expect(resourceMetadata.resource).toBe('https://api.example.com');
-      expect(resourceMetadata.authorization_servers).toEqual(['https://example.com']);
+      expect(resourceMetadata.authorization_servers).toEqual(['https://api.example.com']);
       expect(resourceMetadata.scopes_supported).toBeUndefined();
 
       const authorizationServerResponse = await providerWithPartialMetadata.fetch(
@@ -824,11 +1014,11 @@ describe('OAuthProvider', () => {
         scopesSupported: ['read', 'write'],
       });
 
-      const request = createMockRequest('https://resource.example.com/.well-known/oauth-protected-resource');
+      const request = createMockRequest('https://example.com/.well-known/oauth-protected-resource');
       const response = await crossOriginProvider.fetch(request, mockEnv, mockCtx);
 
       const metadata = await response.json<any>();
-      expect(metadata.resource).toBe('https://resource.example.com');
+      expect(metadata.resource).toBe(TEST_RESOURCE);
       expect(metadata.authorization_servers).toEqual(['https://auth.example.com']);
     });
 
@@ -852,29 +1042,21 @@ describe('OAuthProvider', () => {
       expect(response.headers.get('Content-Length')).toBe('0');
     });
 
-    it('should return metadata with path-based resource identifier per RFC 9728 §3.1', async () => {
-      const request = createMockRequest('https://example.com/.well-known/oauth-protected-resource/mcp');
+    it('should reject a metadata URL with a path suffix not present in the canonical resource', async () => {
+      const request = createMockRequest('https://api.example.com/.well-known/oauth-protected-resource/mcp');
       const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
 
-      expect(response.status).toBe(200);
-
-      const metadata = await response.json<any>();
-      expect(metadata.resource).toBe('https://example.com/mcp');
-      expect(metadata.authorization_servers).toEqual(['https://example.com']);
-      expect(metadata.bearer_methods_supported).toEqual(['header']);
+      expect(response.status).toBe(404);
     });
 
-    it('should return metadata with nested path-based resource identifier', async () => {
+    it('should reject a nested alias of the canonical metadata URL', async () => {
       const request = createMockRequest('https://example.com/.well-known/oauth-protected-resource/api/v1/mcp');
       const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
 
-      expect(response.status).toBe(200);
-
-      const metadata = await response.json<any>();
-      expect(metadata.resource).toBe('https://example.com/api/v1/mcp');
+      expect(response.status).toBe(404);
     });
 
-    it('should handle OPTIONS preflight for path-suffixed protected resource metadata', async () => {
+    it('should return 404 with CORS for OPTIONS on a noncanonical metadata alias', async () => {
       const preflightRequest = createMockRequest(
         'https://example.com/.well-known/oauth-protected-resource/mcp',
         'OPTIONS',
@@ -886,11 +1068,11 @@ describe('OAuthProvider', () => {
 
       const response = await oauthProvider.fetch(preflightRequest, mockEnv, mockCtx);
 
-      expect(response.status).toBe(204);
+      expect(response.status).toBe(404);
       expect(response.headers.get('Access-Control-Allow-Origin')).toBe('https://spa.example.com');
     });
 
-    it('should use custom resourceMetadata.resource even with path-suffixed well-known URL', async () => {
+    it('should reject a path-suffixed alias for an origin canonical resource', async () => {
       const customProvider = new OAuthProvider({
         apiRoute: ['/api/'],
         apiHandler: TestApiHandler,
@@ -906,8 +1088,7 @@ describe('OAuthProvider', () => {
       const request = createMockRequest('https://example.com/.well-known/oauth-protected-resource/mcp');
       const response = await customProvider.fetch(request, mockEnv, mockCtx);
 
-      const metadata = await response.json<any>();
-      expect(metadata.resource).toBe('https://api.example.com');
+      expect(response.status).toBe(404);
     });
   });
 
@@ -1931,6 +2112,7 @@ describe('OAuthProvider', () => {
       expect(fragment.get('token_type')).toBe('bearer');
       expect(fragment.get('expires_in')).toBe('3600');
       expect(fragment.get('scope')).toBe('read write');
+      expect(fragment.get('resource')).toBe(TEST_RESOURCE);
       expect(fragment.get('state')).toBe('xyz123');
       expect(fragment.get('iss')).toBe('https://example.com');
 
@@ -3967,20 +4149,22 @@ describe('OAuthProvider', () => {
       clientSecret = client.client_secret;
     }
 
-    async function rewriteSubjectAudience(audience: string | string[] | undefined): Promise<void> {
+    async function rewriteSubjectAudience(audience: string | string[] | undefined): Promise<string> {
       const tokenKey = (await mockEnv.OAUTH_KV.list({ prefix: 'token:' })).keys[0].name;
       const tokenData = (await mockEnv.OAUTH_KV.get(tokenKey, { type: 'json' })) as Token;
       if (audience === undefined) delete tokenData.audience;
       else tokenData.audience = audience;
       await mockEnv.OAUTH_KV.put(tokenKey, JSON.stringify(tokenData));
+      return tokenKey;
     }
 
-    async function rewriteGrantResource(resource: string | string[] | undefined): Promise<void> {
+    async function rewriteGrantResource(resource: string | string[] | undefined): Promise<string> {
       const grantKey = (await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys[0].name;
       const grant = (await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' })) as Grant;
       if (resource === undefined) delete grant.resource;
       else grant.resource = resource;
       await mockEnv.OAUTH_KV.put(grantKey, JSON.stringify(grant));
+      return grantKey;
     }
 
     async function exchangeAccessToken(subjectToken: string, scope?: string) {
@@ -4127,119 +4311,6 @@ describe('OAuthProvider', () => {
       const newTokens = await exchangeResponse.json<any>();
       // Should return only valid scopes, invalid 'delete' scope should be silently removed
       expect(newTokens.scope).toBe('read write admin');
-    });
-
-    it('should exchange token with different audience/resource', async () => {
-      // First, get a token with a resource
-      const authRequest = createMockRequest(
-        `https://example.com/authorize?response_type=code&client_id=${originalClientId}` +
-          `&redirect_uri=${encodeURIComponent('https://original.example.com/callback')}` +
-          `&scope=read%20write&resource=${encodeURIComponent('https://api1.example.com')}` +
-          `&resource=${encodeURIComponent('https://api2.example.com')}&state=xyz123`
-      );
-
-      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
-      const location = authResponse.headers.get('Location')!;
-      const code = new URL(location).searchParams.get('code')!;
-
-      const params1 = new URLSearchParams();
-      params1.append('grant_type', 'authorization_code');
-      params1.append('code', code);
-      params1.append('redirect_uri', 'https://original.example.com/callback');
-      params1.append('client_id', originalClientId);
-      params1.append('client_secret', originalClientSecret);
-
-      const tokenRequest = createMockRequest(
-        'https://example.com/oauth/token',
-        'POST',
-        { 'Content-Type': 'application/x-www-form-urlencoded' },
-        params1.toString()
-      );
-
-      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
-      const tokens = await tokenResponse.json<any>();
-      const tokenWithResource = tokens.access_token;
-
-      // Now exchange with a narrowed resource
-      const params2 = new URLSearchParams();
-      params2.append('grant_type', 'urn:ietf:params:oauth:grant-type:token-exchange');
-      params2.append('subject_token', tokenWithResource);
-      params2.append('subject_token_type', 'urn:ietf:params:oauth:token-type:access_token');
-      params2.append('requested_token_type', 'urn:ietf:params:oauth:token-type:access_token');
-      params2.append('resource', 'https://api1.example.com'); // Narrow to one resource
-
-      const exchangeRequest = createMockRequest(
-        'https://example.com/oauth/token',
-        'POST',
-        {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
-        },
-        params2.toString()
-      );
-
-      const exchangeResponse = await oauthProvider.fetch(exchangeRequest, mockEnv, mockCtx);
-
-      expect(exchangeResponse.status).toBe(200);
-
-      const newTokens = await exchangeResponse.json<any>();
-      expect(newTokens.resource).toBe('https://api1.example.com');
-    });
-
-    it('should reject token exchange with invalid resource', async () => {
-      // Get a token with a resource
-      const authRequest = createMockRequest(
-        `https://example.com/authorize?response_type=code&client_id=${originalClientId}` +
-          `&redirect_uri=${encodeURIComponent('https://original.example.com/callback')}` +
-          `&scope=read%20write&resource=${encodeURIComponent('https://api1.example.com')}&state=xyz123`
-      );
-
-      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
-      const location = authResponse.headers.get('Location')!;
-      const code = new URL(location).searchParams.get('code')!;
-
-      const params1 = new URLSearchParams();
-      params1.append('grant_type', 'authorization_code');
-      params1.append('code', code);
-      params1.append('redirect_uri', 'https://original.example.com/callback');
-      params1.append('client_id', originalClientId);
-      params1.append('client_secret', originalClientSecret);
-
-      const tokenRequest = createMockRequest(
-        'https://example.com/oauth/token',
-        'POST',
-        { 'Content-Type': 'application/x-www-form-urlencoded' },
-        params1.toString()
-      );
-
-      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
-      const tokens = await tokenResponse.json<any>();
-      const tokenWithResource = tokens.access_token;
-
-      // Try to exchange with a resource not in the original grant
-      const params2 = new URLSearchParams();
-      params2.append('grant_type', 'urn:ietf:params:oauth:grant-type:token-exchange');
-      params2.append('subject_token', tokenWithResource);
-      params2.append('subject_token_type', 'urn:ietf:params:oauth:token-type:access_token');
-      params2.append('requested_token_type', 'urn:ietf:params:oauth:token-type:access_token');
-      params2.append('resource', 'https://api2.example.com'); // Not in original grant
-
-      const exchangeRequest = createMockRequest(
-        'https://example.com/oauth/token',
-        'POST',
-        {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
-        },
-        params2.toString()
-      );
-
-      const exchangeResponse = await oauthProvider.fetch(exchangeRequest, mockEnv, mockCtx);
-
-      expect(exchangeResponse.status).toBe(400);
-
-      const error = await exchangeResponse.json<any>();
-      expect(error.error).toBe('invalid_target');
     });
 
     it('should exchange token with shorter TTL', async () => {
@@ -4442,17 +4513,19 @@ describe('OAuthProvider', () => {
     });
 
     it('should preserve a subject audience that is absent from a legacy grant when resource is omitted', async () => {
-      const subjectResource = 'https://api.example.com/subject';
+      const subjectResource = 'https://example.com';
       await rewriteSubjectAudience(subjectResource);
-      await rewriteGrantResource(undefined);
+      const grantKey = await rewriteGrantResource(undefined);
 
       const exchanged = await (mockEnv.OAUTH_PROVIDER as OAuthHelpers).exchangeToken({ subjectToken: accessToken });
 
       expect(exchanged.resource).toBe(subjectResource);
+      const grant = (await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' })) as Grant;
+      expect(grant.resource).toBeUndefined();
     });
 
     it('should not expand a subject audience from its broader grant when resource is omitted', async () => {
-      const resourceA = 'https://api.example.com/a';
+      const resourceA = 'https://example.com';
       const resourceB = 'https://api.example.com/b';
       await rewriteSubjectAudience(resourceA);
       await rewriteGrantResource([resourceA, resourceB]);
@@ -4473,45 +4546,20 @@ describe('OAuthProvider', () => {
       expect(newToken.scope).toBe('read write');
     });
 
-    it('should exchange token via OAuthHelpers with different audience', async () => {
-      // Get a token with resource first
-      const authRequest = createMockRequest(
-        `https://example.com/authorize?response_type=code&client_id=${originalClientId}` +
-          `&redirect_uri=${encodeURIComponent('https://original.example.com/callback')}` +
-          `&scope=read%20write&resource=${encodeURIComponent('https://api1.example.com')}` +
-          `&resource=${encodeURIComponent('https://api2.example.com')}&state=xyz123`
-      );
+    it('should not let a broader grant expand beyond the subject token audience', async () => {
+      const resourceA = 'https://example.com';
+      const resourceB = 'https://api.example.com/b';
+      await rewriteSubjectAudience(resourceA);
+      await rewriteGrantResource([resourceA, resourceB]);
+      const tokenCountBefore = (await mockEnv.OAUTH_KV.list({ prefix: 'token:' })).keys.length;
 
-      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
-      const location = authResponse.headers.get('Location')!;
-      const code = new URL(location).searchParams.get('code')!;
-
-      const params = new URLSearchParams();
-      params.append('grant_type', 'authorization_code');
-      params.append('code', code);
-      params.append('redirect_uri', 'https://original.example.com/callback');
-      params.append('client_id', originalClientId);
-      params.append('client_secret', originalClientSecret);
-
-      const tokenRequest = createMockRequest(
-        'https://example.com/oauth/token',
-        'POST',
-        { 'Content-Type': 'application/x-www-form-urlencoded' },
-        params.toString()
-      );
-
-      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
-      const tokens = await tokenResponse.json<any>();
-      const tokenWithResource = tokens.access_token;
-
-      const helpers = mockEnv.OAUTH_PROVIDER as OAuthHelpers;
-
-      const newToken = await helpers.exchangeToken({
-        subjectToken: tokenWithResource,
-        aud: 'https://api1.example.com',
-      });
-
-      expect(newToken.resource).toBe('https://api1.example.com');
+      await expect(
+        (mockEnv.OAUTH_PROVIDER as OAuthHelpers).exchangeToken({
+          subjectToken: accessToken,
+          aud: resourceB,
+        })
+      ).rejects.toMatchObject({ code: 'invalid_target' });
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'token:' })).keys).toHaveLength(tokenCountBefore);
     });
 
     it('should exchange token via OAuthHelpers with custom TTL', async () => {
@@ -4714,10 +4762,16 @@ describe('OAuthProvider', () => {
       );
     }
 
-    async function exchangeAssertion(assertion: string, id = clientId, secret = clientSecret) {
+    async function exchangeAssertion(
+      assertion: string,
+      id = clientId,
+      secret = clientSecret,
+      requestedResources: string[] = []
+    ) {
       const params = new URLSearchParams();
       params.append('grant_type', 'urn:ietf:params:oauth:grant-type:jwt-bearer');
       params.append('assertion', assertion);
+      requestedResources.forEach((requestedResource) => params.append('resource', requestedResource));
 
       return enterpriseProvider.fetch(
         createMockRequest(
@@ -4802,6 +4856,55 @@ describe('OAuthProvider', () => {
       expect(apiResponse.status).toBe(200);
     });
 
+    it('should accept an explicit canonical token-request resource for enterprise-managed authorization', async () => {
+      const tokenResponse = await exchangeAssertion(await createAssertion(), clientId, clientSecret, [resource]);
+
+      expect(tokenResponse.status).toBe(200);
+      await expect(tokenResponse.json()).resolves.toMatchObject({ resource });
+    });
+
+    it.each([
+      ['mismatched', ['https://example.com/other-resource']],
+      ['malformed', ['not an absolute URI']],
+      ['multiple', [resource, resource]],
+    ])('should reject a %s explicit token-request resource before EMA mutation', async (_label, resources) => {
+      const tokenResponse = await exchangeAssertion(await createAssertion(), clientId, clientSecret, resources);
+
+      expect(tokenResponse.status).toBe(400);
+      await expect(tokenResponse.json()).resolves.toMatchObject({ error: 'invalid_target' });
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'enterprise-jti:' })).keys).toHaveLength(0);
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys).toHaveLength(0);
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'token:' })).keys).toHaveLength(0);
+    });
+
+    it('should canonicalize a case-variant signed resource before EMA issuance', async () => {
+      const tokenResponse = await exchangeAssertion(await createAssertion({ resource: 'HTTPS://EXAMPLE.COM/api' }));
+
+      expect(tokenResponse.status).toBe(200);
+      const tokens = await tokenResponse.json<{ access_token: string; resource: string }>();
+      expect(tokens.resource).toBe(resource);
+
+      const grantKey = (await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys[0].name;
+      const grant = (await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' })) as Grant;
+      expect(grant.resource).toBe(resource);
+
+      const tokenKey = (await mockEnv.OAUTH_KV.list({ prefix: 'token:' })).keys[0].name;
+      const token = (await mockEnv.OAUTH_KV.get(tokenKey, { type: 'json' })) as Token;
+      expect(token.audience).toBe(resource);
+    });
+
+    it('should require the exact configured resource for enterprise-managed authorization', async () => {
+      const jtiCountBefore = (await mockEnv.OAUTH_KV.list({ prefix: 'enterprise-jti:' })).keys.length;
+      const tokenResponse = await exchangeAssertion(
+        await createAssertion({ resource: 'https://example.com/other-resource' })
+      );
+
+      expect(tokenResponse.status).toBe(400);
+      await expect(tokenResponse.json()).resolves.toMatchObject({ error: 'invalid_target' });
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'enterprise-jti:' })).keys).toHaveLength(jtiCountBefore);
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys).toHaveLength(0);
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'token:' })).keys).toHaveLength(0);
+    });
     it('should accept ES256 assertions when the trusted issuer allows ES256', async () => {
       const ecKey = await createEcJwtKey();
       privateKey = ecKey.privateKey;
@@ -4871,6 +4974,7 @@ describe('OAuthProvider', () => {
       const params = new URLSearchParams();
       params.append('grant_type', 'urn:ietf:params:oauth:grant-type:jwt-bearer');
       params.append('assertion', assertion);
+      params.append('resource', 'https://example.com/other-resource');
 
       const response = await oauthProvider.fetch(
         createMockRequest(
@@ -5458,21 +5562,22 @@ describe('OAuthProvider', () => {
     });
 
     it('should reject EMA configuration without resourceMetadata.resource', () => {
-      expect(
-        () =>
-          new OAuthProvider({
-            apiRoute: ['/api/'],
-            apiHandler: TestApiHandler,
-            defaultHandler: testDefaultHandler,
-            authorizeEndpoint: '/authorize',
-            tokenEndpoint: '/oauth/token',
-            clientRegistrationEndpoint: '/oauth/register',
-            enterpriseManagedAuthorization: {
-              trustedIssuers: async () => ({ issuer, jwksUri: `${issuer}/jwks.json` }),
-              mapClaims: async () => ({ userId: 'user', scope: [], props: null }),
-            },
-          })
-      ).toThrow(/resourceMetadata\.resource/);
+      const optionsWithoutResource = {
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        enterpriseManagedAuthorization: {
+          trustedIssuers: async () => ({ issuer, jwksUri: `${issuer}/jwks.json` }),
+          mapClaims: async () => ({ userId: 'user', scope: [], props: null }),
+        },
+      };
+
+      expect(() => new BaseOAuthProvider(optionsWithoutResource as unknown as OAuthProviderOptions<TestEnv>)).toThrow(
+        /resourceMetadata\.resource/
+      );
     });
 
     it('should reject mapped user IDs that cannot be represented in opaque token format', async () => {
@@ -6346,12 +6451,8 @@ describe('OAuthProvider', () => {
 
       expect(apiResponse.status).toBe(401);
 
-      // Per RFC 9728 §5.1, resource_metadata URL includes the request path
-      // so the client can discover metadata for the specific resource
       const wwwAuth = apiResponse.headers.get('WWW-Authenticate');
-      expect(wwwAuth).toBe(
-        'Bearer realm="OAuth", resource_metadata="https://example.com/.well-known/oauth-protected-resource/api/test"'
-      );
+      expect(wwwAuth).toBe('Bearer realm="OAuth"');
     });
 
     it('should include correct resource_metadata for root API path', async () => {
@@ -6369,30 +6470,54 @@ describe('OAuthProvider', () => {
 
       expect(apiResponse.status).toBe(401);
       const wwwAuth = apiResponse.headers.get('WWW-Authenticate');
-      expect(wwwAuth).toContain('resource_metadata="https://example.com/.well-known/oauth-protected-resource/"');
+      expect(wwwAuth).toContain('resource_metadata="https://example.com/.well-known/oauth-protected-resource"');
     });
 
-    it('should include correct resource_metadata for nested API path', async () => {
+    it('should keep resource_metadata canonical for nested API paths', async () => {
       const apiRequest = createMockRequest('https://example.com/api/v1/deeply/nested/resource');
       const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
 
       expect(apiResponse.status).toBe(401);
       const wwwAuth = apiResponse.headers.get('WWW-Authenticate');
-      expect(wwwAuth).toContain(
-        'resource_metadata="https://example.com/.well-known/oauth-protected-resource/api/v1/deeply/nested/resource"'
-      );
+      expect(wwwAuth).not.toContain('resource_metadata=');
     });
 
-    it('should include correct resource_metadata for cross-origin API route', async () => {
+    it('should use the configured resource host for cross-origin API routes', async () => {
       // The default oauthProvider has apiRoute: ['/api/', 'https://api.example.com/']
       const apiRequest = createMockRequest('https://api.example.com/data');
       const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
 
       expect(apiResponse.status).toBe(401);
       const wwwAuth = apiResponse.headers.get('WWW-Authenticate');
-      expect(wwwAuth).toContain(
-        'resource_metadata="https://api.example.com/.well-known/oauth-protected-resource/data"'
-      );
+      expect(wwwAuth).not.toContain('resource_metadata=');
+    });
+
+    it.each([
+      ['https://resource.example.com', 'https://resource.example.com/.well-known/oauth-protected-resource'],
+      ['https://resource.example.com/', 'https://resource.example.com/.well-known/oauth-protected-resource'],
+      [
+        'https://resource.example.com/?tenant=a',
+        'https://resource.example.com/.well-known/oauth-protected-resource?tenant=a',
+      ],
+      ['https://resource.example.com/mcp', 'https://resource.example.com/.well-known/oauth-protected-resource/mcp'],
+      [
+        'https://resource.example.com/mcp?tenant=a',
+        'https://resource.example.com/.well-known/oauth-protected-resource/mcp?tenant=a',
+      ],
+    ])('builds a discoverable metadata URL for canonical resource %s', async (resource, metadataUrl) => {
+      const provider = new OAuthProvider({
+        apiRoute: [new URL(resource).pathname],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        resourceMetadata: { resource },
+      });
+      const challenge = await provider.fetch(createMockRequest(resource), mockEnv, mockCtx);
+
+      expect(challenge.headers.get('WWW-Authenticate')).toContain(`resource_metadata="${metadataUrl}"`);
+      const metadata = await provider.fetch(createMockRequest(metadataUrl), mockEnv, mockCtx);
+      await expect(metadata.json()).resolves.toMatchObject({ resource });
     });
 
     it('should include correct resource_metadata with trailing slash path', async () => {
@@ -6401,7 +6526,7 @@ describe('OAuthProvider', () => {
 
       expect(apiResponse.status).toBe(401);
       const wwwAuth = apiResponse.headers.get('WWW-Authenticate');
-      expect(wwwAuth).toContain('resource_metadata="https://example.com/.well-known/oauth-protected-resource/api/"');
+      expect(wwwAuth).not.toContain('resource_metadata=');
     });
 
     it('should reject API requests with an invalid token', async () => {
@@ -6432,867 +6557,80 @@ describe('OAuthProvider', () => {
     });
   });
 
-  describe('Audience Validation (RFC 7519 Section 4.1.3)', () => {
-    // Helper to get access token with resource parameter (RFC 8707)
-    async function getAccessTokenWithResource(resource?: string | string[]) {
-      // Create a client
-      const clientData = {
-        redirect_uris: ['https://client.example.com/callback'],
-        client_name: 'Test Client',
-        token_endpoint_auth_method: 'client_secret_post',
-      };
-
-      const registerRequest = createMockRequest(
-        'https://example.com/oauth/register',
-        'POST',
-        { 'Content-Type': 'application/json' },
-        JSON.stringify(clientData)
-      );
-
-      const registerResponse = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
-      const client = await registerResponse.json<any>();
-      const clientId = client.client_id;
-      const clientSecret = client.client_secret;
-      const redirectUri = 'https://client.example.com/callback';
-
-      // Get an auth code for the same resource set that will be requested at
-      // the token endpoint. RFC 8707 does not allow a token request to add a
-      // resource that was absent from the authorization grant.
-      const authorizationUrl = new URL('https://example.com/authorize');
-      authorizationUrl.searchParams.set('response_type', 'code');
-      authorizationUrl.searchParams.set('client_id', clientId);
-      authorizationUrl.searchParams.set('redirect_uri', redirectUri);
-      authorizationUrl.searchParams.set('scope', 'read write');
-      authorizationUrl.searchParams.set('state', 'xyz123');
-      if (resource !== undefined) {
-        const resources = Array.isArray(resource) ? resource : [resource];
-        resources.forEach((value) => authorizationUrl.searchParams.append('resource', value));
-      }
-      const authRequest = createMockRequest(authorizationUrl.toString());
-
-      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
-      const location = authResponse.headers.get('Location')!;
-      const code = new URL(location).searchParams.get('code')!;
-
-      // Exchange for tokens with resource parameter (RFC 8707)
-      const params = new URLSearchParams();
-      params.append('grant_type', 'authorization_code');
-      params.append('code', code);
-      params.append('redirect_uri', redirectUri);
-      params.append('client_id', clientId);
-      params.append('client_secret', clientSecret);
-      if (resource !== undefined) {
-        // RFC 8707: multiple resources are sent as separate parameters
-        if (Array.isArray(resource)) {
-          resource.forEach((r) => params.append('resource', r));
-        } else {
-          params.append('resource', resource);
-        }
-      }
-
-      const tokenRequest = createMockRequest(
-        'https://example.com/oauth/token',
-        'POST',
-        { 'Content-Type': 'application/x-www-form-urlencoded' },
-        params.toString()
-      );
-
-      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
-      const tokens = await tokenResponse.json<{ access_token: string }>();
-      return tokens.access_token;
+  describe('Canonical audience validation (RFC 7519 Section 4.1.3)', () => {
+    function createExternalProvider(resource: string) {
+      return new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        resourceMetadata: { resource },
+        resolveExternalToken: async ({ token }) =>
+          token === 'external-token' ? { props: { userId: 'external-user' }, audience: resource } : null,
+      });
     }
 
-    it('should accept token with matching audience (string)', async () => {
-      const accessToken = await getAccessTokenWithResource('https://example.com');
+    function externalRequest(url: string): Request {
+      return createMockRequest(url, 'GET', { Authorization: 'Bearer external-token' });
+    }
 
-      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
-        Authorization: `Bearer ${accessToken}`,
-      });
+    it('accepts the canonical audience at its exact path and path-boundary descendants', async () => {
+      const provider = createExternalProvider('https://example.com/api/parent');
 
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
-
-      expect(apiResponse.status).toBe(200);
-      const data = await apiResponse.json<any>();
-      expect(data.success).toBe(true);
-      expect(data.user).toEqual({ userId: 'test-user-123', username: 'TestUser' });
-    });
-
-    it('should accept token with matching audience in array', async () => {
-      const accessToken = await getAccessTokenWithResource(['https://example.com', 'https://other.example.com']);
-
-      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
-        Authorization: `Bearer ${accessToken}`,
-      });
-
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
-
-      expect(apiResponse.status).toBe(200);
-      const data = await apiResponse.json<{ success: boolean }>();
-      expect(data.success).toBe(true);
-    });
-
-    it('should accept token with multiple resources at all specified resource servers (E2E)', async () => {
-      // Request token for two resource servers
-      const accessToken = await getAccessTokenWithResource(['https://api1.example.com', 'https://api2.example.com']);
-
-      // Should work at first resource server
-      const api1Request = createMockRequest('https://api1.example.com/api/test', 'GET', {
-        Authorization: `Bearer ${accessToken}`,
-      });
-      const api1Response = await oauthProvider.fetch(api1Request, mockEnv, mockCtx);
-      expect(api1Response.status).toBe(200);
-      const api1Data = await api1Response.json<{ success: boolean }>();
-      expect(api1Data.success).toBe(true);
-
-      // Should also work at second resource server
-      const api2Request = createMockRequest('https://api2.example.com/api/test', 'GET', {
-        Authorization: `Bearer ${accessToken}`,
-      });
-      const api2Response = await oauthProvider.fetch(api2Request, mockEnv, mockCtx);
-      expect(api2Response.status).toBe(200);
-      const api2Data = await api2Response.json<{ success: boolean }>();
-      expect(api2Data.success).toBe(true);
-
-      // Should fail at third resource server not in audience
-      const api3Request = createMockRequest('https://api3.example.com/api/test', 'GET', {
-        Authorization: `Bearer ${accessToken}`,
-      });
-      const api3Response = await oauthProvider.fetch(api3Request, mockEnv, mockCtx);
-      expect(api3Response.status).toBe(401);
-      const api3Error = await api3Response.json<{ error: string }>();
-      expect(api3Error.error).toBe('invalid_token');
-    });
-
-    it('should accept the origin audience default when the client omits resource', async () => {
-      const accessToken = await getAccessTokenWithResource(undefined);
-
-      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
-        Authorization: `Bearer ${accessToken}`,
-      });
-
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
-
-      expect(apiResponse.status).toBe(200);
-      const data = await apiResponse.json<{ success: boolean }>();
-      expect(data.success).toBe(true);
-    });
-
-    it('should reject token with wrong audience (HTTP 401)', async () => {
-      const accessToken = await getAccessTokenWithResource('https://wrong-server.com');
-
-      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
-        Authorization: `Bearer ${accessToken}`,
-      });
-
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
-
-      expect(apiResponse.status).toBe(401);
-
-      const wwwAuth = apiResponse.headers.get('WWW-Authenticate');
-      expect(wwwAuth).toContain('Bearer');
-      expect(wwwAuth).toContain(
-        'resource_metadata="https://example.com/.well-known/oauth-protected-resource/api/test"'
+      expect((await provider.fetch(externalRequest('https://example.com/api/parent'), mockEnv, mockCtx)).status).toBe(
+        200
       );
-      expect(wwwAuth).toContain('error="invalid_token"');
-      expect(wwwAuth).toContain('Invalid audience');
-
-      const error = await apiResponse.json<{ error: string; error_description: string }>();
-      expect(error.error).toBe('invalid_token');
-      expect(error.error_description).toContain('audience');
-    });
-
-    it('should reject token when resource server not in audience array', async () => {
-      const accessToken = await getAccessTokenWithResource(['https://other1.com', 'https://other2.com']);
-
-      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
-        Authorization: `Bearer ${accessToken}`,
-      });
-
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
-
-      expect(apiResponse.status).toBe(401);
-
-      const error = await apiResponse.json<{ error: string; error_description: string }>();
-      expect(error.error).toBe('invalid_token');
-    });
-
-    it('should reject token with audience mismatch on different host', async () => {
-      const accessToken = await getAccessTokenWithResource('https://api.example.com');
-
-      const apiRequest = createMockRequest('https://api2.example.com/api/test', 'GET', {
-        Authorization: `Bearer ${accessToken}`,
-      });
-
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
-
-      expect(apiResponse.status).toBe(401);
-      const error = await apiResponse.json<{ error: string; error_description: string }>();
-      expect(error.error).toBe('invalid_token');
-    });
-
-    it('should reject token with audience mismatch on different protocol', async () => {
-      const accessToken = await getAccessTokenWithResource('http://example.com');
-
-      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
-        Authorization: `Bearer ${accessToken}`,
-      });
-
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
-
-      expect(apiResponse.status).toBe(401);
-      const error = await apiResponse.json<{ error: string; error_description: string }>();
-      expect(error.error).toBe('invalid_token');
-    });
-
-    it('should reject token with different port', async () => {
-      // Token issued for port 8080
-      const accessToken = await getAccessTokenWithResource('https://example.com:8080');
-
-      // Request to default port (443)
-      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
-        Authorization: `Bearer ${accessToken}`,
-      });
-
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
-
-      expect(apiResponse.status).toBe(401);
-      const error = await apiResponse.json<any>();
-      expect(error.error).toBe('invalid_token');
-    });
-
-    it('should reject token when ports do not match', async () => {
-      // Token issued for default port
-      const accessToken = await getAccessTokenWithResource('https://example.com');
-
-      // Request to explicit port 8443
-      const apiRequest = createMockRequest('https://example.com:8443/api/test', 'GET', {
-        Authorization: `Bearer ${accessToken}`,
-      });
-
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
-
-      expect(apiResponse.status).toBe(401);
-      const error = await apiResponse.json<any>();
-      expect(error.error).toBe('invalid_token');
-    });
-
-    it('should accept token with IPv6 resource URI', async () => {
-      const accessToken = await getAccessTokenWithResource('https://[2001:db8::1]:8080');
-
-      const apiRequest = createMockRequest('https://[2001:db8::1]:8080/api/test', 'GET', {
-        Authorization: `Bearer ${accessToken}`,
-      });
-
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
-
-      expect(apiResponse.status).toBe(200);
-      const data = await apiResponse.json<any>();
-      expect(data.success).toBe(true);
-    });
-
-    it('should reject token request with resource containing fragment (RFC 8707)', async () => {
-      // Create a client
-      const clientData = {
-        redirect_uris: ['https://client.example.com/callback'],
-        client_name: 'Test Client',
-        token_endpoint_auth_method: 'client_secret_post',
-      };
-
-      const registerRequest = createMockRequest(
-        'https://example.com/oauth/register',
-        'POST',
-        { 'Content-Type': 'application/json' },
-        JSON.stringify(clientData)
-      );
-
-      const registerResponse = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
-      const client = await registerResponse.json<any>();
-      const clientId = client.client_id;
-      const clientSecret = client.client_secret;
-      const redirectUri = 'https://client.example.com/callback';
-
-      // Get an auth code
-      const authRequest = createMockRequest(
-        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
-          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-          `&scope=read%20write&state=xyz123`
-      );
-
-      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
-      const location = authResponse.headers.get('Location')!;
-      const code = new URL(location).searchParams.get('code')!;
-
-      // Try to exchange with resource containing fragment
-      const params = new URLSearchParams();
-      params.append('grant_type', 'authorization_code');
-      params.append('code', code);
-      params.append('redirect_uri', redirectUri);
-      params.append('client_id', clientId);
-      params.append('client_secret', clientSecret);
-      params.append('resource', 'https://example.com/api#fragment');
-
-      const tokenRequest = createMockRequest(
-        'https://example.com/oauth/token',
-        'POST',
-        { 'Content-Type': 'application/x-www-form-urlencoded' },
-        params.toString()
-      );
-
-      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
-
-      expect(tokenResponse.status).toBe(400);
-      const error = await tokenResponse.json<any>();
-      expect(error.error).toBe('invalid_target');
-      expect(error.error_description).toContain('fragment');
-    });
-
-    it('should reject token request with javascript: resource scheme', async () => {
-      // Create a client
-      const clientData = {
-        redirect_uris: ['https://client.example.com/callback'],
-        client_name: 'Test Client',
-        token_endpoint_auth_method: 'client_secret_post',
-      };
-
-      const registerRequest = createMockRequest(
-        'https://example.com/oauth/register',
-        'POST',
-        { 'Content-Type': 'application/json' },
-        JSON.stringify(clientData)
-      );
-
-      const registerResponse = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
-      const client = await registerResponse.json<any>();
-      const clientId = client.client_id;
-      const clientSecret = client.client_secret;
-      const redirectUri = 'https://client.example.com/callback';
-
-      // Get an auth code
-      const authRequest = createMockRequest(
-        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
-          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-          `&scope=read%20write&state=xyz123`
-      );
-
-      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
-      const location = authResponse.headers.get('Location')!;
-      const code = new URL(location).searchParams.get('code')!;
-
-      // Try to exchange with javascript: resource
-      const params = new URLSearchParams();
-      params.append('grant_type', 'authorization_code');
-      params.append('code', code);
-      params.append('redirect_uri', redirectUri);
-      params.append('client_id', clientId);
-      params.append('client_secret', clientSecret);
-      params.append('resource', 'javascript:alert(1)');
-
-      const tokenRequest = createMockRequest(
-        'https://example.com/oauth/token',
-        'POST',
-        { 'Content-Type': 'application/x-www-form-urlencoded' },
-        params.toString()
-      );
-
-      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
-
-      expect(tokenResponse.status).toBe(400);
-      const error = await tokenResponse.json<any>();
-      expect(error.error).toBe('invalid_target');
-    });
-
-    it('should reject token request with relative URI resource', async () => {
-      // Create a client
-      const clientData = {
-        redirect_uris: ['https://client.example.com/callback'],
-        client_name: 'Test Client',
-        token_endpoint_auth_method: 'client_secret_post',
-      };
-
-      const registerRequest = createMockRequest(
-        'https://example.com/oauth/register',
-        'POST',
-        { 'Content-Type': 'application/json' },
-        JSON.stringify(clientData)
-      );
-
-      const registerResponse = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
-      const client = await registerResponse.json<any>();
-      const clientId = client.client_id;
-      const clientSecret = client.client_secret;
-      const redirectUri = 'https://client.example.com/callback';
-
-      // Get an auth code
-      const authRequest = createMockRequest(
-        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
-          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-          `&scope=read%20write&state=xyz123`
-      );
-
-      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
-      const location = authResponse.headers.get('Location')!;
-      const code = new URL(location).searchParams.get('code')!;
-
-      // Try to exchange with relative URI resource
-      const params = new URLSearchParams();
-      params.append('grant_type', 'authorization_code');
-      params.append('code', code);
-      params.append('redirect_uri', redirectUri);
-      params.append('client_id', clientId);
-      params.append('client_secret', clientSecret);
-      params.append('resource', '/api/resource');
-
-      const tokenRequest = createMockRequest(
-        'https://example.com/oauth/token',
-        'POST',
-        { 'Content-Type': 'application/x-www-form-urlencoded' },
-        params.toString()
-      );
-
-      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
-
-      expect(tokenResponse.status).toBe(400);
-      const error = await tokenResponse.json<any>();
-      expect(error.error).toBe('invalid_target');
-    });
-
-    it('should use resource from authorization request when not provided in token request', async () => {
-      // Create a client
-      const clientData = {
-        redirect_uris: ['https://client.example.com/callback'],
-        client_name: 'Test Client',
-        token_endpoint_auth_method: 'client_secret_post',
-      };
-
-      const registerRequest = createMockRequest(
-        'https://example.com/oauth/register',
-        'POST',
-        { 'Content-Type': 'application/json' },
-        JSON.stringify(clientData)
-      );
-
-      const registerResponse = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
-      const client = await registerResponse.json<any>();
-      const clientId = client.client_id;
-      const clientSecret = client.client_secret;
-      const redirectUri = 'https://client.example.com/callback';
-
-      // Get an auth code WITH resource parameter
-      const authRequest = createMockRequest(
-        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
-          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-          `&resource=${encodeURIComponent('https://api.example.com')}` +
-          `&scope=read%20write&state=xyz123`
-      );
-
-      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
-      const location = authResponse.headers.get('Location')!;
-      const code = new URL(location).searchParams.get('code')!;
-
-      // Exchange WITHOUT resource parameter in token request
-      const params = new URLSearchParams();
-      params.append('grant_type', 'authorization_code');
-      params.append('code', code);
-      params.append('redirect_uri', redirectUri);
-      params.append('client_id', clientId);
-      params.append('client_secret', clientSecret);
-      // No resource parameter here!
-
-      const tokenRequest = createMockRequest(
-        'https://example.com/oauth/token',
-        'POST',
-        { 'Content-Type': 'application/x-www-form-urlencoded' },
-        params.toString()
-      );
-
-      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
-      expect(tokenResponse.status).toBe(200);
-      const tokens = await tokenResponse.json<any>();
-      const accessToken = tokens.access_token;
-
-      // Use token at the resource server specified in authorization request
-      const apiRequest = createMockRequest('https://api.example.com/api/test', 'GET', {
-        Authorization: `Bearer ${accessToken}`,
-      });
-
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
-      expect(apiResponse.status).toBe(200);
-      const data = await apiResponse.json<any>();
-      expect(data.success).toBe(true);
-    });
-
-    it('should validate audience for external tokens with matching audience', async () => {
-      const externalProvider = new OAuthProvider({
-        apiRoute: ['/api/', 'https://example.com/'],
-        apiHandler: TestApiHandler,
-        defaultHandler: testDefaultHandler,
-        authorizeEndpoint: '/authorize',
-        tokenEndpoint: '/oauth/token',
-        clientRegistrationEndpoint: '/oauth/register',
-        scopesSupported: ['read', 'write', 'profile'],
-        resolveExternalToken: async ({ token }) => {
-          if (token === 'external-token-with-audience') {
-            return {
-              props: { userId: 'external-user', source: 'external' },
-              audience: 'https://example.com',
-            };
-          }
-          return null;
-        },
-      });
-
-      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
-        Authorization: 'Bearer external-token-with-audience',
-      });
-
-      const apiResponse = await externalProvider.fetch(apiRequest, mockEnv, mockCtx);
-
-      expect(apiResponse.status).toBe(200);
-      const data = await apiResponse.json<any>();
-      expect(data.success).toBe(true);
-    });
-
-    it('should reject external tokens with wrong audience', async () => {
-      const externalProvider = new OAuthProvider({
-        apiRoute: ['/api/', 'https://example.com/'],
-        apiHandler: TestApiHandler,
-        defaultHandler: testDefaultHandler,
-        authorizeEndpoint: '/authorize',
-        tokenEndpoint: '/oauth/token',
-        clientRegistrationEndpoint: '/oauth/register',
-        scopesSupported: ['read', 'write', 'profile'],
-        resolveExternalToken: async ({ token }) => {
-          if (token === 'external-token-wrong-audience') {
-            return {
-              props: { userId: 'external-user', source: 'external' },
-              audience: 'https://wrong-server.com',
-            };
-          }
-          return null;
-        },
-      });
-
-      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
-        Authorization: 'Bearer external-token-wrong-audience',
-      });
-
-      const apiResponse = await externalProvider.fetch(apiRequest, mockEnv, mockCtx);
-
-      expect(apiResponse.status).toBe(401);
-      const error = await apiResponse.json<any>();
-      expect(error.error).toBe('invalid_token');
-      expect(error.error_description).toContain('audience');
-    });
-
-    it('should accept token with path-aware audience at matching path (RFC 8707)', async () => {
-      // Request token with path-specific resource indicator
-      const accessToken = await getAccessTokenWithResource('https://example.com/api/test');
-
-      // Request to exact matching path should succeed
-      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
-        Authorization: `Bearer ${accessToken}`,
-      });
-
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
-
-      expect(apiResponse.status).toBe(200);
-      const data = await apiResponse.json<any>();
-      expect(data.success).toBe(true);
-    });
-
-    it('should reject token with path-aware audience at different path (RFC 8707)', async () => {
-      const accessToken = await getAccessTokenWithResource('https://example.com/api/test');
-
-      const apiRequest = createMockRequest('https://example.com/api/other', 'GET', {
-        Authorization: `Bearer ${accessToken}`,
-      });
-
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
-
-      expect(apiResponse.status).toBe(401);
-      const error = await apiResponse.json<any>();
-      expect(error.error).toBe('invalid_token');
-      expect(error.error_description).toContain('audience');
-    });
-
-    it('should accept external token with path-aware audience at matching path (RFC 8707)', async () => {
-      const externalProvider = new OAuthProvider({
-        apiRoute: ['/api/', 'https://example.com/'],
-        apiHandler: TestApiHandler,
-        defaultHandler: testDefaultHandler,
-        authorizeEndpoint: '/authorize',
-        tokenEndpoint: '/oauth/token',
-        clientRegistrationEndpoint: '/oauth/register',
-        scopesSupported: ['read', 'write', 'profile'],
-        resolveExternalToken: async ({ token }) => {
-          if (token === 'external-token-path-audience') {
-            return {
-              props: { userId: 'external-user', source: 'external' },
-              audience: 'https://example.com/api/test',
-            };
-          }
-          return null;
-        },
-      });
-
-      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
-        Authorization: 'Bearer external-token-path-audience',
-      });
-
-      const apiResponse = await externalProvider.fetch(apiRequest, mockEnv, mockCtx);
-
-      expect(apiResponse.status).toBe(200);
-      const data = await apiResponse.json<any>();
-      expect(data.success).toBe(true);
-    });
-
-    it('should reject external token with path-aware audience at different path (RFC 8707)', async () => {
-      const externalProvider = new OAuthProvider({
-        apiRoute: ['/api/', 'https://example.com/'],
-        apiHandler: TestApiHandler,
-        defaultHandler: testDefaultHandler,
-        authorizeEndpoint: '/authorize',
-        tokenEndpoint: '/oauth/token',
-        clientRegistrationEndpoint: '/oauth/register',
-        scopesSupported: ['read', 'write', 'profile'],
-        resolveExternalToken: async ({ token }) => {
-          if (token === 'external-token-path-mismatch') {
-            return {
-              props: { userId: 'external-user', source: 'external' },
-              audience: 'https://example.com/api/test',
-            };
-          }
-          return null;
-        },
-      });
-
-      const apiRequest = createMockRequest('https://example.com/api/other', 'GET', {
-        Authorization: 'Bearer external-token-path-mismatch',
-      });
-
-      const apiResponse = await externalProvider.fetch(apiRequest, mockEnv, mockCtx);
-
-      expect(apiResponse.status).toBe(401);
-      const error = await apiResponse.json<any>();
-      expect(error.error).toBe('invalid_token');
-      expect(error.error_description).toContain('audience');
-    });
-
-    it('should allow sub-path access with parent path audience (prefix matching on path boundary)', async () => {
-      const accessToken = await getAccessTokenWithResource('https://example.com/api');
-
-      const apiRequest = createMockRequest('https://example.com/api/admin', 'GET', {
-        Authorization: `Bearer ${accessToken}`,
-      });
-
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
-
-      expect(apiResponse.status).toBe(200);
-      const data = await apiResponse.json<any>();
-      expect(data.success).toBe(true);
-    });
-
-    it('should reject access when audience path is a string prefix but not on a path boundary', async () => {
-      // audience is "/api/test" but request is "/api/testing" — the audience is a string prefix
-      // but NOT a path-boundary prefix, so it must be rejected
-      const accessToken = await getAccessTokenWithResource('https://example.com/api/test');
-
-      const apiRequest = createMockRequest('https://example.com/api/testing', 'GET', {
-        Authorization: `Bearer ${accessToken}`,
-      });
-
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
-
-      expect(apiResponse.status).toBe(401);
-      const error = await apiResponse.json<any>();
-      expect(error.error).toBe('invalid_token');
-      expect(error.error_description).toContain('audience');
-    });
-
-    it('should match path-aware audience when request includes query string', async () => {
-      const accessToken = await getAccessTokenWithResource('https://example.com/api/test');
-
-      const apiRequest = createMockRequest('https://example.com/api/test?foo=bar&baz=qux', 'GET', {
-        Authorization: `Bearer ${accessToken}`,
-      });
-
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
-
-      expect(apiResponse.status).toBe(200);
-      const data = await apiResponse.json<any>();
-      expect(data.success).toBe(true);
-    });
-
-    it('should preserve a query component that is part of the audience', async () => {
-      const accessToken = await getAccessTokenWithResource('https://example.com/api/test?tenant=one');
-      const request = (url: string) =>
-        createMockRequest(url, 'GET', {
-          Authorization: `Bearer ${accessToken}`,
-        });
-
       expect(
-        (await oauthProvider.fetch(request('https://example.com/api/test?tenant=one'), mockEnv, mockCtx)).status
+        (await provider.fetch(externalRequest('https://example.com/api/parent/child'), mockEnv, mockCtx)).status
       ).toBe(200);
-      expect((await oauthProvider.fetch(request('https://example.com/api/test'), mockEnv, mockCtx)).status).toBe(401);
+      expect((await provider.fetch(externalRequest('https://example.com/api/parent/'), mockEnv, mockCtx)).status).toBe(
+        200
+      );
+    });
+
+    it('treats a trailing-slash canonical path as the descendant boundary', async () => {
+      const provider = createExternalProvider('https://example.com/api/parent/');
+
       expect(
-        (await oauthProvider.fetch(request('https://example.com/api/test?tenant=two'), mockEnv, mockCtx)).status
+        (await provider.fetch(externalRequest('https://example.com/api/parent/child'), mockEnv, mockCtx)).status
+      ).toBe(200);
+      expect((await provider.fetch(externalRequest('https://example.com/api/parent'), mockEnv, mockCtx)).status).toBe(
+        401
+      );
+    });
+
+    it('rejects sibling paths and non-boundary string prefixes', async () => {
+      const provider = createExternalProvider('https://example.com/api/parent');
+
+      expect((await provider.fetch(externalRequest('https://example.com/api/sibling'), mockEnv, mockCtx)).status).toBe(
+        401
+      );
+      expect(
+        (await provider.fetch(externalRequest('https://example.com/api/parentish'), mockEnv, mockCtx)).status
       ).toBe(401);
     });
 
-    it('should accept trailing slash as sub-path of audience (prefix matching)', async () => {
-      const accessToken = await getAccessTokenWithResource('https://example.com/api/test');
+    it('preserves a query component that is part of the canonical audience', async () => {
+      const provider = createExternalProvider('https://example.com/api/test?tenant=one');
 
-      const apiRequest = createMockRequest('https://example.com/api/test/', 'GET', {
-        Authorization: `Bearer ${accessToken}`,
-      });
-
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
-
-      expect(apiResponse.status).toBe(200);
-      const data = await apiResponse.json<any>();
-      expect(data.success).toBe(true);
+      expect(
+        (await provider.fetch(externalRequest('https://example.com/api/test?tenant=one'), mockEnv, mockCtx)).status
+      ).toBe(200);
+      expect((await provider.fetch(externalRequest('https://example.com/api/test'), mockEnv, mockCtx)).status).toBe(
+        401
+      );
+      expect(
+        (await provider.fetch(externalRequest('https://example.com/api/test?tenant=two'), mockEnv, mockCtx)).status
+      ).toBe(401);
     });
   });
 
-  describe('Resource Parameter Downscoping (RFC 8707)', () => {
-    it('should reject upscoping without consuming the authorization code', async () => {
-      // Create a client
-      const clientData = {
-        redirect_uris: ['https://client.example.com/callback'],
-        client_name: 'Test Client',
-        token_endpoint_auth_method: 'client_secret_post',
-      };
-
-      const registerRequest = createMockRequest(
-        'https://example.com/oauth/register',
-        'POST',
-        { 'Content-Type': 'application/json' },
-        JSON.stringify(clientData)
-      );
-
-      const registerResponse = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
-      const client = await registerResponse.json<any>();
-      const clientId = client.client_id;
-      const clientSecret = client.client_secret;
-      const redirectUri = 'https://client.example.com/callback';
-
-      // Get an auth code with resource=https://api1.example.com
-      const authRequest = createMockRequest(
-        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
-          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-          `&scope=read%20write&state=xyz123&resource=https://api1.example.com`
-      );
-
-      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
-      const location = authResponse.headers.get('Location')!;
-      const code = new URL(location).searchParams.get('code')!;
-
-      // Try to exchange with resource=https://api2.example.com (not in authorization!)
-      const params = new URLSearchParams();
-      params.append('grant_type', 'authorization_code');
-      params.append('code', code);
-      params.append('redirect_uri', redirectUri);
-      params.append('client_id', clientId);
-      params.append('client_secret', clientSecret);
-      params.append('resource', 'https://api2.example.com'); // Different resource - upscoping!
-
-      const tokenRequest = createMockRequest(
-        'https://example.com/oauth/token',
-        'POST',
-        { 'Content-Type': 'application/x-www-form-urlencoded' },
-        params.toString()
-      );
-
-      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
-
-      expect(tokenResponse.status).toBe(400);
-      const error = await tokenResponse.json<any>();
-      expect(error.error).toBe('invalid_target');
-      expect(error.error_description).toContain('not included in the authorization request');
-
-      // A rejected token request did not exchange the code, so retrying it with
-      // a resource from the original grant should succeed.
-      params.set('resource', 'https://api1.example.com');
-      const retryResponse = await oauthProvider.fetch(
-        createMockRequest(
-          'https://example.com/oauth/token',
-          'POST',
-          { 'Content-Type': 'application/x-www-form-urlencoded' },
-          params.toString()
-        ),
-        mockEnv,
-        mockCtx
-      );
-
-      expect(retryResponse.status).toBe(200);
-      const tokens = await retryResponse.json<any>();
-      expect(tokens.access_token).toBeDefined();
-      expect(tokens.resource).toBe('https://api1.example.com');
-    });
-
-    it('should allow downscoping (requesting subset of authorized resources)', async () => {
-      // Create a client
-      const clientData = {
-        redirect_uris: ['https://client.example.com/callback'],
-        client_name: 'Test Client',
-        token_endpoint_auth_method: 'client_secret_post',
-      };
-
-      const registerRequest = createMockRequest(
-        'https://example.com/oauth/register',
-        'POST',
-        { 'Content-Type': 'application/json' },
-        JSON.stringify(clientData)
-      );
-
-      const registerResponse = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
-      const client = await registerResponse.json<any>();
-      const clientId = client.client_id;
-      const clientSecret = client.client_secret;
-      const redirectUri = 'https://client.example.com/callback';
-
-      // Get an auth code with TWO resources
-      const authRequest = createMockRequest(
-        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
-          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-          `&scope=read%20write&state=xyz123` +
-          `&resource=https://api1.example.com&resource=https://api2.example.com`
-      );
-
-      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
-      const location = authResponse.headers.get('Location')!;
-      const code = new URL(location).searchParams.get('code')!;
-
-      // Exchange with only ONE resource (downscoping - subset of original)
-      const params = new URLSearchParams();
-      params.append('grant_type', 'authorization_code');
-      params.append('code', code);
-      params.append('redirect_uri', redirectUri);
-      params.append('client_id', clientId);
-      params.append('client_secret', clientSecret);
-      params.append('resource', 'https://api1.example.com'); // Subset - downscoping allowed!
-
-      const tokenRequest = createMockRequest(
-        'https://example.com/oauth/token',
-        'POST',
-        { 'Content-Type': 'application/x-www-form-urlencoded' },
-        params.toString()
-      );
-
-      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
-
-      expect(tokenResponse.status).toBe(200);
-      const tokens = await tokenResponse.json<any>();
-      expect(tokens.access_token).toBeDefined();
-      expect(tokens.resource).toBe('https://api1.example.com');
-    });
-  });
-
-  describe('Configured resource policy and RFC 8707 defaults', () => {
+  describe('Required canonical resource policy', () => {
     const configuredResource = 'https://example.com/api';
     const redirectUri = 'https://client.example.com/callback';
 
-    function createProvider(resource?: string, overrides: Partial<OAuthProviderOptions<TestEnv>> = {}) {
+    function createProvider(overrides: Partial<OAuthProviderOptions<TestEnv>> = {}) {
       return new OAuthProvider<TestEnv>({
         apiRoute: ['/api/'],
         apiHandler: TestApiHandler,
@@ -7300,7 +6638,7 @@ describe('OAuthProvider', () => {
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
         clientRegistrationEndpoint: '/oauth/register',
-        resourceMetadata: resource ? { resource } : { resource_name: 'Test MCP Server' },
+        resourceMetadata: { resource: configuredResource },
         ...overrides,
       });
     }
@@ -7366,22 +6704,6 @@ describe('OAuthProvider', () => {
       );
     }
 
-    async function getOnlyGrant(): Promise<{ key: string; grant: Grant }> {
-      const keys = (await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys;
-      expect(keys).toHaveLength(1);
-      const key = keys[0].name;
-      const grant = (await mockEnv.OAUTH_KV.get(key, { type: 'json' })) as Grant | null;
-      expect(grant).not.toBeNull();
-      return { key, grant: grant! };
-    }
-
-    async function rewriteAsV082MissingResourceGrant(): Promise<{ key: string; grant: Grant }> {
-      const { key, grant } = await getOnlyGrant();
-      delete grant.resource;
-      await mockEnv.OAUTH_KV.put(key, JSON.stringify(grant));
-      return { key, grant };
-    }
-
     async function refresh(
       provider: OAuthProvider<TestEnv>,
       client: any,
@@ -7410,286 +6732,435 @@ describe('OAuthProvider', () => {
       );
     }
 
-    it('should preserve an unbound flow when neither the provider nor client supplies a resource', async () => {
+    async function getOnlyGrant(): Promise<{ key: string; grant: Grant }> {
+      const keys = (await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys;
+      expect(keys).toHaveLength(1);
+      const key = keys[0].name;
+      const grant = (await mockEnv.OAUTH_KV.get(key, { type: 'json' })) as Grant | null;
+      expect(grant).not.toBeNull();
+      return { key, grant: grant! };
+    }
+
+    async function rewriteAsV082MissingResourceGrant(): Promise<{ key: string; grant: Grant }> {
+      const { key, grant } = await getOnlyGrant();
+      delete grant.resource;
+      await mockEnv.OAUTH_KV.put(key, JSON.stringify(grant));
+      return { key, grant };
+    }
+
+    async function issueTokens(
+      provider: OAuthProvider<TestEnv>,
+      client: any,
+      authorizationResources?: string[],
+      codeResource?: string
+    ): Promise<any> {
+      const authorization = await authorize(provider, client.client_id, authorizationResources);
+      const code = new URL(authorization.headers.get('Location')!).searchParams.get('code')!;
+      const response = await exchangeCode(provider, client, code, codeResource);
+      expect(response.status).toBe(200);
+      return response.json<any>();
+    }
+
+    it.each([
+      ['000', false, false, false],
+      ['001', false, false, true],
+      ['010', false, true, false],
+      ['011', false, true, true],
+      ['100', true, false, false],
+      ['101', true, false, true],
+      ['110', true, true, false],
+      ['111', true, true, true],
+    ] as const)(
+      'supports resource presence pattern %s across authorize, code exchange, and refresh',
+      async (_pattern, authorizationSendsResource, codeExchangeSendsResource, refreshSendsResource) => {
+        const provider = createProvider();
+        const client = await registerClient(provider);
+        const tokens = await issueTokens(
+          provider,
+          client,
+          authorizationSendsResource ? [configuredResource] : undefined,
+          codeExchangeSendsResource ? configuredResource : undefined
+        );
+
+        expect(tokens.resource).toBe(configuredResource);
+        await expect(getOnlyGrant()).resolves.toMatchObject({
+          grant: { resource: configuredResource },
+        });
+
+        const refreshed = await refresh(
+          provider,
+          client,
+          tokens.refresh_token,
+          refreshSendsResource ? configuredResource : undefined
+        );
+        expect(refreshed.status).toBe(200);
+        await expect(refreshed.json()).resolves.toMatchObject({ resource: configuredResource });
+      }
+    );
+
+    it('accepts only ASCII case differences in scheme and host and returns the configured spelling', async () => {
       const provider = createProvider();
       const client = await registerClient(provider);
-      const authorization = await authorize(provider, client.client_id);
-      const code = new URL(authorization.headers.get('Location')!).searchParams.get('code')!;
-      const { grant: authorizationGrant } = await getOnlyGrant();
-      expect(authorizationGrant.resource).toBeUndefined();
+      const caseVariant = 'HTTPS://EXAMPLE.COM/api';
+      const tokens = await issueTokens(provider, client, [caseVariant], caseVariant);
+      const refreshed = await refresh(provider, client, tokens.refresh_token, caseVariant);
 
-      const response = await exchangeCode(provider, client, code);
-
-      expect(response.status).toBe(200);
-      const tokens = await response.json<any>();
-      expect(tokens.resource).toBeUndefined();
-      const { grant: exchangedGrant } = await getOnlyGrant();
-      expect(exchangedGrant.resource).toBeUndefined();
-      const apiResponse = await provider.fetch(
-        createMockRequest('https://example.com/api/test', 'GET', {
-          Authorization: `Bearer ${tokens.access_token}`,
-        }),
-        mockEnv,
-        mockCtx
-      );
-      expect(apiResponse.status).toBe(200);
-
-      const refreshed = await refresh(provider, client, tokens.refresh_token);
+      expect(tokens.resource).toBe(configuredResource);
       expect(refreshed.status).toBe(200);
-      await expect(refreshed.json()).resolves.not.toHaveProperty('resource');
-      const { grant: refreshedGrant } = await getOnlyGrant();
-      expect(refreshedGrant.resource).toBeUndefined();
+      await expect(refreshed.json()).resolves.toMatchObject({ resource: configuredResource });
     });
 
-    it('should inherit an authorization resource when the token request omits it', async () => {
+    it.each([
+      ['path case', 'https://example.com/API'],
+      ['trailing slash', 'https://example.com/api/'],
+      ['query', 'https://example.com/api?tenant=a'],
+      ['explicit default port', 'https://example.com:443/api'],
+      ['different port', 'https://example.com:8443/api'],
+      ['different host', 'https://other.example.com/api'],
+    ])('rejects a %s difference from the canonical resource', async (_label, resource) => {
       const provider = createProvider();
       const client = await registerClient(provider);
-      const authorization = await authorize(provider, client.client_id, ['https://example.com/api']);
-      const code = new URL(authorization.headers.get('Location')!).searchParams.get('code')!;
 
-      const response = await exchangeCode(provider, client, code);
-
-      expect(response.status).toBe(200);
-      await expect(response.json()).resolves.toMatchObject({ resource: 'https://example.com/api' });
+      await expect(authorize(provider, client.client_id, [resource])).rejects.toMatchObject({
+        code: 'invalid_target',
+      });
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys).toHaveLength(0);
     });
 
-    it('should complete a reconstructed authorization request without resource or issuer as unbound', async () => {
+    it('rejects malformed, mismatched, and multi-valued authorization resources before storage', async () => {
       const provider = createProvider();
-      await provider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
-      const client = await mockEnv.OAUTH_PROVIDER!.createClient({
-        redirectUris: [redirectUri],
-        tokenEndpointAuthMethod: 'client_secret_post',
-      });
-
-      const result = await mockEnv.OAUTH_PROVIDER!.completeAuthorization({
-        request: {
-          responseType: 'code',
-          clientId: client.clientId,
-          redirectUri,
-          scope: [],
-          state: '',
-        },
-        userId: 'unbound-resource-policy-user',
-        metadata: {},
-        scope: [],
-        props: {},
-      });
-
-      expect(new URL(result.redirectTo).searchParams.get('code')).toBeTruthy();
-      const { grant } = await getOnlyGrant();
-      expect(grant.resource).toBeUndefined();
-    });
-
-    it('should default an omitted authorization resource to the configured canonical resource', async () => {
-      const provider = createProvider(configuredResource);
       const client = await registerClient(provider);
 
-      expect((await authorize(provider, client.client_id)).status).toBe(302);
-      const { grant } = await getOnlyGrant();
-      expect(grant.resource).toBe(configuredResource);
+      for (const resources of [
+        [''],
+        [configuredResource + '#'],
+        ['https://other.example.com/api'],
+        [configuredResource, configuredResource],
+      ]) {
+        await expect(authorize(provider, client.client_id, resources)).rejects.toMatchObject({
+          code: 'invalid_target',
+        });
+      }
 
-      await expect(
-        authorize(provider, client.client_id, [configuredResource, 'https://other.example/resource'])
-      ).rejects.toMatchObject({
-        code: 'invalid_target',
-        description: `The resource parameter must exactly match ${configuredResource}`,
-      });
-      await expect(authorize(provider, client.client_id, [''])).rejects.toMatchObject({
-        code: 'invalid_target',
-      });
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys).toHaveLength(0);
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'token:' })).keys).toHaveLength(0);
     });
 
-    it('should default a reconstructed authorization request to the configured resource', async () => {
-      const provider = createProvider(configuredResource);
-      await provider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
-      const client = await mockEnv.OAUTH_PROVIDER!.createClient({
-        redirectUris: [redirectUri],
-        tokenEndpointAuthMethod: 'client_secret_post',
-      });
-
-      const result = await mockEnv.OAUTH_PROVIDER!.completeAuthorization({
-        request: {
-          responseType: 'code',
-          clientId: client.clientId,
-          redirectUri,
-          scope: [],
-          state: '',
-        },
-        userId: 'resource-policy-user',
-        metadata: {},
-        scope: [],
-        props: {},
-      });
-
-      expect(new URL(result.redirectTo).searchParams.get('code')).toBeTruthy();
-      const { grant } = await getOnlyGrant();
-      expect(grant.resource).toBe(configuredResource);
-    });
-
-    it('should inherit the configured grant resource at code exchange without allowing an override', async () => {
-      const provider = createProvider(configuredResource);
+    it('rejects an invalid code-exchange resource without consuming the code', async () => {
+      const provider = createProvider();
       const client = await registerClient(provider);
       const authorization = await authorize(provider, client.client_id);
       const code = new URL(authorization.headers.get('Location')!).searchParams.get('code')!;
 
-      const broad = await exchangeCode(provider, client, code, 'https://example.com');
-      expect(broad.status).toBe(400);
-      await expect(broad.json()).resolves.toMatchObject({ error: 'invalid_target' });
+      for (const resource of ['', configuredResource + '#', 'https://other.example.com/api']) {
+        const rejected = await exchangeCode(provider, client, code, resource);
+        expect(rejected.status).toBe(400);
+        await expect(rejected.json()).resolves.toMatchObject({ error: 'invalid_target' });
+      }
 
-      const malformed = await exchangeCode(provider, client, code, '');
-      expect(malformed.status).toBe(400);
-      await expect(malformed.json()).resolves.toMatchObject({ error: 'invalid_target' });
+      const duplicate = await exchangeCode(provider, client, code, [configuredResource, configuredResource]);
+      expect(duplicate.status).toBe(400);
+      await expect(duplicate.json()).resolves.toMatchObject({ error: 'invalid_target' });
 
-      const multiple = await exchangeCode(provider, client, code, [configuredResource, configuredResource]);
-      expect(multiple.status).toBe(400);
-      await expect(multiple.json()).resolves.toMatchObject({ error: 'invalid_target' });
-
-      const inherited = await exchangeCode(provider, client, code);
-      expect(inherited.status).toBe(200);
-      await expect(inherited.json()).resolves.toMatchObject({ resource: configuredResource });
+      const retry = await exchangeCode(provider, client, code);
+      expect(retry.status).toBe(200);
+      await expect(retry.json()).resolves.toMatchObject({ resource: configuredResource });
     });
 
-    it('should inherit the configured grant resource during refresh without allowing an override', async () => {
-      const provider = createProvider(configuredResource);
+    it('rejects an invalid refresh resource before rotation or storage mutation', async () => {
+      const provider = createProvider();
       const client = await registerClient(provider);
-      const authorization = await authorize(provider, client.client_id, [configuredResource]);
-      const code = new URL(authorization.headers.get('Location')!).searchParams.get('code')!;
-      const tokenResponse = await exchangeCode(provider, client, code);
-      const tokens = await tokenResponse.json<any>();
+      const tokens = await issueTokens(provider, client);
       const { key } = await getOnlyGrant();
       const grantBefore = await mockEnv.OAUTH_KV.get(key);
       const tokenCountBefore = (await mockEnv.OAUTH_KV.list({ prefix: 'token:' })).keys.length;
 
-      const broad = await refresh(provider, client, tokens.refresh_token, 'https://example.com');
-      expect(broad.status).toBe(400);
-      await expect(broad.json()).resolves.toMatchObject({ error: 'invalid_target' });
-
-      const malformed = await refresh(provider, client, tokens.refresh_token, '');
-      expect(malformed.status).toBe(400);
-      await expect(malformed.json()).resolves.toMatchObject({ error: 'invalid_target' });
-
-      const multiple = await refresh(provider, client, tokens.refresh_token, [configuredResource, configuredResource]);
-      expect(multiple.status).toBe(400);
-      await expect(multiple.json()).resolves.toMatchObject({ error: 'invalid_target' });
-
-      expect(await mockEnv.OAUTH_KV.get(key)).toBe(grantBefore);
-      expect((await mockEnv.OAUTH_KV.list({ prefix: 'token:' })).keys).toHaveLength(tokenCountBefore);
-
-      const inherited = await refresh(provider, client, tokens.refresh_token);
-      expect(inherited.status).toBe(200);
-      await expect(inherited.json()).resolves.toMatchObject({ resource: configuredResource });
-    });
-
-    it('should use the configured resource for a v0.8.2-shaped code grant without rewriting it', async () => {
-      const provider = createProvider(configuredResource);
-      const client = await registerClient(provider);
-      const authorization = await authorize(provider, client.client_id);
-      const code = new URL(authorization.headers.get('Location')!).searchParams.get('code')!;
-      const { key } = await rewriteAsV082MissingResourceGrant();
-      const legacyGrantBefore = await mockEnv.OAUTH_KV.get(key);
-      const tokenCountBefore = (await mockEnv.OAUTH_KV.list({ prefix: 'token:' })).keys.length;
-
-      const blocked = await exchangeCode(provider, client, code, 'https://example.com');
-      expect(blocked.status).toBe(400);
-      await expect(blocked.json()).resolves.toMatchObject({ error: 'invalid_target' });
-      expect(await mockEnv.OAUTH_KV.get(key)).toBe(legacyGrantBefore);
-      expect((await mockEnv.OAUTH_KV.list({ prefix: 'token:' })).keys).toHaveLength(tokenCountBefore);
-
-      const migrated = await exchangeCode(provider, client, code);
-      expect(migrated.status).toBe(200);
-      await expect(migrated.json()).resolves.toMatchObject({ resource: configuredResource });
-      const storedGrant = (await mockEnv.OAUTH_KV.get(key, { type: 'json' })) as Grant | null;
-      expect(storedGrant?.resource).toBeUndefined();
+      for (const resource of ['', configuredResource + '#', 'https://other.example.com/api']) {
+        const rejected = await refresh(provider, client, tokens.refresh_token, resource);
+        expect(rejected.status).toBe(400);
+        await expect(rejected.json()).resolves.toMatchObject({ error: 'invalid_target' });
+        expect(await mockEnv.OAUTH_KV.get(key)).toBe(grantBefore);
+        expect((await mockEnv.OAUTH_KV.list({ prefix: 'token:' })).keys).toHaveLength(tokenCountBefore);
+      }
     });
 
     it.each([
-      ['omitted', undefined],
-      ['explicit canonical', configuredResource],
-    ])(
-      'should use the configured resource for a v0.8.2-shaped refresh grant when the client resource is %s',
-      async (_label, requestedResource) => {
-        const provider = createProvider(configuredResource);
+      ['omitted', undefined, 200],
+      ['explicit canonical', configuredResource, 200],
+      ['explicit mismatch', 'https://other.example.com/api', 400],
+    ] as const)(
+      'handles an in-flight v0.8.2 missing-resource code grant with %s resource',
+      async (_label, requestedResource, expectedStatus) => {
+        const provider = createProvider();
         const client = await registerClient(provider);
         const authorization = await authorize(provider, client.client_id);
         const code = new URL(authorization.headers.get('Location')!).searchParams.get('code')!;
-        const tokenResponse = await exchangeCode(provider, client, code);
-        const tokens = await tokenResponse.json<any>();
         const { key } = await rewriteAsV082MissingResourceGrant();
-        const migrated = await refresh(provider, client, tokens.refresh_token, requestedResource);
-        expect(migrated.status).toBe(200);
-        await expect(migrated.json()).resolves.toMatchObject({ resource: configuredResource });
-        const storedGrant = (await mockEnv.OAUTH_KV.get(key, { type: 'json' })) as Grant | null;
-        expect(storedGrant?.resource).toBeUndefined();
+        const grantBefore = await mockEnv.OAUTH_KV.get(key);
+        const tokenCountBefore = (await mockEnv.OAUTH_KV.list({ prefix: 'token:' })).keys.length;
+
+        const response = await exchangeCode(provider, client, code, requestedResource);
+        expect(response.status).toBe(expectedStatus);
+
+        if (expectedStatus === 200) {
+          await expect(response.json()).resolves.toMatchObject({ resource: configuredResource });
+          await expect(mockEnv.OAUTH_KV.get(key, { type: 'json' })).resolves.toMatchObject({
+            resource: configuredResource,
+          });
+        } else {
+          await expect(response.json()).resolves.toMatchObject({ error: 'invalid_target' });
+          expect(await mockEnv.OAUTH_KV.get(key)).toBe(grantBefore);
+          expect((await mockEnv.OAUTH_KV.list({ prefix: 'token:' })).keys).toHaveLength(tokenCountBefore);
+
+          const retry = await exchangeCode(provider, client, code);
+          expect(retry.status).toBe(200);
+          await expect(retry.json()).resolves.toMatchObject({ resource: configuredResource });
+          await expect(mockEnv.OAUTH_KV.get(key, { type: 'json' })).resolves.toMatchObject({
+            resource: configuredResource,
+          });
+        }
       }
     );
 
-    it('should use changing explicit resources for an unbound legacy grant without persisting either one', async () => {
+    it.each([30, Number.NaN, Number.POSITIVE_INFINITY, 60.5])(
+      'leaves a missing-resource code grant unchanged for invalid callback TTL %s and binds it on retry',
+      async (invalidTtl) => {
+        let useInvalidTtl = true;
+        const provider = createProvider({
+          tokenExchangeCallback: async () => ({ accessTokenTTL: useInvalidTtl ? invalidTtl : 3600 }),
+        });
+        const client = await registerClient(provider);
+        const authorization = await authorize(provider, client.client_id);
+        const code = new URL(authorization.headers.get('Location')!).searchParams.get('code')!;
+        const { key, grant } = await rewriteAsV082MissingResourceGrant();
+        const grantBefore = await mockEnv.OAUTH_KV.get(key);
+        const wrappedKeyBefore = grant.authCodeWrappedKey;
+
+        const rejected = await exchangeCode(provider, client, code);
+        expect(rejected.status).toBe(400);
+        await expect(rejected.json()).resolves.toMatchObject({ error: 'invalid_request' });
+        expect(await mockEnv.OAUTH_KV.get(key)).toBe(grantBefore);
+        await expect(mockEnv.OAUTH_KV.get(key, { type: 'json' })).resolves.toMatchObject({
+          authCodeWrappedKey: wrappedKeyBefore,
+        });
+
+        useInvalidTtl = false;
+        const retry = await exchangeCode(provider, client, code);
+        expect(retry.status).toBe(200);
+        await expect(retry.json()).resolves.toMatchObject({ resource: configuredResource });
+        await expect(mockEnv.OAUTH_KV.get(key, { type: 'json' })).resolves.toMatchObject({
+          resource: configuredResource,
+        });
+      }
+    );
+
+    it('canonicalizes a v0.8.2 code grant that already stored the resource', async () => {
       const provider = createProvider();
       const client = await registerClient(provider);
       const authorization = await authorize(provider, client.client_id);
       const code = new URL(authorization.headers.get('Location')!).searchParams.get('code')!;
-      const { key } = await rewriteAsV082MissingResourceGrant();
+      const { key, grant } = await getOnlyGrant();
+      grant.resource = 'HTTPS://EXAMPLE.COM/api';
+      await mockEnv.OAUTH_KV.put(key, JSON.stringify(grant));
 
-      const first = await exchangeCode(provider, client, code, 'https://example.com/first');
-      expect(first.status).toBe(200);
-      const firstTokens = await first.json<any>();
-      expect(firstTokens.resource).toBe('https://example.com/first');
-      expect(((await mockEnv.OAUTH_KV.get(key, { type: 'json' })) as Grant | null)?.resource).toBeUndefined();
-
-      const second = await refresh(provider, client, firstTokens.refresh_token, 'https://example.com/second');
-      expect(second.status).toBe(200);
-      const secondTokens = await second.json<any>();
-      expect(secondTokens.resource).toBe('https://example.com/second');
-      expect(((await mockEnv.OAUTH_KV.get(key, { type: 'json' })) as Grant | null)?.resource).toBeUndefined();
-
-      const omitted = await refresh(provider, client, secondTokens.refresh_token);
-      expect(omitted.status).toBe(200);
-      await expect(omitted.json()).resolves.not.toHaveProperty('resource');
-      expect(((await mockEnv.OAUTH_KV.get(key, { type: 'json' })) as Grant | null)?.resource).toBeUndefined();
+      const response = await exchangeCode(provider, client, code);
+      expect(response.status).toBe(200);
+      await expect(mockEnv.OAUTH_KV.get(key, { type: 'json' })).resolves.toMatchObject({
+        resource: configuredResource,
+      });
     });
 
-    it('should let a v0.8.2 grant with a stored resource inherit it when upgraded clients omit token resources', async () => {
-      const provider = createProvider();
-      const client = await registerClient(provider);
-      const authorization = await authorize(provider, client.client_id, ['https://example.com/api']);
-      const code = new URL(authorization.headers.get('Location')!).searchParams.get('code')!;
+    it.each([
+      ['omitted', undefined, 200],
+      ['explicit canonical', configuredResource, 200],
+      ['explicit mismatch', 'https://other.example.com/api', 400],
+    ] as const)(
+      'handles a v0.8.2 missing-resource refresh with %s resource',
+      async (_label, requestedResource, expectedStatus) => {
+        const provider = createProvider();
+        const client = await registerClient(provider);
+        const tokens = await issueTokens(provider, client);
+        const { key } = await rewriteAsV082MissingResourceGrant();
+        const grantBefore = await mockEnv.OAUTH_KV.get(key);
+        const tokenCountBefore = (await mockEnv.OAUTH_KV.list({ prefix: 'token:' })).keys.length;
 
-      const exchanged = await exchangeCode(provider, client, code);
-      expect(exchanged.status).toBe(200);
-      const tokens = await exchanged.json<any>();
-      expect(tokens.resource).toBe('https://example.com/api');
+        const response = await refresh(provider, client, tokens.refresh_token, requestedResource);
+        expect(response.status).toBe(expectedStatus);
+
+        if (expectedStatus === 200) {
+          await expect(response.json()).resolves.toMatchObject({ resource: configuredResource });
+          await expect(mockEnv.OAUTH_KV.get(key, { type: 'json' })).resolves.toMatchObject({
+            resource: configuredResource,
+          });
+        } else {
+          await expect(response.json()).resolves.toMatchObject({ error: 'invalid_target' });
+          expect(await mockEnv.OAUTH_KV.get(key)).toBe(grantBefore);
+          expect((await mockEnv.OAUTH_KV.list({ prefix: 'token:' })).keys).toHaveLength(tokenCountBefore);
+        }
+      }
+    );
+
+    it('keeps an old unbound access token unusable while refresh binds the grant and replacement token', async () => {
+      const provider = createProvider({ allowTokenExchangeGrant: true });
+      const client = await registerClient(provider);
+      const tokens = await issueTokens(provider, client);
+      const { key, grant } = await getOnlyGrant();
+      delete grant.resource;
+      await mockEnv.OAUTH_KV.put(key, JSON.stringify(grant));
+
+      const oldTokenKey = (await mockEnv.OAUTH_KV.list({ prefix: 'token:' })).keys[0].name;
+      const oldToken = (await mockEnv.OAUTH_KV.get(oldTokenKey, { type: 'json' })) as Token;
+      delete oldToken.audience;
+      await mockEnv.OAUTH_KV.put(oldTokenKey, JSON.stringify(oldToken));
+
+      for (const aud of [undefined, configuredResource]) {
+        await expect(
+          mockEnv.OAUTH_PROVIDER!.exchangeToken({ subjectToken: tokens.access_token, aud })
+        ).rejects.toMatchObject({ code: 'invalid_target' });
+        expect(((await mockEnv.OAUTH_KV.get(key, { type: 'json' })) as Grant).resource).toBeUndefined();
+      }
 
       const refreshed = await refresh(provider, client, tokens.refresh_token);
       expect(refreshed.status).toBe(200);
-      await expect(refreshed.json()).resolves.toMatchObject({ resource: 'https://example.com/api' });
+      const refreshedTokens = await refreshed.json<any>();
+      expect(refreshedTokens.resource).toBe(configuredResource);
+      await expect(mockEnv.OAUTH_KV.get(key, { type: 'json' })).resolves.toMatchObject({
+        resource: configuredResource,
+      });
+
+      const apiRequest = (accessToken: string) =>
+        createMockRequest('https://example.com/api/test', 'GET', {
+          Authorization: `Bearer ${accessToken}`,
+        });
+      expect((await provider.fetch(apiRequest(tokens.access_token), mockEnv, mockCtx)).status).toBe(401);
+      expect((await provider.fetch(apiRequest(refreshedTokens.access_token), mockEnv, mockCtx)).status).toBe(200);
+      await expect(mockEnv.OAUTH_PROVIDER!.exchangeToken({ subjectToken: tokens.access_token })).rejects.toMatchObject({
+        code: 'invalid_target',
+      });
+      await expect(
+        mockEnv.OAUTH_PROVIDER!.exchangeToken({ subjectToken: refreshedTokens.access_token })
+      ).resolves.toMatchObject({ resource: configuredResource });
     });
 
-    it('should reject a malformed legacy refresh resource before mutation and preserve omission', async () => {
+    it('keeps a canonical compatibility token usable until refresh migrates its missing-resource grant', async () => {
+      const provider = createProvider({ allowTokenExchangeGrant: true });
+      const client = await registerClient(provider);
+      const tokens = await issueTokens(provider, client);
+      const { key } = await rewriteAsV082MissingResourceGrant();
+
+      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
+        Authorization: `Bearer ${tokens.access_token}`,
+      });
+      expect((await provider.fetch(apiRequest, mockEnv, mockCtx)).status).toBe(200);
+      await expect(mockEnv.OAUTH_PROVIDER!.exchangeToken({ subjectToken: tokens.access_token })).resolves.toMatchObject(
+        { resource: configuredResource }
+      );
+      expect(((await mockEnv.OAUTH_KV.get(key, { type: 'json' })) as Grant).resource).toBeUndefined();
+
+      const refreshed = await refresh(provider, client, tokens.refresh_token);
+      expect(refreshed.status).toBe(200);
+      await expect(refreshed.json()).resolves.toMatchObject({ resource: configuredResource });
+      await expect(mockEnv.OAUTH_KV.get(key, { type: 'json' })).resolves.toMatchObject({
+        resource: configuredResource,
+      });
+    });
+
+    it('canonicalizes a stored single-element resource array on refresh', async () => {
       const provider = createProvider();
       const client = await registerClient(provider);
-      const authorization = await authorize(provider, client.client_id);
-      const code = new URL(authorization.headers.get('Location')!).searchParams.get('code')!;
-      const tokenResponse = await exchangeCode(provider, client, code);
-      const tokens = await tokenResponse.json<any>();
-      const { key } = await rewriteAsV082MissingResourceGrant();
-      const legacyGrantBefore = await mockEnv.OAUTH_KV.get(key);
-      const tokenCountBefore = (await mockEnv.OAUTH_KV.list({ prefix: 'token:' })).keys.length;
+      const tokens = await issueTokens(provider, client);
+      const { key, grant } = await getOnlyGrant();
+      grant.resource = [configuredResource];
+      await mockEnv.OAUTH_KV.put(key, JSON.stringify(grant));
 
-      const malformed = await refresh(provider, client, tokens.refresh_token, '');
-      expect(malformed.status).toBe(400);
-      await expect(malformed.json()).resolves.toMatchObject({ error: 'invalid_target' });
-      expect(await mockEnv.OAUTH_KV.get(key)).toBe(legacyGrantBefore);
-      expect((await mockEnv.OAUTH_KV.list({ prefix: 'token:' })).keys).toHaveLength(tokenCountBefore);
-
-      const unbound = await refresh(provider, client, tokens.refresh_token);
-      expect(unbound.status).toBe(200);
-      const unboundTokens = await unbound.json<any>();
-      expect(unboundTokens.resource).toBeUndefined();
-      const stillLegacy = (await mockEnv.OAUTH_KV.get(key, { type: 'json' })) as Grant | null;
-      expect(stillLegacy?.resource).toBeUndefined();
+      const response = await refresh(provider, client, tokens.refresh_token);
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toMatchObject({ resource: configuredResource });
+      await expect(mockEnv.OAUTH_KV.get(key, { type: 'json' })).resolves.toMatchObject({
+        resource: configuredResource,
+      });
     });
 
-    it('should reject an explicitly malformed reconstructed resource before writing grants', async () => {
+    it.each([
+      ['multiple', [configuredResource, configuredResource]],
+      ['mismatched', ['https://other.example.com/api']],
+    ])('rejects a stored %s resource array without mutating the grant', async (_label, storedResource) => {
+      const provider = createProvider();
+      const client = await registerClient(provider);
+      const tokens = await issueTokens(provider, client);
+      const { key, grant } = await getOnlyGrant();
+      grant.resource = storedResource;
+      await mockEnv.OAUTH_KV.put(key, JSON.stringify(grant));
+      const grantBefore = await mockEnv.OAUTH_KV.get(key);
+
+      const response = await refresh(provider, client, tokens.refresh_token);
+      expect(response.status).toBe(400);
+      await expect(response.json()).resolves.toMatchObject({ error: 'invalid_target' });
+      expect(await mockEnv.OAUTH_KV.get(key)).toBe(grantBefore);
+    });
+
+    it('canonicalizes a v0.8.2 refresh grant that already stored the resource', async () => {
+      const provider = createProvider();
+      const client = await registerClient(provider);
+      const tokens = await issueTokens(provider, client);
+      const { key, grant } = await getOnlyGrant();
+      grant.resource = 'HTTPS://EXAMPLE.COM/api';
+      await mockEnv.OAUTH_KV.put(key, JSON.stringify(grant));
+
+      const response = await refresh(provider, client, tokens.refresh_token);
+      expect(response.status).toBe(200);
+      await expect(mockEnv.OAUTH_KV.get(key, { type: 'json' })).resolves.toMatchObject({
+        resource: configuredResource,
+      });
+    });
+
+    it('normalizes a grant whose stored resource differs only by scheme and host case', async () => {
+      const provider = createProvider();
+      const client = await registerClient(provider);
+      const tokens = await issueTokens(provider, client);
+      const { key, grant } = await getOnlyGrant();
+      grant.resource = 'HTTPS://EXAMPLE.COM/api';
+      await mockEnv.OAUTH_KV.put(key, JSON.stringify(grant));
+
+      const response = await refresh(provider, client, tokens.refresh_token);
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toMatchObject({ resource: configuredResource });
+      await expect(mockEnv.OAUTH_KV.get(key, { type: 'json' })).resolves.toMatchObject({
+        resource: configuredResource,
+      });
+    });
+
+    it('rejects a stored empty-fragment resource before refresh mutation', async () => {
+      const provider = createProvider();
+      const client = await registerClient(provider);
+      const tokens = await issueTokens(provider, client);
+      const { key, grant } = await getOnlyGrant();
+      grant.resource = configuredResource + '#';
+      await mockEnv.OAUTH_KV.put(key, JSON.stringify(grant));
+      const grantBefore = await mockEnv.OAUTH_KV.get(key);
+
+      const response = await refresh(provider, client, tokens.refresh_token);
+      expect(response.status).toBe(400);
+      await expect(response.json()).resolves.toMatchObject({ error: 'invalid_target' });
+      expect(await mockEnv.OAUTH_KV.get(key)).toBe(grantBefore);
+    });
+
+    it('does not rewrite a grant bound to a different resource', async () => {
+      const provider = createProvider();
+      const client = await registerClient(provider);
+      const tokens = await issueTokens(provider, client);
+      const { key, grant } = await getOnlyGrant();
+      grant.resource = 'https://example.com';
+      await mockEnv.OAUTH_KV.put(key, JSON.stringify(grant));
+      const grantBefore = await mockEnv.OAUTH_KV.get(key);
+
+      const blocked = await refresh(provider, client, tokens.refresh_token);
+      expect(blocked.status).toBe(400);
+      await expect(blocked.json()).resolves.toMatchObject({ error: 'invalid_target' });
+      expect(await mockEnv.OAUTH_KV.get(key)).toBe(grantBefore);
+    });
+
+    it('pins reconstructed authorization requests to canonical and rejects explicit mismatch', async () => {
       const provider = createProvider();
       await provider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
       const client = await mockEnv.OAUTH_PROVIDER!.createClient({
@@ -7704,32 +7175,34 @@ describe('OAuthProvider', () => {
         state: '',
       };
 
-      for (const request of [
-        { ...baseRequest, resource: [] },
-        { ...baseRequest, resource: ['not a URI'] },
-      ]) {
-        await expect(
-          mockEnv.OAUTH_PROVIDER!.completeAuthorization({
-            request,
-            userId: 'invalid-reconstructed-resource-user',
-            metadata: {},
-            scope: [],
-            props: {},
-          })
-        ).rejects.toMatchObject({ code: 'invalid_target' });
-      }
+      const result = await mockEnv.OAUTH_PROVIDER!.completeAuthorization({
+        request: baseRequest,
+        userId: 'resource-policy-user',
+        metadata: {},
+        scope: [],
+        props: {},
+      });
+      expect(new URL(result.redirectTo).searchParams.get('code')).toBeTruthy();
+      await expect(getOnlyGrant()).resolves.toMatchObject({
+        grant: { resource: configuredResource },
+      });
 
-      expect((await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys).toHaveLength(0);
-      expect((await mockEnv.OAUTH_KV.list({ prefix: 'token:' })).keys).toHaveLength(0);
+      await expect(
+        mockEnv.OAUTH_PROVIDER!.completeAuthorization({
+          request: { ...baseRequest, resource: 'https://other.example.com/api' },
+          userId: 'resource-policy-user',
+          metadata: {},
+          scope: [],
+          props: {},
+        })
+      ).rejects.toMatchObject({ code: 'invalid_target' });
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys).toHaveLength(1);
     });
 
-    it('should inherit the configured grant resource during token exchange', async () => {
-      const provider = createProvider(configuredResource, { allowTokenExchangeGrant: true });
+    it('requires token exchange subject and requested audiences to match canonical', async () => {
+      const provider = createProvider({ allowTokenExchangeGrant: true });
       const client = await registerClient(provider);
-      const authorization = await authorize(provider, client.client_id, [configuredResource]);
-      const code = new URL(authorization.headers.get('Location')!).searchParams.get('code')!;
-      const tokenResponse = await exchangeCode(provider, client, code, configuredResource);
-      const tokens = await tokenResponse.json<any>();
+      const tokens = await issueTokens(provider, client, [configuredResource], configuredResource);
 
       const exchanged = await mockEnv.OAUTH_PROVIDER!.exchangeToken({ subjectToken: tokens.access_token });
       expect(exchanged.resource).toBe(configuredResource);
@@ -7742,298 +7215,46 @@ describe('OAuthProvider', () => {
       ).rejects.toMatchObject({ code: 'invalid_target' });
     });
 
-    it('should reject a legacy origin-wide internal audience when a path resource is configured', async () => {
-      const permissiveProvider = createProvider();
-      const client = await registerClient(permissiveProvider);
-      const authorization = await authorize(permissiveProvider, client.client_id);
-      const code = new URL(authorization.headers.get('Location')!).searchParams.get('code')!;
-      const tokenResponse = await exchangeCode(permissiveProvider, client, code);
-      const tokens = await tokenResponse.json<any>();
-      const strictProvider = createProvider(configuredResource);
-
-      const response = await strictProvider.fetch(
+    it('requires exact canonical audiences for internal and external API tokens', async () => {
+      const provider = createProvider();
+      const client = await registerClient(provider);
+      const tokens = await issueTokens(provider, client);
+      const validRequest = () =>
         createMockRequest('https://example.com/api/test', 'GET', {
-          Authorization: `Bearer ${tokens.access_token}`,
-        }),
-        mockEnv,
-        mockCtx
-      );
+          Authorization: 'Bearer ' + tokens.access_token,
+        });
 
-      expect(response.status).toBe(401);
-      await expect(response.json()).resolves.toMatchObject({
-        error: 'invalid_token',
-        error_description: 'Access token is not bound to the configured resource',
-      });
-    });
+      expect((await provider.fetch(validRequest(), mockEnv, mockCtx)).status).toBe(200);
 
-    it('should reject absent and broader external audiences when a resource is configured', async () => {
-      const request = () =>
+      const tokenKey = (await mockEnv.OAUTH_KV.list({ prefix: 'token:' })).keys[0].name;
+      const token = (await mockEnv.OAUTH_KV.get(tokenKey, { type: 'json' })) as Token;
+      token.audience = 'https://example.com';
+      await mockEnv.OAUTH_KV.put(tokenKey, JSON.stringify(token));
+      expect((await provider.fetch(validRequest(), mockEnv, mockCtx)).status).toBe(401);
+
+      const externalRequest = () =>
         createMockRequest('https://example.com/api/test', 'GET', {
           Authorization: 'Bearer external-token',
         });
-      const withoutAudience = createProvider(configuredResource, {
+      const withoutAudience = createProvider({
+        // @ts-expect-error exercise runtime rejection of a pre-1.0 resolver result.
         resolveExternalToken: async () => ({ props: { external: true } }),
       });
-      const broadAudience = createProvider(configuredResource, {
+      const broadAudience = createProvider({
         resolveExternalToken: async () => ({ props: { external: true }, audience: 'https://example.com' }),
       });
-      const exactAudience = createProvider(configuredResource, {
+      const exactAudience = createProvider({
         resolveExternalToken: async () => ({ props: { external: true }, audience: configuredResource }),
       });
-
-      expect((await withoutAudience.fetch(request(), mockEnv, mockCtx)).status).toBe(401);
-      expect((await broadAudience.fetch(request(), mockEnv, mockCtx)).status).toBe(401);
-      expect((await exactAudience.fetch(request(), mockEnv, mockCtx)).status).toBe(200);
-    });
-  });
-
-  describe('resourceMatchOriginOnly option', () => {
-    let originMatchingProvider: OAuthProvider<TestEnv>;
-
-    beforeEach(() => {
-      originMatchingProvider = new OAuthProvider({
-        apiRoute: ['/api/', 'https://api.example.com/'],
-        apiHandler: TestApiHandler,
-        defaultHandler: testDefaultHandler,
-        authorizeEndpoint: '/authorize',
-        tokenEndpoint: '/oauth/token',
-        clientRegistrationEndpoint: '/oauth/register',
-        scopesSupported: ['read', 'write', 'profile'],
-        accessTokenTTL: 3600,
-        resourceMatchOriginOnly: true,
-      });
-    });
-
-    async function registerClientAndGetCode(
-      provider: OAuthProvider<TestEnv>,
-      resource: string
-    ): Promise<{ clientId: string; clientSecret: string; code: string; redirectUri: string }> {
-      const clientData = {
-        redirect_uris: ['https://client.example.com/callback'],
-        client_name: 'Test Client',
-        token_endpoint_auth_method: 'client_secret_post',
-      };
-      const registerResponse = await provider.fetch(
-        createMockRequest(
-          'https://example.com/oauth/register',
-          'POST',
-          { 'Content-Type': 'application/json' },
-          JSON.stringify(clientData)
-        ),
-        mockEnv,
-        mockCtx
-      );
-      const client = await registerResponse.json<any>();
-      const redirectUri = 'https://client.example.com/callback';
-
-      const authRequest = createMockRequest(
-        `https://example.com/authorize?response_type=code&client_id=${client.client_id}` +
-          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-          `&scope=read%20write&state=xyz123&resource=${encodeURIComponent(resource)}`
-      );
-      const authResponse = await provider.fetch(authRequest, mockEnv, mockCtx);
-      const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
-
-      return { clientId: client.client_id, clientSecret: client.client_secret, code, redirectUri };
-    }
-
-    it('should allow path-aware resource on token exchange when grant has origin-only resource', async () => {
-      // Grant issued with origin-only resource (pre-0.4.0 behavior)
-      const { clientId, clientSecret, code, redirectUri } = await registerClientAndGetCode(
-        originMatchingProvider,
-        'https://api1.example.com'
-      );
-
-      // Token exchange with path-aware resource (post-0.4.0 client behavior)
-      const params = new URLSearchParams();
-      params.append('grant_type', 'authorization_code');
-      params.append('code', code);
-      params.append('redirect_uri', redirectUri);
-      params.append('client_id', clientId);
-      params.append('client_secret', clientSecret);
-      params.append('resource', 'https://api1.example.com/mcp');
-
-      const tokenResponse = await originMatchingProvider.fetch(
-        createMockRequest(
-          'https://example.com/oauth/token',
-          'POST',
-          { 'Content-Type': 'application/x-www-form-urlencoded' },
-          params.toString()
-        ),
-        mockEnv,
-        mockCtx
-      );
-
-      expect(tokenResponse.status).toBe(200);
-      const tokens = await tokenResponse.json<any>();
-      expect(tokens.access_token).toBeDefined();
-      expect(tokens.refresh_token).toBeDefined();
-    });
-
-    it('should allow path-aware resource on refresh when grant has origin-only resource', async () => {
-      // Grant with origin-only resource
-      const { clientId, clientSecret, code, redirectUri } = await registerClientAndGetCode(
-        originMatchingProvider,
-        'https://api1.example.com'
-      );
-
-      // Initial token exchange (origin-only, matching grant)
-      const params = new URLSearchParams();
-      params.append('grant_type', 'authorization_code');
-      params.append('code', code);
-      params.append('redirect_uri', redirectUri);
-      params.append('client_id', clientId);
-      params.append('client_secret', clientSecret);
-      params.append('resource', 'https://api1.example.com');
-
-      const tokenResponse = await originMatchingProvider.fetch(
-        createMockRequest(
-          'https://example.com/oauth/token',
-          'POST',
-          { 'Content-Type': 'application/x-www-form-urlencoded' },
-          params.toString()
-        ),
-        mockEnv,
-        mockCtx
-      );
-      const tokens = await tokenResponse.json<any>();
-
-      // Refresh with path-aware resource (simulating post-upgrade client)
-      const refreshParams = new URLSearchParams();
-      refreshParams.append('grant_type', 'refresh_token');
-      refreshParams.append('refresh_token', tokens.refresh_token);
-      refreshParams.append('client_id', clientId);
-      refreshParams.append('client_secret', clientSecret);
-      refreshParams.append('resource', 'https://api1.example.com/mcp');
-
-      const refreshResponse = await originMatchingProvider.fetch(
-        createMockRequest(
-          'https://example.com/oauth/token',
-          'POST',
-          { 'Content-Type': 'application/x-www-form-urlencoded' },
-          refreshParams.toString()
-        ),
-        mockEnv,
-        mockCtx
-      );
-
-      expect(refreshResponse.status).toBe(200);
-      const refreshedTokens = await refreshResponse.json<any>();
-      expect(refreshedTokens.access_token).toBeDefined();
-    });
-
-    it('should reject an invalid refresh resource without rotating or mutating the grant', async () => {
-      const { clientId, clientSecret, code, redirectUri } = await registerClientAndGetCode(
-        originMatchingProvider,
-        'https://api1.example.com'
-      );
-      const exchangeParams = new URLSearchParams({
-        grant_type: 'authorization_code',
-        code,
-        redirect_uri: redirectUri,
-        client_id: clientId,
-        client_secret: clientSecret,
-        resource: 'https://api1.example.com',
-      });
-      const tokenResponse = await originMatchingProvider.fetch(
-        createMockRequest(
-          'https://example.com/oauth/token',
-          'POST',
-          { 'Content-Type': 'application/x-www-form-urlencoded' },
-          exchangeParams.toString()
-        ),
-        mockEnv,
-        mockCtx
-      );
-      const tokens = await tokenResponse.json<any>();
-      const grantKey = (await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys[0].name;
-      const grantBefore = await mockEnv.OAUTH_KV.get(grantKey);
-      const refreshParams = new URLSearchParams({
-        grant_type: 'refresh_token',
-        refresh_token: tokens.refresh_token,
-        client_id: clientId,
-        client_secret: clientSecret,
-        resource: 'https://evil.example.com/mcp',
+      const malformedAudience = createProvider({
+        resolveExternalToken: async () =>
+          ({ props: { external: true }, audience: { unexpected: true } }) as unknown as ResolveExternalTokenResult,
       });
 
-      const response = await originMatchingProvider.fetch(
-        createMockRequest(
-          'https://example.com/oauth/token',
-          'POST',
-          { 'Content-Type': 'application/x-www-form-urlencoded' },
-          refreshParams.toString()
-        ),
-        mockEnv,
-        mockCtx
-      );
-
-      expect(response.status).toBe(400);
-      await expect(response.json()).resolves.toMatchObject({ error: 'invalid_target' });
-      expect(await mockEnv.OAUTH_KV.get(grantKey)).toBe(grantBefore);
-      expect((await mockEnv.OAUTH_KV.list({ prefix: 'token:' })).keys).toHaveLength(1);
-    });
-
-    it('should still reject different origins even with resourceMatchOriginOnly enabled', async () => {
-      const { clientId, clientSecret, code, redirectUri } = await registerClientAndGetCode(
-        originMatchingProvider,
-        'https://api1.example.com'
-      );
-
-      // Try token exchange with completely different origin
-      const params = new URLSearchParams();
-      params.append('grant_type', 'authorization_code');
-      params.append('code', code);
-      params.append('redirect_uri', redirectUri);
-      params.append('client_id', clientId);
-      params.append('client_secret', clientSecret);
-      params.append('resource', 'https://evil.example.com/mcp');
-
-      const tokenResponse = await originMatchingProvider.fetch(
-        createMockRequest(
-          'https://example.com/oauth/token',
-          'POST',
-          { 'Content-Type': 'application/x-www-form-urlencoded' },
-          params.toString()
-        ),
-        mockEnv,
-        mockCtx
-      );
-
-      expect(tokenResponse.status).toBe(400);
-      const error = await tokenResponse.json<any>();
-      expect(error.error).toBe('invalid_target');
-    });
-
-    it('should reject path-aware resource without the flag (default strict matching)', async () => {
-      // Use the default oauthProvider (no resourceMatchOriginOnly)
-      const { clientId, clientSecret, code, redirectUri } = await registerClientAndGetCode(
-        oauthProvider,
-        'https://api1.example.com'
-      );
-
-      // Token exchange with path-aware resource — should fail with strict matching
-      const params = new URLSearchParams();
-      params.append('grant_type', 'authorization_code');
-      params.append('code', code);
-      params.append('redirect_uri', redirectUri);
-      params.append('client_id', clientId);
-      params.append('client_secret', clientSecret);
-      params.append('resource', 'https://api1.example.com/mcp');
-
-      const tokenResponse = await oauthProvider.fetch(
-        createMockRequest(
-          'https://example.com/oauth/token',
-          'POST',
-          { 'Content-Type': 'application/x-www-form-urlencoded' },
-          params.toString()
-        ),
-        mockEnv,
-        mockCtx
-      );
-
-      expect(tokenResponse.status).toBe(400);
-      const error = await tokenResponse.json<any>();
-      expect(error.error).toBe('invalid_target');
+      expect((await withoutAudience.fetch(externalRequest(), mockEnv, mockCtx)).status).toBe(401);
+      expect((await broadAudience.fetch(externalRequest(), mockEnv, mockCtx)).status).toBe(401);
+      expect((await exactAudience.fetch(externalRequest(), mockEnv, mockCtx)).status).toBe(200);
+      expect((await malformedAudience.fetch(externalRequest(), mockEnv, mockCtx)).status).toBe(401);
     });
   });
 
@@ -8387,7 +7608,7 @@ describe('OAuthProvider', () => {
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
-        resolveExternalToken: async () => ({ props: {} }),
+        resolveExternalToken: async () => ({ props: {}, audience: TEST_RESOURCE }),
       });
       const request = createMockRequest('https://example.com/api/test', 'GET', {
         Origin: 'https://client.example.com',
@@ -10446,7 +9667,7 @@ describe('OAuthProvider', () => {
         resolveExternalToken: async ({ env }) => {
           expectTypeOf(env).toEqualTypeOf<ResolverEnv>();
           expect(env.TOKEN_ISSUER).toBe('https://issuer.example.com');
-          return { props: { source: env.TOKEN_ISSUER } };
+          return { props: { source: env.TOKEN_ISSUER }, audience: TEST_RESOURCE };
         },
       });
 
@@ -10509,6 +9730,7 @@ describe('OAuthProvider', () => {
           // Simulate successful external token validation
           if (input.token === 'external-valid-token') {
             return {
+              audience: TEST_RESOURCE,
               props: {
                 userId: 'external-user-456',
                 username: 'ExternalUser',
@@ -10606,9 +9828,7 @@ describe('OAuthProvider', () => {
 
       expect(response.status).toBe(401);
       expect(response.headers.get('Cache-Control')).toBe('no-store');
-      expect(response.headers.get('WWW-Authenticate')).toBe(
-        'Bearer realm="OAuth", resource_metadata="https://example.com/.well-known/oauth-protected-resource/api/test", error="invalid_token"'
-      );
+      expect(response.headers.get('WWW-Authenticate')).toBe('Bearer realm="OAuth", error="invalid_token"');
       await expect(response.json()).resolves.toEqual({
         error: 'invalid_token',
         error_description: 'external token expired',
@@ -10643,7 +9863,7 @@ describe('OAuthProvider', () => {
       expect(response.status).toBe(403);
       expect(response.headers.get('X-Trace-Id')).toBe('trace-123');
       expect(response.headers.get('WWW-Authenticate')).toBe(
-        'Bearer realm="OAuth", resource_metadata="https://example.com/.well-known/oauth-protected-resource/api/test", error="insufficient_scope", scope="account:read profile:read"'
+        'Bearer realm="OAuth", error="insufficient_scope", scope="account:read profile:read"'
       );
       expect(response.headers.get('WWW-Authenticate')).not.toContain('baseline:read');
       expect(response.headers.get('WWW-Authenticate')).not.toContain('offline_access');
@@ -10830,6 +10050,7 @@ describe('OAuthProvider', () => {
         resolveExternalToken: async (input) => {
           externalTokenCalls.push({ token: input.token });
           return {
+            audience: TEST_RESOURCE,
             props: { source: 'external', shouldNeverSeeThis: true },
           };
         },
@@ -10920,6 +10141,7 @@ describe('OAuthProvider', () => {
           // Even if token looks like internal format, treat it as external
           if (input.token === 'user123:grant456:secret789') {
             return {
+              audience: TEST_RESOURCE,
               props: {
                 userId: 'external-user-from-mimicked-token',
                 source: 'external-service',
@@ -10966,6 +10188,7 @@ describe('OAuthProvider', () => {
           // Handle JWT-like tokens
           if (input.token.startsWith('eyJ')) {
             return {
+              audience: TEST_RESOURCE,
               props: {
                 userId: 'jwt-user',
                 tokenType: 'jwt',
@@ -10977,6 +10200,7 @@ describe('OAuthProvider', () => {
           // Handle simple bearer tokens
           if (input.token === 'simple-bearer-token') {
             return {
+              audience: TEST_RESOURCE,
               props: {
                 userId: 'bearer-user',
                 tokenType: 'bearer',
@@ -11033,6 +10257,7 @@ describe('OAuthProvider', () => {
 
           if (input.token === 'async-valid-token') {
             return {
+              audience: TEST_RESOURCE,
               props: {
                 userId: 'async-user',
                 validatedAt: new Date().toISOString(),
