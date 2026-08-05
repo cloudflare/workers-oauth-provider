@@ -1,0 +1,19 @@
+__tests__/oauth-provider.test.ts
+  s_efcb44b158a516::t_8df4729e0fa3de 957-958,990,1005-1006,2424,2553,2563,2584,2602,2611,2632-2634,2637,2653,2655,2671,2786-2787,2796,2809,10074,10088-10089,10091-10092,10094-10095,10097,10100,10102-10103,10106-10107,10109,10111-10112,10134-10135,10150,10152,10155,10158-10159
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8771687e82fd9bec44bebffbdd03af7a1bc91626",
+  "prompts": {},
+  "sessions": {
+    "s_efcb44b158a516": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "019fd2fc-f5b3-70fc-9b8d-2c293ef2434c",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Matt Carey <mcarey@cloudflare.com>"
+    }
+  }
+}
