@@ -14,6 +14,7 @@ interface AuthorizationServerMetadata {
   issuer: string;
   authorization_endpoint: string;
   token_endpoint: string;
+  protected_resources: string[];
   registration_endpoint?: string;
   revocation_endpoint: string;
   response_types_supported: string[];
@@ -42,6 +43,7 @@ describe.each(MCP_AUTH_REVISIONS)('MCP %s authorization server conformance', (re
       issuer: CONFORMANCE_ORIGIN,
       authorization_endpoint: `${CONFORMANCE_ORIGIN}/authorize`,
       token_endpoint: `${CONFORMANCE_ORIGIN}/oauth/token`,
+      protected_resources: [MCP_RESOURCE],
       registration_endpoint: `${CONFORMANCE_ORIGIN}/oauth/register`,
       revocation_endpoint: `${CONFORMANCE_ORIGIN}/oauth/token`,
       response_types_supported: ['code'],
