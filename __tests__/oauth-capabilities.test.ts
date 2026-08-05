@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   AuthorizationError,
   buildOAuthServerCapabilities,
+  negotiateCimdClientCapabilities,
   normalizePkceCodeChallengeMethod,
   validateAuthorizationPkce,
   validateAuthorizationResponseType,
@@ -88,6 +89,65 @@ describe('OAuth server capabilities', () => {
         responseTypes: ['code'],
       })
     ).not.toThrow();
+  });
+
+  it('negotiates a supported CIMD subset from additional advertised capabilities', () => {
+    expect(
+      negotiateCimdClientCapabilities(defaults, {
+        tokenEndpointAuthMethod: 'none',
+        grantTypes: ['authorization_code', 'refresh_token', 'urn:ietf:params:oauth:grant-type:jwt-bearer'],
+        responseTypes: ['code', 'id_token'],
+      })
+    ).toEqual({
+      tokenEndpointAuthMethod: 'none',
+      grantTypes: ['authorization_code', 'refresh_token'],
+      responseTypes: ['code'],
+    });
+  });
+
+  it('does not enable capabilities that a CIMD client omitted', () => {
+    expect(
+      negotiateCimdClientCapabilities(defaults, {
+        tokenEndpointAuthMethod: 'none',
+        grantTypes: ['urn:example:unsupported-grant'],
+        responseTypes: ['id_token'],
+      })
+    ).toEqual({
+      tokenEndpointAuthMethod: 'none',
+      grantTypes: [],
+      responseTypes: [],
+    });
+  });
+
+  it('retains JWT bearer when enterprise-managed authorization is enabled', () => {
+    const withEnterpriseManagedAuthorization = buildOAuthServerCapabilities({
+      allowImplicitFlow: false,
+      allowPlainPKCE: false,
+      allowTokenExchangeGrant: false,
+      enterpriseManagedAuthorization: true,
+    });
+
+    expect(
+      negotiateCimdClientCapabilities(withEnterpriseManagedAuthorization, {
+        tokenEndpointAuthMethod: 'none',
+        grantTypes: ['authorization_code', 'refresh_token', 'urn:ietf:params:oauth:grant-type:jwt-bearer'],
+        responseTypes: ['code'],
+      })
+    ).toEqual({
+      tokenEndpointAuthMethod: 'none',
+      grantTypes: ['authorization_code', 'refresh_token', 'urn:ietf:params:oauth:grant-type:jwt-bearer'],
+      responseTypes: ['code'],
+    });
+  });
+
+  it('rejects an inconsistent effective CIMD capability subset', () => {
+    expect(() =>
+      negotiateCimdClientCapabilities(defaults, {
+        tokenEndpointAuthMethod: 'none',
+        grantTypes: ['authorization_code', 'urn:example:unsupported-grant'],
+        responseTypes: ['id_token'],
+      })
+    ).toThrow('grant_types authorization_code and response_types code must be registered together');
   });
 });
 

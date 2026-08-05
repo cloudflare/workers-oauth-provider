@@ -4,6 +4,7 @@ import {
   AuthorizationError,
   buildOAuthServerCapabilities,
   isValidOAuthScopeToken,
+  negotiateCimdClientCapabilities,
   normalizePkceCodeChallengeMethod,
   validateAuthorizationPkce,
   validateAuthorizationResponseType,
@@ -4451,17 +4452,18 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         );
       }
 
-      const grantTypes = OAuthProviderImpl.validateStringArray(rawMetadata.grant_types, 'grant_types') || [
+      const advertisedGrantTypes = OAuthProviderImpl.validateStringArray(rawMetadata.grant_types, 'grant_types') || [
         GrantType.AUTHORIZATION_CODE,
       ];
-      const responseTypes = OAuthProviderImpl.validateStringArray(rawMetadata.response_types, 'response_types') || [
-        'code',
-      ];
+      const advertisedResponseTypes = OAuthProviderImpl.validateStringArray(
+        rawMetadata.response_types,
+        'response_types'
+      ) || ['code'];
       const effectiveAuthMethod = tokenEndpointAuthMethod || 'none';
-      validateClientCapabilities(this.serverCapabilities, {
+      const { grantTypes, responseTypes } = negotiateCimdClientCapabilities(this.serverCapabilities, {
         tokenEndpointAuthMethod: effectiveAuthMethod,
-        grantTypes,
-        responseTypes,
+        grantTypes: advertisedGrantTypes,
+        responseTypes: advertisedResponseTypes,
       });
 
       return {

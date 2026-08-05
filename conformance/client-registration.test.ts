@@ -102,7 +102,7 @@ describe.each(mcpAuthRevisionsSince('2025-11-25'))('MCP %s client registration c
     expect(tokens.access_token).toBeTruthy();
   });
 
-  it('advertises CIMD and completes a public-client flow from a metadata document', async () => {
+  it('negotiates CIMD capabilities and completes a public-client flow from a metadata document', async () => {
     const clientId = 'https://client.example.com/oauth/client-metadata.json';
     const client: OAuthClientCredentials = {
       clientId,
@@ -115,8 +115,8 @@ describe.each(mcpAuthRevisionsSince('2025-11-25'))('MCP %s client registration c
         client_id: clientId,
         client_name: 'MCP CIMD conformance client',
         redirect_uris: [CLIENT_REDIRECT_URI],
-        grant_types: ['authorization_code', 'refresh_token'],
-        response_types: ['code'],
+        grant_types: ['authorization_code', 'refresh_token', 'urn:ietf:params:oauth:grant-type:jwt-bearer'],
+        response_types: ['code', 'id_token'],
         token_endpoint_auth_method: 'none',
       });
     });
