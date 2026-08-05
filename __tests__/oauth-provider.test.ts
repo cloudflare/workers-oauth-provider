@@ -4,6 +4,7 @@ import {
   CimdFetchError,
   ExternalTokenError,
   OAuthError,
+  OAuthAuthorizationServer,
   OAuthProvider as BaseOAuthProvider,
   type OAuthHelpers,
   type OAuthProviderOptions,
@@ -564,42 +565,6 @@ describe('OAuthProvider', () => {
       // Implicit flow is enabled in the default test provider, so fragment mode should be advertised
       expect(metadata.response_modes_supported).toContain('query');
       expect(metadata.response_modes_supported).toContain('fragment');
-    });
-
-    it('should advertise its protected resource independently of the authorization server origin', async () => {
-      const splitProvider = new OAuthProvider({
-        apiRoute: ['/api/'],
-        apiHandler: TestApiHandler,
-        defaultHandler: testDefaultHandler,
-        authorizeEndpoint: 'https://auth.example.com/authorize',
-        tokenEndpoint: 'https://auth.example.com/oauth/token',
-        resourceMetadata: {
-          resource: 'https://mcp.example.com/mcp',
-          authorization_servers: ['https://auth.example.com'],
-        },
-      });
-      const response = await splitProvider.fetch(
-        createMockRequest('https://auth.example.com/.well-known/oauth-authorization-server'),
-        mockEnv,
-        mockCtx
-      );
-
-      expect(response.status).toBe(200);
-      await expect(response.json()).resolves.toMatchObject({
-        issuer: 'https://auth.example.com',
-        protected_resources: ['https://mcp.example.com/mcp'],
-      });
-
-      const resourceResponse = await splitProvider.fetch(
-        createMockRequest('https://mcp.example.com/.well-known/oauth-protected-resource/mcp'),
-        mockEnv,
-        mockCtx
-      );
-      expect(resourceResponse.status).toBe(200);
-      await expect(resourceResponse.json()).resolves.toMatchObject({
-        resource: 'https://mcp.example.com/mcp',
-        authorization_servers: ['https://auth.example.com'],
-      });
     });
 
     it('should not include fragment response mode when implicit flow is disabled', async () => {
@@ -14106,6 +14071,579 @@ describe('OAuthProvider', () => {
       // Should purge the orphaned grant using grantData.id and grantData.userId
       expect(result.grantsPurged).toBe(1);
       expect(result.done).toBe(true);
+    });
+  });
+});
+
+describe('functional authorization-server and resource-server composition', () => {
+  const issuer = 'https://auth.example.com';
+  const calendarResource = 'https://calendar.example.com/mcp';
+  const driveResource = 'https://drive.example.com/mcp';
+  let env: TestEnv;
+  let ctx: MockExecutionContext;
+
+  beforeEach(() => {
+    env = createMockEnv();
+    ctx = new MockExecutionContext();
+  });
+
+  function resourceHandler(name: string) {
+    return {
+      fetch(_request: Request, _env: TestEnv, executionContext: ExecutionContext) {
+        return Response.json({ name, props: (executionContext as MockExecutionContext).props });
+      },
+    };
+  }
+
+  function createRoles(policy: { defaultResource?: string; legacyGrantResource?: string } = {}) {
+    const authorizationServer = new OAuthAuthorizationServer<TestEnv>({
+      issuer,
+      authorizeEndpoint: '/authorize',
+      tokenEndpoint: '/oauth/token',
+      clientRegistrationEndpoint: '/oauth/register',
+      scopesSupported: ['calendar:read', 'drive:read'],
+      ...policy,
+    });
+    const calendar = authorizationServer.protectResource({
+      resourceMetadata: {
+        resource: calendarResource,
+        scopes_supported: ['calendar:read'],
+        resource_name: 'Calendar MCP',
+      },
+      handler: resourceHandler('calendar'),
+    });
+    const drive = authorizationServer.protectResource({
+      resourceMetadata: {
+        resource: driveResource,
+        scopes_supported: ['drive:read'],
+        resource_name: 'Drive MCP',
+      },
+      handler: resourceHandler('drive'),
+    });
+    return { authorizationServer, calendar, drive };
+  }
+
+  async function registerClient(authorizationServer: OAuthAuthorizationServer<TestEnv>) {
+    const response = await authorizationServer.fetch(
+      createMockRequest(
+        `${issuer}/oauth/register`,
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify({
+          redirect_uris: ['https://client.example.com/callback'],
+          token_endpoint_auth_method: 'client_secret_post',
+        })
+      ),
+      env,
+      ctx
+    );
+    expect(response.status).toBe(201);
+    return response.json<any>();
+  }
+
+  async function authorize(
+    authorizationServer: OAuthAuthorizationServer<TestEnv>,
+    client: any,
+    resources: string[] = []
+  ): Promise<string> {
+    const url = new URL(`${issuer}/authorize`);
+    url.searchParams.set('response_type', 'code');
+    url.searchParams.set('client_id', client.client_id);
+    url.searchParams.set('redirect_uri', 'https://client.example.com/callback');
+    url.searchParams.set('scope', resources[0] === driveResource ? 'drive:read' : 'calendar:read');
+    url.searchParams.set('state', 'state');
+    for (const resource of resources) url.searchParams.append('resource', resource);
+    const oauth = authorizationServer.getOAuthApi(env);
+    const request = await oauth.parseAuthRequest(createMockRequest(url.href));
+    const { redirectTo } = await oauth.completeAuthorization({
+      request,
+      userId: 'test-user-123',
+      metadata: { testConsent: true },
+      scope: request.scope,
+      props: { userId: 'test-user-123', username: 'TestUser' },
+    });
+    return new URL(redirectTo).searchParams.get('code')!;
+  }
+
+  async function exchangeCode(
+    authorizationServer: OAuthAuthorizationServer<TestEnv>,
+    client: any,
+    code: string,
+    resource?: string
+  ) {
+    const body = new URLSearchParams({
+      grant_type: 'authorization_code',
+      code,
+      client_id: client.client_id,
+      client_secret: client.client_secret,
+      redirect_uri: 'https://client.example.com/callback',
+    });
+    if (resource) body.set('resource', resource);
+    return authorizationServer.fetch(
+      createMockRequest(
+        `${issuer}/oauth/token`,
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body.toString()
+      ),
+      env,
+      ctx
+    );
+  }
+
+  async function issueTokens(authorizationServer: OAuthAuthorizationServer<TestEnv>, client: any, resource?: string) {
+    const code = await authorize(authorizationServer, client, resource ? [resource] : []);
+    const response = await exchangeCode(authorizationServer, client, code);
+    expect(response.status).toBe(200);
+    return response.json<any>();
+  }
+
+  async function refresh(
+    authorizationServer: OAuthAuthorizationServer<TestEnv>,
+    client: any,
+    refreshToken: string,
+    resource?: string
+  ) {
+    const body = new URLSearchParams({
+      grant_type: 'refresh_token',
+      refresh_token: refreshToken,
+      client_id: client.client_id,
+      client_secret: client.client_secret,
+    });
+    if (resource) body.set('resource', resource);
+    return authorizationServer.fetch(
+      createMockRequest(
+        `${issuer}/oauth/token`,
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body.toString()
+      ),
+      env,
+      ctx
+    );
+  }
+
+  it('publishes one AS and independent metadata for two routed MCP resources', async () => {
+    const { authorizationServer, calendar, drive } = createRoles();
+    const metadataResponse = await authorizationServer.fetch(
+      createMockRequest(`${issuer}/.well-known/oauth-authorization-server`),
+      env,
+      ctx
+    );
+    expect(metadataResponse.status).toBe(200);
+    await expect(metadataResponse.json()).resolves.toMatchObject({
+      issuer,
+      authorization_endpoint: `${issuer}/authorize`,
+      token_endpoint: `${issuer}/oauth/token`,
+      protected_resources: [calendarResource, driveResource],
+    });
+
+    const metadataPost = await authorizationServer.fetch(
+      createMockRequest(`${issuer}/.well-known/oauth-authorization-server`, 'POST'),
+      env,
+      ctx
+    );
+    expect(metadataPost.status).toBe(405);
+    expect(metadataPost.headers.get('Allow')).toBe('GET');
+
+    const calendarMetadata = await calendar.fetch(
+      createMockRequest('https://calendar.example.com/.well-known/oauth-protected-resource/mcp'),
+      env,
+      ctx
+    );
+    await expect(calendarMetadata.json()).resolves.toMatchObject({
+      resource: calendarResource,
+      authorization_servers: [issuer],
+      resource_name: 'Calendar MCP',
+    });
+
+    const calendarMetadataPost = await calendar.fetch(
+      createMockRequest('https://calendar.example.com/.well-known/oauth-protected-resource/mcp', 'POST'),
+      env,
+      ctx
+    );
+    expect(calendarMetadataPost.status).toBe(405);
+    expect(calendarMetadataPost.headers.get('Allow')).toBe('GET');
+
+    const driveMetadata = await drive.fetch(
+      createMockRequest('https://drive.example.com/.well-known/oauth-protected-resource/mcp'),
+      env,
+      ctx
+    );
+    await expect(driveMetadata.json()).resolves.toMatchObject({
+      resource: driveResource,
+      authorization_servers: [issuer],
+      resource_name: 'Drive MCP',
+    });
+
+    expect(
+      (
+        await calendar.fetch(
+          createMockRequest('https://calendar.example.com/.well-known/oauth-authorization-server'),
+          env,
+          ctx
+        )
+      ).status
+    ).toBe(404);
+
+    expect(
+      (
+        await authorizationServer.fetch(
+          createMockRequest('https://calendar.example.com/.well-known/oauth-authorization-server'),
+          env,
+          ctx
+        )
+      ).status
+    ).toBe(404);
+  });
+
+  it('removes a path issuer trailing slash when deriving RFC 8414 discovery', async () => {
+    const pathIssuer = 'https://auth.example.com/tenant///';
+    const authorizationServer = new OAuthAuthorizationServer<TestEnv>({
+      issuer: pathIssuer,
+      authorizeEndpoint: '/tenant/authorize',
+      tokenEndpoint: '/tenant/oauth/token',
+    }).registerResource(calendarResource);
+
+    const response = await authorizationServer.fetch(
+      createMockRequest('https://auth.example.com/.well-known/oauth-authorization-server/tenant'),
+      env,
+      ctx
+    );
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({ issuer: pathIssuer });
+
+    expect(
+      (
+        await authorizationServer.fetch(
+          createMockRequest('https://auth.example.com/.well-known/oauth-authorization-server/tenant/'),
+          env,
+          ctx
+        )
+      ).status
+    ).toBe(404);
+  });
+
+  it.each(['https://auth.example.com/x|y', 'https://auth.example.com/x^y'])(
+    'rejects an RFC 3986-unsafe issuer %s',
+    (unsafeIssuer) => {
+      expect(
+        () =>
+          new OAuthAuthorizationServer<TestEnv>({
+            issuer: unsafeIssuer,
+            authorizeEndpoint: '/authorize',
+            tokenEndpoint: '/oauth/token',
+          })
+      ).toThrow('authorizationServer.issuer');
+    }
+  );
+
+  it('requires secure fragment-free endpoints in the role-based API', () => {
+    expect(
+      () =>
+        new OAuthAuthorizationServer<TestEnv>({
+          issuer,
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: 'http://auth.example.com/oauth/token',
+        })
+    ).toThrow('tokenEndpoint must be an absolute HTTPS URL');
+
+    expect(
+      () =>
+        new OAuthAuthorizationServer<TestEnv>({
+          issuer,
+          authorizeEndpoint: '/authorize#consent',
+          tokenEndpoint: '/oauth/token',
+        })
+    ).toThrow('authorizeEndpoint must not contain a fragment');
+
+    expect(
+      () =>
+        new OAuthAuthorizationServer<TestEnv>({
+          issuer,
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: 'https://user:password@auth.example.com/oauth/token',
+        })
+    ).toThrow('tokenEndpoint must be an absolute HTTPS URL');
+  });
+
+  it('rejects exact collisions between provider-owned AS endpoints', () => {
+    expect(
+      () =>
+        new OAuthAuthorizationServer<TestEnv>({
+          issuer,
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: '/oauth',
+          clientRegistrationEndpoint: '/oauth',
+        })
+    ).toThrow('clientRegistrationEndpoint must not collide with tokenEndpoint');
+
+    expect(
+      () =>
+        new OAuthAuthorizationServer<TestEnv>({
+          issuer,
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: '/.well-known/oauth-authorization-server',
+        })
+    ).toThrow('tokenEndpoint must not collide with the authorization server metadata endpoint');
+
+    expect(
+      () =>
+        new OAuthAuthorizationServer<TestEnv>({
+          issuer,
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: '/oauth/token',
+          clientRegistrationEndpoint: '/.well-known/oauth-authorization-server',
+        })
+    ).toThrow('clientRegistrationEndpoint must not collide with the authorization server metadata endpoint');
+  });
+
+  it('retains static authorization queries and distinguishes same-path AS endpoints', async () => {
+    const authorizationServer = new OAuthAuthorizationServer<TestEnv>({
+      issuer,
+      authorizeEndpoint: '/authorize?tenant=calendar',
+      tokenEndpoint: `${issuer}/oauth?operation=token`,
+      clientRegistrationEndpoint: `${issuer}/oauth?operation=register`,
+    }).registerResource(calendarResource);
+    const oauth = authorizationServer.getOAuthApi(env);
+    const client = await oauth.createClient({
+      redirectUris: ['https://client.example.com/callback'],
+      tokenEndpointAuthMethod: 'client_secret_post',
+    });
+
+    const authorizationUrl = new URL(`${issuer}/authorize?tenant=calendar`);
+    authorizationUrl.searchParams.set('response_type', 'code');
+    authorizationUrl.searchParams.set('client_id', client.clientId);
+    authorizationUrl.searchParams.set('redirect_uri', 'https://client.example.com/callback');
+    await expect(oauth.parseAuthRequest(createMockRequest(authorizationUrl.href))).resolves.toMatchObject({
+      clientId: client.clientId,
+      resource: calendarResource,
+    });
+
+    authorizationUrl.searchParams.set('tenant', 'drive');
+    await expect(oauth.parseAuthRequest(createMockRequest(authorizationUrl.href))).rejects.toMatchObject({
+      description: 'Authorization request was sent to an unconfigured endpoint',
+    });
+
+    authorizationUrl.searchParams.delete('tenant');
+    authorizationUrl.searchParams.append('tenant', 'drive');
+    authorizationUrl.searchParams.append('tenant', 'calendar');
+    await expect(oauth.parseAuthRequest(createMockRequest(authorizationUrl.href))).rejects.toMatchObject({
+      description: 'Authorization request was sent to an unconfigured endpoint',
+    });
+
+    const registrationResponse = await authorizationServer.fetch(
+      createMockRequest(
+        `${issuer}/oauth?operation=register`,
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify({
+          redirect_uris: ['https://client.example.com/callback'],
+          token_endpoint_auth_method: 'none',
+        })
+      ),
+      env,
+      ctx
+    );
+    expect(registrationResponse.status).toBe(201);
+
+    const missingQueryResponse = await authorizationServer.fetch(
+      createMockRequest(
+        `${issuer}/oauth`,
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify({ redirect_uris: ['https://client.example.com/callback'] })
+      ),
+      env,
+      ctx
+    );
+    expect(missingQueryResponse.status).toBe(404);
+  });
+
+  it('snapshots protected-resource metadata during registration', async () => {
+    const resourceMetadata = {
+      resource: calendarResource,
+      authorization_servers: [issuer],
+      scopes_supported: ['calendar:read'],
+    };
+    const authorizationServer = new OAuthAuthorizationServer<TestEnv>({
+      issuer,
+      authorizeEndpoint: '/authorize',
+      tokenEndpoint: '/oauth/token',
+    });
+    const calendar = authorizationServer.protectResource({
+      resourceMetadata,
+      handler: resourceHandler('calendar'),
+    });
+
+    resourceMetadata.resource = 'https://mutated.example.com/mcp';
+    resourceMetadata.authorization_servers.push('https://mutated.example.com');
+    resourceMetadata.scopes_supported.push('mutated:scope');
+
+    const serverMetadata = await authorizationServer.fetch(
+      createMockRequest(`${issuer}/.well-known/oauth-authorization-server`),
+      env,
+      ctx
+    );
+    await expect(serverMetadata.json()).resolves.toMatchObject({ protected_resources: [calendarResource] });
+
+    const resourceResponse = await calendar.fetch(
+      createMockRequest('https://calendar.example.com/.well-known/oauth-protected-resource/mcp'),
+      env,
+      ctx
+    );
+    await expect(resourceResponse.json()).resolves.toMatchObject({
+      resource: calendarResource,
+      authorization_servers: [issuer],
+      scopes_supported: ['calendar:read'],
+    });
+  });
+
+  it('serves an explicitly configured token endpoint on another origin', async () => {
+    const tokenEndpoint = 'https://tokens.example.com/oauth/token';
+    const authorizationServer = new OAuthAuthorizationServer<TestEnv>({
+      issuer,
+      authorizeEndpoint: '/authorize',
+      tokenEndpoint,
+    }).registerResource(calendarResource);
+
+    const metadata = await authorizationServer.fetch(
+      createMockRequest(`${issuer}/.well-known/oauth-authorization-server`),
+      env,
+      ctx
+    );
+    await expect(metadata.json()).resolves.toMatchObject({ issuer, token_endpoint: tokenEndpoint });
+
+    const tokenResponse = await authorizationServer.fetch(
+      createMockRequest(
+        tokenEndpoint,
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        'grant_type=authorization_code'
+      ),
+      env,
+      ctx
+    );
+    expect(tokenResponse.status).toBe(401);
+    await expect(tokenResponse.json()).resolves.toMatchObject({ error: 'invalid_client' });
+  });
+
+  it('binds each grant to one resource and rejects it at the other MCP server', async () => {
+    const { authorizationServer, calendar, drive } = createRoles();
+    const client = await registerClient(authorizationServer);
+    const calendarTokens = await issueTokens(authorizationServer, client, calendarResource);
+    await expect(
+      authorizationServer.validateToken(calendarTokens.access_token, calendarResource, env)
+    ).resolves.toMatchObject({ audience: calendarResource, clientId: client.client_id });
+    await expect(
+      authorizationServer.validateToken(calendarTokens.access_token, driveResource, env)
+    ).resolves.toBeNull();
+
+    const calendarResponse = await calendar.fetch(
+      createMockRequest(calendarResource, 'GET', { Authorization: `Bearer ${calendarTokens.access_token}` }),
+      env,
+      ctx
+    );
+    expect(calendarResponse.status).toBe(200);
+    await expect(calendarResponse.json()).resolves.toMatchObject({ name: 'calendar' });
+
+    const replayAtDrive = await drive.fetch(
+      createMockRequest(driveResource, 'GET', { Authorization: `Bearer ${calendarTokens.access_token}` }),
+      env,
+      ctx
+    );
+    expect(replayAtDrive.status).toBe(401);
+
+    const driveTokens = await issueTokens(authorizationServer, client, driveResource);
+    expect(
+      (
+        await drive.fetch(
+          createMockRequest(driveResource, 'GET', { Authorization: `Bearer ${driveTokens.access_token}` }),
+          env,
+          ctx
+        )
+      ).status
+    ).toBe(200);
+
+    // Authorizing Drive must not replace the same user's Calendar grant.
+    expect(
+      (
+        await calendar.fetch(
+          createMockRequest(calendarResource, 'GET', { Authorization: `Bearer ${calendarTokens.access_token}` }),
+          env,
+          ctx
+        )
+      ).status
+    ).toBe(200);
+  });
+
+  it('requires one resource in an ambiguous authorization request', async () => {
+    const { authorizationServer } = createRoles();
+    const client = await registerClient(authorizationServer);
+
+    await expect(authorize(authorizationServer, client)).rejects.toMatchObject({ code: 'invalid_target' });
+    await expect(authorize(authorizationServer, client, [calendarResource, driveResource])).rejects.toMatchObject({
+      code: 'invalid_target',
+    });
+    await expect(authorize(authorizationServer, client, ['https://unknown.example.com/mcp'])).rejects.toMatchObject({
+      code: 'invalid_target',
+    });
+  });
+
+  it('supports an explicit compatibility default for clients that omit resource', async () => {
+    const { authorizationServer, calendar } = createRoles({ defaultResource: calendarResource });
+    const client = await registerClient(authorizationServer);
+    const tokens = await issueTokens(authorizationServer, client);
+    expect(tokens.resource).toBe(calendarResource);
+    expect(
+      (
+        await calendar.fetch(
+          createMockRequest(calendarResource, 'GET', { Authorization: `Bearer ${tokens.access_token}` }),
+          env,
+          ctx
+        )
+      ).status
+    ).toBe(200);
+  });
+
+  it('migrates an unbound old grant only to the server-selected legacy resource', async () => {
+    const { authorizationServer } = createRoles({ legacyGrantResource: calendarResource });
+    const client = await registerClient(authorizationServer);
+    const tokens = await issueTokens(authorizationServer, client, calendarResource);
+    const grantPage = await env.OAUTH_KV.list({ prefix: 'grant:' });
+    expect(grantPage.keys).toHaveLength(1);
+    const grantKey = grantPage.keys[0].name;
+    const legacyGrant = (await env.OAUTH_KV.get(grantKey, { type: 'json' })) as Grant;
+    delete legacyGrant.resource;
+    await env.OAUTH_KV.put(grantKey, JSON.stringify(legacyGrant));
+
+    const attemptedSwitch = await refresh(authorizationServer, client, tokens.refresh_token, driveResource);
+    expect(attemptedSwitch.status).toBe(400);
+    await expect(env.OAUTH_KV.get(grantKey, { type: 'json' })).resolves.not.toHaveProperty('resource');
+
+    const migrated = await refresh(authorizationServer, client, tokens.refresh_token);
+    expect(migrated.status).toBe(200);
+    await expect(migrated.json()).resolves.toMatchObject({ resource: calendarResource });
+    await expect(env.OAUTH_KV.get(grantKey, { type: 'json' })).resolves.toMatchObject({
+      resource: calendarResource,
+    });
+  });
+
+  it('can register remote audiences without hosting their handlers', async () => {
+    const authorizationServer = new OAuthAuthorizationServer<TestEnv>({
+      issuer,
+      authorizeEndpoint: '/authorize',
+      tokenEndpoint: '/oauth/token',
+    })
+      .registerResource(calendarResource)
+      .registerResource(driveResource);
+    const response = await authorizationServer.fetch(
+      createMockRequest(`${issuer}/.well-known/oauth-authorization-server`),
+      env,
+      ctx
+    );
+    await expect(response.json()).resolves.toMatchObject({
+      protected_resources: [calendarResource, driveResource],
     });
   });
 });

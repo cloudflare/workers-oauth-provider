@@ -152,6 +152,180 @@ Before calling a protected handler, the provider reads the bearer token, rejects
 
 Requests outside the protected route prefixes go to `defaultHandler`. In the example above, that handler owns `/authorize`.
 
+## One authorization server with multiple MCP resources
+
+`OAuthAuthorizationServer` separates the authorization-server role from each protected-resource role while keeping them composable. Call `protectResource()` once for every MCP resource hosted by the same Worker. Each call registers one canonical audience with the authorization server and returns a fetch handler that serves only that resource's RFC 9728 metadata, Bearer challenges, and protected API.
+
+The following optional example (`npm install hono`) binds one Worker to three custom domains and uses Hono's hostname-aware path function to route without a hostname `switch`. The application owns the interactive `/authorize` route; `authorizationServer.fetch()` owns discovery, token, revocation, and optional registration endpoints. The original `Request` is forwarded as `c.req.raw`, so authorization-server and protected-resource URL validation still sees the real origin.
+
+```ts
+import { Hono } from 'hono';
+import { OAuthAuthorizationServer } from '@cloudflare/workers-oauth-provider';
+
+const AUTH_ISSUER = 'https://auth.example.com';
+const CALENDAR_RESOURCE = 'https://calendar.example.com/mcp';
+const DRIVE_RESOURCE = 'https://drive.example.com/mcp';
+
+interface Env {
+  OAUTH_KV: KVNamespace;
+}
+
+interface AuthProps {
+  userId: string;
+  scopes: string[];
+}
+
+const authorizationServer = new OAuthAuthorizationServer<Env>({
+  issuer: AUTH_ISSUER,
+  authorizeEndpoint: '/authorize',
+  tokenEndpoint: '/oauth/token',
+  clientRegistrationEndpoint: '/oauth/register',
+  scopesSupported: ['calendar:read', 'drive:read'],
+});
+
+const calendar = authorizationServer.protectResource<AuthProps>({
+  resourceMetadata: {
+    resource: CALENDAR_RESOURCE,
+    scopes_supported: ['calendar:read'],
+    resource_name: 'Calendar MCP',
+  },
+  handler: {
+    async fetch(_request, _env, ctx) {
+      if (!ctx.props.scopes.includes('calendar:read')) return new Response('Forbidden', { status: 403 });
+      return Response.json({ userId: ctx.props.userId, server: 'calendar' });
+    },
+  },
+});
+
+const drive = authorizationServer.protectResource<AuthProps>({
+  resourceMetadata: {
+    resource: DRIVE_RESOURCE,
+    scopes_supported: ['drive:read'],
+    resource_name: 'Drive MCP',
+  },
+  handler: {
+    async fetch(_request, _env, ctx) {
+      if (!ctx.props.scopes.includes('drive:read')) return new Response('Forbidden', { status: 403 });
+      return Response.json({ userId: ctx.props.userId, server: 'drive' });
+    },
+  },
+});
+
+const app = new Hono<{ Bindings: Env }>({
+  getPath(request) {
+    const url = new URL(request.url);
+    return `/${url.hostname}${url.pathname}`;
+  },
+});
+
+// Authenticate the user and obtain consent here. Production code should render
+// AuthorizationError safely as shown in the quick start.
+app.get('/auth.example.com/authorize', async (c) => {
+  const oauth = authorizationServer.getOAuthApi(c.env);
+  const request = await oauth.parseAuthRequest(c.req.raw);
+  const { redirectTo } = await oauth.completeAuthorization({
+    request,
+    userId: 'user-123',
+    metadata: {},
+    scope: request.scope,
+    props: { userId: 'user-123', scopes: request.scope },
+  });
+  return c.redirect(redirectTo);
+});
+
+app.all('/auth.example.com/*', (c) => authorizationServer.fetch(c.req.raw, c.env, c.executionCtx));
+app.all('/calendar.example.com/*', (c) => calendar.fetch(c.req.raw, c.env, c.executionCtx));
+app.all('/drive.example.com/*', (c) => drive.fetch(c.req.raw, c.env, c.executionCtx));
+
+export default app;
+```
+
+Route all three custom domains to that Worker:
+
+```jsonc
+{
+  "workers_dev": false,
+  "routes": [
+    { "pattern": "auth.example.com", "custom_domain": true },
+    { "pattern": "calendar.example.com", "custom_domain": true },
+    { "pattern": "drive.example.com", "custom_domain": true },
+  ],
+}
+```
+
+`authorizationServer.fetch()` serves only the AS role at `auth.example.com`; the handles returned by `protectResource()` serve only their registered resource. Authorization server metadata advertises both canonical identifiers in `protected_resources`, while Calendar and Drive publish independent protected resource metadata that points back to `https://auth.example.com`.
+
+Registration is functional and happens during module initialization. Call `protectResource()` or `registerResource()` before the first request; an authorization server with no registered resources cannot publish useful metadata or issue a resource-bound grant.
+
+### Resource servers in separate Workers
+
+Use `registerResource()` when the authorization server issues tokens for a resource it does not host. The standalone resource Worker can use `createOAuthResourceServer()` to publish its own RFC 9728 metadata, issue Bearer challenges, enforce the canonical audience, and expose validated application data as `ctx.props`:
+
+```ts
+import { createOAuthResourceServer, type ValidatedAccessToken } from '@cloudflare/workers-oauth-provider';
+
+const AUTH_ISSUER = 'https://auth.example.com';
+const CALENDAR_RESOURCE = 'https://calendar.example.com/mcp';
+
+interface AuthProps {
+  userId: string;
+  scopes: string[];
+}
+
+interface CalendarEnv {
+  AUTHORIZATION_SERVER: {
+    validateToken(token: string): Promise<ValidatedAccessToken<{ userId: string }> | null>;
+  };
+}
+
+export default createOAuthResourceServer<CalendarEnv, AuthProps>({
+  resourceMetadata: {
+    resource: CALENDAR_RESOURCE,
+    authorization_servers: [AUTH_ISSUER],
+    scopes_supported: ['calendar:read'],
+    resource_name: 'Calendar MCP',
+  },
+  async validateToken({ token, env }) {
+    const validation = await env.AUTHORIZATION_SERVER.validateToken(token);
+    if (!validation) return null;
+    return {
+      audience: validation.audience,
+      expiresAt: validation.expiresAt,
+      props: {
+        ...validation.props,
+        scopes: validation.scope,
+      },
+    };
+  },
+  handler: {
+    async fetch(_request, _env, ctx) {
+      if (!ctx.props.scopes.includes('calendar:read')) {
+        return new Response('Forbidden', { status: 403 });
+      }
+      return Response.json({ userId: ctx.props.userId });
+    },
+  },
+});
+```
+
+The `validateToken` callback is deliberately transport-independent. For Workers, a private Service Binding can expose a resource-specific method backed by `authorizationServer.validateToken()`:
+
+```ts
+import { WorkerEntrypoint } from 'cloudflare:workers';
+
+authorizationServer.registerResource(CALENDAR_RESOURCE).registerResource(DRIVE_RESOURCE);
+
+export class CalendarTokenValidator extends WorkerEntrypoint<Env> {
+  validateToken(token: string) {
+    return authorizationServer.validateToken(token, CALENDAR_RESOURCE, this.env);
+  }
+}
+```
+
+Bind the Calendar Worker to `CalendarTokenValidator`; expose a separate Drive entrypoint fixed to `DRIVE_RESOURCE`. Fixing the resource on the authorization-server side prevents one resource Worker from asking to validate tokens for another audience. `createOAuthResourceServer()` also rejects a successful callback result whose `audience` is not its configured canonical resource and returns `503` when validation infrastructure throws. It passes only the validator's `props` to the handler, so the validator must copy or derive every scope and identity field the handler needs, as above, or enforce authorization itself. The package does not create a public token-introspection or JWT-validation endpoint; applications choose and secure the callback transport.
+
+The existing `OAuthProvider` constructor remains supported. It is the concise combined AS-and-resource API used by the quick start and is appropriate when one Worker protects one canonical resource. Existing applications do not need to move to `OAuthAuthorizationServer` to upgrade.
+
 ## How MCP authorization discovery works
 
 An MCP client discovers authorization in two stages, following the [MCP authorization server discovery rules](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/authorization-server-discovery).
@@ -172,7 +346,7 @@ For an MCP endpoint at `https://mcp.example.com/mcp`:
    ```
 
 4. That document identifies one or more authorization server issuers through `authorization_servers`.
-5. The client fetches this provider's RFC 8414 authorization server metadata:
+5. The client fetches RFC 8414 authorization server metadata from the selected issuer. In the single-origin quick start that is:
 
    ```text
    https://mcp.example.com/.well-known/oauth-authorization-server
@@ -187,7 +361,7 @@ Protected resource metadata and authorization server metadata serve different ro
 
 ### Protected resource metadata
 
-`resourceMetadata.resource` is required. Configure one canonical HTTPS protected-resource identifier with a lowercase scheme and host:
+Every protected resource needs its own `resourceMetadata.resource`. Configure each canonical HTTPS identifier with a lowercase scheme and host:
 
 ```ts
 resourceMetadata: {
@@ -207,9 +381,9 @@ https://mcp.example.com/.well-known/oauth-protected-resource/mcp
 
 That document returns the configured canonical `resource`. The discovery URL is built from the canonical resource: an origin uses `/.well-known/oauth-protected-resource`, and a path and query are inserted after the well-known prefix.
 
-RFC 9728 requires challenge-discovered metadata to identify the original requested resource URL. The provider therefore includes `resource_metadata` only when the protected request URL is the canonical resource itself. A canonical path may still be a base audience for descendants: a token for `https://mcp.example.com/mcp` is accepted at `/mcp/tools`, but a request to that descendant does not advertise a mismatched metadata document. If clients must discover authorization from multiple entry paths, expose an exact canonical MCP endpoint for discovery or use separate provider instances and canonical resources.
+RFC 9728 requires challenge-discovered metadata to identify the original requested resource URL. The provider therefore includes `resource_metadata` only when the protected request URL is the canonical resource itself. A canonical path may still be a base audience for descendants: a token for `https://mcp.example.com/mcp` is accepted at `/mcp/tools`, but a request to that descendant does not advertise a mismatched metadata document. If clients must discover authorization from multiple entry paths, register a distinct canonical resource for each entry point and route its protected-resource handle explicitly.
 
-`authorization_servers` may contain more than one issuer. Each value must use canonical HTTPS issuer spelling: lowercase scheme and host, with no userinfo, default port, dot segments, query, or fragment. OAuth issuer comparison is exact. The MCP client chooses an authorization server and must keep credentials and tokens separate for each issuer.
+`authorization_servers` may contain more than one issuer. Each value must use canonical HTTPS issuer spelling: lowercase scheme and host, with no userinfo, default port, dot segments, query, or fragment. OAuth issuer comparison is exact. The MCP client chooses an authorization server and must keep credentials and tokens separate for each issuer. A resource registered with `OAuthAuthorizationServer.protectResource()` defaults this list to that server's configured `issuer`; the standalone `createOAuthResourceServer()` requires it explicitly.
 
 ### Authorization server metadata
 
@@ -218,7 +392,7 @@ The provider publishes RFC 8414 metadata containing:
 - `issuer`
 - `authorization_endpoint`
 - `token_endpoint`
-- `protected_resources`, containing the configured canonical resource
+- `protected_resources`, containing the authorization server's registered canonical resources
 - `registration_endpoint`, when DCR is enabled
 - supported response and grant types
 - token endpoint authentication methods
@@ -243,7 +417,7 @@ A typical flow has three steps:
 
 `completeAuthorization()` repeats response-type validation before writing a grant or revoking existing grants. Validation errors from reconstructed requests are also typed as `AuthorizationError`, but applications should not construct redirects from untrusted reconstructed values; the redirect context is attached only by `parseAuthRequest()`.
 
-`completeAuthorization()` stores a new grant and, by default, revokes existing grants for the same user and client after the new grant is safely stored. Set `revokeExistingGrants: false` only when the application intentionally allows concurrent grants for the same user and client.
+`completeAuthorization()` stores a new grant and, by default, revokes existing grants for the same user, client, and resource after the new grant is safely stored. A grant for another registered resource is a separate authorization and is not revoked. Set `revokeExistingGrants: false` only when the application intentionally allows concurrent grants within the same resource.
 
 For users with many grants, `revokeExistingGrantsBatchSize` controls the KV page size used during that scan. It defaults to `50` and is capped at KV's maximum page size of `1000`.
 
@@ -346,29 +520,41 @@ The provider owns `tokenEndpoint`. It exchanges authorization codes for tokens, 
 
 ## Resources and token audiences
 
-Every provider has one required canonical `resourceMetadata.resource`. It must be an absolute HTTPS URI without a fragment, use lowercase `https` and a lowercase host, and contain an RFC 3986-safe producer serialization. Userinfo, default ports, dot-segment paths, and an empty path before a query are rejected because `Request` would rewrite them before RFC 9728 comparison. A bare origin is the only empty-path exception; use `/` before a query. Query components are supported but discouraged by RFC 9728.
+An authorization server may register one or more protected resources. Each resource has one canonical `resourceMetadata.resource`: an absolute HTTPS URI without a fragment, with lowercase `https` and a lowercase host, and an RFC 3986-safe producer serialization. Userinfo, default ports, dot-segment paths, and an empty path before a query are rejected because `Request` would rewrite them before RFC 9728 comparison. A bare origin is the only empty-path exception; use `/` before a query. Query components are supported but discouraged by RFC 9728.
 
-Current MCP clients are required to send `resource` in authorization and token requests. For compatibility with legacy clients, the provider tolerates omission at authorization, code exchange, and refresh. It always defaults or inherits the configured canonical value, stores it on the grant, returns it in token responses, and uses it as the access-token audience. Older clients therefore keep working without receiving unbound tokens.
+Every authorization grant and access token is bound to exactly one registered resource. A central authorization server can therefore issue separate Calendar and Drive tokens from one KV namespace, but it never turns those into one multi-audience bearer token. Completing a new authorization for Drive does not replace the same user and client's Calendar grant.
 
-An explicit client value must identify the same canonical resource. ASCII case differences in the URI scheme and host are accepted, but port, path, query, trailing slash, and array cardinality remain strict. The provider always stores and returns its configured lowercase scheme-and-host spelling. Malformed, multi-valued, or mismatched input returns `invalid_target` before code consumption, callbacks, refresh rotation, or storage writes.
+Conforming MCP clients are required to send `resource` in authorization and token requests. Resource selection and compatibility work as follows:
 
-Token exchange cannot change the resource. Both the subject-token audience and any explicit requested resource must match the configured canonical value. Internal and externally validated tokens are accepted at protected routes only when their audience matches that value.
+- When the authorization server has one registered resource, that sole resource is selected if an authorization request omits `resource`. This preserves existing `OAuthProvider` behavior.
+- When it has multiple registered resources, an authorization request must identify exactly one of them. Set `defaultResource` on `OAuthAuthorizationServer` only when older clients that omit `resource` should be routed to a deliberate compatibility default.
+- An authorization-code or refresh-token request may omit `resource`; the server inherits the resource already stored on the grant. If present, it must match that grant and cannot retarget it.
+- Malformed, unknown, or multi-valued resource input returns `invalid_target` before code consumption, callbacks, refresh rotation, or storage writes.
+
+ASCII case differences in the URI scheme and host are accepted, but port, path, query, trailing slash, and array cardinality remain strict. The authorization server always stores and returns the configured lowercase scheme-and-host spelling. The token response includes the selected resource, and the access-token audience contains that resource alone.
+
+Token exchange cannot change the resource. Both the subject-token audience and any explicit requested resource must resolve to the same registered canonical value. Internally and externally validated tokens are accepted at a protected route only when their audience matches that route's resource.
 
 Path-aware API validation uses path-boundary prefix matching. A canonical audience for `https://example.com/mcp` covers `/mcp` and `/mcp/tools`, but not `/mcp-other`. A canonical trailing slash remains significant.
 
 ### Upgrading to 1.0
 
-Choose the one canonical `resourceMetadata.resource` that is authoritative for every grant in the provider's KV namespace. When processing the next valid code exchange or refresh, a grant with no stored resource is bound to that configured value. A matching stored resource is inherited (and normalized to the configured scheme-and-host spelling); a different stored resource is rejected and requires reconnecting.
+The existing combined `OAuthProvider` configuration has one `resourceMetadata.resource`. That sole resource automatically acts as both the omitted-authorization default and the migration destination for grants created before resource binding, so existing single-resource clients can continue without adding a `resource` parameter.
 
-Clients do not need to add a resource parameter. Previously issued access tokens with no audience are rejected by 1.0's protected-resource check, but their refresh grants can acquire the configured resource on refresh.
+For a multi-resource `OAuthAuthorizationServer`, `defaultResource` and `legacyGrantResource` solve different compatibility problems:
 
-Use one provider and KV namespace per canonical resource. A shared namespace containing ambiguous grants for multiple protected resources or tenants cannot be migrated safely to one audience.
+- `defaultResource` selects the resource for a new authorization request that omits `resource`.
+- `legacyGrantResource` is the server-controlled migration destination for an old stored grant that has no resource. A client-supplied token-request parameter cannot choose or change this destination.
+
+Both values must name a registered resource. If a multi-resource server omits `legacyGrantResource`, an old unbound grant cannot be migrated safely and must be reauthorized. A stored grant already bound to a registered resource keeps that resource; a grant bound to an unregistered value fails closed.
+
+Previously issued access tokens with no audience are rejected by 1.0's protected-resource check, but an eligible refresh grant can acquire the server-selected migration resource on refresh. Multiple resources can share the same authorization server, provider implementation, and KV namespace; separate storage is an optional deployment boundary, not a resource-binding requirement.
 
 The 1.0 API removes `resourceMatchOriginOnly`. Canonical matching with scheme/host case tolerance replaces it.
 
 ## Scopes and step-up authorization
 
-`scopesSupported` is published only in authorization server metadata. Configure `resourceMetadata.scopes_supported` explicitly with the minimal scopes required for basic protected-resource functionality and baseline Bearer challenges.
+`scopesSupported` is published only in authorization server metadata. Configure each protected resource's `resourceMetadata.scopes_supported` explicitly with the minimal scopes required for its basic functionality and baseline Bearer challenges.
 
 The application decides which requested scopes to grant through `completeAuthorization({ scope })`. Token and refresh requests can only narrow those scopes.
 
@@ -384,6 +570,7 @@ The package also supports:
 - Structured callback errors through the exported `OAuthError` and `ExternalTokenError` classes.
 - Custom error observation or responses through `onError`.
 - Experimental MCP Enterprise-Managed Authorization using ID-JAG assertions.
+- One authorization server with multiple same-Worker or separately routed MCP resources.
 - Multiple protected handlers through `apiHandlers`.
 - Configurable access token, refresh token, and DCR client lifetimes.
 
@@ -423,6 +610,8 @@ Deleting a client through `OAuthHelpers.deleteClient()` also revokes its grants 
 
 ## Configuration reference
 
+The existing `OAuthProvider` combined configuration uses these options:
+
 | Option                             | Purpose                                                  | Default                                  |
 | ---------------------------------- | -------------------------------------------------------- | ---------------------------------------- |
 | `apiRoute` and `apiHandler`        | Protect one or more route prefixes with one handler      | Use these or `apiHandlers`               |
@@ -444,7 +633,20 @@ Deleting a client through `OAuthHelpers.deleteClient()` also revokes its grants 
 | `enterpriseManagedAuthorization`   | Enable experimental ID-JAG grant support                 | Disabled                                 |
 | `onError`                          | Observe or replace OAuth error responses                 | Logs a warning                           |
 
-Consult the exported `OAuthProviderOptions`, callback interfaces, and JSDoc in [`src/oauth-provider.ts`](https://github.com/cloudflare/workers-oauth-provider/blob/main/src/oauth-provider.ts) for the complete typed API.
+The functional role API adds these surfaces without removing `OAuthProvider`:
+
+| Surface                                          | Purpose                                                                     |
+| ------------------------------------------------ | --------------------------------------------------------------------------- |
+| `new OAuthAuthorizationServer({ issuer, … })`    | Create the AS role with a canonical RFC 8414 issuer                         |
+| `protectResource({ resourceMetadata, handler })` | Register and host one protected resource, returning its fetch surface       |
+| `registerResource(resource)`                     | Register a canonical audience hosted by another Worker or service           |
+| `defaultResource`                                | Select a deliberate default for new authorization requests that omit it     |
+| `legacyGrantResource`                            | Select the server-controlled migration target for old unbound grants        |
+| `getOAuthApi(env)`                               | Obtain OAuth helpers for an application-owned authorization route           |
+| `validateToken(token, resource, env)`            | Validate an opaque token against one fixed registered audience              |
+| `createOAuthResourceServer({ … })`               | Create a standalone resource role around an application validation callback |
+
+Consult the exported `OAuthProviderOptions`, `OAuthAuthorizationServerOptions`, resource-server callback interfaces, and JSDoc in [`src/oauth-provider.ts`](https://github.com/cloudflare/workers-oauth-provider/blob/main/src/oauth-provider.ts) for the complete typed API.
 
 ## OAuth helpers
 

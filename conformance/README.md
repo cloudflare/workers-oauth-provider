@@ -23,7 +23,7 @@ The matrix follows every dated authorization revision represented by the officia
 
 Requirements are enabled from the revision that introduced them. Shared OAuth behavior is exercised against every revision, with the target revision sent in the `MCP-Protocol-Version` header.
 
-These are client compatibility profiles, not server-side protocol negotiation. The server always uses one fixed canonical resource. Only client wire behavior changes by revision: the legacy `2025-03-26` profile omits the RFC 8707 `resource` parameter, while `2025-06-18` and later include it in authorization and token requests as required. The provider deliberately tolerates legacy omission by defaulting to or inheriting the same canonical value, while explicit malformed or mismatched values fail with `invalid_target`.
+These are client compatibility profiles, not server-side protocol negotiation. This test fixture always uses one fixed canonical resource. Only client wire behavior changes by revision: the legacy `2025-03-26` profile omits the RFC 8707 `resource` parameter, while `2025-06-18` and later include it in authorization and token requests as required. The provider deliberately tolerates legacy omission by defaulting to or inheriting the same canonical value, while explicit malformed or mismatched values fail with `invalid_target`.
 
 ## Coverage and traceability
 
