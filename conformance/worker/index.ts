@@ -77,7 +77,7 @@ function createProviderOptions(configuration: WorkerConfiguration): OAuthProvide
     scopesSupported: [READ_SCOPE, WRITE_SCOPE, OFFLINE_ACCESS_SCOPE],
     clientIdMetadataDocumentEnabled: true,
     resourceMetadata: {
-      ...(configuration.resource ? { resource: configuration.resource } : {}),
+      resource: configuration.resource,
       authorization_servers: [configuration.origin],
       scopes_supported: configuration.resourceScopes,
       bearer_methods_supported: ['header'],

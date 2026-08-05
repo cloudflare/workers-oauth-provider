@@ -12,7 +12,7 @@ export type TokenEndpointAuthMethod = 'none' | 'client_secret_basic' | 'client_s
 export interface WorkerConfiguration {
   dynamicClientRegistration: boolean;
   origin: string;
-  resource?: string;
+  resource: string;
   resourceScopes: string[];
 }
 

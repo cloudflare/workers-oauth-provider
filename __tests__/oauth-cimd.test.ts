@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { CimdFetchError, OAuthProvider } from '../src/oauth-provider';
+import { CimdFetchError, OAuthProvider as BaseOAuthProvider, type OAuthProviderOptions } from '../src/oauth-provider';
 import {
   MockExecutionContext,
   TestApiHandler,
@@ -8,6 +8,26 @@ import {
   testDefaultHandler,
   type TestEnv,
 } from './test-helpers';
+
+const TEST_RESOURCE = 'https://example.com';
+
+type TestProviderOptions<Env> = Omit<OAuthProviderOptions<Env>, 'resourceMetadata'> & {
+  resourceMetadata?: Partial<OAuthProviderOptions<Env>['resourceMetadata']>;
+};
+
+/** Supply the canonical resource required by 1.0 unless a test overrides it. */
+class OAuthProvider<Env = Cloudflare.Env> extends BaseOAuthProvider<Env> {
+  constructor(options: TestProviderOptions<Env>) {
+    const { resourceMetadata, ...providerOptions } = options;
+    super({
+      ...providerOptions,
+      resourceMetadata: {
+        resource: TEST_RESOURCE,
+        ...resourceMetadata,
+      },
+    });
+  }
+}
 
 let oauthProvider: OAuthProvider<TestEnv>;
 let mockEnv: TestEnv;
