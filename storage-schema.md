@@ -146,7 +146,7 @@ Token records store metadata about issued access tokens, including denormalized 
 
 **Key format:** `token:{userId}:{grantId}:{tokenId}`
 
-**Content Example:**
+**Content Example (RFC 9068 JWT mode):**
 
 ```json
 {
@@ -156,6 +156,9 @@ Token records store metadata about issued access tokens, including denormalized 
   "createdAt": 1644256123,
   "expiresAt": 1644259723,
   "audience": "https://example.com/mcp",
+  "scope": ["document.read", "document.write"],
+  "format": "jwt",
+  "jti": "buH6s9KfA2H0dZQpX3wJ8g",
   "wrappedEncryptionKey": "base64-encoded wrapped encryption key",
   "grant": {
     "clientId": "abc123",
@@ -165,7 +168,7 @@ Token records store metadata about issued access tokens, including denormalized 
 }
 ```
 
-> **Note:** The token format is `{userId}:{grantId}:{random-secret}` which embeds the identifiers needed for efficient lookups. The token key format includes the user ID and grant ID to enable efficient revocation of all tokens for a specific grant. The token record contains denormalized grant information to eliminate the need for a separate grant lookup during token validation. The token also carries a wrapped encryption key that can only be unwrapped using the actual token string, allowing decryption of the encrypted props.
+> **Note:** Opaque access tokens use `{userId}:{grantId}:{random-secret}`. When RFC 9068 access tokens are enabled, the client instead receives a signed JWT and the record includes `format: "jwt"` and its `jti`; absence of `format` means the opaque representation. In both modes, `id` and the final KV key component are the SHA-256 hash of the complete token. The token record remains the source of stateful revocation and encrypted application props. Its wrapped encryption key can be unwrapped only with the actual token string.
 
 > **Audience safety:** Every access token issued by 1.0 carries exactly one registered canonical resource as its audience. Token exchange cannot change that audience. Persisted token types keep the field optional only so old KV records can be decoded; each protected-resource surface rejects records whose audience is missing or belongs to another resource. A client holding an unbound pre-1.0 access token should refresh or reconnect.
 
@@ -198,10 +201,11 @@ Token records store metadata about issued access tokens, including denormalized 
    - Each token type (authorization code, refresh token, access token) has its own wrapped key
    - The wrapping algorithm used is AES-KW (AES Key Wrap)
 
-4. **Token Format**: Tokens use the format `{userId}:{grantId}:{random-secret}` which allows:
-   - Direct access to token records without needing to look up grants separately
-   - Verification that the token was issued for the specific grant and user
-   - Enhanced security through proper validation checks
+4. **Token Format**:
+   - Opaque access tokens use `{userId}:{grantId}:{random-secret}` for direct lookup
+   - Opt-in RFC 9068 access tokens are signed JWTs; their verified subject and private grant claim identify the same record prefix
+   - The complete access token is hashed for the KV key and wraps the props encryption key in either mode
+   - JWT payloads are signed but not encrypted; only application data explicitly selected by `publicClaims` is included
 
 5. **TTL-based Expiration**: Access tokens automatically expire using KV's TTL feature, reducing the need for manual cleanup.
 
@@ -248,7 +252,8 @@ Token records store metadata about issued access tokens, including denormalized 
    - Both tokens are returned to the client
 
 4. When the client makes API requests with the access token:
-   - The system looks up the token directly using the structured key format
+   - For an opaque token, the system uses its structured identifiers to find the token record
+   - For a JWT, the system first verifies the signature, issuer, audience, lifetime, and claims, then finds the token record using its verified identifiers and the hash of the complete JWT
    - The wrapped encryption key is unwrapped using the access token
    - The props are decrypted using the unwrapped key
    - The decrypted props are made available to the API handler
@@ -270,4 +275,5 @@ Token records store metadata about issued access tokens, including denormalized 
 - Monitor KV usage metrics to ensure you stay within Cloudflare's limits for your plan.
 - The design uses KV's `list()` capability with key prefixes to efficiently query related data like all grants for a user, eliminating the need for separate list indexes.
 - When a grant is revoked via `revokeGrant()`, associated tokens are immediately deleted. When a client is deleted via `deleteClient()`, all grants and tokens for that client are also deleted.
+- A separately deployed resource server that validates a JWT only from its signature and claims does not read this KV state, so deletion is observed there only after token expiry unless the application adds a status check.
 - The `purgeExpiredData()` method provides defense-in-depth garbage collection for orphaned grants and tokens. It is designed to be called from a scheduled handler (Cron Trigger).

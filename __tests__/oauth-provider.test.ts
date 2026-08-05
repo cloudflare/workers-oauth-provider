@@ -3,6 +3,7 @@ import {
   AuthorizationError,
   CimdFetchError,
   ExternalTokenError,
+  createJwtAccessTokens,
   OAuthError,
   OAuthAuthorizationServer,
   OAuthProvider as BaseOAuthProvider,
@@ -12,6 +13,7 @@ import {
   type ResolveExternalTokenResult,
   type Grant,
   type Token,
+  type JwtAccessTokenPublicKey,
 } from '../src/oauth-provider';
 import type { ExecutionContext } from '@cloudflare/workers-types';
 // We're importing WorkerEntrypoint from our mock implementation
@@ -14082,6 +14084,11 @@ describe('functional authorization-server and resource-server composition', () =
   let env: TestEnv;
   let ctx: MockExecutionContext;
 
+  interface FunctionalAuthProps {
+    userId: string;
+    username: string;
+  }
+
   beforeEach(() => {
     env = createMockEnv();
     ctx = new MockExecutionContext();
@@ -14095,8 +14102,41 @@ describe('functional authorization-server and resource-server composition', () =
     };
   }
 
+  async function createTestJwtAccessTokens() {
+    const keyPair = (await crypto.subtle.generateKey(
+      {
+        name: 'RSASSA-PKCS1-v1_5',
+        modulusLength: 2048,
+        publicExponent: new Uint8Array([1, 0, 1]),
+        hash: 'SHA-256',
+      },
+      true,
+      ['sign', 'verify']
+    )) as CryptoKeyPair;
+    const publicJwk = {
+      ...((await crypto.subtle.exportKey('jwk', keyPair.publicKey)) as JsonWebKey),
+      kid: 'integration-key',
+      alg: 'RS256' as const,
+      use: 'sig',
+      key_ops: ['verify'],
+    } satisfies JwtAccessTokenPublicKey;
+    return createJwtAccessTokens<TestEnv, FunctionalAuthProps>({
+      issuer,
+      jwksUri: `${issuer}/.well-known/jwks.json`,
+      keys: () => ({
+        current: {
+          kid: publicJwk.kid,
+          alg: 'RS256',
+          privateKey: keyPair.privateKey,
+          publicJwk,
+        },
+      }),
+      publicClaims: ({ props }) => ({ userId: props.userId }),
+    });
+  }
+
   function createRoles(policy: { defaultResource?: string; legacyGrantResource?: string } = {}) {
-    const authorizationServer = new OAuthAuthorizationServer<TestEnv>({
+    const authorizationServer = new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>({
       issuer,
       authorizeEndpoint: '/authorize',
       tokenEndpoint: '/oauth/token',
@@ -14123,7 +14163,7 @@ describe('functional authorization-server and resource-server composition', () =
     return { authorizationServer, calendar, drive };
   }
 
-  async function registerClient(authorizationServer: OAuthAuthorizationServer<TestEnv>) {
+  async function registerClient<Props>(authorizationServer: OAuthAuthorizationServer<TestEnv, Props>) {
     const response = await authorizationServer.fetch(
       createMockRequest(
         `${issuer}/oauth/register`,
@@ -14142,7 +14182,7 @@ describe('functional authorization-server and resource-server composition', () =
   }
 
   async function authorize(
-    authorizationServer: OAuthAuthorizationServer<TestEnv>,
+    authorizationServer: OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>,
     client: any,
     resources: string[] = []
   ): Promise<string> {
@@ -14166,7 +14206,7 @@ describe('functional authorization-server and resource-server composition', () =
   }
 
   async function exchangeCode(
-    authorizationServer: OAuthAuthorizationServer<TestEnv>,
+    authorizationServer: OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>,
     client: any,
     code: string,
     resource?: string
@@ -14191,7 +14231,11 @@ describe('functional authorization-server and resource-server composition', () =
     );
   }
 
-  async function issueTokens(authorizationServer: OAuthAuthorizationServer<TestEnv>, client: any, resource?: string) {
+  async function issueTokens(
+    authorizationServer: OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>,
+    client: any,
+    resource?: string
+  ) {
     const code = await authorize(authorizationServer, client, resource ? [resource] : []);
     const response = await exchangeCode(authorizationServer, client, code);
     expect(response.status).toBe(200);
@@ -14199,7 +14243,7 @@ describe('functional authorization-server and resource-server composition', () =
   }
 
   async function refresh(
-    authorizationServer: OAuthAuthorizationServer<TestEnv>,
+    authorizationServer: OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>,
     client: any,
     refreshToken: string,
     resource?: string
@@ -14231,12 +14275,14 @@ describe('functional authorization-server and resource-server composition', () =
       ctx
     );
     expect(metadataResponse.status).toBe(200);
-    await expect(metadataResponse.json()).resolves.toMatchObject({
+    const authorizationServerMetadata = await metadataResponse.json<any>();
+    expect(authorizationServerMetadata).toMatchObject({
       issuer,
       authorization_endpoint: `${issuer}/authorize`,
       token_endpoint: `${issuer}/oauth/token`,
       protected_resources: [calendarResource, driveResource],
     });
+    expect(authorizationServerMetadata).not.toHaveProperty('jwks_uri');
 
     const metadataPost = await authorizationServer.fetch(
       createMockRequest(`${issuer}/.well-known/oauth-authorization-server`, 'POST'),
@@ -14396,6 +14442,57 @@ describe('functional authorization-server and resource-server composition', () =
           clientRegistrationEndpoint: '/.well-known/oauth-authorization-server',
         })
     ).toThrow('clientRegistrationEndpoint must not collide with the authorization server metadata endpoint');
+
+    const collidingJwks = createJwtAccessTokens<TestEnv>({
+      issuer,
+      jwksUri: `${issuer}/oauth/token`,
+      keys: () => {
+        throw new Error('not reached during route validation');
+      },
+    });
+    expect(
+      () =>
+        new OAuthAuthorizationServer<TestEnv>({
+          issuer,
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: '/oauth/token',
+          accessTokens: collidingJwks,
+        })
+    ).toThrow('accessTokens.jwksUri must not collide with tokenEndpoint');
+
+    const authorizationQueryCollision = createJwtAccessTokens<TestEnv>({
+      issuer,
+      jwksUri: `${issuer}/authorize?document=jwks`,
+      keys: () => {
+        throw new Error('not reached during route validation');
+      },
+    });
+    expect(
+      () =>
+        new OAuthAuthorizationServer<TestEnv>({
+          issuer,
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: '/oauth/token',
+          accessTokens: authorizationQueryCollision,
+        })
+    ).toThrow('accessTokens.jwksUri must not collide with authorizeEndpoint');
+
+    const wrongIssuerTokens = createJwtAccessTokens<TestEnv>({
+      issuer: 'https://other-auth.example.com',
+      jwksUri: 'https://other-auth.example.com/.well-known/jwks.json',
+      keys: () => {
+        throw new Error('not reached during issuer validation');
+      },
+    });
+    expect(
+      () =>
+        new OAuthAuthorizationServer<TestEnv>({
+          issuer,
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: '/oauth/token',
+          accessTokens: wrongIssuerTokens,
+        })
+    ).toThrow('accessTokens issuer must exactly match');
   });
 
   it('retains static authorization queries and distinguishes same-path AS endpoints', async () => {
@@ -14645,5 +14742,327 @@ describe('functional authorization-server and resource-server composition', () =
     await expect(response.json()).resolves.toMatchObject({
       protected_resources: [calendarResource, driveResource],
     });
+  });
+
+  it('serves JWKS and preserves confidential ctx.props with state-backed JWT access tokens', async () => {
+    const accessTokens = await createTestJwtAccessTokens();
+    expect(
+      () =>
+        new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>({
+          issuer,
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: '/oauth/token',
+          accessTokens: { ...accessTokens },
+        })
+    ).toThrow('accessTokens must be created by createJwtAccessTokens');
+    const externalResolver = vi.fn(async () => ({
+      props: { acceptedByExternalResolver: true },
+      audience: calendarResource,
+      expiresAt: Math.floor(Date.now() / 1000) + 3600,
+    }));
+    const authorizationServer = new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>({
+      issuer,
+      authorizeEndpoint: '/authorize',
+      tokenEndpoint: '/oauth/token',
+      clientRegistrationEndpoint: '/oauth/register',
+      scopesSupported: ['calendar:read'],
+      accessTokens,
+    });
+    const calendar = authorizationServer.protectResource({
+      resourceMetadata: { resource: calendarResource, scopes_supported: ['calendar:read'] },
+      handler: resourceHandler('calendar'),
+      resolveExternalToken: externalResolver,
+    });
+    const client = await registerClient(authorizationServer);
+    const tokens = await issueTokens(authorizationServer, client, calendarResource);
+
+    expect(tokens.access_token.split('.')).toHaveLength(3);
+    const encodedPayload = tokens.access_token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+    const payload = JSON.parse(atob(encodedPayload.padEnd(Math.ceil(encodedPayload.length / 4) * 4, '=')));
+    expect(payload).toMatchObject({
+      iss: issuer,
+      aud: calendarResource,
+      client_id: client.client_id,
+      'https://workers.cloudflare.com/oauth-provider/claims/public': { userId: 'test-user-123' },
+    });
+    expect(JSON.stringify(payload)).not.toContain('TestUser');
+
+    const metadata = await authorizationServer.fetch(
+      createMockRequest(`${issuer}/.well-known/oauth-authorization-server`),
+      env,
+      ctx
+    );
+    await expect(metadata.json()).resolves.toMatchObject({
+      jwks_uri: `${issuer}/.well-known/jwks.json`,
+    });
+    const jwks = await authorizationServer.fetch(createMockRequest(`${issuer}/.well-known/jwks.json`), env, ctx);
+    expect(jwks.status).toBe(200);
+    expect(jwks.headers.get('Cache-Control')).toBe('public, max-age=300');
+    await expect(jwks.json()).resolves.toMatchObject({
+      keys: [{ kid: 'integration-key', alg: 'RS256', use: 'sig' }],
+    });
+    const jwksOptions = await authorizationServer.fetch(
+      createMockRequest(`${issuer}/.well-known/jwks.json`, 'OPTIONS'),
+      env,
+      ctx
+    );
+    expect(jwksOptions.status).toBe(204);
+    const jwksPost = await authorizationServer.fetch(
+      createMockRequest(`${issuer}/.well-known/jwks.json`, 'POST'),
+      env,
+      ctx
+    );
+    expect(jwksPost.status).toBe(405);
+    expect(jwksPost.headers.get('Allow')).toBe('GET');
+
+    await expect(authorizationServer.validateToken(tokens.access_token, calendarResource, env)).resolves.toMatchObject({
+      props: { userId: 'test-user-123', username: 'TestUser' },
+      audience: calendarResource,
+      clientId: client.client_id,
+    });
+    const accepted = await calendar.fetch(
+      createMockRequest(calendarResource, 'GET', { Authorization: `Bearer ${tokens.access_token}` }),
+      env,
+      ctx
+    );
+    expect(accepted.status).toBe(200);
+    await expect(accepted.json()).resolves.toMatchObject({
+      props: { userId: 'test-user-123', username: 'TestUser' },
+    });
+
+    const parts = tokens.access_token.split('.');
+    parts[2] = `${parts[2][0] === 'A' ? 'B' : 'A'}${parts[2].slice(1)}`;
+    const rejected = await calendar.fetch(
+      createMockRequest(calendarResource, 'GET', { Authorization: `Bearer ${parts.join('.')}` }),
+      env,
+      ctx
+    );
+    expect(rejected.status).toBe(401);
+    expect(externalResolver).not.toHaveBeenCalled();
+
+    const tokenKeys = await env.OAUTH_KV.list({ prefix: 'token:' });
+    expect(tokenKeys.keys).toHaveLength(1);
+    const storedToken = (await env.OAUTH_KV.get(tokenKeys.keys[0].name, { type: 'json' })) as Token;
+    expect(storedToken).toMatchObject({
+      format: 'jwt',
+      jti: payload.jti,
+    });
+    await env.OAUTH_KV.put(tokenKeys.keys[0].name, JSON.stringify({ ...storedToken, jti: 'corrupted' }));
+    await expect(authorizationServer.validateToken(tokens.access_token, calendarResource, env)).resolves.toBeNull();
+    await env.OAUTH_KV.put(tokenKeys.keys[0].name, JSON.stringify(storedToken));
+
+    const revocation = await authorizationServer.fetch(
+      createMockRequest(
+        `${issuer}/oauth/token`,
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        new URLSearchParams({
+          token: tokens.access_token,
+          token_type_hint: 'access_token',
+          client_id: client.client_id,
+          client_secret: client.client_secret,
+        }).toString()
+      ),
+      env,
+      ctx
+    );
+    expect(revocation.status).toBe(200);
+    await expect(authorizationServer.validateToken(tokens.access_token, calendarResource, env)).resolves.toBeNull();
+  });
+
+  it('accepts legacy opaque tokens and upgrades an existing refresh grant to JWT issuance', async () => {
+    const opaqueRoles = createRoles();
+    const client = await registerClient(opaqueRoles.authorizationServer);
+    const opaqueTokens = await issueTokens(opaqueRoles.authorizationServer, client, calendarResource);
+    expect(opaqueTokens.access_token.split(':')).toHaveLength(3);
+
+    const accessTokens = await createTestJwtAccessTokens();
+    const jwtServer = new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>({
+      issuer,
+      authorizeEndpoint: '/authorize',
+      tokenEndpoint: '/oauth/token',
+      clientRegistrationEndpoint: '/oauth/register',
+      scopesSupported: ['calendar:read'],
+      accessTokens,
+    });
+    const calendar = jwtServer.protectResource({
+      resourceMetadata: { resource: calendarResource, scopes_supported: ['calendar:read'] },
+      handler: resourceHandler('calendar'),
+    });
+
+    expect(
+      (
+        await calendar.fetch(
+          createMockRequest(calendarResource, 'GET', { Authorization: `Bearer ${opaqueTokens.access_token}` }),
+          env,
+          ctx
+        )
+      ).status
+    ).toBe(200);
+
+    const refreshed = await refresh(jwtServer, client, opaqueTokens.refresh_token);
+    expect(refreshed.status).toBe(200);
+    const refreshedTokens = await refreshed.json<any>();
+    expect(refreshedTokens.access_token.split('.')).toHaveLength(3);
+    expect(
+      (
+        await calendar.fetch(
+          createMockRequest(calendarResource, 'GET', { Authorization: `Bearer ${refreshedTokens.access_token}` }),
+          env,
+          ctx
+        )
+      ).status
+    ).toBe(200);
+  });
+
+  it('revokes a stored JWT after its resource is removed from the live registry', async () => {
+    const accessTokens = await createTestJwtAccessTokens();
+    const issuerOptions = {
+      issuer,
+      authorizeEndpoint: '/authorize',
+      tokenEndpoint: '/oauth/token',
+      clientRegistrationEndpoint: '/oauth/register',
+      scopesSupported: ['calendar:read'],
+      accessTokens,
+    };
+    const issuingServer = new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>(issuerOptions);
+    issuingServer.protectResource({
+      resourceMetadata: { resource: calendarResource, scopes_supported: ['calendar:read'] },
+      handler: resourceHandler('calendar'),
+    });
+    const client = await registerClient(issuingServer);
+    const tokens = await issueTokens(issuingServer, client, calendarResource);
+
+    // A later deployment may stop advertising/serving the resource while its
+    // previously issued tokens and their state records are still live.
+    const authorizationServerOnly = new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>(issuerOptions);
+    const revocation = await authorizationServerOnly.fetch(
+      createMockRequest(
+        `${issuer}/oauth/token`,
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        new URLSearchParams({
+          token: tokens.access_token,
+          token_type_hint: 'access_token',
+          client_id: client.client_id,
+          client_secret: client.client_secret,
+        }).toString()
+      ),
+      env,
+      ctx
+    );
+    expect(revocation.status).toBe(200);
+    expect((await env.OAUTH_KV.list({ prefix: 'token:' })).keys).toHaveLength(0);
+
+    // Re-registering the same audience cannot resurrect the revoked token.
+    const readdedServer = new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>(issuerOptions);
+    const readdedCalendar = readdedServer.protectResource({
+      resourceMetadata: { resource: calendarResource, scopes_supported: ['calendar:read'] },
+      handler: resourceHandler('calendar'),
+    });
+    const replay = await readdedCalendar.fetch(
+      createMockRequest(calendarResource, 'GET', { Authorization: `Bearer ${tokens.access_token}` }),
+      env,
+      ctx
+    );
+    expect(replay.status).toBe(401);
+  });
+
+  it('uses JWT issuance for implicit and token-exchange flows', async () => {
+    const implicitTokens = await createTestJwtAccessTokens();
+    const implicitServer = new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>({
+      issuer,
+      authorizeEndpoint: '/authorize',
+      tokenEndpoint: '/oauth/token',
+      allowImplicitFlow: true,
+      accessTokens: implicitTokens,
+    });
+    const implicitCalendar = implicitServer.protectResource({
+      resourceMetadata: { resource: calendarResource, scopes_supported: ['calendar:read'] },
+      handler: resourceHandler('calendar'),
+    });
+    const implicitApi = implicitServer.getOAuthApi(env);
+    const implicitClient = await implicitApi.createClient({
+      redirectUris: ['https://client.example.com/callback'],
+      tokenEndpointAuthMethod: 'none',
+      grantTypes: ['implicit'],
+      responseTypes: ['token'],
+    });
+    const implicitUrl = new URL(`${issuer}/authorize`);
+    implicitUrl.search = new URLSearchParams({
+      response_type: 'token',
+      client_id: implicitClient.clientId,
+      redirect_uri: 'https://client.example.com/callback',
+      scope: 'calendar:read',
+      resource: calendarResource,
+    }).toString();
+    const implicitRequest = await implicitApi.parseAuthRequest(createMockRequest(implicitUrl.href));
+    const implicitResult = await implicitApi.completeAuthorization({
+      request: implicitRequest,
+      userId: 'implicit-user',
+      metadata: {},
+      scope: implicitRequest.scope,
+      props: { userId: 'implicit-user', username: 'ImplicitUser' },
+    });
+    const implicitAccessToken = new URLSearchParams(new URL(implicitResult.redirectTo).hash.slice(1)).get(
+      'access_token'
+    )!;
+    expect(implicitAccessToken.split('.')).toHaveLength(3);
+    expect(
+      (
+        await implicitCalendar.fetch(
+          createMockRequest(calendarResource, 'GET', { Authorization: `Bearer ${implicitAccessToken}` }),
+          env,
+          ctx
+        )
+      ).status
+    ).toBe(200);
+
+    env = createMockEnv();
+    const exchangeTokens = await createTestJwtAccessTokens();
+    const exchangeServer = new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>({
+      issuer,
+      authorizeEndpoint: '/authorize',
+      tokenEndpoint: '/oauth/token',
+      clientRegistrationEndpoint: '/oauth/register',
+      scopesSupported: ['calendar:read'],
+      allowTokenExchangeGrant: true,
+      accessTokens: exchangeTokens,
+    });
+    const exchangeCalendar = exchangeServer.protectResource({
+      resourceMetadata: { resource: calendarResource, scopes_supported: ['calendar:read'] },
+      handler: resourceHandler('calendar'),
+    });
+    const exchangeClient = await registerClient(exchangeServer);
+    const subject = await issueTokens(exchangeServer, exchangeClient, calendarResource);
+    const exchangeResponse = await exchangeServer.fetch(
+      createMockRequest(
+        `${issuer}/oauth/token`,
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        new URLSearchParams({
+          grant_type: 'urn:ietf:params:oauth:grant-type:token-exchange',
+          subject_token: subject.access_token,
+          subject_token_type: 'urn:ietf:params:oauth:token-type:access_token',
+          resource: calendarResource,
+          client_id: exchangeClient.client_id,
+          client_secret: exchangeClient.client_secret,
+        }).toString()
+      ),
+      env,
+      ctx
+    );
+    expect(exchangeResponse.status).toBe(200);
+    const exchanged = await exchangeResponse.json<any>();
+    expect(exchanged.access_token.split('.')).toHaveLength(3);
+    expect(
+      (
+        await exchangeCalendar.fetch(
+          createMockRequest(calendarResource, 'GET', { Authorization: `Bearer ${exchanged.access_token}` }),
+          env,
+          ctx
+        )
+      ).status
+    ).toBe(200);
   });
 });
