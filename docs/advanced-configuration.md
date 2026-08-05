@@ -67,7 +67,7 @@ Plain errors continue to surface as 500 responses.
 
 ## OAuth 2.0 Token Exchange
 
-Set `allowTokenExchangeGrant: true` to enable RFC 8693. Clients can exchange an existing access token for a token with narrower scopes or a shorter lifetime. Token exchange cannot change the required canonical resource audience.
+Set `allowTokenExchangeGrant: true` to enable RFC 8693. Clients can exchange an existing access token for a token with narrower scopes or a shorter lifetime. Token exchange cannot change the subject grant's registered canonical resource audience.
 
 Application code can also call:
 
@@ -75,12 +75,12 @@ Application code can also call:
 await env.OAUTH_PROVIDER.exchangeToken({
   subjectToken,
   scope: ['documents:read'],
-  aud: 'https://mcp.example.com/mcp', // Must match resourceMetadata.resource
+  aud: 'https://mcp.example.com/mcp', // Must match the subject grant's resource
   expiresIn: 900,
 });
 ```
 
-The new token cannot exceed the subject token's scope ceiling or remaining lifetime. Its subject audience and any `aud` request value must match `resourceMetadata.resource`.
+The new token cannot exceed the subject token's scope ceiling or remaining lifetime. Its subject audience and any `aud` request value must resolve to the same registered resource.
 
 ## Enterprise-managed authorization
 
