@@ -48,7 +48,7 @@ Client records store OAuth client application information.
   "responseTypes": ["code"],
   "registrationDate": 1644256123,
   "tokenEndpointAuthMethod": "client_secret_basic",
-  "tokenEndpointAuthMethodPolicy": "strict"
+  "authMethodExplicit": true
 }
 ```
 
@@ -56,7 +56,7 @@ Client records store OAuth client application information.
 
 > **Note:** The optional `i18n` map holds RFC 7591 §2.2 internationalized variants of the human-readable metadata fields (`client_name`, `client_uri`, `logo_uri`, `tos_uri`, `policy_uri`), keyed by the raw `field#<BCP 47 language tag>` member name. Canonical (un-tagged) values remain in their own fields. URI variants are validated as absolute http(s) URLs, the same as their canonical counterparts.
 
-> **Note:** `tokenEndpointAuthMethodPolicy` is internal storage metadata and is not returned by `OAuthHelpers`. `strict` means the stored `tokenEndpointAuthMethod` is enforced exactly. `legacy-compatible` marks a confidential registration whose method was defaulted. A missing policy identifies a pre-policy client record. For only `legacy-compatible` and missing-policy confidential records, `client_secret_basic` and `client_secret_post` are interchangeable after the stored secret validates. Public (`none`), CIMD, missing or unknown method, and secretless records remain strict. Authentication never rewrites the client record or its TTL; explicitly setting `tokenEndpointAuthMethod` with `OAuthHelpers.updateClient()` stores `strict`.
+> **Note:** `authMethodExplicit: true` is stored only when the client explicitly selects `tokenEndpointAuthMethod`, and is not returned by `OAuthHelpers`. When the marker is absent, confidential clients may use `client_secret_basic` or `client_secret_post` after the stored secret validates. Public (`none`), CIMD, missing or unknown methods, and secretless records do not receive this compatibility. Authentication never rewrites the client record or its TTL; setting `tokenEndpointAuthMethod` with `OAuthHelpers.updateClient()` adds the marker.
 
 **TTL:** Dynamically registered clients (DCR) default to 90 days. Clients created via `OAuthHelpers.createClient()` have no expiration. Configurable via the `clientRegistrationTTL` option.
 

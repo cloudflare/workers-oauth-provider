@@ -321,9 +321,9 @@ MCP 2026-07-28 deprecates DCR for new implementations in favor of CIMD. The endp
 
 Registration accepts only authentication methods, grants, and response types implemented by the configured provider, and rejects inconsistent grant/response combinations before storage. Omitted metadata uses the RFC 7591 defaults: `client_secret_basic`, `grant_types: ["authorization_code"]`, and `response_types: ["code"]`.
 
-An explicitly supplied `token_endpoint_auth_method` is enforced exactly. For compatibility with clients registered before method provenance was stored, confidential client records without provenance—and new registrations that default to `client_secret_basic`—may authenticate with either `client_secret_basic` or `client_secret_post`, but only after the same stored client secret validates. This compatibility never crosses between `none` and a secret method and does not apply to CIMD clients. Calling `OAuthHelpers.updateClient()` with an explicit `tokenEndpointAuthMethod` marks an older client strict; unrelated updates preserve its existing policy.
+An explicitly supplied `token_endpoint_auth_method` is enforced exactly. When it is omitted, no explicit-method marker is stored and the client may use either `client_secret_basic` or `client_secret_post`, provided the same stored secret validates. Client records written by earlier releases have no marker and receive the same compatibility. This never crosses between `none` and a secret method and does not apply to CIMD clients.
 
-Clients that explicitly register one secret transport but present the other must be upgraded. A pre-policy record receives the migration fallback until it expires, but re-registering with an explicit method creates a strict record.
+Calling `OAuthHelpers.updateClient()` with `tokenEndpointAuthMethod` adds the marker; unrelated updates leave it unchanged.
 
 Related options:
 
