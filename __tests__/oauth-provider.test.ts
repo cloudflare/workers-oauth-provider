@@ -11073,11 +11073,30 @@ describe('OAuthProvider', () => {
         await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(CimdFetchError);
       });
 
-      it.each([
-        ['an unsupported grant type', { grant_types: ['password'], response_types: [] }],
-        ['an unsupported response type', { grant_types: [], response_types: ['id_token'] }],
-        ['an inconsistent grant and response type', { grant_types: ['authorization_code'], response_types: [] }],
-      ])('should reject CIMD metadata with %s', async (_label, metadata) => {
+      it('should negotiate supported capabilities from Claude.ai-style CIMD metadata', async () => {
+        const cimdUrl = 'https://claude.ai/oauth/mcp-oauth-client-metadata';
+        const metadata = {
+          client_id: cimdUrl,
+          client_name: 'Claude',
+          client_uri: 'https://claude.ai',
+          redirect_uris: ['https://claude.ai/api/mcp/auth_callback'],
+          token_endpoint_auth_method: 'none',
+          grant_types: ['authorization_code', 'refresh_token', 'urn:ietf:params:oauth:grant-type:jwt-bearer'],
+          response_types: ['code'],
+        };
+        globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(createMockFetchResponse(metadata)));
+
+        const authRequest = createMockRequest(
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://claude.ai/api/mcp/auth_callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=S256`,
+          'GET'
+        );
+
+        const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+
+        expect(authResponse.status).toBe(302);
+      });
+
+      it('should reject CIMD metadata with inconsistent effective grant and response types', async () => {
         const cimdUrl = 'https://client.example.com/oauth/metadata.json';
         globalThis.fetch = vi.fn().mockResolvedValue(
           createMockFetchResponse({
@@ -11085,7 +11104,8 @@ describe('OAuthProvider', () => {
             client_name: 'Invalid Capabilities Client',
             redirect_uris: ['https://client.example.com/callback'],
             token_endpoint_auth_method: 'none',
-            ...metadata,
+            grant_types: ['authorization_code', 'urn:example:unsupported-grant'],
+            response_types: ['id_token'],
           })
         );
 

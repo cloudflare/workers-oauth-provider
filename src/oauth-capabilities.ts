@@ -112,6 +112,30 @@ export function validateClientCapabilities(server: OAuthServerCapabilities, clie
   }
 }
 
+/**
+ * Selects the capabilities from a Client ID Metadata Document that this
+ * authorization server supports. CIMD documents may advertise extension
+ * capabilities alongside the flow used with this server, so unsupported grant
+ * and response types are omitted from the effective client metadata instead of
+ * invalidating an otherwise usable client.
+ *
+ * The effective subset is still checked for grant/response consistency, and
+ * token endpoint authentication must have a mutually supported method.
+ */
+export function negotiateCimdClientCapabilities(
+  server: OAuthServerCapabilities,
+  client: ClientCapabilities
+): { grantTypes: string[]; responseTypes: string[]; tokenEndpointAuthMethod: string } {
+  const effective = {
+    grantTypes: client.grantTypes.filter((grantType) => server.grantTypes.includes(grantType)),
+    responseTypes: client.responseTypes.filter((responseType) => server.responseTypes.includes(responseType)),
+    tokenEndpointAuthMethod: client.tokenEndpointAuthMethod,
+  };
+
+  validateClientCapabilities(server, effective);
+  return effective;
+}
+
 export function validateAuthorizationResponseType(
   server: OAuthServerCapabilities,
   responseType: string,
