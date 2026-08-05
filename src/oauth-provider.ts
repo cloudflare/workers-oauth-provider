@@ -866,37 +866,28 @@ export interface ClientInfo {
   tokenEndpointAuthMethod: string;
 }
 
-/**
- * Internal storage provenance for token endpoint authentication policy.
- *
- * Records written before this field existed intentionally remain unversioned.
- * They receive the same narrow confidential-client transport compatibility as
- * newly defaulted registrations, while an explicitly selected method is strict.
- */
-type ClientAuthMethodPolicy = 'strict' | 'legacy-compatible';
-
 interface StoredClientInfo extends ClientInfo {
-  tokenEndpointAuthMethodPolicy?: ClientAuthMethodPolicy;
+  /** Present only when tokenEndpointAuthMethod was explicitly selected. */
+  authMethodExplicit?: true;
 }
 
 function toPublicClientInfo(client: StoredClientInfo): ClientInfo {
-  const { tokenEndpointAuthMethodPolicy: _policy, ...publicClient } = client;
+  const { authMethodExplicit: _explicit, ...publicClient } = client;
   return publicClient;
 }
 
-function canUseLegacyConfidentialClientAuthTransport(
+function isClientAuthMethodAllowed(
   client: StoredClientInfo,
   presentedMethod: string,
   isClientMetadataDocument: boolean
 ): boolean {
+  if (presentedMethod === client.tokenEndpointAuthMethod) return true;
+
   const isSecretMethod = (method: string): boolean =>
     method === 'client_secret_basic' || method === 'client_secret_post';
-  const isCompatiblePolicy =
-    client.tokenEndpointAuthMethodPolicy === undefined || client.tokenEndpointAuthMethodPolicy === 'legacy-compatible';
-
   return (
     !isClientMetadataDocument &&
-    isCompatiblePolicy &&
+    client.authMethodExplicit === undefined &&
     isSecretMethod(client.tokenEndpointAuthMethod) &&
     isSecretMethod(presentedMethod)
   );
@@ -2021,15 +2012,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         ? 'client_secret_post'
         : 'none';
     const registeredAuthMethod = clientInfo.tokenEndpointAuthMethod;
-    const canUseLegacyConfidentialTransport =
-      presentedAuthMethod !== registeredAuthMethod &&
-      canUseLegacyConfidentialClientAuthTransport(
+    if (
+      !isClientAuthMethodAllowed(
         clientInfo,
         presentedAuthMethod,
         !!this.options.clientIdMetadataDocumentEnabled && this.isClientMetadataUrl(clientInfo.clientId)
-      );
-
-    if (presentedAuthMethod !== registeredAuthMethod && !canUseLegacyConfidentialTransport) {
+      )
+    ) {
       return this.createInvalidClientResponse('Client authentication failed', basicAuthenticationAttempted, {
         category: 'client-authentication',
         reason: 'token_endpoint_auth_method_mismatch',
@@ -3757,7 +3746,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         responseTypes,
         registrationDate: Math.floor(Date.now() / 1000),
         tokenEndpointAuthMethod: authMethod,
-        tokenEndpointAuthMethodPolicy: authMethodWasExplicit ? 'strict' : 'legacy-compatible',
+        ...(authMethodWasExplicit ? { authMethodExplicit: true as const } : {}),
       };
 
       // Add client secret only for confidential clients
@@ -5870,7 +5859,7 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
       responseTypes: clientInfo.responseTypes || ['code'],
       registrationDate: Math.floor(Date.now() / 1000),
       tokenEndpointAuthMethod,
-      tokenEndpointAuthMethodPolicy: authMethodWasExplicit ? 'strict' : 'legacy-compatible',
+      ...(authMethodWasExplicit ? { authMethodExplicit: true as const } : {}),
     };
 
     // Validate each redirect URI scheme
@@ -5975,9 +5964,9 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
       ...updates,
       clientId: client.clientId, // Ensure clientId doesn't change
       tokenEndpointAuthMethod: authMethod, // Use determined auth method
-      // This is internal provenance: callers cannot inject or downgrade it through
+      // This is internal provenance: callers cannot inject or remove it through
       // the public Partial<ClientInfo> update object.
-      tokenEndpointAuthMethodPolicy: authMethodWasExplicit ? 'strict' : client.tokenEndpointAuthMethodPolicy,
+      authMethodExplicit: authMethodWasExplicit ? true : client.authMethodExplicit,
     };
 
     // Only include client secret for confidential clients
