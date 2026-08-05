@@ -552,6 +552,7 @@ describe('OAuthProvider', () => {
       expect(metadata.issuer).toBe('https://example.com');
       expect(metadata.authorization_endpoint).toBe('https://example.com/authorize');
       expect(metadata.token_endpoint).toBe('https://example.com/oauth/token');
+      expect(metadata.protected_resources).toEqual(['https://example.com']);
       expect(metadata.registration_endpoint).toBe('https://example.com/oauth/register');
       expect(metadata.scopes_supported).toEqual(['read', 'write', 'profile']);
       expect(metadata.response_types_supported).toContain('code');
@@ -563,6 +564,42 @@ describe('OAuthProvider', () => {
       // Implicit flow is enabled in the default test provider, so fragment mode should be advertised
       expect(metadata.response_modes_supported).toContain('query');
       expect(metadata.response_modes_supported).toContain('fragment');
+    });
+
+    it('should advertise its protected resource independently of the authorization server origin', async () => {
+      const splitProvider = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: 'https://auth.example.com/authorize',
+        tokenEndpoint: 'https://auth.example.com/oauth/token',
+        resourceMetadata: {
+          resource: 'https://mcp.example.com/mcp',
+          authorization_servers: ['https://auth.example.com'],
+        },
+      });
+      const response = await splitProvider.fetch(
+        createMockRequest('https://auth.example.com/.well-known/oauth-authorization-server'),
+        mockEnv,
+        mockCtx
+      );
+
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toMatchObject({
+        issuer: 'https://auth.example.com',
+        protected_resources: ['https://mcp.example.com/mcp'],
+      });
+
+      const resourceResponse = await splitProvider.fetch(
+        createMockRequest('https://mcp.example.com/.well-known/oauth-protected-resource/mcp'),
+        mockEnv,
+        mockCtx
+      );
+      expect(resourceResponse.status).toBe(200);
+      await expect(resourceResponse.json()).resolves.toMatchObject({
+        resource: 'https://mcp.example.com/mcp',
+        authorization_servers: ['https://auth.example.com'],
+      });
     });
 
     it('should not include fragment response mode when implicit flow is disabled', async () => {

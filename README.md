@@ -218,6 +218,7 @@ The provider publishes RFC 8414 metadata containing:
 - `issuer`
 - `authorization_endpoint`
 - `token_endpoint`
+- `protected_resources`, containing the configured canonical resource
 - `registration_endpoint`, when DCR is enabled
 - supported response and grant types
 - token endpoint authentication methods
@@ -347,7 +348,7 @@ The provider owns `tokenEndpoint`. It exchanges authorization codes for tokens, 
 
 Every provider has one required canonical `resourceMetadata.resource`. It must be an absolute HTTPS URI without a fragment, use lowercase `https` and a lowercase host, and contain an RFC 3986-safe producer serialization. Userinfo, default ports, dot-segment paths, and an empty path before a query are rejected because `Request` would rewrite them before RFC 9728 comparison. A bare origin is the only empty-path exception; use `/` before a query. Query components are supported but discouraged by RFC 9728.
 
-Clients may omit `resource` at authorization, code exchange, and refresh. The provider always defaults or inherits the configured canonical value, stores it on the grant, returns it in token responses, and uses it as the access-token audience. Older clients therefore keep working without receiving unbound tokens.
+Current MCP clients are required to send `resource` in authorization and token requests. For compatibility with legacy clients, the provider tolerates omission at authorization, code exchange, and refresh. It always defaults or inherits the configured canonical value, stores it on the grant, returns it in token responses, and uses it as the access-token audience. Older clients therefore keep working without receiving unbound tokens.
 
 An explicit client value must identify the same canonical resource. ASCII case differences in the URI scheme and host are accepted, but port, path, query, trailing slash, and array cardinality remain strict. The provider always stores and returns its configured lowercase scheme-and-host spelling. Malformed, multi-valued, or mismatched input returns `invalid_target` before code consumption, callbacks, refresh rotation, or storage writes.
 

@@ -533,10 +533,11 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
      * The protected resource identifier HTTPS URL (RFC 9728 `resource` field).
      *
      * Every grant and access-token audience is pinned to this exact resource.
-     * Clients may omit the RFC 8707 `resource` parameter; an explicit value
-     * must match this canonical identifier. Configure an RFC 3986-safe HTTPS
-     * producer URL with lowercase scheme/host and no userinfo, default port,
-     * fragment, or dot segments.
+     * MCP clients are required to send the RFC 8707 `resource` parameter. For
+     * compatibility with legacy clients, the provider tolerates omission and
+     * uses this canonical identifier; an explicit value must match it. Configure
+     * an RFC 3986-safe HTTPS producer URL with lowercase scheme/host and no
+     * userinfo, default port, fragment, or dot segments.
      */
     resource: string;
     /**
@@ -2203,6 +2204,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       issuer: new URL(tokenEndpoint).origin,
       authorization_endpoint: authorizeEndpoint,
       token_endpoint: tokenEndpoint,
+      // RFC 9728 §4. This provider issues for exactly one enumerable
+      // protected resource, even when the AS and RS use different origins.
+      protected_resources: [this.options.resourceMetadata.resource],
       // not implemented: jwks_uri
       registration_endpoint: registrationEndpoint,
       scopes_supported: this.options.scopesSupported,
@@ -2311,7 +2315,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       }
 
       // Validate an explicit resource before any grant-specific callbacks or
-      // mutations. Omission remains valid and inherits the configured resource.
+      // mutations. Tolerate legacy omission and inherit the configured resource.
       this.validateTokenRequestResourceIndicator(body.resource);
 
       if (grantType === GrantType.AUTHORIZATION_CODE) {
