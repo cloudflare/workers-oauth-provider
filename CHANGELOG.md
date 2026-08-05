@@ -1,5 +1,17 @@
 # @cloudflare/workers-oauth-provider
 
+## 0.10.1
+
+### Patch Changes
+
+- [#287](https://github.com/cloudflare/workers-oauth-provider/pull/287) [`30b1f4f`](https://github.com/cloudflare/workers-oauth-provider/commit/30b1f4f4853cad79cb2ba162dc9101b6cea46aa3) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Preserve Basic and POST authentication interoperability for legacy and defaulted confidential clients while enforcing explicitly selected methods.
+
+- [#285](https://github.com/cloudflare/workers-oauth-provider/pull/285) [`737dfa2`](https://github.com/cloudflare/workers-oauth-provider/commit/737dfa2c3ab4b76506c375535e1192a2c6ef6d72) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Negotiate Client ID Metadata Document grant and response types with the authorization server's supported capabilities instead of rejecting documents that advertise additional values.
+
+- [#288](https://github.com/cloudflare/workers-oauth-provider/pull/288) [`7a6baf9`](https://github.com/cloudflare/workers-oauth-provider/commit/7a6baf9b32345c9ffa2eb4e43be8968900da98af) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Restore v0.8.2-compatible resource handling for grants without a stored RFC 8707 resource. Configured canonical resources are defaulted and inherited, bound grants reject explicit mismatches, and an unconfigured legacy grant can issue an unbound token or use an explicit token-request resource without persisting a new grant binding.
+
+  Deprecate `resourceMatchOriginOnly` without changing its behavior.
+
 ## 0.10.0
 
 ### Minor Changes
