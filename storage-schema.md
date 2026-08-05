@@ -46,13 +46,17 @@ Client records store OAuth client application information.
   "contacts": ["dev@example.com"],
   "grantTypes": ["authorization_code", "refresh_token"],
   "responseTypes": ["code"],
-  "registrationDate": 1644256123
+  "registrationDate": 1644256123,
+  "tokenEndpointAuthMethod": "client_secret_basic",
+  "tokenEndpointAuthMethodPolicy": "strict"
 }
 ```
 
 > **Note:** The `clientSecret` is stored as a SHA-256 hash, not in plaintext. The actual secret is only returned to the client when initially created or updated, and never stored.
 
 > **Note:** The optional `i18n` map holds RFC 7591 §2.2 internationalized variants of the human-readable metadata fields (`client_name`, `client_uri`, `logo_uri`, `tos_uri`, `policy_uri`), keyed by the raw `field#<BCP 47 language tag>` member name. Canonical (un-tagged) values remain in their own fields. URI variants are validated as absolute http(s) URLs, the same as their canonical counterparts.
+
+> **Note:** `tokenEndpointAuthMethodPolicy` is internal storage metadata and is not returned by `OAuthHelpers`. `strict` means the stored `tokenEndpointAuthMethod` is enforced exactly. `legacy-compatible` marks a confidential registration whose method was defaulted. A missing policy identifies a pre-policy client record. For only `legacy-compatible` and missing-policy confidential records, `client_secret_basic` and `client_secret_post` are interchangeable after the stored secret validates. Public (`none`), CIMD, missing or unknown method, and secretless records remain strict. Authentication never rewrites the client record or its TTL; explicitly setting `tokenEndpointAuthMethod` with `OAuthHelpers.updateClient()` stores `strict`.
 
 **TTL:** Dynamically registered clients (DCR) default to 90 days. Clients created via `OAuthHelpers.createClient()` have no expiration. Configurable via the `clientRegistrationTTL` option.
 

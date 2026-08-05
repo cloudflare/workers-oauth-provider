@@ -954,6 +954,8 @@ describe('OAuthProvider', () => {
       expect(savedClient.clientId).toBe(registeredClient.client_id);
       // Secret should be stored as a hash
       expect(savedClient.clientSecret).not.toBe(registeredClient.client_secret);
+      expect(savedClient.tokenEndpointAuthMethodPolicy).toBe('strict');
+      expect(registeredClient.tokenEndpointAuthMethodPolicy).toBeUndefined();
     });
 
     it('should register a public client', async () => {
@@ -985,6 +987,7 @@ describe('OAuthProvider', () => {
       const savedClient = await mockEnv.OAUTH_KV.get(`client:${registeredClient.client_id}`, { type: 'json' });
       expect(savedClient).not.toBeNull();
       expect(savedClient.clientSecret).toBeUndefined(); // No secret stored
+      expect(savedClient.tokenEndpointAuthMethodPolicy).toBe('strict');
     });
 
     it('should apply RFC 7591 defaults and return the values actually registered', async () => {
@@ -999,6 +1002,8 @@ describe('OAuthProvider', () => {
       const savedClient = await mockEnv.OAUTH_KV.get(`client:${registeredClient.client_id}`, { type: 'json' });
       expect(savedClient.grantTypes).toEqual(['authorization_code']);
       expect(savedClient.responseTypes).toEqual(['code']);
+      expect(savedClient.tokenEndpointAuthMethodPolicy).toBe('legacy-compatible');
+      expect(registeredClient.tokenEndpointAuthMethodPolicy).toBeUndefined();
     });
 
     it('should accept enabled extension grant and response types', async () => {
@@ -2404,6 +2409,38 @@ describe('OAuthProvider', () => {
       };
     }
 
+    async function seedV082Client(
+      tokenEndpointAuthMethod: 'client_secret_basic' | 'client_secret_post',
+      options?: { expirationTtl?: number }
+    ): Promise<TestClientCredentials> {
+      const clientId = `v0.8.2-${tokenEndpointAuthMethod}-${crypto.randomUUID()}`;
+      const clientSecret = 'v0.8.2-client-secret';
+      const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(clientSecret));
+      const clientSecretHash = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join(
+        ''
+      );
+
+      // This intentionally mirrors the complete persisted client shape written by
+      // v0.8.2: it has a registered method but predates policy provenance.
+      await mockEnv.OAUTH_KV.put(
+        `client:${clientId}`,
+        JSON.stringify({
+          clientId,
+          clientSecret: clientSecretHash,
+          redirectUris: ['https://client.example.com/callback'],
+          clientName: 'v0.8.2 Client',
+          contacts: ['owner@example.com'],
+          grantTypes: ['authorization_code', 'refresh_token'],
+          responseTypes: ['code'],
+          registrationDate: 1_754_000_000,
+          tokenEndpointAuthMethod,
+        }),
+        options
+      );
+
+      return { clientId, clientSecret, tokenEndpointAuthMethod };
+    }
+
     // Helper to create a test client before authorization tests
     async function createTestClient(tokenEndpointAuthMethod: TokenEndpointAuthMethod = 'client_secret_post') {
       const client = await registerTestClient(tokenEndpointAuthMethod);
@@ -2498,6 +2535,306 @@ describe('OAuthProvider', () => {
         );
       }
     );
+
+    it.each([
+      ['client_secret_basic', 'client_secret_post'],
+      ['client_secret_post', 'client_secret_basic'],
+    ] as const)(
+      'accepts %s-to-%s transport interoperability for an exact v0.8.2 client record',
+      async (registeredMethod, presentedMethod) => {
+        const client = await seedV082Client(registeredMethod);
+        const response = await requestTokenWithClientAuthentication(client, presentedMethod);
+
+        expect(response.status).toBe(400);
+        expect(await response.json<any>()).toMatchObject({ error: 'invalid_grant' });
+      }
+    );
+
+    it('requires the same stored secret before accepting a legacy-compatible transport', async () => {
+      const client = await seedV082Client('client_secret_post');
+      const response = await requestTokenWithClientAuthentication(
+        { ...client, clientSecret: 'not-the-registered-secret' },
+        'client_secret_basic'
+      );
+
+      await expectBasicClientError(response, 'Client authentication failed: invalid client_secret');
+    });
+
+    it('lets a newly defaulted confidential registration use Basic or POST without exposing policy metadata', async () => {
+      const registrationResponse = await oauthProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify({
+            redirect_uris: ['https://client.example.com/callback'],
+            client_name: 'Defaulted Client',
+          })
+        ),
+        mockEnv,
+        mockCtx
+      );
+      const registration = await registrationResponse.json<any>();
+      const client: TestClientCredentials = {
+        clientId: registration.client_id,
+        clientSecret: registration.client_secret,
+        tokenEndpointAuthMethod: 'client_secret_basic',
+      };
+
+      expect(registration.tokenEndpointAuthMethodPolicy).toBeUndefined();
+      for (const presentedMethod of ['client_secret_basic', 'client_secret_post'] as const) {
+        const response = await requestTokenWithClientAuthentication(client, presentedMethod);
+        expect(response.status).toBe(400);
+        expect(await response.json<any>()).toMatchObject({ error: 'invalid_grant' });
+      }
+    });
+
+    it('does not rewrite or extend a legacy client record while authenticating it', async () => {
+      const client = await seedV082Client('client_secret_basic', { expirationTtl: 60 });
+      const put = vi.spyOn(mockEnv.OAUTH_KV, 'put');
+
+      const response = await requestTokenWithClientAuthentication(client, 'client_secret_post');
+      expect(response.status).toBe(400);
+      expect(await response.json<any>()).toMatchObject({ error: 'invalid_grant' });
+      expect(put).not.toHaveBeenCalled();
+
+      const storedBeforeExpiry = await mockEnv.OAUTH_KV.get(`client:${client.clientId}`, { type: 'json' });
+      expect(storedBeforeExpiry.tokenEndpointAuthMethodPolicy).toBeUndefined();
+      mockEnv.OAUTH_KV.advanceTime(61_000);
+      expect(await mockEnv.OAUTH_KV.get(`client:${client.clientId}`, { type: 'json' })).toBeNull();
+    });
+
+    it.each([
+      ['client_secret_basic', 'client_secret_post'],
+      ['client_secret_post', 'client_secret_basic'],
+    ] as const)(
+      'uses %s-to-%s compatibility for revocation while keeping explicit clients strict',
+      async (registeredMethod, presentedMethod) => {
+        const revoke = (client: TestClientCredentials): Promise<Response> => {
+          const body = new URLSearchParams({ token: 'already-unknown-token' });
+          const headers: Record<string, string> = { 'Content-Type': 'application/x-www-form-urlencoded' };
+          if (presentedMethod === 'client_secret_basic') {
+            headers.Authorization = `Basic ${btoa(`${client.clientId}:${client.clientSecret}`)}`;
+          } else {
+            body.set('client_id', client.clientId);
+            body.set('client_secret', client.clientSecret!);
+          }
+          return oauthProvider.fetch(
+            createMockRequest('https://example.com/oauth/token', 'POST', headers, body.toString()),
+            mockEnv,
+            mockCtx
+          );
+        };
+
+        const legacyResponse = await revoke(await seedV082Client(registeredMethod));
+        expect(legacyResponse.status).toBe(200);
+
+        const strictResponse = await revoke(await registerTestClient(registeredMethod));
+        expect(strictResponse.status).toBe(401);
+        expect(strictResponse.headers.get('WWW-Authenticate')).toBe(
+          presentedMethod === 'client_secret_basic' ? 'Basic realm="OAuth"' : null
+        );
+        expect(await strictResponse.json<any>()).toEqual({
+          error: 'invalid_client',
+          error_description: 'Client authentication failed',
+        });
+      }
+    );
+
+    it('does not broaden compatibility to public, malformed, unknown, or secretless records', async () => {
+      const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode('stored-secret'));
+      const clientSecret = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+      const cases = [
+        { suffix: 'public', tokenEndpointAuthMethod: 'none', includeSecret: false },
+        { suffix: 'missing-method', tokenEndpointAuthMethod: undefined, includeSecret: true },
+        { suffix: 'unknown-method', tokenEndpointAuthMethod: 'private_key_jwt', includeSecret: true },
+        { suffix: 'secretless', tokenEndpointAuthMethod: 'client_secret_basic', includeSecret: false },
+        {
+          suffix: 'unknown-policy',
+          tokenEndpointAuthMethod: 'client_secret_basic',
+          tokenEndpointAuthMethodPolicy: 'future-policy',
+          includeSecret: true,
+        },
+      ];
+
+      for (const testCase of cases) {
+        const clientId = `legacy-${testCase.suffix}`;
+        await mockEnv.OAUTH_KV.put(
+          `client:${clientId}`,
+          JSON.stringify({
+            clientId,
+            ...(testCase.includeSecret ? { clientSecret } : {}),
+            redirectUris: ['https://client.example.com/callback'],
+            ...(testCase.tokenEndpointAuthMethod === undefined
+              ? {}
+              : { tokenEndpointAuthMethod: testCase.tokenEndpointAuthMethod }),
+            ...('tokenEndpointAuthMethodPolicy' in testCase
+              ? { tokenEndpointAuthMethodPolicy: testCase.tokenEndpointAuthMethodPolicy }
+              : {}),
+          })
+        );
+        const response = await requestTokenWithClientAuthentication(
+          {
+            clientId,
+            clientSecret: 'stored-secret',
+            tokenEndpointAuthMethod: 'client_secret_post',
+          },
+          'client_secret_post'
+        );
+        expect(response.status, testCase.suffix).toBe(401);
+        expect(await response.json<any>()).toMatchObject({ error: 'invalid_client' });
+      }
+
+      const confidentialClient = await seedV082Client('client_secret_basic');
+      const unauthenticatedResponse = await requestTokenWithClientAuthentication(confidentialClient, 'none');
+      expect(unauthenticatedResponse.status).toBe(401);
+      expect(await unauthenticatedResponse.json<any>()).toMatchObject({ error: 'invalid_client' });
+    });
+
+    it('treats a URL-shaped v0.8.2 KV client as stored metadata when CIMD is disabled', async () => {
+      const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode('stored-secret'));
+      const clientSecret = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+      const metadataUrlClientId = 'https://client.example.com/oauth/client.json';
+      await mockEnv.OAUTH_KV.put(
+        `client:${metadataUrlClientId}`,
+        JSON.stringify({
+          clientId: metadataUrlClientId,
+          clientSecret,
+          redirectUris: ['https://client.example.com/callback'],
+          tokenEndpointAuthMethod: 'client_secret_basic',
+        })
+      );
+      const metadataUrlResponse = await requestTokenWithClientAuthentication(
+        {
+          clientId: metadataUrlClientId,
+          clientSecret: 'stored-secret',
+          tokenEndpointAuthMethod: 'client_secret_post',
+        },
+        'client_secret_post'
+      );
+      expect(metadataUrlResponse.status).toBe(400);
+      expect(await metadataUrlResponse.json<any>()).toMatchObject({ error: 'invalid_grant' });
+    });
+
+    it('rejects missing secrets plus malformed and mixed Basic authentication for legacy records', async () => {
+      const client = await seedV082Client('client_secret_post');
+      const tokenBody = new URLSearchParams({
+        grant_type: 'authorization_code',
+        code: 'invalid-code',
+      });
+
+      const missingSecretResponse = await oauthProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            Authorization: `Basic ${btoa(`${client.clientId}:`)}`,
+          },
+          tokenBody.toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+      await expectBasicClientError(missingSecretResponse, 'Client authentication failed: missing client_secret');
+
+      const malformedResponse = await oauthProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            Authorization: 'Basic definitely-not-base64',
+          },
+          tokenBody.toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+      await expectBasicClientError(malformedResponse, 'Client authentication failed: invalid Basic credentials');
+
+      tokenBody.set('client_id', client.clientId);
+      tokenBody.set('client_secret', client.clientSecret!);
+      const mixedResponse = await oauthProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            Authorization: `Basic ${btoa(`${client.clientId}:${client.clientSecret}`)}`,
+          },
+          tokenBody.toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+      expect(mixedResponse.status).toBe(400);
+      expect(await mixedResponse.json<any>()).toEqual({
+        error: 'invalid_request',
+        error_description: 'Client must not use multiple authentication methods',
+      });
+    });
+
+    it('reports a stable internal mismatch reason while keeping the wire error generic', async () => {
+      const onError = vi.fn();
+      const provider = new OAuthProvider<TestEnv>({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        onError,
+      });
+      const clientId = 'strict-mismatch-client';
+      const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode('strict-secret'));
+      const clientSecret = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+      await mockEnv.OAUTH_KV.put(
+        `client:${clientId}`,
+        JSON.stringify({
+          clientId,
+          clientSecret,
+          redirectUris: ['https://client.example.com/callback'],
+          tokenEndpointAuthMethod: 'client_secret_basic',
+          tokenEndpointAuthMethodPolicy: 'strict',
+        })
+      );
+
+      const response = await provider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          new URLSearchParams({
+            grant_type: 'authorization_code',
+            code: 'invalid-code',
+            client_id: clientId,
+            client_secret: 'strict-secret',
+          }).toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+
+      expect(response.status).toBe(401);
+      expect(await response.json<any>()).toEqual({
+        error: 'invalid_client',
+        error_description: 'Client authentication failed',
+      });
+      expect(onError).toHaveBeenCalledWith(
+        expect.objectContaining({
+          code: 'invalid_client',
+          internal: {
+            category: 'client-authentication',
+            reason: 'token_endpoint_auth_method_mismatch',
+            detail: {
+              clientId,
+              registeredMethod: 'client_secret_basic',
+              presentedMethod: 'client_secret_post',
+            },
+          },
+        })
+      );
+    });
 
     it('should exchange auth code for tokens', async () => {
       // First get an auth code
@@ -9734,6 +10071,102 @@ describe('OAuthProvider', () => {
       // Verify client was deleted
       const clientsAfterDelete = await mockEnv.OAUTH_PROVIDER!.listClients();
       expect(clientsAfterDelete.items.length).toBe(0);
+    });
+
+    it('keeps authentication provenance internal and makes explicit updates strict', async () => {
+      await oauthProvider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
+      const helpers = mockEnv.OAUTH_PROVIDER!;
+
+      const defaultedClient = await helpers.createClient({
+        redirectUris: ['https://defaulted.example.com/callback'],
+        clientName: 'Defaulted helper client',
+      });
+      const explicitClient = await helpers.createClient({
+        redirectUris: ['https://explicit.example.com/callback'],
+        clientName: 'Explicit helper client',
+        tokenEndpointAuthMethod: 'client_secret_post',
+      });
+
+      expect((defaultedClient as any).tokenEndpointAuthMethodPolicy).toBeUndefined();
+      expect((explicitClient as any).tokenEndpointAuthMethodPolicy).toBeUndefined();
+      expect(
+        (await mockEnv.OAUTH_KV.get(`client:${defaultedClient.clientId}`, { type: 'json' }))
+          .tokenEndpointAuthMethodPolicy
+      ).toBe('legacy-compatible');
+      expect(
+        (await mockEnv.OAUTH_KV.get(`client:${explicitClient.clientId}`, { type: 'json' }))
+          .tokenEndpointAuthMethodPolicy
+      ).toBe('strict');
+
+      const preservedDefaultPolicy = await helpers.updateClient(defaultedClient.clientId, {
+        clientName: 'Renamed defaulted helper client',
+      });
+      expect((preservedDefaultPolicy as any).tokenEndpointAuthMethodPolicy).toBeUndefined();
+      expect(
+        (await mockEnv.OAUTH_KV.get(`client:${defaultedClient.clientId}`, { type: 'json' }))
+          .tokenEndpointAuthMethodPolicy
+      ).toBe('legacy-compatible');
+
+      const attemptedDowngrade = await helpers.updateClient(explicitClient.clientId, {
+        clientName: 'Still strict',
+        tokenEndpointAuthMethodPolicy: 'legacy-compatible',
+      } as any);
+      expect((attemptedDowngrade as any).tokenEndpointAuthMethodPolicy).toBeUndefined();
+      expect(
+        (await mockEnv.OAUTH_KV.get(`client:${explicitClient.clientId}`, { type: 'json' }))
+          .tokenEndpointAuthMethodPolicy
+      ).toBe('strict');
+
+      const postResponse = await oauthProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          new URLSearchParams({
+            grant_type: 'authorization_code',
+            code: 'invalid-code',
+            client_id: defaultedClient.clientId,
+            client_secret: defaultedClient.clientSecret!,
+          }).toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+      expect(postResponse.status).toBe(400);
+      expect(await postResponse.json<any>()).toMatchObject({ error: 'invalid_grant' });
+
+      const listed = await helpers.listClients();
+      expect(listed.items).toHaveLength(2);
+      expect(listed.items.every((client) => (client as any).tokenEndpointAuthMethodPolicy === undefined)).toBe(true);
+      expect(
+        ((await helpers.lookupClient(defaultedClient.clientId)) as any).tokenEndpointAuthMethodPolicy
+      ).toBeUndefined();
+
+      const legacyClientId = 'unversioned-helper-client';
+      await mockEnv.OAUTH_KV.put(
+        `client:${legacyClientId}`,
+        JSON.stringify({
+          clientId: legacyClientId,
+          clientSecret: 'pre-hashed-secret',
+          redirectUris: ['https://legacy.example.com/callback'],
+          clientName: 'Unversioned client',
+          tokenEndpointAuthMethod: 'client_secret_basic',
+        })
+      );
+
+      const unrelatedUpdate = await helpers.updateClient(legacyClientId, { clientName: 'Renamed unversioned client' });
+      expect((unrelatedUpdate as any).tokenEndpointAuthMethodPolicy).toBeUndefined();
+      expect(
+        (await mockEnv.OAUTH_KV.get(`client:${legacyClientId}`, { type: 'json' })).tokenEndpointAuthMethodPolicy
+      ).toBeUndefined();
+
+      const strictUpdate = await helpers.updateClient(legacyClientId, {
+        tokenEndpointAuthMethod: 'client_secret_basic',
+      });
+      expect((strictUpdate as any).tokenEndpointAuthMethodPolicy).toBeUndefined();
+      expect(
+        (await mockEnv.OAUTH_KV.get(`client:${legacyClientId}`, { type: 'json' })).tokenEndpointAuthMethodPolicy
+      ).toBe('strict');
     });
   });
 

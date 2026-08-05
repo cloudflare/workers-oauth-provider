@@ -864,6 +864,42 @@ export interface ClientInfo {
 }
 
 /**
+ * Internal storage provenance for token endpoint authentication policy.
+ *
+ * Records written before this field existed intentionally remain unversioned.
+ * They receive the same narrow confidential-client transport compatibility as
+ * newly defaulted registrations, while an explicitly selected method is strict.
+ */
+type ClientAuthMethodPolicy = 'strict' | 'legacy-compatible';
+
+interface StoredClientInfo extends ClientInfo {
+  tokenEndpointAuthMethodPolicy?: ClientAuthMethodPolicy;
+}
+
+function toPublicClientInfo(client: StoredClientInfo): ClientInfo {
+  const { tokenEndpointAuthMethodPolicy: _policy, ...publicClient } = client;
+  return publicClient;
+}
+
+function canUseLegacyConfidentialClientAuthTransport(
+  client: StoredClientInfo,
+  presentedMethod: string,
+  isClientMetadataDocument: boolean
+): boolean {
+  const isSecretMethod = (method: string): boolean =>
+    method === 'client_secret_basic' || method === 'client_secret_post';
+  const isCompatiblePolicy =
+    client.tokenEndpointAuthMethodPolicy === undefined || client.tokenEndpointAuthMethodPolicy === 'legacy-compatible';
+
+  return (
+    !isClientMetadataDocument &&
+    isCompatiblePolicy &&
+    isSecretMethod(client.tokenEndpointAuthMethod) &&
+    isSecretMethod(presentedMethod)
+  );
+}
+
+/**
  * Options for completing an authorization request
  */
 export interface CompleteAuthorizationOptions {
@@ -1947,7 +1983,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     // Verify client exists
-    let clientInfo: ClientInfo | null;
+    let clientInfo: StoredClientInfo | null;
     try {
       clientInfo = await this.getClient(env, clientId);
     } catch (error) {
@@ -1981,8 +2017,25 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       : formData.has('client_secret')
         ? 'client_secret_post'
         : 'none';
-    if (presentedAuthMethod !== clientInfo.tokenEndpointAuthMethod) {
-      return this.createInvalidClientResponse('Client authentication failed', basicAuthenticationAttempted);
+    const registeredAuthMethod = clientInfo.tokenEndpointAuthMethod;
+    const canUseLegacyConfidentialTransport =
+      presentedAuthMethod !== registeredAuthMethod &&
+      canUseLegacyConfidentialClientAuthTransport(
+        clientInfo,
+        presentedAuthMethod,
+        !!this.options.clientIdMetadataDocumentEnabled && this.isClientMetadataUrl(clientInfo.clientId)
+      );
+
+    if (presentedAuthMethod !== registeredAuthMethod && !canUseLegacyConfidentialTransport) {
+      return this.createInvalidClientResponse('Client authentication failed', basicAuthenticationAttempted, {
+        category: 'client-authentication',
+        reason: 'token_endpoint_auth_method_mismatch',
+        detail: {
+          clientId: clientInfo.clientId,
+          registeredMethod: registeredAuthMethod,
+          presentedMethod: presentedAuthMethod,
+        },
+      });
     }
 
     // For confidential clients, validate the secret
@@ -3621,10 +3674,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       return this.createErrorResponse('invalid_request', { description: 'Invalid JSON payload', statusCode: 400 });
     }
 
+    let authMethodWasExplicit: boolean;
     let authMethod: string;
     let grantTypes: string[];
     let responseTypes: string[];
     try {
+      authMethodWasExplicit = clientMetadata.token_endpoint_auth_method !== undefined;
       authMethod =
         OAuthProviderImpl.validateStringField(clientMetadata.token_endpoint_auth_method) || 'client_secret_basic';
       grantTypes = OAuthProviderImpl.validateStringArray(clientMetadata.grant_types, 'grant_types') || [
@@ -3664,7 +3719,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       hashedSecret = await hashSecret(clientSecret);
     }
 
-    let clientInfo: ClientInfo;
+    let clientInfo: StoredClientInfo;
     try {
       // Validate redirect URIs - must exist and have at least one entry
       const redirectUris = OAuthProviderImpl.validateStringArray(clientMetadata.redirect_uris);
@@ -3692,6 +3747,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         responseTypes,
         registrationDate: Math.floor(Date.now() / 1000),
         tokenEndpointAuthMethod: authMethod,
+        tokenEndpointAuthMethodPolicy: authMethodWasExplicit ? 'strict' : 'legacy-compatible',
       };
 
       // Add client secret only for confidential clients
@@ -4055,7 +4111,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * propagate, and a CIMD metadata fetch failure throws `CimdFetchError`), so an
    * upstream outage is distinguishable from an unregistered client.
    */
-  async getClient(env: Env & ProviderEnv, clientId: string): Promise<ClientInfo | null> {
+  async getClient(env: Env & ProviderEnv, clientId: string): Promise<StoredClientInfo | null> {
     // Check if this is a CIMD (Client ID Metadata Document) URL
     if (this.isClientMetadataUrl(clientId)) {
       if (!this.options.clientIdMetadataDocumentEnabled) {
@@ -5528,7 +5584,8 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
    * validating the metadata document fails.
    */
   async lookupClient(clientId: string): Promise<ClientInfo | null> {
-    return await this.provider.getClient(this.env, clientId);
+    const client = await this.provider.getClient(this.env, clientId);
+    return client ? toPublicClientInfo(client) : null;
   }
 
   /**
@@ -5757,11 +5814,12 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
     const clientId = generateRandomString(16);
 
     // Determine token endpoint auth method
+    const authMethodWasExplicit = clientInfo.tokenEndpointAuthMethod !== undefined;
     const tokenEndpointAuthMethod = clientInfo.tokenEndpointAuthMethod || 'client_secret_basic';
     const isPublicClient = tokenEndpointAuthMethod === 'none';
 
     // Create a new client object
-    const newClient: ClientInfo = {
+    const newClient: StoredClientInfo = {
       clientId,
       redirectUris: clientInfo.redirectUris || [],
       clientName: clientInfo.clientName,
@@ -5780,6 +5838,7 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
       responseTypes: clientInfo.responseTypes || ['code'],
       registrationDate: Math.floor(Date.now() / 1000),
       tokenEndpointAuthMethod,
+      tokenEndpointAuthMethodPolicy: authMethodWasExplicit ? 'strict' : 'legacy-compatible',
     };
 
     // Validate each redirect URI scheme
@@ -5798,7 +5857,7 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
     await this.env.OAUTH_KV.put(`client:${clientId}`, JSON.stringify(newClient));
 
     // Create the response object
-    const clientResponse = { ...newClient };
+    const clientResponse = toPublicClientInfo(newClient);
 
     // Return confidential clients with their unhashed secret
     if (!isPublicClient && clientSecret) {
@@ -5836,7 +5895,7 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
       const clientId = key.name.substring('client:'.length);
       const client = await this.provider.getClient(this.env, clientId);
       if (client) {
-        clients.push(client);
+        clients.push(toPublicClientInfo(client));
       }
     });
 
@@ -5862,7 +5921,8 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
     }
 
     // Determine token endpoint auth method
-    let authMethod = updates.tokenEndpointAuthMethod || client.tokenEndpointAuthMethod || 'client_secret_basic';
+    const authMethodWasExplicit = updates.tokenEndpointAuthMethod !== undefined;
+    const authMethod = updates.tokenEndpointAuthMethod || client.tokenEndpointAuthMethod || 'client_secret_basic';
     const isPublicClient = authMethod === 'none';
 
     // Handle changes in auth method
@@ -5878,11 +5938,14 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
       secretToStore = await hashSecret(updates.clientSecret);
     }
 
-    const updatedClient: ClientInfo = {
+    const updatedClient: StoredClientInfo = {
       ...client,
       ...updates,
       clientId: client.clientId, // Ensure clientId doesn't change
       tokenEndpointAuthMethod: authMethod, // Use determined auth method
+      // This is internal provenance: callers cannot inject or downgrade it through
+      // the public Partial<ClientInfo> update object.
+      tokenEndpointAuthMethodPolicy: authMethodWasExplicit ? 'strict' : client.tokenEndpointAuthMethodPolicy,
     };
 
     // Only include client secret for confidential clients
@@ -5900,7 +5963,7 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
     await this.env.OAUTH_KV.put(`client:${clientId}`, JSON.stringify(updatedClient), clientKvOptions);
 
     // Create a response object
-    const response = { ...updatedClient };
+    const response = toPublicClientInfo(updatedClient);
 
     // For confidential clients, return unhashed secret if a new one was provided
     if (!isPublicClient && originalSecret) {
