@@ -1,11 +1,14 @@
 import { WorkerEntrypoint } from 'cloudflare:workers';
 import {
   AuthorizationError,
+  createJwtAccessTokens,
   ExternalTokenError,
   OAuthProvider,
   getOAuthApi,
   type OAuthHelpers,
   type OAuthProviderOptions,
+  type JwtAccessTokenAlgorithm,
+  type JwtAccessTokenPublicKey,
 } from '../../src/oauth-provider';
 import {
   CLIENT_REDIRECT_URI,
@@ -108,6 +111,59 @@ function requireProvider(): OAuthProvider<ConformanceWorkerEnv> {
 }
 
 export default class McpOAuthConformanceWorker extends WorkerEntrypoint<ConformanceWorkerEnv> {
+  /** Exercise signing and verification in real workerd WebCrypto, not Node's test implementation. */
+  async roundTripJwt(algorithm: JwtAccessTokenAlgorithm): Promise<{
+    header: Record<string, unknown>;
+    verified: boolean;
+  }> {
+    const keyPair = (await crypto.subtle.generateKey(
+      algorithm === 'RS256'
+        ? {
+            name: 'RSASSA-PKCS1-v1_5',
+            modulusLength: 2048,
+            publicExponent: new Uint8Array([1, 0, 1]),
+            hash: 'SHA-256',
+          }
+        : { name: 'ECDSA', namedCurve: 'P-256' },
+      true,
+      ['sign', 'verify']
+    )) as CryptoKeyPair;
+    const publicJwk = {
+      ...((await crypto.subtle.exportKey('jwk', keyPair.publicKey)) as JsonWebKey),
+      kid: `workerd-${algorithm}`,
+      alg: algorithm,
+      use: 'sig',
+      key_ops: ['verify'],
+    } satisfies JwtAccessTokenPublicKey;
+    const issuer = 'https://auth.workerd.test';
+    const audience = 'https://resource.workerd.test/mcp';
+    const accessTokens = createJwtAccessTokens<ConformanceWorkerEnv, { secret: string }>({
+      issuer,
+      jwksUri: `${issuer}/.well-known/jwks.json`,
+      keys: () => ({
+        current: { kid: publicJwk.kid, alg: algorithm, privateKey: keyPair.privateKey, publicJwk },
+      }),
+    });
+    const now = Math.floor(Date.now() / 1000);
+    const issued = await accessTokens.issue({
+      props: { secret: 'not-in-the-jwt' },
+      userId: 'workerd-user',
+      grantId: 'workerd-grant',
+      clientId: 'workerd-client',
+      scope: ['mcp:read'],
+      audience,
+      issuedAt: now,
+      expiresAt: now + 300,
+      env: this.env,
+    });
+    const encodedHeader = issued.token.split('.')[0].replace(/-/g, '+').replace(/_/g, '/');
+    const header = JSON.parse(atob(encodedHeader.padEnd(Math.ceil(encodedHeader.length / 4) * 4, '=')));
+    return {
+      header,
+      verified: (await accessTokens.verify(issued.token, [audience], this.env))?.userId === 'workerd-user',
+    };
+  }
+
   configure(nextConfiguration: WorkerConfiguration): void {
     configuration = nextConfiguration;
     provider = new OAuthProvider(createProviderOptions(nextConfiguration));
