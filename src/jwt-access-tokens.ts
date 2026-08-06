@@ -199,11 +199,12 @@ export interface JwtAccessTokenValidation<Props> {
 }
 
 /**
- * Create an RFC 9068 access-token issuer for `OAuthAuthorizationServer`.
+ * Create an RFC 9068 access-token signer and reader for `OAuthAuthorizationServer`.
  *
- * New access tokens become signed JWTs. The provider still keeps its encrypted
- * token-context record so built-in validation, confidential `ctx.props`, token
- * exchange, and immediate revocation retain their existing behavior.
+ * New access tokens default to signed JWTs; `accessTokenFormat` can keep writing
+ * opaque tokens during a reader-first rollout. The provider still keeps its
+ * encrypted token-context record so built-in validation, confidential
+ * `ctx.props`, token exchange, and immediate revocation retain their behavior.
  */
 export function createJwtAccessTokens<Env = Cloudflare.Env, Props = unknown>(
   options: JwtAccessTokensOptions<Env, Props>

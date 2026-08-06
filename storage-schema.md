@@ -168,7 +168,7 @@ Token records store metadata about issued access tokens, including denormalized 
 }
 ```
 
-> **Note:** Opaque access tokens use `{userId}:{grantId}:{random-secret}`. When RFC 9068 access tokens are enabled, the client instead receives a signed JWT and the record includes `format: "jwt"` and its `jti`; absence of `format` means the opaque representation. In both modes, `id` and the final KV key component are the SHA-256 hash of the complete token. The token record remains the source of stateful revocation and encrypted application props. Its wrapped encryption key can be unwrapped only with the actual token string.
+> **Note:** Opaque access tokens use `{userId}:{grantId}:{random-secret}`. When the RFC 9068 issuance policy selects JWT, the client instead receives a signed token and the record includes `format: "jwt"` and its `jti`; absence of `format` means the opaque representation. In both modes, `id` and the final KV key component are the SHA-256 hash of the complete token. The token record remains the source of stateful revocation and encrypted application props. Its wrapped encryption key can be unwrapped only with the actual token string.
 
 > **Audience safety:** Every access token issued by 1.0 carries exactly one registered canonical resource as its audience. Token exchange cannot change that audience. Persisted token types keep the field optional only so old KV records can be decoded; each protected-resource surface rejects records whose audience is missing or belongs to another resource. A client holding an unbound pre-1.0 access token should refresh or reconnect.
 

@@ -620,6 +620,9 @@ interface OAuthAuthorizationServerConfiguration<Env = Cloudflare.Env> {
   /** Optional RFC 9068 JWT access-token issuer created by `createJwtAccessTokens()`. */
   accessTokens?: InternalJwtAccessTokens<Env>;
 
+  /** Functional policy selecting the format of each newly issued access token. */
+  accessTokenFormat?: AccessTokenFormatPolicy<Env>;
+
   /**
    * Resource selected when a new authorization request omits `resource`.
    * Omit this in a multi-resource deployment to require clients to choose.
@@ -634,6 +637,21 @@ interface OAuthAuthorizationServerConfiguration<Env = Cloudflare.Env> {
    */
   legacyGrantResource?: string;
 }
+
+/** Access-token representations supported by the authorization server. */
+export type AccessTokenFormat = 'opaque' | 'jwt';
+
+/** Immutable context passed to an access-token format policy before issuance. */
+export interface AccessTokenFormatContext<Env = Cloudflare.Env> {
+  readonly env: Env;
+  readonly clientId: string;
+  readonly resource: string;
+}
+
+/** Functional policy for selecting the representation of each new access token. */
+export type AccessTokenFormatPolicy<Env = Cloudflare.Env> = (
+  context: AccessTokenFormatContext<Env>
+) => AccessTokenFormat | Promise<AccessTokenFormat>;
 
 /** Internal input used when `protectResource()` registers one hosted role. */
 interface InternalProtectedResourceConfiguration<Env = Cloudflare.Env> {
@@ -684,11 +702,27 @@ export type OAuthAuthorizationServerOptions<Env = Cloudflare.Env, Props = unknow
   legacyGrantResource?: string;
 
   /**
-   * Functional RFC 9068 JWT access-token issuer. When omitted, access tokens
-   * keep the legacy opaque format. Authorization codes and refresh tokens stay
-   * opaque in either mode.
+   * Installs RFC 9068 access-token signing and validation and publishes
+   * `jwks_uri`. When configured, the authorization server accepts both its
+   * valid JWT access tokens and compatible legacy opaque access tokens.
+   *
+   * New access tokens default to JWT. Use `accessTokenFormat` to stage the JWT
+   * reader and JWKS before enabling JWT issuance. Authorization codes and
+   * refresh tokens remain opaque.
    */
   accessTokens?: JwtAccessTokens<Env, Props>;
+
+  /**
+   * Selects the representation of each newly issued access token. This controls
+   * issuance only: it does not restrict accepted token formats, rewrite existing
+   * tokens, or change refresh-token format.
+   *
+   * Requires `accessTokens` and defaults to JWT. Return `opaque` during a
+   * reader-before-writer deployment, then return `jwt` after every consumer can
+   * validate JWTs. A thrown error or invalid result fails issuance; the provider
+   * never silently downgrades to opaque.
+   */
+  accessTokenFormat?: AccessTokenFormatPolicy<Env>;
 
   /** Typed props refresh/exchange hook for this authorization server. */
   tokenExchangeCallback?: (
@@ -823,7 +857,7 @@ export interface OAuthHelpers<Props = any> {
    *
    * Performs two sweep phases:
    * 1. Grant sweep: removes orphaned grants (client deleted) and expired grants (defense-in-depth for KV TTL)
-   * 2. Token sweep: removes orphaned tokens (grant deleted) as defense-in-depth
+   * 2. Token sweep: removes orphaned tokens (grant or owning client deleted) as defense-in-depth
    *
    * Safe to call repeatedly — deleted records disappear from KV, so subsequent invocations
    * naturally process fresh records without needing a persisted cursor.
@@ -1239,20 +1273,21 @@ export interface TokenBase {
   scope: string[];
 
   /**
-   * Access-token representation. Absence means the legacy opaque format.
+   * Access-token representation. Absence means the opaque representation.
    */
   format?: 'jwt';
 
   /**
-   * JWT ID for RFC 9068 access tokens. Absent on legacy opaque tokens.
+   * JWT ID for RFC 9068 access tokens. Absent on opaque tokens.
    */
   jti?: string;
 }
 
 /**
  * Token record stored in KV.
- * Legacy access tokens use "{userId}:{grantId}:{random-secret}". An
- * authorization server with RFC 9068 enabled returns a signed JWT instead.
+ * Opaque access tokens use "{userId}:{grantId}:{random-secret}". An
+ * authorization server can return a signed JWT instead according to its
+ * access-token format policy.
  * Both representations store only the hash of the complete token string.
  * This contains only access tokens; refresh tokens are stored within the grant records.
  */
@@ -1263,11 +1298,11 @@ export interface Token extends TokenBase {
   wrappedEncryptionKey: string;
 
   /**
-   * Denormalized grant information for faster access
+   * Denormalized token authorization information for faster access
    */
   grant: {
     /**
-     * Client that received this grant
+     * Client that received this token
      */
     clientId: string;
 
@@ -1289,11 +1324,11 @@ export interface Token extends TokenBase {
  */
 export interface TokenSummary<T = any> extends TokenBase {
   /**
-   * Denormalized grant information for faster access
+   * Denormalized token authorization information for faster access
    */
   grant: {
     /**
-     * Client that received this grant
+     * Client that received this token
      */
     clientId: string;
 
@@ -1369,7 +1404,7 @@ export interface PurgeOptions {
   purgeExpiredGrants?: boolean;
 
   /**
-   * Whether to purge orphaned tokens whose grant no longer exists.
+   * Whether to purge orphaned tokens whose grant or owning registered client no longer exists.
    * Tokens already auto-expire via KV TTL (default 1 hour), so this is
    * defense-in-depth for partial revokeGrant() failures.
    * Defaults to true.
@@ -1445,6 +1480,9 @@ export interface GrantSummary {
  * Options for creating an access token
  */
 interface CreateAccessTokenOptions<Env = Cloudflare.Env> {
+  /** Prevalidated access-token representation selected before grant mutation. */
+  format: AccessTokenFormat;
+
   /**
    * User ID
    */
@@ -1579,6 +1617,7 @@ export class OAuthAuthorizationServer<Env = Cloudflare.Env, Props = unknown> {
       tokenEndpoint,
       clientRegistrationEndpoint,
       accessTokens,
+      accessTokenFormat,
       ...commonOptions
     } = options;
     this.#impl = new OAuthProviderImpl<Env>({
@@ -1592,6 +1631,7 @@ export class OAuthAuthorizationServer<Env = Cloudflare.Env, Props = unknown> {
         tokenEndpoint,
         clientRegistrationEndpoint,
         accessTokens,
+        accessTokenFormat,
         defaultResource,
         legacyGrantResource,
       },
@@ -1671,6 +1711,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   /** Optional RFC 9068 access-token component for the role-based AS. */
   private readonly jwtAccessTokens: InternalJwtAccessTokens<Env> | undefined;
 
+  /** Optional reader-first rollout policy for newly issued access tokens. */
+  private readonly accessTokenFormatPolicy: AccessTokenFormatPolicy<Env> | undefined;
+
   /** Every protected-resource role hosted by this provider. */
   private readonly resourceServers: NormalizedResourceServer<Env>[];
 
@@ -1721,6 +1764,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       this.validateAuthorizationServerIssuer(authorizationServer.issuer);
       this.explicitIssuer = authorizationServer.issuer;
       this.jwtAccessTokens = authorizationServer.accessTokens;
+      this.accessTokenFormatPolicy = authorizationServer.accessTokenFormat;
+      if (this.accessTokenFormatPolicy !== undefined && typeof this.accessTokenFormatPolicy !== 'function') {
+        throw new TypeError('accessTokenFormat must be a function');
+      }
+      if (this.accessTokenFormatPolicy && !this.jwtAccessTokens) {
+        throw new TypeError('accessTokenFormat requires accessTokens');
+      }
       if (this.jwtAccessTokens && this.jwtAccessTokens.issuer !== authorizationServer.issuer) {
         throw new TypeError('accessTokens issuer must exactly match authorizationServer.issuer');
       }
@@ -1735,6 +1785,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     } else {
       this.explicitIssuer = undefined;
       this.jwtAccessTokens = undefined;
+      this.accessTokenFormatPolicy = undefined;
       normalizedOptions = options;
       configuredResourceServers = [
         {
@@ -3283,6 +3334,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       });
     }
 
+    // Resolve rollout policy before consuming the authorization code or writing
+    // grant/token state. A policy outage must leave this code retryable.
+    const accessTokenFormat = await this.selectAccessTokenFormat({
+      env,
+      clientId: grantData.clientId,
+      resource: audience,
+    });
+
     // Calculate the access token expiration time (after callback might have updated TTL)
     const now = Math.floor(Date.now() / 1000);
 
@@ -3327,6 +3386,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Create and store access token with potentially narrowed scopes
     const accessToken = await this.createAccessToken({
+      format: accessTokenFormat,
       userId,
       grantId,
       clientId: grantData.clientId,
@@ -3564,6 +3624,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       });
     }
 
+    // Resolve rollout policy before rotating the refresh token or persisting a
+    // legacy-resource backfill, so a failed decision leaves the grant retryable.
+    const accessTokenFormat = await this.selectAccessTokenFormat({
+      env,
+      clientId: grantData.clientId,
+      resource: audience,
+    });
+
     // Generate new refresh token for rotation
     const refreshTokenSecret = generateRandomString(TOKEN_LENGTH);
     const newRefreshToken = `${userId}:${grantId}:${refreshTokenSecret}`;
@@ -3598,6 +3666,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Centralized issuance preserves old opaque-token validation while allowing
     // this AS to switch new and refreshed access tokens to RFC 9068 JWTs.
     const newAccessToken = await this.createAccessToken({
+      format: accessTokenFormat,
       userId,
       grantId,
       clientId: grantData.clientId,
@@ -3770,11 +3839,20 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       });
     }
 
+    const accessTokenFormat = await this.selectAccessTokenFormat({
+      env,
+      clientId: clientInfo.clientId,
+      resource: newAudience,
+    });
+
     // Create and store access token
     const newAccessToken = await this.createAccessToken({
+      format: accessTokenFormat,
       userId: tokenSummary.userId,
       grantId: tokenSummary.grantId,
-      clientId: tokenSummary.grant.clientId,
+      // The new token belongs to the authenticated exchanging client, which
+      // may differ from the client that originally received the subject token.
+      clientId: clientInfo.clientId,
       scope: tokenScopes,
       encryptedProps: encryptedAccessTokenProps,
       encryptionKey: accessTokenEncryptionKey,
@@ -3938,8 +4016,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    *
    * Sequence:
    *   parse → validate header → trust issuer → fetch JWKS → select key →
-   *   verify signature → validate claims → record jti → parse scope →
-   *   run mapper → validate mapper result → compute TTL → mint token.
+   *   verify signature → validate claims → parse scope → select token format →
+   *   record jti → run mapper → validate mapper result → compute TTL → mint token.
    */
   private async runEmaPipeline(args: {
     body: any;
@@ -4000,6 +4078,16 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     });
     if (!claims.ok) return claims;
 
+    const requestedScope = parseEmaScopeParam(body.scope, claims.value.assertionScopes);
+    if (!requestedScope.ok) return requestedScope;
+
+    // A rollout-policy failure must not consume the one-use assertion JTI.
+    const accessTokenFormat = await this.selectAccessTokenFormat({
+      env,
+      clientId: clientInfo.clientId,
+      resource: configuredResource,
+    });
+
     // Fresh clock read so the JTI KV TTL reflects the assertion's remaining
     // lifetime at the moment of write, not at pipeline start (JWKS fetch
     // already burned several ms; mapper hasn't run yet).
@@ -4012,9 +4100,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       env,
     });
     if (!replay.ok) return replay;
-
-    const requestedScope = parseEmaScopeParam(body.scope, claims.value.assertionScopes);
-    if (!requestedScope.ok) return requestedScope;
 
     let mapperOutput: unknown;
     try {
@@ -4048,6 +4133,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     return ok(
       await this.issueEmaAccessToken({
+        format: accessTokenFormat,
         clientId: clientInfo.clientId,
         userId: mapped.value.userId,
         mapperScope: mapped.value.scope,
@@ -4107,6 +4193,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * and create an access token bound to the resource as audience.
    */
   private async issueEmaAccessToken(args: {
+    format: AccessTokenFormat;
     clientId: string;
     userId: string;
     mapperScope: string[];
@@ -4144,6 +4231,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     await this.saveGrantWithTTL(args.env, `grant:${args.userId}:${grantId}`, grant, args.now);
 
     const accessToken = await this.createAccessToken({
+      format: args.format,
       userId: args.userId,
       grantId,
       clientId: args.clientId,
@@ -4964,13 +5052,40 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     };
   }
 
+  async selectAccessTokenFormat(context: AccessTokenFormatContext<Env>): Promise<AccessTokenFormat> {
+    if (!this.jwtAccessTokens) return 'opaque';
+    if (!this.accessTokenFormatPolicy) return 'jwt';
+
+    // Policies may be shared with application code. Give them an immutable
+    // snapshot of only the canonical rollout inputs available before any
+    // grant, authorization-code, replay-marker, or token mutation.
+    const policyContext = Object.freeze({ ...context });
+    const format = await this.accessTokenFormatPolicy(policyContext);
+    if (format !== 'opaque' && format !== 'jwt') {
+      throw new TypeError("accessTokenFormat must return either 'opaque' or 'jwt'");
+    }
+    return format;
+  }
+
   /**
    * Creates and stores an access token
    * @param params - Options for creating the access token
    * @returns The access token string
    */
   async createAccessToken(params: CreateAccessTokenOptions<Env>): Promise<string> {
-    const { userId, grantId, clientId, scope, encryptedProps, encryptionKey, expiresIn, audience, env } = params;
+    const {
+      format,
+      userId,
+      grantId,
+      clientId,
+      scope: requestedScope,
+      encryptedProps,
+      encryptionKey,
+      expiresIn,
+      audience,
+      env,
+    } = params;
+    const scope = [...requestedScope];
 
     // Central guard for all access-token writes: Cloudflare KV rejects an `expirationTtl`
     // below 60 seconds, so a TTL derived from a callback override or a near-expiry source
@@ -4981,18 +5096,23 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         description: 'Requested token lifetime must be at least 60 seconds',
       });
     }
+    if (format !== 'opaque' && format !== 'jwt') {
+      throw new TypeError("Access-token format must be either 'opaque' or 'jwt'");
+    }
 
     const now = Math.floor(Date.now() / 1000);
     const accessTokenExpiresAt = now + expiresIn;
 
     let accessToken: string;
     let jwtId: string | undefined;
-    if (this.jwtAccessTokens) {
+    if (format === 'jwt') {
+      const jwtAccessTokens = this.jwtAccessTokens;
+      if (!jwtAccessTokens) throw new TypeError('JWT access-token issuance requires accessTokens');
       // The signed payload is client-readable. The JWT helper receives decrypted
       // props only so its explicit publicClaims mapper can select safe values;
       // the complete props remain encrypted in the state record below.
       const props = await decryptProps(encryptionKey, encryptedProps);
-      const issued = await this.jwtAccessTokens.issue({
+      const issued = await jwtAccessTokens.issue({
         props,
         userId,
         grantId,
@@ -6492,6 +6612,14 @@ class OAuthHelpersImpl<Env = Cloudflare.Env, Props = any> implements OAuthHelper
       // Resource selection was validated before any grant or token mutation.
       const audience = effectiveResource;
 
+      // Select the writer before storing the implicit grant. A policy failure
+      // leaves no grant or token state behind.
+      const accessTokenFormat = await this.provider.selectAccessTokenFormat({
+        env: this.env,
+        clientId: options.request.clientId,
+        resource: audience,
+      });
+
       // Store the grant without an auth code (will be referenced by the access token)
       const grant: Grant = {
         id: grantId,
@@ -6509,6 +6637,7 @@ class OAuthHelpersImpl<Env = Cloudflare.Env, Props = any> implements OAuthHelper
       await this.env.OAUTH_KV.put(grantKey, JSON.stringify(grant));
 
       const accessToken = await this.provider.createAccessToken({
+        format: accessTokenFormat,
         userId: options.userId,
         grantId,
         clientId: options.request.clientId,
@@ -6773,7 +6902,9 @@ class OAuthHelpersImpl<Env = Cloudflare.Env, Props = any> implements OAuthHelper
   }
 
   /**
-   * Deletes an OAuth client and revokes all associated grants across all users.
+   * Deletes an OAuth client and revokes all associated grants and access tokens
+   * across all users. Token exchange can issue a token to this client under a
+   * different client's source grant, so both record types must be scanned.
    * @param clientId - The ID of the client to delete
    * @returns A Promise resolving when the deletion is confirmed.
    */
@@ -6796,6 +6927,30 @@ class OAuthHelpersImpl<Env = Cloudflare.Env, Props = any> implements OAuthHelper
         const grantData: Grant | null = await this.env.OAUTH_KV.get(key.name, { type: 'json' });
         if (grantData && grantData.clientId === clientId) {
           await this.revokeGrant(grantData.id, grantData.userId);
+        }
+      }
+
+      if (result.list_complete) {
+        allProcessed = true;
+      } else {
+        cursor = result.cursor;
+      }
+    }
+
+    // Revoke exchanged access tokens owned by this client but stored below a
+    // source grant owned by another client. Ordinary tokens were already
+    // removed by revokeGrant() above.
+    cursor = undefined;
+    allProcessed = false;
+    while (!allProcessed) {
+      const listOptions: { prefix: string; cursor?: string } = { prefix: 'token:' };
+      if (cursor) listOptions.cursor = cursor;
+      const result = await this.env.OAUTH_KV.list(listOptions);
+
+      for (const key of result.keys) {
+        const tokenData: Token | null = await this.env.OAUTH_KV.get(key.name, { type: 'json' });
+        if (tokenData?.grant?.clientId === clientId) {
+          await this.env.OAUTH_KV.delete(key.name);
         }
       }
 
@@ -6967,11 +7122,11 @@ class OAuthHelpersImpl<Env = Cloudflare.Env, Props = any> implements OAuthHelper
       tokensPurged: 0,
       done: false,
     };
+    const knownGoodClients = new Set<string>();
+    const knownMissingClients = new Set<string>();
 
     // Phase 1: Grant sweep
     if (purgeOrphanedGrants || purgeExpiredGrants) {
-      const knownGoodClients = new Set<string>();
-      const knownMissingClients = new Set<string>();
       let grantCursor: string | undefined;
       let grantsDone = false;
 
@@ -7060,19 +7215,39 @@ class OAuthHelpersImpl<Env = Cloudflare.Env, Props = any> implements OAuthHelper
           if (!tokenData) continue;
 
           const grantKey = `grant:${tokenData.userId}:${tokenData.grantId}`;
-
+          let shouldPurge = false;
           if (knownMissingGrants.has(grantKey)) {
-            await this.env.OAUTH_KV.delete(key.name);
-            result.tokensPurged++;
+            shouldPurge = true;
           } else if (!knownGoodGrants.has(grantKey)) {
             const grantExists = await this.env.OAUTH_KV.get(grantKey);
             if (grantExists) {
               knownGoodGrants.add(grantKey);
             } else {
               knownMissingGrants.add(grantKey);
-              await this.env.OAUTH_KV.delete(key.name);
-              result.tokensPurged++;
+              shouldPurge = true;
             }
+          }
+
+          // Exchanged tokens may be owned by a different client than their
+          // backing source grant. Skip CIMD clients, which have no KV record.
+          const tokenClientId = tokenData.grant?.clientId;
+          if (!shouldPurge && tokenClientId && !this.provider.isClientMetadataUrl(tokenClientId)) {
+            if (knownMissingClients.has(tokenClientId)) {
+              shouldPurge = true;
+            } else if (!knownGoodClients.has(tokenClientId)) {
+              const client = await this.env.OAUTH_KV.get(`client:${tokenClientId}`, { type: 'json' });
+              if (client) {
+                knownGoodClients.add(tokenClientId);
+              } else {
+                knownMissingClients.add(tokenClientId);
+                shouldPurge = true;
+              }
+            }
+          }
+
+          if (shouldPurge) {
+            await this.env.OAUTH_KV.delete(key.name);
+            result.tokensPurged++;
           }
         }
 

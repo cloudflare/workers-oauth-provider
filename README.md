@@ -323,7 +323,7 @@ Bind the Calendar Worker to `CalendarTokenValidator`; expose a separate Drive en
 
 ### Signed JWT access tokens
 
-Access tokens remain opaque by default. An `OAuthAuthorizationServer` can opt in to signed [RFC 9068](https://www.rfc-editor.org/rfc/rfc9068.html) JWT access tokens with `createJwtAccessTokens()`. Authorization codes and refresh tokens remain opaque.
+Access tokens remain opaque by default. An `OAuthAuthorizationServer` can install signed [RFC 9068](https://www.rfc-editor.org/rfc/rfc9068.html) JWT access-token support with `createJwtAccessTokens()`. With no issuance policy, new access tokens become JWTs. Authorization codes and refresh tokens remain opaque.
 
 OAuth clients must continue treating the access-token string as opaque; JWT validation is a resource-server concern.
 
@@ -341,6 +341,7 @@ const CALENDAR_RESOURCE = 'https://calendar.example.com/mcp';
 
 interface Env {
   OAUTH_KV: KVNamespace;
+  JWT_ISSUANCE_ENABLED: boolean;
 }
 
 interface AuthProps {
@@ -504,7 +505,7 @@ async function validateDuringMigration(input: Parameters<typeof validateCalendar
 // Temporarily use this instead of validateCalendarJwt in createOAuthResourceServer().
 ```
 
-Do not fall through to a permissive external-token resolver. The fallback above is the `CalendarTokenValidator` Service Binding from the preceding example, so its authorization-server-side call is fixed to `CALENDAR_RESOURCE`. Remove it after every legacy opaque access token has expired.
+Do not fall through to a permissive external-token resolver. The fallback above is the `CalendarTokenValidator` Service Binding from the preceding example, so its authorization-server-side call is fixed to `CALENDAR_RESOURCE`. Remove it only after the rollout checks and maximum-lifetime window below.
 
 Rotate keys in this order:
 
@@ -515,13 +516,26 @@ Rotate keys in this order:
 
 Resource Workers should fetch only the configured `jwks_uri`, never cache longer than its response allows, and select exactly one key by `kid` and pinned algorithm.
 
-Roll this out reader before writer:
+Roll this out reader before writer. `accessTokens` installs the JWT reader, signer, and JWKS; `accessTokenFormat` controls only the representation of each newly issued access token:
 
-1. Upgrade authorization-server deployments while leaving `accessTokens` unset. This is a no-behavior-change step: they continue issuing and accepting opaque access tokens.
-2. Deploy JWT validation, plus any temporary opaque-token fallback, to separate resource Workers.
-3. Enable `accessTokens` only after every token-consuming path can accept JWTs. A configured authorization server and its `protectResource()` surfaces enable JWT issuance and stateful JWT reading together. New and refreshed access tokens become JWTs; existing authorization codes and refresh tokens remain valid.
+```ts
+const authorizationServer = new OAuthAuthorizationServer<Env, AuthProps>({
+  issuer: AUTH_ISSUER,
+  authorizeEndpoint: '/authorize',
+  tokenEndpoint: '/oauth/token',
+  accessTokens: jwtAccessTokens,
+  accessTokenFormat: ({ env }) => (env.JWT_ISSUANCE_ENABLED ? 'jwt' : 'opaque'),
+});
+```
 
-State-backed provider surfaces continue accepting access tokens issued in the old opaque format until those tokens expire. A JWT-only offline validator does not understand an old opaque token, so keep a temporary fallback to the Service Binding validator if that resource must accept both during rollout. Once JWT issuance begins, do not roll back to a version that cannot read JWT access tokens until all issued JWTs have expired.
+The policy runs for every access-token issuance. Its immutable context contains `env`, the authenticated `clientId`, and the canonical `resource`, so application code can use a deployment flag or a deterministic client/resource cohort. Keep it local and highly available: throwing, rejecting, or returning anything except `opaque` or `jwt` fails before one-use authorization state is consumed rather than silently downgrading security.
+
+1. Configure `accessTokens` while the callback returns `opaque`, then deploy the authorization server everywhere. It publishes `jwks_uri`, serves the future signing key, and accepts both compatible opaque tokens and JWTs while continuing to issue opaque access tokens.
+2. Deploy JWT validation to every token consumer. A separate resource Worker must temporarily fall back to its resource-pinned Service Binding validator for old opaque tokens.
+3. Verify the deployment and wait at least the JWKS cache lifetime before changing the callback to return `jwt`. New authorization-code, refresh, implicit, token-exchange, and enterprise-managed access tokens now become JWTs. Existing access tokens are not converted or invalidated, and authorization codes and refresh tokens remain opaque.
+4. Confirm every issuer instance and rollout cohort now returns `jwt`, then keep the opaque fallback for the maximum effective access-token lifetime measured from the last possible opaque issuance, including any TTL overrides. To roll back after removing that fallback, first restore the resource-pinned opaque fallback to every JWT-only consumer, then return `opaque`; retain `accessTokens`, its JWKS, and every required verification key until all previously issued JWTs have expired plus cache time and clock skew.
+
+State-backed provider surfaces continue accepting compatible access tokens issued in the old opaque format until those tokens expire. A JWT-only offline validator does not understand an old opaque token, which is why the temporary fallback is required. Never roll back to a package version or configuration that cannot read still-live JWT access tokens. This token-format rollout does not bypass the resource migration policy: a pre-resource access-token record with no trustworthy canonical audience remains unusable, although its refresh grant can migrate according to `legacyGrantResource`.
 
 The existing `OAuthProvider` constructor remains supported. It is the concise combined AS-and-resource API used by the quick start and is appropriate when one Worker protects one canonical resource. Existing applications do not need to move to `OAuthAuthorizationServer` to upgrade.
 
@@ -839,7 +853,8 @@ The functional role API adds these surfaces without removing `OAuthProvider`:
 | Surface                                          | Purpose                                                                     |
 | ------------------------------------------------ | --------------------------------------------------------------------------- |
 | `new OAuthAuthorizationServer({ issuer, … })`    | Create the AS role with a canonical RFC 8414 issuer                         |
-| `createJwtAccessTokens({ … })`                   | Opt in to signed access tokens while retaining stateful encrypted props     |
+| `createJwtAccessTokens({ … })`                   | Install JWT signing, reading, and JWKS while retaining stateful token props |
+| `accessTokenFormat(context)`                     | Select opaque or JWT format for each newly issued access token              |
 | `createJwtAccessTokenValidator({ … })`           | Validate pinned JWT claims offline for one fixed resource                   |
 | `protectResource({ resourceMetadata, handler })` | Register and host one protected resource, returning its fetch surface       |
 | `registerResource(resource)`                     | Register a canonical audience hosted by another Worker or service           |
