@@ -405,6 +405,15 @@ async function readJsonWithSizeLimit(
   maxBytes: number,
   signal: AbortSignal
 ): Promise<{ value: unknown; bytes: Uint8Array }> {
+  const contentLength = response.headers.get('Content-Length');
+  if (contentLength !== null) {
+    const declaredSize = Number(contentLength);
+    if (Number.isFinite(declaredSize) && declaredSize > maxBytes) {
+      await response.body?.cancel().catch(() => undefined);
+      throw new Error(`Client metadata exceeds size limit: ${contentLength} bytes (max ${maxBytes})`);
+    }
+  }
+
   const reader = response.body?.getReader();
   if (!reader) throw new Error('Client metadata response body is empty');
 
@@ -506,6 +515,40 @@ async function cacheValidatedDocument(
 }
 
 /**
+ * Resolves a previously validated cache entry. A stored document that stops
+ * validating (changed server capabilities, stricter rules after an upgrade)
+ * is evicted so the caller re-resolves from origin in the same request;
+ * timeout aborts propagate instead.
+ */
+async function tryResolveFromCache(
+  cache: Cache | undefined,
+  metadataUrl: string,
+  server: OAuthServerCapabilities,
+  signal: AbortSignal
+): Promise<ResolvedClientIdMetadataDocument | undefined> {
+  let cached: Response | undefined;
+  try {
+    cached = await cache?.match(metadataUrl);
+  } catch {
+    return undefined;
+  }
+  if (!cached) return undefined;
+
+  try {
+    const { value } = await readJsonWithSizeLimit(cached, CIMD_MAX_SIZE_BYTES, signal);
+    return resolveClientIdMetadataDocument(metadataUrl, value, server);
+  } catch (error) {
+    if (signal.aborted) throw error;
+    try {
+      await cache?.delete(metadataUrl);
+    } catch {
+      // Ignore cleanup failures; the caller's origin fetch is authoritative.
+    }
+    return undefined;
+  }
+}
+
+/**
  * Fetches, bounds, parses, validates, and negotiates a Client ID Metadata
  * Document into the single effective client configuration used by OAuth flows.
  */
@@ -520,43 +563,12 @@ export async function fetchClientIdMetadataDocument(
 
   try {
     const cache = await openCimdCache();
-
-    let cached: Response | undefined;
-    try {
-      cached = await cache?.match(metadataUrl);
-    } catch {
-      cached = undefined;
-    }
-
-    if (cached) {
-      try {
-        const { value } = await readJsonWithSizeLimit(cached, CIMD_MAX_SIZE_BYTES, abortController.signal);
-        return resolveClientIdMetadataDocument(metadataUrl, value, server);
-      } catch (error) {
-        if (abortController.signal.aborted) throw error;
-        // A stored document that stops validating (changed server capabilities,
-        // stricter rules after an upgrade) must not fail the flow: evict it and
-        // resolve from origin within the same request.
-        try {
-          await cache?.delete(metadataUrl);
-        } catch {
-          // Ignore cleanup failures; the origin fetch below is authoritative.
-        }
-      }
-    }
+    const cachedDocument = await tryResolveFromCache(cache, metadataUrl, server, abortController.signal);
+    if (cachedDocument) return cachedDocument;
 
     const response = await fetchCimdOrigin(metadataUrl, abortController.signal);
     if (!response.ok) {
       throw new Error(`Failed to fetch client metadata: HTTP ${response.status}`);
-    }
-
-    const contentLength = response.headers.get('content-length');
-    if (contentLength !== null) {
-      const declaredSize = Number(contentLength);
-      if (Number.isFinite(declaredSize) && declaredSize > CIMD_MAX_SIZE_BYTES) {
-        await response.body?.cancel().catch(() => undefined);
-        throw new Error(`Client metadata exceeds size limit: ${contentLength} bytes (max ${CIMD_MAX_SIZE_BYTES})`);
-      }
     }
 
     const { value, bytes } = await readJsonWithSizeLimit(response, CIMD_MAX_SIZE_BYTES, abortController.signal);
