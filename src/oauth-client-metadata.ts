@@ -265,8 +265,16 @@ export function resolveDynamicClientRegistrationMetadata(
   };
 }
 
+/**
+ * Path component of the raw client ID string. Deliberately not
+ * `new URL().pathname`: WHATWG parsing collapses the `.` and `..` segments
+ * that CIMD §3 requires rejecting, and normalizes `\` and scheme-relative
+ * forms this validation must see verbatim.
+ */
 function rawPath(clientId: string): string {
-  const authorityStart = clientId.indexOf('://') + 3;
+  const schemeEnd = clientId.indexOf('://');
+  if (schemeEnd === -1) return '';
+  const authorityStart = schemeEnd + 3;
   const authorityEndOffset = clientId.slice(authorityStart).search(/[/?#]/);
   if (authorityEndOffset === -1) return '';
   const pathStart = authorityStart + authorityEndOffset;
