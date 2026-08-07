@@ -4,17 +4,22 @@ import {
   AuthorizationError,
   buildOAuthServerCapabilities,
   isValidOAuthScopeToken,
-  negotiateCimdClientCapabilities,
   normalizePkceCodeChallengeMethod,
   validateAuthorizationPkce,
   validateAuthorizationResponseType,
   validatePkceCodeChallengeMethod,
   validateAuthorizationServerScopes,
-  validateClientCapabilities,
   withAuthorizationRedirect,
   type OAuthServerCapabilities,
   type PkceCodeChallengeMethod,
 } from './oauth-capabilities';
+import {
+  fetchClientIdMetadataDocument,
+  isClientIdMetadataDocumentUrl,
+  resolveDynamicClientRegistrationMetadata,
+  validateRedirectUriScheme,
+  type ResolvedDynamicClientRegistrationMetadata,
+} from './oauth-client-metadata';
 import {
   EMA_DEFAULT_CLOCK_SKEW_SECONDS,
   EMA_DEFAULT_MAX_ASSERTION_LIFETIME_SECONDS,
@@ -3657,8 +3662,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // can still consume it (e.g. to verify a signature over the raw bytes).
     const callbackRequest = request.clone();
 
-    // Parse client metadata with a size limitation
-    let clientMetadata;
+    // Parse client metadata with a size limitation. JSON syntax errors are
+    // invalid_request; the typed metadata resolver reports invalid shapes as
+    // invalid_client_metadata.
+    let parsedJson: unknown;
     try {
       const text = await request.text();
       if (text.length > 1048576) {
@@ -3668,96 +3675,55 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
           statusCode: 413,
         });
       }
-      clientMetadata = JSON.parse(text);
-    } catch (error) {
+      parsedJson = JSON.parse(text);
+    } catch {
       return this.createErrorResponse('invalid_request', { description: 'Invalid JSON payload', statusCode: 400 });
     }
 
-    let authMethodWasExplicit: boolean;
-    let authMethod: string;
-    let grantTypes: string[];
-    let responseTypes: string[];
+    let metadata: ResolvedDynamicClientRegistrationMetadata;
     try {
-      authMethodWasExplicit = clientMetadata.token_endpoint_auth_method !== undefined;
-      authMethod =
-        OAuthProviderImpl.validateStringField(clientMetadata.token_endpoint_auth_method) || 'client_secret_basic';
-      grantTypes = OAuthProviderImpl.validateStringArray(clientMetadata.grant_types, 'grant_types') || [
-        GrantType.AUTHORIZATION_CODE,
-      ];
-      responseTypes = OAuthProviderImpl.validateStringArray(clientMetadata.response_types, 'response_types') || [
-        'code',
-      ];
-      validateClientCapabilities(this.serverCapabilities, {
-        tokenEndpointAuthMethod: authMethod,
-        grantTypes,
-        responseTypes,
-      });
+      metadata = resolveDynamicClientRegistrationMetadata(parsedJson, this.serverCapabilities);
     } catch (error) {
       return this.createErrorResponse('invalid_client_metadata', {
         description: error instanceof Error ? error.message : 'Invalid client metadata',
       });
     }
-    const isPublicClient = authMethod === 'none';
 
-    // Check if public client registrations are disallowed
+    const clientMetadata = parsedJson as Record<string, unknown>;
+    const authMethod = metadata.tokenEndpointAuthMethod;
+    const isPublicClient = authMethod === 'none';
     if (isPublicClient && this.options.disallowPublicClientRegistration) {
       return this.createErrorResponse('invalid_client_metadata', {
         description: 'Public client registration is not allowed',
       });
     }
 
-    // Create client ID
     const clientId = generateRandomString(16);
-
-    // Only create client secret for confidential clients
     let clientSecret: string | undefined;
     let hashedSecret: string | undefined;
-
     if (!isPublicClient) {
       clientSecret = generateRandomString(32);
       hashedSecret = await hashSecret(clientSecret);
     }
 
-    let clientInfo: StoredClientInfo;
-    try {
-      // Validate redirect URIs - must exist and have at least one entry
-      const redirectUris = OAuthProviderImpl.validateStringArray(clientMetadata.redirect_uris);
-      if (!redirectUris || redirectUris.length === 0) {
-        throw new Error('At least one redirect URI is required');
-      }
-
-      // Validate each redirect URI scheme
-      for (const uri of redirectUris) {
-        validateRedirectUriScheme(uri);
-      }
-
-      clientInfo = {
-        clientId,
-        redirectUris,
-        clientName: OAuthProviderImpl.validateStringField(clientMetadata.client_name, 'client_name'),
-        logoUri: OAuthProviderImpl.validateOptionalUriField(clientMetadata.logo_uri, 'logo_uri'),
-        clientUri: OAuthProviderImpl.validateOptionalUriField(clientMetadata.client_uri, 'client_uri'),
-        policyUri: OAuthProviderImpl.validateOptionalUriField(clientMetadata.policy_uri, 'policy_uri'),
-        tosUri: OAuthProviderImpl.validateOptionalUriField(clientMetadata.tos_uri, 'tos_uri'),
-        jwksUri: OAuthProviderImpl.validateOptionalUriField(clientMetadata.jwks_uri, 'jwks_uri'),
-        i18n: OAuthProviderImpl.extractI18nFields(clientMetadata),
-        contacts: OAuthProviderImpl.validateStringArray(clientMetadata.contacts),
-        grantTypes,
-        responseTypes,
-        registrationDate: Math.floor(Date.now() / 1000),
-        tokenEndpointAuthMethod: authMethod,
-        ...(authMethodWasExplicit ? { authMethodExplicit: true as const } : {}),
-      };
-
-      // Add client secret only for confidential clients
-      if (!isPublicClient && hashedSecret) {
-        clientInfo.clientSecret = hashedSecret;
-      }
-    } catch (error) {
-      return this.createErrorResponse('invalid_client_metadata', {
-        description: error instanceof Error ? error.message : 'Invalid client metadata',
-      });
-    }
+    const clientInfo: StoredClientInfo = {
+      clientId,
+      redirectUris: metadata.redirectUris,
+      clientName: metadata.clientName,
+      logoUri: metadata.logoUri,
+      clientUri: metadata.clientUri,
+      policyUri: metadata.policyUri,
+      tosUri: metadata.tosUri,
+      jwksUri: metadata.jwksUri,
+      i18n: metadata.i18n,
+      contacts: metadata.contacts,
+      grantTypes: metadata.grantTypes,
+      responseTypes: metadata.responseTypes,
+      registrationDate: Math.floor(Date.now() / 1000),
+      tokenEndpointAuthMethod: authMethod,
+      ...(metadata.authMethodExplicit ? { authMethodExplicit: true as const } : {}),
+      ...(!isPublicClient && hashedSecret ? { clientSecret: hashedSecret } : {}),
+    };
 
     if (this.options.clientRegistrationCallback) {
       // Note: RFC 7591 §3.1.1 `software_statement` claims are not processed by
@@ -3792,7 +3758,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     if (this.options.clientRegistrationTTL !== undefined) {
       clientKvOptions.expirationTtl = this.options.clientRegistrationTTL;
     }
-    await env.OAUTH_KV.put(`client:${clientId}`, JSON.stringify(clientInfo), clientKvOptions);
+    await env.OAUTH_KV.put(`client:${clientInfo.clientId}`, JSON.stringify(clientInfo), clientKvOptions);
 
     // Return client information with the original unhashed secret
     const response: Record<string, any> = {
@@ -4289,310 +4255,16 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * Not private because OAuthHelpersImpl needs access for purgeExpiredData.
    */
   isClientMetadataUrl(clientId: string): boolean {
-    try {
-      const url = new URL(clientId);
-      return url.protocol === 'https:' && url.pathname !== '/';
-    } catch {
-      return false;
-    }
+    return isClientIdMetadataDocumentUrl(clientId);
   }
 
   /**
-   * Maximum size for CIMD metadata documents (5KB per IETF spec recommendation)
+   * Fetches and resolves a Client ID Metadata Document through the typed CIMD
+   * module, which owns transport limits, document parsing, cross-field
+   * invariants, and capability negotiation.
    */
-  private static readonly CIMD_MAX_SIZE_BYTES = 5 * 1024;
-
-  /**
-   * Request timeout for CIMD metadata fetches (10 seconds)
-   * Prevents slow-loris style attacks
-   */
-  private static readonly CIMD_FETCH_TIMEOUT_MS = 10_000;
-
-  /**
-   * Allowed authentication methods for CIMD clients (per IETF spec)
-   * CIMD clients cannot use symmetric secrets since there's no pre-shared secret
-   */
-  // private_key_jwt can be added once token-endpoint assertion validation is implemented.
-  // Accepting it in metadata before then creates clients that can authorize but never exchange a code.
-  private static readonly CIMD_ALLOWED_AUTH_METHODS = ['none'];
-
-  /**
-   * Validates that a field is a string or undefined
-   * @param field - The field value to validate
-   * @param fieldName - Name of the field for error messages
-   * @returns The validated string or undefined
-   * @throws Error if field is not a string or undefined
-   */
-  private static validateStringField(field: unknown, fieldName?: string): string | undefined {
-    if (field === undefined) return undefined;
-    if (typeof field !== 'string') {
-      throw new Error(
-        fieldName ? `Invalid ${fieldName}: expected string, got ${typeof field}` : 'Field must be a string'
-      );
-    }
-    return field;
-  }
-
-  /**
-   * Validates that a field is an optional URI string using a safe scheme.
-   *
-   * Client metadata URI fields (e.g. logo_uri, client_uri, policy_uri, tos_uri,
-   * jwks_uri) are frequently rendered into HTML attributes such as `<a href>` or
-   * `<img src>` on consent screens. Permitting non-http(s) schemes such as
-   * `javascript:` or `data:` would allow script execution in that context, so we
-   * require an absolute http: or https: URL here, matching how redirect URIs are
-   * already restricted.
-   *
-   * @param field - The field to validate
-   * @param fieldName - Name of the field for error messages
-   * @returns The validated URI string or undefined
-   * @throws Error if the field is not a string or is not an absolute http(s) URL
-   */
-  private static validateOptionalUriField(field: unknown, fieldName: string): string | undefined {
-    const value = OAuthProviderImpl.validateStringField(field, fieldName);
-    if (value === undefined) return undefined;
-
-    let parsed: URL;
-    try {
-      parsed = new URL(value);
-    } catch {
-      throw new Error(`Invalid ${fieldName}: must be an absolute http: or https: URL`);
-    }
-
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-      throw new Error(`Invalid ${fieldName}: must be an absolute http: or https: URL`);
-    }
-
-    return value;
-  }
-
-  /**
-   * The human-readable client metadata fields that may carry RFC 7591 §2.2
-   * internationalized variants, mapped to whether the value must be a URI.
-   * URI fields are validated with the same scheme rules as their canonical
-   * counterparts; plain fields only need to be strings.
-   */
-  private static readonly I18N_FIELDS: Record<string, 'string' | 'uri'> = {
-    client_name: 'string',
-    client_uri: 'uri',
-    logo_uri: 'uri',
-    tos_uri: 'uri',
-    policy_uri: 'uri',
-  };
-
-  /**
-   * Extracts RFC 7591 §2.2 internationalized metadata variants from a raw
-   * registration payload.
-   *
-   * Localized variants are expressed by appending a `#<BCP 47 language tag>`
-   * suffix to a metadata member name (e.g. `client_name#ja`, `tos_uri#fr`).
-   * Only the human-readable fields the RFC names are considered; each value is
-   * validated with the same rules as its canonical field (URI fields must be
-   * absolute http(s) URLs). The raw `field#tag` keys are preserved verbatim so
-   * that consumers can do their own locale matching.
-   *
-   * @param raw - The parsed client metadata object
-   * @returns A map of `field#tag` to validated value, or undefined if none present
-   * @throws Error if a localized value fails its field's validation
-   */
-  private static extractI18nFields(raw: Record<string, unknown>): Record<string, string> | undefined {
-    const result: Record<string, string> = {};
-
-    for (const key of Object.keys(raw)) {
-      const hashIndex = key.indexOf('#');
-      if (hashIndex <= 0 || hashIndex === key.length - 1) continue;
-
-      const baseField = key.slice(0, hashIndex);
-      const kind = OAuthProviderImpl.I18N_FIELDS[baseField];
-      if (!kind) continue;
-
-      const validated =
-        kind === 'uri'
-          ? OAuthProviderImpl.validateOptionalUriField(raw[key], key)
-          : OAuthProviderImpl.validateStringField(raw[key], key);
-
-      if (validated !== undefined) {
-        result[key] = validated;
-      }
-    }
-
-    return Object.keys(result).length > 0 ? result : undefined;
-  }
-
-  /**
-   * Validates that a field is a string array or undefined
-   * @param arr - The array to validate
-   * @param fieldName - Name of the field for error messages
-   * @returns The validated string array or undefined
-   * @throws Error if field is not a string array or undefined
-   */
-  private static validateStringArray(arr: unknown, fieldName?: string): string[] | undefined {
-    if (arr === undefined) return undefined;
-    if (!Array.isArray(arr)) {
-      throw new Error(fieldName ? `Invalid ${fieldName}: expected array, got ${typeof arr}` : 'Field must be an array');
-    }
-    if (!arr.every((item) => typeof item === 'string')) {
-      throw new Error(
-        fieldName ? `Invalid ${fieldName}: array must contain only strings` : 'All array elements must be strings'
-      );
-    }
-    return arr;
-  }
-
-  /**
-   * Fetches and validates a Client ID Metadata Document from the given URL
-   * Per the MCP spec, the client_id in the document must match the URL exactly
-   *
-   * Uses Cloudflare HTTP cache for caching (via cacheEverything option).
-   * Response size is limited to 5KB per IETF spec.
-   *
-   * @param metadataUrl - The HTTPS URL to fetch metadata from
-   * @returns The client information
-   * @throws Error if fetch fails or validation fails
-   */
-  private async fetchClientMetadataDocument(metadataUrl: string): Promise<ClientInfo> {
-    const abortController = new AbortController();
-    const timeoutId = setTimeout(() => abortController.abort(), OAuthProviderImpl.CIMD_FETCH_TIMEOUT_MS);
-
-    try {
-      const response = await fetch(metadataUrl, {
-        headers: { Accept: 'application/json' },
-        signal: abortController.signal,
-        cf: { cacheEverything: true },
-      });
-
-      clearTimeout(timeoutId);
-
-      if (!response.ok) {
-        throw new Error(`Failed to fetch client metadata: HTTP ${response.status}`);
-      }
-
-      const contentLength = response.headers.get('content-length');
-      if (contentLength && parseInt(contentLength, 10) > OAuthProviderImpl.CIMD_MAX_SIZE_BYTES) {
-        throw new Error(
-          `Client metadata exceeds size limit: ${contentLength} bytes (max ${OAuthProviderImpl.CIMD_MAX_SIZE_BYTES})`
-        );
-      }
-
-      const rawMetadata = await this.readJsonWithSizeLimit(response, OAuthProviderImpl.CIMD_MAX_SIZE_BYTES);
-
-      const clientId = OAuthProviderImpl.validateStringField(rawMetadata.client_id, 'client_id');
-      const clientName = OAuthProviderImpl.validateStringField(rawMetadata.client_name, 'client_name');
-      const redirectUris = OAuthProviderImpl.validateStringArray(rawMetadata.redirect_uris, 'redirect_uris');
-      const declaredAuthMethod = OAuthProviderImpl.validateStringField(
-        rawMetadata.token_endpoint_auth_method,
-        'token_endpoint_auth_method'
-      );
-      const authMethodChoices = OAuthProviderImpl.validateStringArray(
-        rawMetadata.token_endpoint_auth_methods_supported,
-        'token_endpoint_auth_methods_supported'
-      );
-      const tokenEndpointAuthMethod = declaredAuthMethod ?? (authMethodChoices?.includes('none') ? 'none' : undefined);
-
-      // Validate that client_id matches the URL (required by spec)
-      if (clientId !== metadataUrl) {
-        throw new Error(`client_id "${clientId}" does not match metadata URL "${metadataUrl}"`);
-      }
-
-      if (!clientName?.trim()) {
-        throw new Error('client_name is required and must not be empty');
-      }
-
-      if (!redirectUris || redirectUris.length === 0) {
-        throw new Error('redirect_uris is required and must not be empty');
-      }
-
-      if (
-        (declaredAuthMethod && !OAuthProviderImpl.CIMD_ALLOWED_AUTH_METHODS.includes(declaredAuthMethod)) ||
-        (authMethodChoices &&
-          !authMethodChoices.some((method) => OAuthProviderImpl.CIMD_ALLOWED_AUTH_METHODS.includes(method)))
-      ) {
-        throw new Error(
-          `CIMD client does not support an accepted token endpoint authentication method. ` +
-            `Supported methods: ${OAuthProviderImpl.CIMD_ALLOWED_AUTH_METHODS.join(', ')}`
-        );
-      }
-
-      const advertisedGrantTypes = OAuthProviderImpl.validateStringArray(rawMetadata.grant_types, 'grant_types') || [
-        GrantType.AUTHORIZATION_CODE,
-      ];
-      const advertisedResponseTypes = OAuthProviderImpl.validateStringArray(
-        rawMetadata.response_types,
-        'response_types'
-      ) || ['code'];
-      const effectiveAuthMethod = tokenEndpointAuthMethod || 'none';
-      const { grantTypes, responseTypes } = negotiateCimdClientCapabilities(this.serverCapabilities, {
-        tokenEndpointAuthMethod: effectiveAuthMethod,
-        grantTypes: advertisedGrantTypes,
-        responseTypes: advertisedResponseTypes,
-      });
-
-      return {
-        clientId,
-        redirectUris,
-        clientName,
-        clientUri: OAuthProviderImpl.validateOptionalUriField(rawMetadata.client_uri, 'client_uri'),
-        logoUri: OAuthProviderImpl.validateOptionalUriField(rawMetadata.logo_uri, 'logo_uri'),
-        policyUri: OAuthProviderImpl.validateOptionalUriField(rawMetadata.policy_uri, 'policy_uri'),
-        tosUri: OAuthProviderImpl.validateOptionalUriField(rawMetadata.tos_uri, 'tos_uri'),
-        jwksUri: OAuthProviderImpl.validateOptionalUriField(rawMetadata.jwks_uri, 'jwks_uri'),
-        i18n: OAuthProviderImpl.extractI18nFields(rawMetadata),
-        contacts: OAuthProviderImpl.validateStringArray(rawMetadata.contacts, 'contacts'),
-        grantTypes,
-        responseTypes,
-        tokenEndpointAuthMethod: effectiveAuthMethod,
-      };
-    } finally {
-      clearTimeout(timeoutId);
-    }
-  }
-
-  /**
-   * Reads JSON from a response with a size limit to prevent DoS attacks.
-   * Streams the response body and aborts if it exceeds the limit.
-   *
-   * @param response - The fetch response
-   * @param maxBytes - Maximum allowed size in bytes
-   * @returns Parsed JSON object
-   * @throws Error if response body is null, size exceeded, or JSON parse failed
-   */
-  private async readJsonWithSizeLimit(response: Response, maxBytes: number): Promise<Record<string, unknown>> {
-    const reader = response.body?.getReader();
-    if (!reader) {
-      throw new Error('Response body is null');
-    }
-
-    const chunks: Uint8Array[] = [];
-    let totalSize = 0;
-
-    while (true) {
-      const { done, value } = await reader.read();
-
-      if (done) {
-        break;
-      }
-
-      if (value) {
-        totalSize += value.length;
-
-        if (totalSize > maxBytes) {
-          await reader.cancel();
-          throw new Error(`Response exceeded size limit of ${maxBytes} bytes`);
-        }
-
-        chunks.push(value);
-      }
-    }
-
-    const allChunks = new Uint8Array(totalSize);
-    let position = 0;
-    for (const chunk of chunks) {
-      allChunks.set(chunk, position);
-      position += chunk.length;
-    }
-
-    const text = new TextDecoder().decode(allChunks);
-    return JSON.parse(text);
+  private fetchClientMetadataDocument(metadataUrl: string): Promise<ClientInfo> {
+    return fetchClientIdMetadataDocument(metadataUrl, this.serverCapabilities);
   }
 
   /**
@@ -5136,50 +4808,6 @@ async function generateTokenId(token: string): Promise<string> {
   const hashHex = hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
 
   return hashHex;
-}
-
-/**
- * Validates that a redirect URI does not use a dangerous pseudo-scheme.
- * Normalizes the URI by trimming whitespace and checking the scheme in a
- * case-insensitive manner to prevent bypass attacks.
- * Per RFC 3986, control characters are explicitly disallowed in URIs and
- * will cause rejection rather than silent removal.
- * @param redirectUri - The redirect URI to validate
- * @throws Error if the URI uses a blacklisted scheme or contains control characters
- */
-function validateRedirectUriScheme(redirectUri: string): void {
-  // List of dangerous pseudo-schemes that should not be allowed
-  const dangerousSchemes = ['javascript:', 'data:', 'vbscript:', 'file:', 'mailto:', 'blob:'];
-
-  // 1. Trim leading and trailing whitespace (allowed per RFC 3986 preprocessing)
-  const normalized = redirectUri.trim();
-
-  // 2. Reject URIs containing control characters (RFC 3986 compliance)
-  // Control characters (0x00-0x1F, 0x7F-0x9F) are explicitly disallowed in URIs
-  // and their presence indicates a malformed or potentially malicious URI
-  for (let i = 0; i < normalized.length; i++) {
-    const code = normalized.charCodeAt(i);
-    if ((code >= 0x00 && code <= 0x1f) || (code >= 0x7f && code <= 0x9f)) {
-      throw new Error('Invalid redirect URI');
-    }
-  }
-
-  // 3. Extract the scheme by finding everything before the first ':'
-  const colonIndex = normalized.indexOf(':');
-  if (colonIndex === -1) {
-    // No scheme present - reject relative URIs
-    throw new Error('Invalid redirect URI');
-  }
-
-  // Get the scheme and convert to lowercase for case-insensitive comparison
-  const scheme = normalized.substring(0, colonIndex + 1).toLowerCase();
-
-  // Check against blacklist
-  for (const dangerousScheme of dangerousSchemes) {
-    if (scheme === dangerousScheme) {
-      throw new Error('Invalid redirect URI');
-    }
-  }
 }
 
 /**

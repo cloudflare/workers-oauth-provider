@@ -151,6 +151,48 @@ describe('OAuth server capabilities', () => {
   });
 });
 
+describe('CIMD token endpoint authentication negotiation', () => {
+  function negotiateAuthMethod(preferred?: string, choices?: string[]): string {
+    return negotiateCimdClientCapabilities(defaults, {
+      grantTypes: ['authorization_code'],
+      responseTypes: ['code'],
+      tokenEndpointAuthMethod: preferred,
+      tokenEndpointAuthMethodsSupported: choices,
+    }).tokenEndpointAuthMethod;
+  }
+
+  it.each([
+    ['defaults an omitted method', undefined, undefined, 'none'],
+    ['keeps an implemented preference', 'none', undefined, 'none'],
+    ['selects an implemented choice', undefined, ['private_key_jwt', 'none'], 'none'],
+    ['falls back from an unsupported preference', 'private_key_jwt', ['none', 'private_key_jwt'], 'none'],
+  ])('%s', (_label, preferred, choices, expected) => {
+    expect(negotiateAuthMethod(preferred, choices)).toBe(expected);
+  });
+
+  it.each([
+    ['an unsupported preference without choices', 'private_key_jwt', undefined],
+    ['unsupported choices without a preference', undefined, ['private_key_jwt']],
+    ['an empty choice list', undefined, []],
+  ])('rejects %s', (_label, preferred, choices) => {
+    expect(() => negotiateAuthMethod(preferred, choices)).toThrow(
+      'CIMD client does not support an accepted token endpoint authentication method'
+    );
+  });
+
+  it('rejects symmetric secret methods', () => {
+    expect(() => negotiateAuthMethod('client_secret_post', ['client_secret_post'])).toThrow(
+      'CIMD clients cannot use symmetric token endpoint authentication method'
+    );
+  });
+
+  it('rejects a preferred method omitted from the corresponding choices', () => {
+    expect(() => negotiateAuthMethod('none', ['private_key_jwt'])).toThrow(
+      'token_endpoint_auth_method must be included in token_endpoint_auth_methods_supported'
+    );
+  });
+});
+
 describe('PKCE capabilities', () => {
   it.each([
     ['S256', 'S256'],
