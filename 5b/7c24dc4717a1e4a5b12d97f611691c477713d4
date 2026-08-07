@@ -1,0 +1,21 @@
+__tests__/oauth-provider.test.ts
+  s_e595a515ab55a7::t_08c16c3aa0ab8f 11367
+src/oauth-client-metadata.ts
+  s_e595a515ab55a7::t_15fddaf97354f2 513,528,552,567,591
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5b7c24dc4717a1e4a5b12d97f611691c477713d4",
+  "prompts": {},
+  "sessions": {
+    "s_e595a515ab55a7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6eb18ba3-cefa-4ac2-b413-641e203ea1e1",
+        "model": "unknown"
+      },
+      "human_author": "Matt Carey <mcarey@cloudflare.com>"
+    }
+  }
+}
