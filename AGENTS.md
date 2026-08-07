@@ -36,6 +36,7 @@ workers-oauth-provider/
 ├── src/
 │   ├── oauth-provider.ts      # Core provider implementation
 │   ├── oauth-capabilities.ts  # Pure server/client metadata capability policy
+│   ├── oauth-client-metadata.ts # Typed DCR parsing and CIMD resolution pipeline
 │   └── ema/                   # Enterprise-Managed Authorization pipeline
 ├── __tests__/
 │   ├── oauth-provider.test.ts # Comprehensive provider integration suite
@@ -62,7 +63,7 @@ workers-oauth-provider/
 └── README.md                  # Usage documentation
 ```
 
-**Audit-oriented architecture:** Request orchestration and storage-backed OAuth behavior remain in `src/oauth-provider.ts`. Pure authorization-server/client capability policy lives in `src/oauth-capabilities.ts`. The experimental Enterprise-Managed Authorization validation pipeline is isolated in `src/ema/` so its JWT and trust-boundary code can be reviewed independently.
+**Audit-oriented architecture:** Request orchestration and storage-backed OAuth behavior remain in `src/oauth-provider.ts`. Typed OAuth client metadata parsing plus CIMD fetching and resolution live in `src/oauth-client-metadata.ts`; pure authorization-server/client capability policy lives in `src/oauth-capabilities.ts`. The experimental Enterprise-Managed Authorization validation pipeline is isolated in `src/ema/` so its JWT and trust-boundary code can be reviewed independently.
 
 ## Setup
 
@@ -231,6 +232,7 @@ This library implements multiple OAuth/security RFCs. When making changes, maint
 - OAuth 2.0 Authorization Server Issuer Identification (RFC 9207)
 - OAuth 2.0 Protected Resource Metadata (RFC 9728)
 - Client ID Metadata Documents (draft spec)
+- OpenID Connect RP Metadata Choices 1.0
 
 ### Generated files
 

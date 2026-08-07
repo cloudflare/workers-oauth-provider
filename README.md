@@ -294,18 +294,21 @@ new OAuthProvider({
 }
 ```
 
-The compatibility flag prevents outbound CIMD fetches from using legacy same-zone origin routing, which is necessary for SSRF protection. The provider advertises `client_id_metadata_document_supported: true` only when both settings are present.
+The compatibility flag prevents outbound CIMD fetches from using legacy same-zone origin routing, which is necessary for SSRF protection. The provider advertises `client_id_metadata_document_supported: true` only when both settings are present. CIMD fetches also use the `cache` option of `fetch`, which requires a compatibility date of `2024-11-11` or later (or the `cache_option_enabled` compatibility flag).
 
-CIMD validation includes:
+CIMD validation follows [draft-ietf-oauth-client-id-metadata-document-00](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-client-id-metadata-document-00) — the revision pinned by the MCP 2026-07-28 authorization spec — and includes:
 
-- HTTPS URL with a non-root path.
+- An HTTPS Client Identifier URL with a path component and no userinfo, fragment, or dot path segments.
 - A document `client_id` exactly matching its URL.
-- Non-empty `client_name` and `redirect_uris` fields.
+- Non-empty `client_name` and `redirect_uris` fields, as MCP requires, with unsafe redirect schemes rejected at ingestion.
 - Exact authorization-request redirect URI validation, with RFC 8252 loopback port handling.
-- A 5 KB response size limit and 10 second fetch timeout.
-- Safe URI schemes for client metadata fields.
+- A 5 KB response size limit and a 10 second timeout covering both headers and body.
+- Valid UTF-8 JSON object syntax and safe URI schemes for client metadata fields.
+- No embedded client secrets or private JWK material.
 
-CIMD currently supports only `token_endpoint_auth_method: "none"`.
+Validated documents are cached according to their `Cache-Control` headers, capped at 7 days. Error responses and invalid documents are never cached, and a cached document that stops validating is evicted and re-resolved from origin within the same request.
+
+CIMD token endpoint authentication is negotiated from `token_endpoint_auth_method` and the OpenID RP Metadata Choices field `token_endpoint_auth_methods_supported`. The provider currently implements only `none`: a client may prefer `private_key_jwt` while also offering `none`, in which case the provider selects `none` and applies public-client PKCE requirements. A client that offers only `private_key_jwt` is rejected until assertion validation is implemented.
 
 When a CIMD document cannot be fetched or validated, the token endpoint returns a generic `invalid_client` response and reports diagnostics through `onError.internal`. `OAuthHelpers` methods that resolve a CIMD client throw the exported `CimdFetchError`, allowing applications to distinguish an upstream metadata failure from a client that does not exist. See [Advanced configuration](https://github.com/cloudflare/workers-oauth-provider/blob/main/docs/advanced-configuration.md#cimd-fetch-errors) for an example.
 
@@ -319,9 +322,9 @@ clientRegistrationEndpoint: '/oauth/register';
 
 MCP 2026-07-28 deprecates DCR for new implementations in favor of CIMD. The endpoint remains useful for compatibility with clients that do not support CIMD.
 
-Registration accepts only authentication methods, grants, and response types implemented by the configured provider, and rejects inconsistent grant/response combinations before storage. Omitted metadata uses the RFC 7591 defaults: `client_secret_basic`, `grant_types: ["authorization_code"]`, and `response_types: ["code"]`.
+Registration accepts only authentication methods, grants, and response types implemented by the configured provider, and rejects inconsistent grant/response combinations before storage. Choice-valued `token_endpoint_auth_methods_supported` input is negotiated to one effective `token_endpoint_auth_method`; grant and response registrations remain strict. Omitted metadata uses the RFC 7591 defaults: `client_secret_basic`, `grant_types: ["authorization_code"]`, and `response_types: ["code"]`.
 
-An explicitly supplied `token_endpoint_auth_method` is enforced exactly. When it is omitted, no explicit-method marker is stored and the client may use either `client_secret_basic` or `client_secret_post`, provided the same stored secret validates. Client records written by earlier releases have no marker and receive the same compatibility. This never crosses between `none` and a secret method and does not apply to CIMD clients.
+The effective `token_endpoint_auth_method` returned by registration is enforced exactly. When both authentication metadata fields are omitted, no explicit-method marker is stored and the client may use either `client_secret_basic` or `client_secret_post`, provided the same stored secret validates. Client records written by earlier releases have no marker and receive the same compatibility. This never crosses between `none` and a secret method and does not apply to CIMD clients.
 
 Calling `OAuthHelpers.updateClient()` with `tokenEndpointAuthMethod` adds the marker; unrelated updates leave it unchanged.
 
@@ -465,6 +468,7 @@ The package implements or supports the relevant portions of:
 - [OAuth 2.0 Authorization Server Issuer Identification, RFC 9207](https://datatracker.ietf.org/doc/html/rfc9207)
 - [OAuth 2.0 Protected Resource Metadata, RFC 9728](https://datatracker.ietf.org/doc/html/rfc9728)
 - [OAuth Client ID Metadata Documents](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-client-id-metadata-document-00)
+- [OpenID Connect RP Metadata Choices 1.0](https://openid.net/specs/openid-connect-rp-metadata-choices-1_0-final.html)
 - [MCP Enterprise-Managed Authorization](https://modelcontextprotocol.io/extensions/auth/enterprise-managed-authorization), with experimental package support
 
 ## Development

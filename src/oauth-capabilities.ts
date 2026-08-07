@@ -74,6 +74,14 @@ export interface ClientCapabilities {
   readonly tokenEndpointAuthMethod: string;
 }
 
+/** Client-advertised capabilities parsed from OAuth client metadata. */
+export interface ClientMetadataCapabilities {
+  readonly grantTypes: readonly string[];
+  readonly responseTypes: readonly string[];
+  readonly tokenEndpointAuthMethod?: string;
+  readonly tokenEndpointAuthMethodsSupported?: readonly string[];
+}
+
 export function buildOAuthServerCapabilities(options: {
   allowImplicitFlow: boolean;
   allowPlainPKCE: boolean;
@@ -113,6 +121,85 @@ export function validateClientCapabilities(server: OAuthServerCapabilities, clie
   }
 }
 
+const SHARED_SECRET_TOKEN_ENDPOINT_AUTH_METHODS = new Set([
+  'client_secret_basic',
+  'client_secret_post',
+  'client_secret_jwt',
+]);
+
+function negotiateTokenEndpointAuthMethod(options: {
+  acceptedMethods: readonly string[];
+  defaultMethod: string;
+  preferredMethod: string | undefined;
+  supportedMethods: readonly string[] | undefined;
+  context: string;
+}): string {
+  const { acceptedMethods, defaultMethod, preferredMethod, supportedMethods, context } = options;
+  if (preferredMethod !== undefined && supportedMethods !== undefined && !supportedMethods.includes(preferredMethod)) {
+    throw new Error('token_endpoint_auth_method must be included in token_endpoint_auth_methods_supported');
+  }
+
+  const advertisedMethods = supportedMethods ?? [preferredMethod ?? defaultMethod];
+  const effectiveMethod =
+    preferredMethod !== undefined && acceptedMethods.includes(preferredMethod)
+      ? preferredMethod
+      : acceptedMethods.find((method) => advertisedMethods.includes(method));
+
+  if (effectiveMethod !== undefined) return effectiveMethod;
+
+  const advertised = [...new Set([...(preferredMethod === undefined ? [] : [preferredMethod]), ...advertisedMethods])];
+  throw new Error(
+    `${context} does not support an accepted token endpoint authentication method. ` +
+      `Supported methods: ${acceptedMethods.join(', ')}. ` +
+      `Client advertised: ${advertised.length > 0 ? advertised.join(', ') : '(none)'}`
+  );
+}
+
+function negotiateCimdTokenEndpointAuthMethod(
+  server: OAuthServerCapabilities,
+  preferredMethod: string | undefined,
+  supportedMethods: readonly string[] | undefined
+): string {
+  if (preferredMethod !== undefined && SHARED_SECRET_TOKEN_ENDPOINT_AUTH_METHODS.has(preferredMethod)) {
+    throw new Error(`CIMD clients cannot use symmetric token endpoint authentication method: ${preferredMethod}`);
+  }
+
+  const acceptedMethods = server.tokenEndpointAuthMethods.filter(
+    (method) => !SHARED_SECRET_TOKEN_ENDPOINT_AUTH_METHODS.has(method)
+  );
+  return negotiateTokenEndpointAuthMethod({
+    acceptedMethods,
+    defaultMethod: 'none',
+    preferredMethod,
+    supportedMethods,
+    context: 'CIMD client',
+  });
+}
+
+/**
+ * Negotiates choice-valued authentication metadata while keeping DCR grant and
+ * response registration strict.
+ */
+export function negotiateDynamicClientRegistrationCapabilities(
+  server: OAuthServerCapabilities,
+  client: ClientMetadataCapabilities
+): { grantTypes: string[]; responseTypes: string[]; tokenEndpointAuthMethod: string } {
+  const effective = {
+    grantTypes: [...client.grantTypes],
+    responseTypes: [...client.responseTypes],
+    tokenEndpointAuthMethod: negotiateTokenEndpointAuthMethod({
+      acceptedMethods: server.tokenEndpointAuthMethods,
+      defaultMethod: 'client_secret_basic',
+      preferredMethod: client.tokenEndpointAuthMethod,
+      supportedMethods: client.tokenEndpointAuthMethodsSupported,
+      context: 'Client',
+    }),
+  };
+
+  validateClientCapabilities(server, effective);
+  return effective;
+}
+
 /**
  * Selects the capabilities from a Client ID Metadata Document that this
  * authorization server supports. CIMD documents may advertise extension
@@ -125,12 +212,16 @@ export function validateClientCapabilities(server: OAuthServerCapabilities, clie
  */
 export function negotiateCimdClientCapabilities(
   server: OAuthServerCapabilities,
-  client: ClientCapabilities
+  client: ClientMetadataCapabilities
 ): { grantTypes: string[]; responseTypes: string[]; tokenEndpointAuthMethod: string } {
   const effective = {
     grantTypes: client.grantTypes.filter((grantType) => server.grantTypes.includes(grantType)),
     responseTypes: client.responseTypes.filter((responseType) => server.responseTypes.includes(responseType)),
-    tokenEndpointAuthMethod: client.tokenEndpointAuthMethod,
+    tokenEndpointAuthMethod: negotiateCimdTokenEndpointAuthMethod(
+      server,
+      client.tokenEndpointAuthMethod,
+      client.tokenEndpointAuthMethodsSupported
+    ),
   };
 
   validateClientCapabilities(server, effective);

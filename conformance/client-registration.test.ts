@@ -102,22 +102,29 @@ describe.each(mcpAuthRevisionsSince('2025-11-25'))('MCP %s client registration c
     expect(tokens.access_token).toBeTruthy();
   });
 
-  it('negotiates CIMD capabilities and completes a public-client flow from a metadata document', async () => {
-    const clientId = 'https://client.example.com/oauth/client-metadata.json';
+  it('negotiates the live ChatGPT CIMD shape and completes a public-client flow', async () => {
+    // Frozen from the live document and independently verified on 2026-08-07.
+    const clientId = 'https://chatgpt.com/oauth/IbUR3zxyNQ16/client.json';
+    const redirectUri = 'https://chatgpt.com/connector/oauth/IbUR3zxyNQ16';
     const client: OAuthClientCredentials = {
       clientId,
-      redirectUri: CLIENT_REDIRECT_URI,
+      redirectUri,
       tokenEndpointAuthMethod: 'none',
     };
     fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
       expect(String(input)).toBe(clientId);
       return Response.json({
         client_id: clientId,
-        client_name: 'MCP CIMD conformance client',
-        redirect_uris: [CLIENT_REDIRECT_URI],
+        client_uri: 'https://chatgpt.com/',
+        client_name: 'ChatGPT',
+        logo_uri: 'https://persistent.oaistatic.com/sonic/misc/openai-logo.png',
+        redirect_uris: [redirectUri],
         grant_types: ['authorization_code', 'refresh_token', 'urn:ietf:params:oauth:grant-type:jwt-bearer'],
         response_types: ['code', 'id_token'],
-        token_endpoint_auth_method: 'none',
+        token_endpoint_auth_method: 'private_key_jwt',
+        token_endpoint_auth_methods_supported: ['none', 'private_key_jwt'],
+        token_endpoint_auth_signing_alg: 'RS256',
+        jwks_uri: 'https://chatgpt.com/oauth/jwks.json',
       });
     });
     oauth = await createMcpOAuthClient(revision, { dynamicClientRegistration: false });
