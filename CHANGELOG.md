@@ -1,5 +1,13 @@
 # @cloudflare/workers-oauth-provider
 
+## 0.10.2
+
+### Patch Changes
+
+- [#295](https://github.com/cloudflare/workers-oauth-provider/pull/295) [`3a41fd7`](https://github.com/cloudflare/workers-oauth-provider/commit/3a41fd7fc23bafc905548d2e587a4bb1c231320e) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Fix client authentication method negotiation so ChatGPT can prefer `private_key_jwt` while offering the provider's supported `none` alternative.
+
+  DCR and CIMD now use one typed client metadata parser aligned with draft-ietf-oauth-client-id-metadata-document-00 (the revision pinned by MCP 2026-07-28) and OpenID Connect RP Metadata Choices 1.0. The CIMD resolver validates cross-field choices and prohibited credentials, rejects unsafe document URLs, applies response-size and timeout limits to the complete fetch, caches only validated documents with a 7-day lifetime cap, and recovers from a cached document that stops validating by re-resolving from origin in the same request.
+
 ## 0.10.1
 
 ### Patch Changes
