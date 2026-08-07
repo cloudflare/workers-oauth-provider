@@ -16,6 +16,7 @@ import {
 import {
   fetchClientIdMetadataDocument,
   isClientIdMetadataDocumentUrl,
+  requireJsonObject,
   resolveDynamicClientRegistrationMetadata,
   validateRedirectUriScheme,
   type ResolvedDynamicClientRegistrationMetadata,
@@ -3680,16 +3681,17 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       return this.createErrorResponse('invalid_request', { description: 'Invalid JSON payload', statusCode: 400 });
     }
 
+    let clientMetadata: Record<string, unknown>;
     let metadata: ResolvedDynamicClientRegistrationMetadata;
     try {
-      metadata = resolveDynamicClientRegistrationMetadata(parsedJson, this.serverCapabilities);
+      clientMetadata = requireJsonObject(parsedJson);
+      metadata = resolveDynamicClientRegistrationMetadata(clientMetadata, this.serverCapabilities);
     } catch (error) {
       return this.createErrorResponse('invalid_client_metadata', {
         description: error instanceof Error ? error.message : 'Invalid client metadata',
       });
     }
 
-    const clientMetadata = parsedJson as Record<string, unknown>;
     const authMethod = metadata.tokenEndpointAuthMethod;
     const isPublicClient = authMethod === 'none';
     if (isPublicClient && this.options.disallowPublicClientRegistration) {
@@ -4088,7 +4090,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         throw new Error(`CIMD is enabled but 'global_fetch_strictly_public' compatibility flag is not set.`);
       }
       try {
-        return await this.fetchClientMetadataDocument(clientId);
+        return await fetchClientIdMetadataDocument(clientId, this.serverCapabilities);
       } catch (error) {
         // CIMD fetch failed (size limit, timeout, HTTP error, invalid metadata, etc.)
         // Throw a tagged error rather than returning null: KV-backed lookups
@@ -4256,15 +4258,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    */
   isClientMetadataUrl(clientId: string): boolean {
     return isClientIdMetadataDocumentUrl(clientId);
-  }
-
-  /**
-   * Fetches and resolves a Client ID Metadata Document through the typed CIMD
-   * module, which owns transport limits, document parsing, cross-field
-   * invariants, and capability negotiation.
-   */
-  private fetchClientMetadataDocument(metadataUrl: string): Promise<ClientInfo> {
-    return fetchClientIdMetadataDocument(metadataUrl, this.serverCapabilities);
   }
 
   /**

@@ -79,7 +79,7 @@ export interface ResolvedClientIdMetadataDocument extends OAuthClientDisplayMeta
   tokenEndpointAuthMethod: string;
 }
 
-function requireJsonObject(value: unknown): Record<string, unknown> {
+export function requireJsonObject(value: unknown): Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     throw new Error('Client metadata must be a JSON object');
   }
@@ -159,8 +159,7 @@ function validateChoiceConsistency(
   }
 }
 
-function parseOAuthClientMetadata(value: unknown): ParsedOAuthClientMetadata {
-  const raw = requireJsonObject(value);
+function parseOAuthClientMetadata(raw: Record<string, unknown>): ParsedOAuthClientMetadata {
   const tokenEndpointAuthMethod = optionalString(raw.token_endpoint_auth_method, 'token_endpoint_auth_method');
   const tokenEndpointAuthMethodsSupported = optionalStringArray(
     raw.token_endpoint_auth_methods_supported,
@@ -234,16 +233,24 @@ export function validateRedirectUriScheme(redirectUri: string): void {
   if (dangerousSchemes.includes(scheme)) throw new Error('Invalid redirect URI');
 }
 
+function requireValidRedirectUris(redirectUris: string[] | undefined): string[] {
+  if (!redirectUris || redirectUris.length === 0) {
+    throw new Error('redirect_uris is required and must not be empty');
+  }
+  for (const redirectUri of redirectUris) validateRedirectUriScheme(redirectUri);
+  return redirectUris;
+}
+
 /**
  * Resolves a Dynamic Client Registration request into the complete metadata
  * shape that can be stored, applying RFC 7591 defaults and server capability
  * validation exactly once.
  */
 export function resolveDynamicClientRegistrationMetadata(
-  value: unknown,
+  raw: Record<string, unknown>,
   server: OAuthServerCapabilities
 ): ResolvedDynamicClientRegistrationMetadata {
-  const metadata = parseOAuthClientMetadata(value);
+  const metadata = parseOAuthClientMetadata(raw);
   const capabilities = negotiateDynamicClientRegistrationCapabilities(server, {
     tokenEndpointAuthMethod: metadata.tokenEndpointAuthMethod,
     tokenEndpointAuthMethodsSupported: metadata.tokenEndpointAuthMethodsSupported,
@@ -251,14 +258,9 @@ export function resolveDynamicClientRegistrationMetadata(
     responseTypes: metadata.responseTypes ?? ['code'],
   });
 
-  if (!metadata.redirectUris || metadata.redirectUris.length === 0) {
-    throw new Error('At least one redirect URI is required');
-  }
-  for (const redirectUri of metadata.redirectUris) validateRedirectUriScheme(redirectUri);
-
   return {
     ...pickDisplayMetadata(metadata),
-    redirectUris: metadata.redirectUris,
+    redirectUris: requireValidRedirectUris(metadata.redirectUris),
     ...capabilities,
     authMethodExplicit:
       metadata.tokenEndpointAuthMethod !== undefined || metadata.tokenEndpointAuthMethodsSupported !== undefined,
@@ -353,10 +355,7 @@ function resolveClientIdMetadataDocument(
     throw new Error(`client_id "${metadata.clientId}" does not match metadata URL "${metadataUrl}"`);
   }
   if (!metadata.clientName?.trim()) throw new Error('client_name is required and must not be empty');
-  if (!metadata.redirectUris || metadata.redirectUris.length === 0) {
-    throw new Error('redirect_uris is required and must not be empty');
-  }
-  for (const redirectUri of metadata.redirectUris) validateRedirectUriScheme(redirectUri);
+  const redirectUris = requireValidRedirectUris(metadata.redirectUris);
 
   if ('client_secret' in raw || 'client_secret_expires_at' in raw) {
     throw new Error('CIMD documents must not contain client secrets');
@@ -376,7 +375,7 @@ function resolveClientIdMetadataDocument(
     ...pickDisplayMetadata(metadata),
     clientId: metadata.clientId,
     clientName: metadata.clientName,
-    redirectUris: metadata.redirectUris,
+    redirectUris,
     ...capabilities,
   };
 }
