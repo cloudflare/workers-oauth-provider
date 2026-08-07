@@ -11665,6 +11665,37 @@ describe('OAuthProvider', () => {
         expect(response.status).toBe(302);
       });
 
+      it('should negotiate none when ChatGPT declares private_key_jwt and supports none', async () => {
+        // The document ChatGPT actually publishes: the declared method is a preference,
+        // and the list underneath is what there is to negotiate against.
+        const cimdUrl = 'https://chatgpt.com/oauth/IbUR3zxyNQ16/client.json';
+        const validMetadata = {
+          client_id: cimdUrl,
+          client_uri: 'https://chatgpt.com/',
+          client_name: 'ChatGPT',
+          redirect_uris: ['https://chatgpt.com/connector/oauth/IbUR3zxyNQ16'],
+          token_endpoint_auth_method: 'private_key_jwt',
+          token_endpoint_auth_methods_supported: ['none', 'private_key_jwt'],
+          token_endpoint_auth_signing_alg: 'RS256',
+          grant_types: ['authorization_code', 'refresh_token'],
+          response_types: ['code'],
+          jwks_uri: 'https://chatgpt.com/oauth/jwks.json',
+        };
+
+        globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(createMockFetchResponse(validMetadata)));
+        const authRequest = createMockRequest(
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}` +
+            `&redirect_uri=${encodeURIComponent(validMetadata.redirect_uris[0])}` +
+            `&response_type=code&state=test-state` +
+            `&code_challenge=test-challenge&code_challenge_method=S256`,
+          'GET'
+        );
+
+        const response = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+
+        expect(response.status).toBe(302);
+      });
+
       it('should reject private_key_jwt until token-endpoint assertion validation is implemented', async () => {
         const cimdUrl = 'https://client.example.com/oauth/metadata.json';
         const validMetadata = {

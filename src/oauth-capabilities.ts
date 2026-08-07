@@ -114,6 +114,52 @@ export function validateClientCapabilities(server: OAuthServerCapabilities, clie
 }
 
 /**
+ * Token endpoint authentication methods a Client ID Metadata Document may use.
+ *
+ * CIMD clients have no pre-shared secret, so the symmetric methods are out.
+ * `private_key_jwt` can be added once token-endpoint assertion validation is
+ * implemented. Accepting it in metadata before then creates clients that can
+ * authorize but never exchange a code.
+ */
+export const CIMD_SUPPORTED_TOKEN_ENDPOINT_AUTH_METHODS: readonly string[] = ['none'];
+
+/**
+ * Selects the token endpoint authentication method for a Client ID Metadata
+ * Document.
+ *
+ * `token_endpoint_auth_method` is the client's preference and
+ * `token_endpoint_auth_methods_supported` is the set it can negotiate within,
+ * so a document naming a method this server does not implement is only unusable
+ * when it offers no alternative alongside it. Preferring the declared method
+ * keeps a document that names an acceptable one unaffected.
+ *
+ * Returns undefined for a document that says nothing about client
+ * authentication, leaving the caller's default in place.
+ *
+ * @throws Error if the document asked for something and nothing was mutually supported
+ */
+export function negotiateCimdTokenEndpointAuthMethod(
+  declaredMethod: string | undefined,
+  supportedMethods: readonly string[] | undefined
+): string | undefined {
+  const isSupported = (method: string) => CIMD_SUPPORTED_TOKEN_ENDPOINT_AUTH_METHODS.includes(method);
+
+  if (declaredMethod !== undefined && isSupported(declaredMethod)) return declaredMethod;
+
+  const negotiated = supportedMethods?.find(isSupported);
+  if (negotiated !== undefined) return negotiated;
+
+  if (declaredMethod === undefined && supportedMethods === undefined) return undefined;
+
+  const advertised = [...(declaredMethod === undefined ? [] : [declaredMethod]), ...(supportedMethods ?? [])];
+  throw new Error(
+    `CIMD client does not support an accepted token endpoint authentication method. ` +
+      `Supported methods: ${CIMD_SUPPORTED_TOKEN_ENDPOINT_AUTH_METHODS.join(', ')}. ` +
+      `Client advertised: ${advertised.join(', ')}`
+  );
+}
+
+/**
  * Selects the capabilities from a Client ID Metadata Document that this
  * authorization server supports. CIMD documents may advertise extension
  * capabilities alongside the flow used with this server, so unsupported grant

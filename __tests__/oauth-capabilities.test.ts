@@ -4,6 +4,7 @@ import {
   AuthorizationError,
   buildOAuthServerCapabilities,
   negotiateCimdClientCapabilities,
+  negotiateCimdTokenEndpointAuthMethod,
   normalizePkceCodeChallengeMethod,
   validateAuthorizationPkce,
   validateAuthorizationResponseType,
@@ -148,6 +149,44 @@ describe('OAuth server capabilities', () => {
         responseTypes: ['id_token'],
       })
     ).toThrow('grant_types authorization_code and response_types code must be registered together');
+  });
+});
+
+describe('CIMD token endpoint authentication method', () => {
+  it.each([
+    ['a document that says nothing about client authentication', undefined, undefined, undefined],
+    ['a declared method this server implements', 'none', undefined, 'none'],
+    ['a declared method backed by an equal list', 'none', ['none'], 'none'],
+    [
+      'a declared method this server does not implement, alongside one it does',
+      'private_key_jwt',
+      ['none', 'private_key_jwt'],
+      'none',
+    ],
+    ['a list alone that contains a method this server implements', undefined, ['private_key_jwt', 'none'], 'none'],
+  ])('selects %s', (_case, declared, supported, expected) => {
+    expect(negotiateCimdTokenEndpointAuthMethod(declared, supported)).toBe(expected);
+  });
+
+  it.each([
+    ['a declared method this server does not implement, with nothing to fall back to', 'private_key_jwt', undefined],
+    ['a list with no method this server implements', undefined, ['private_key_jwt']],
+    [
+      'a symmetric method, which a client with no pre-shared secret cannot use',
+      'client_secret_post',
+      ['client_secret_post'],
+    ],
+    ['an empty list, which offers nothing', undefined, []],
+  ])('rejects %s', (_case, declared, supported) => {
+    expect(() => negotiateCimdTokenEndpointAuthMethod(declared, supported)).toThrow(
+      'CIMD client does not support an accepted token endpoint authentication method'
+    );
+  });
+
+  it('names what the client advertised, so the mismatch is legible', () => {
+    expect(() => negotiateCimdTokenEndpointAuthMethod('private_key_jwt', ['tls_client_auth'])).toThrow(
+      'Supported methods: none. Client advertised: private_key_jwt, tls_client_auth'
+    );
   });
 });
 

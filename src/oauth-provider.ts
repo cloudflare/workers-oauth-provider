@@ -5,6 +5,7 @@ import {
   buildOAuthServerCapabilities,
   isValidOAuthScopeToken,
   negotiateCimdClientCapabilities,
+  negotiateCimdTokenEndpointAuthMethod,
   normalizePkceCodeChallengeMethod,
   validateAuthorizationPkce,
   validateAuthorizationResponseType,
@@ -4309,14 +4310,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   private static readonly CIMD_FETCH_TIMEOUT_MS = 10_000;
 
   /**
-   * Allowed authentication methods for CIMD clients (per IETF spec)
-   * CIMD clients cannot use symmetric secrets since there's no pre-shared secret
-   */
-  // private_key_jwt can be added once token-endpoint assertion validation is implemented.
-  // Accepting it in metadata before then creates clients that can authorize but never exchange a code.
-  private static readonly CIMD_ALLOWED_AUTH_METHODS = ['none'];
-
-  /**
    * Validates that a field is a string or undefined
    * @param field - The field value to validate
    * @param fieldName - Name of the field for error messages
@@ -4487,7 +4480,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         rawMetadata.token_endpoint_auth_methods_supported,
         'token_endpoint_auth_methods_supported'
       );
-      const tokenEndpointAuthMethod = declaredAuthMethod ?? (authMethodChoices?.includes('none') ? 'none' : undefined);
 
       // Validate that client_id matches the URL (required by spec)
       if (clientId !== metadataUrl) {
@@ -4502,16 +4494,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         throw new Error('redirect_uris is required and must not be empty');
       }
 
-      if (
-        (declaredAuthMethod && !OAuthProviderImpl.CIMD_ALLOWED_AUTH_METHODS.includes(declaredAuthMethod)) ||
-        (authMethodChoices &&
-          !authMethodChoices.some((method) => OAuthProviderImpl.CIMD_ALLOWED_AUTH_METHODS.includes(method)))
-      ) {
-        throw new Error(
-          `CIMD client does not support an accepted token endpoint authentication method. ` +
-            `Supported methods: ${OAuthProviderImpl.CIMD_ALLOWED_AUTH_METHODS.join(', ')}`
-        );
-      }
+      const tokenEndpointAuthMethod = negotiateCimdTokenEndpointAuthMethod(declaredAuthMethod, authMethodChoices);
 
       const advertisedGrantTypes = OAuthProviderImpl.validateStringArray(rawMetadata.grant_types, 'grant_types') || [
         GrantType.AUTHORIZATION_CODE,
