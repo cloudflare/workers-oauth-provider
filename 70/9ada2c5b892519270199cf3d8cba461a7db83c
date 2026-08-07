@@ -1,0 +1,25 @@
+.changeset/cimd-metadata-resolution.md
+  s_0b3003d5997402::t_92c8125a4f1989 7
+README.md
+  s_0b3003d5997402::t_749cacd91247fc 297,299,301,303,309-310
+__tests__/oauth-provider.test.ts
+  s_0b3003d5997402::t_e2ce8d1c311d69 11360-11362,11374-11375,11377-11378,11382,11515-11525,11530-11532,11534-11536,11539-11558,11560-11564,11567-11568,11578,11580-11581,11973-11975,11977-11986,11993-11994
+src/oauth-client-metadata.ts
+  s_0b3003d5997402::t_b5ed2fc2badb9c 10,326,345,501-507,509-516,525-527,529-530,556-559,561,563,566-581,583-584,600
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "709ada2c5b892519270199cf3d8cba461a7db83c",
+  "prompts": {},
+  "sessions": {
+    "s_0b3003d5997402": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fd6b0-e1c0-7b61-ba71-7591b8469662",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Matt Carey <mcarey@cloudflare.com>"
+    }
+  }
+}
