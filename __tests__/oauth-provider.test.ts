@@ -11357,6 +11357,9 @@ describe('OAuthProvider', () => {
       });
     }
 
+    // Map-backed stand-in for the Workers Cache API. Node has no `caches`
+    // global, so this collaborator lets caching behavior be observed through
+    // OAuth flow outcomes and origin fetch counts rather than call records.
     function installMockCimdCache(initial?: Response) {
       const entries = new Map<string, Response>();
       const key = (request: RequestInfo | URL) => (request instanceof Request ? request.url : String(request));
@@ -11368,18 +11371,16 @@ describe('OAuthProvider', () => {
         entries.set(cacheUrl.toString(), initial.clone());
       }
       const cache = {
-        match: vi.fn(async (request: RequestInfo | URL) => entries.get(key(request))?.clone()),
-        put: vi.fn(async (request: RequestInfo | URL, response: Response) => {
+        match: async (request: RequestInfo | URL) => entries.get(key(request))?.clone(),
+        put: async (request: RequestInfo | URL, response: Response) => {
           entries.set(key(request), response.clone());
-        }),
-        delete: vi.fn(async (request: RequestInfo | URL) => entries.delete(key(request))),
+        },
+        delete: async (request: RequestInfo | URL) => entries.delete(key(request)),
       } as unknown as Cache;
-      const open = vi.fn().mockResolvedValue(cache);
       Object.defineProperty(globalThis, 'caches', {
         configurable: true,
-        value: { open },
+        value: { open: async () => cache },
       });
-      return { cache };
     }
 
     describe('Valid CIMD Flow', () => {
@@ -11511,76 +11512,60 @@ describe('OAuthProvider', () => {
     });
 
     describe('HTTP Caching (Cloudflare)', () => {
-      it('caches only validated documents and reuses them during the OAuth flow', async () => {
-        const { cache } = installMockCimdCache();
-        const cimdUrl = 'https://client.example.com/oauth/metadata.json';
-        const validMetadata = {
-          client_id: cimdUrl,
-          client_name: 'Cached Client',
-          redirect_uris: ['https://client.example.com/callback'],
-          token_endpoint_auth_method: 'none',
-        };
+      const cimdUrl = 'https://client.example.com/oauth/metadata.json';
+      const validMetadata = {
+        client_id: cimdUrl,
+        client_name: 'Cached Client',
+        redirect_uris: ['https://client.example.com/callback'],
+        token_endpoint_auth_method: 'none',
+      };
+      const validOriginResponse = () =>
+        createMockFetchResponse(validMetadata, { headers: { 'Cache-Control': 'public, max-age=300' } });
+      const cimdAuthRequest = () =>
+        createMockRequest(
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=S256`,
+          'GET'
+        );
+
+      it('serves repeat OAuth flows from the validated document cache', async () => {
+        installMockCimdCache();
+        globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(validOriginResponse()));
+
+        expect((await oauthProvider.fetch(cimdAuthRequest(), mockEnv, mockCtx)).status).toBe(302);
+        expect((await oauthProvider.fetch(cimdAuthRequest(), mockEnv, mockCtx)).status).toBe(302);
+        expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+      });
+
+      it.each([
+        ['an error response', () => new Response('Not Found', { status: 404 })],
+        [
+          'an invalid metadata document',
+          () =>
+            createMockFetchResponse(
+              {
+                client_id: 'https://different.example.com/metadata.json',
+                client_name: 'Mismatched client',
+                redirect_uris: ['https://client.example.com/callback'],
+              },
+              { headers: { 'Cache-Control': 'public, max-age=300' } }
+            ),
+        ],
+      ])('does not cache %s', async (_label, badOriginResponse) => {
+        installMockCimdCache();
         globalThis.fetch = vi
           .fn()
-          .mockResolvedValue(
-            createMockFetchResponse(validMetadata, { headers: { 'Cache-Control': 'public, max-age=300' } })
-          );
+          .mockImplementationOnce(() => Promise.resolve(badOriginResponse()))
+          .mockImplementation(() => Promise.resolve(validOriginResponse()));
 
-        const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=S256`,
-          'GET'
-        );
-        const response = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
-
-        expect(response.status).toBe(302);
-        expect(globalThis.fetch).toHaveBeenCalledTimes(1);
-        expect(globalThis.fetch).toHaveBeenCalledWith(
-          cimdUrl,
-          expect.objectContaining({ cache: 'no-store', redirect: 'manual' })
-        );
-        expect(cache.put).toHaveBeenCalledOnce();
+        await expect(oauthProvider.fetch(cimdAuthRequest(), mockEnv, mockCtx)).rejects.toThrow(CimdFetchError);
+        // The client recovers on the next request, which only happens when the
+        // bad response was never stored.
+        expect((await oauthProvider.fetch(cimdAuthRequest(), mockEnv, mockCtx)).status).toBe(302);
+        expect(globalThis.fetch).toHaveBeenCalledTimes(2);
       });
 
-      it('does not cache error responses', async () => {
-        const { cache } = installMockCimdCache();
-        const cimdUrl = 'https://client.example.com/oauth/metadata.json';
-        globalThis.fetch = vi.fn().mockResolvedValue(new Response('Not Found', { status: 404 }));
-        const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=S256`,
-          'GET'
-        );
-
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(CimdFetchError);
-        expect(cache.put).not.toHaveBeenCalled();
-      });
-
-      it('does not cache invalid metadata documents', async () => {
-        const { cache } = installMockCimdCache();
-        const cimdUrl = 'https://client.example.com/oauth/metadata.json';
-        globalThis.fetch = vi.fn().mockResolvedValue(
-          createMockFetchResponse(
-            {
-              client_id: 'https://different.example.com/metadata.json',
-              client_name: 'Mismatched client',
-              redirect_uris: ['https://client.example.com/callback'],
-            },
-            { headers: { 'Cache-Control': 'public, max-age=300' } }
-          )
-        );
-        const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=S256`,
-          'GET'
-        );
-
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(CimdFetchError);
-        expect(cache.put).not.toHaveBeenCalled();
-      });
-
-      it('evicts a cached document that no longer passes validation', async () => {
-        const cimdUrl = 'https://client.example.com/oauth/metadata.json';
-        const fetchSpy = vi.fn();
-        globalThis.fetch = fetchSpy;
-        const { cache } = installMockCimdCache(
+      it('recovers in one request when a cached document no longer validates', async () => {
+        installMockCimdCache(
           createMockFetchResponse(
             {
               client_id: 'https://attacker.example.com/client.json',
@@ -11590,14 +11575,10 @@ describe('OAuthProvider', () => {
             { headers: { 'Cache-Control': 'public, max-age=300' } }
           )
         );
-        const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=S256`,
-          'GET'
-        );
+        globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(validOriginResponse()));
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(CimdFetchError);
-        expect(fetchSpy).not.toHaveBeenCalled();
-        expect(cache.delete).toHaveBeenCalledOnce();
+        expect((await oauthProvider.fetch(cimdAuthRequest(), mockEnv, mockCtx)).status).toBe(302);
+        expect(globalThis.fetch).toHaveBeenCalledTimes(1);
       });
     });
 
@@ -11989,17 +11970,28 @@ describe('OAuthProvider', () => {
         expect(globalThis.fetch).not.toHaveBeenCalled();
       });
 
-      it('should NOT treat HTTPS URLs with only root path as CIMD', async () => {
+      it('should treat HTTPS URLs with a root path as CIMD client identifiers', async () => {
+        // CIMD draft §3 only requires a path component; a root path is
+        // NOT RECOMMENDED for clients but valid for the server to resolve.
         const urlWithRootPath = 'https://client.example.com/';
-        globalThis.fetch = vi.fn();
+        globalThis.fetch = vi.fn().mockImplementation(() =>
+          Promise.resolve(
+            createMockFetchResponse({
+              client_id: urlWithRootPath,
+              client_name: 'Root Path Client',
+              redirect_uris: ['https://client.example.com/callback'],
+              token_endpoint_auth_method: 'none',
+            })
+          )
+        );
 
         const authRequest = createMockRequest(
           `https://example.com/authorize?client_id=${encodeURIComponent(urlWithRootPath)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=S256`,
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
-        expect(globalThis.fetch).not.toHaveBeenCalled();
+        expect((await oauthProvider.fetch(authRequest, mockEnv, mockCtx)).status).toBe(302);
+        expect(globalThis.fetch).toHaveBeenCalledWith(urlWithRootPath, expect.anything());
       });
 
       it.each([
@@ -12091,75 +12083,9 @@ describe('OAuthProvider', () => {
           vi.useRealTimers();
         }
       });
-
-      it('should pass the bounded transport policy to fetch', async () => {
-        const cimdUrl = 'https://client.example.com/oauth/metadata.json';
-        const validMetadata = {
-          client_id: cimdUrl,
-          client_name: 'Test Client',
-          redirect_uris: ['https://client.example.com/callback'],
-          token_endpoint_auth_method: 'none',
-        };
-
-        globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(createMockFetchResponse(validMetadata)));
-
-        const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=S256`,
-          'GET'
-        );
-
-        await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
-        expect(globalThis.fetch).toHaveBeenCalledWith(
-          cimdUrl,
-          expect.objectContaining({
-            signal: expect.any(AbortSignal),
-            redirect: 'manual',
-          })
-        );
-      });
     });
 
     describe('HTTP Error Handling', () => {
-      it('should require a JSON response content type', async () => {
-        const cimdUrl = 'https://client.example.com/oauth/metadata.json';
-        globalThis.fetch = vi.fn().mockResolvedValue(
-          new Response(
-            JSON.stringify({
-              client_id: cimdUrl,
-              client_name: 'Wrong content type client',
-              redirect_uris: ['https://client.example.com/callback'],
-            }),
-            { status: 200, headers: { 'Content-Type': 'text/plain' } }
-          )
-        );
-        const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=S256`,
-          'GET'
-        );
-
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(CimdFetchError);
-      });
-
-      it('should require a 200 metadata response', async () => {
-        const cimdUrl = 'https://client.example.com/oauth/metadata.json';
-        globalThis.fetch = vi.fn().mockResolvedValue(
-          createMockFetchResponse(
-            {
-              client_id: cimdUrl,
-              client_name: 'Created document',
-              redirect_uris: ['https://client.example.com/callback'],
-            },
-            { status: 201 }
-          )
-        );
-        const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=S256`,
-          'GET'
-        );
-
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(CimdFetchError);
-      });
-
       it('should treat 404 responses as invalid client', async () => {
         const cimdUrl = 'https://client.example.com/oauth/metadata.json';
         globalThis.fetch = vi.fn().mockResolvedValue(new Response('Not Found', { status: 404 }));

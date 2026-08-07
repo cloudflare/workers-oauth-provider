@@ -294,18 +294,19 @@ new OAuthProvider({
 }
 ```
 
-The compatibility flag prevents outbound CIMD fetches from using legacy same-zone origin routing, which is necessary for SSRF protection. The provider advertises `client_id_metadata_document_supported: true` only when both settings are present.
+The compatibility flag prevents outbound CIMD fetches from using legacy same-zone origin routing, which is necessary for SSRF protection. The provider advertises `client_id_metadata_document_supported: true` only when both settings are present. CIMD fetches also use the `cache` option of `fetch`, which requires a compatibility date of `2024-11-11` or later (or the `cache_option_enabled` compatibility flag).
 
-CIMD validation includes:
+CIMD validation follows [draft-ietf-oauth-client-id-metadata-document-00](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-client-id-metadata-document-00) — the revision pinned by the MCP 2026-07-28 authorization spec — and includes:
 
-- An HTTPS Client Identifier URL with a non-root path and no userinfo, fragment, or dot path segments.
-- A direct HTTP 200 response. Redirects are not followed, and cacheable documents enter the named cache only after validation.
+- An HTTPS Client Identifier URL with a path component and no userinfo, fragment, or dot path segments.
 - A document `client_id` exactly matching its URL.
-- Non-empty `client_name` and `redirect_uris` fields, with unsafe redirect schemes rejected at ingestion.
+- Non-empty `client_name` and `redirect_uris` fields, as MCP requires, with unsafe redirect schemes rejected at ingestion.
 - Exact authorization-request redirect URI validation, with RFC 8252 loopback port handling.
 - A 5 KB response size limit and a 10 second timeout covering both headers and body.
 - Valid UTF-8 JSON object syntax and safe URI schemes for client metadata fields.
 - No embedded client secrets or private JWK material.
+
+Validated documents are cached according to their `Cache-Control` headers, capped at 7 days. Error responses and invalid documents are never cached, and a cached document that stops validating is evicted and re-resolved from origin within the same request.
 
 CIMD token endpoint authentication is negotiated from `token_endpoint_auth_method` and the OpenID RP Metadata Choices field `token_endpoint_auth_methods_supported`. The provider currently implements only `none`: a client may prefer `private_key_jwt` while also offering `none`, in which case the provider selects `none` and applies public-client PKCE requirements. A client that offers only `private_key_jwt` is rejected until assertion validation is implemented.
 

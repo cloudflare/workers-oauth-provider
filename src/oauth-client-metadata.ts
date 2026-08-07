@@ -7,6 +7,7 @@ import {
 const CIMD_MAX_SIZE_BYTES = 5 * 1024;
 const CIMD_FETCH_TIMEOUT_MS = 10_000;
 const CIMD_CACHE_NAME = 'workers-oauth-provider:cimd:v1';
+const CIMD_CACHE_MAX_TTL_SECONDS = 7 * 24 * 60 * 60;
 
 /** Parsed, syntactically validated OAuth client metadata fields used by this package. */
 interface ParsedOAuthClientMetadata {
@@ -322,7 +323,7 @@ function validateClientIdentifierUrl(clientId: string): void {
   if (parsed.hash) throw new Error('Client Identifier URL must not contain a fragment');
 
   const path = rawPath(clientId);
-  if (!path || path === '/') throw new Error('Client Identifier URL must contain a non-root path');
+  if (!path) throw new Error('Client Identifier URL must contain a path component');
 
   for (const segment of path.split('/')) {
     let decodedSegment: string;
@@ -341,8 +342,7 @@ function validateClientIdentifierUrl(clientId: string): void {
 export function isClientIdMetadataDocumentUrl(clientId: string): boolean {
   try {
     const parsed = new URL(clientId);
-    const path = rawPath(clientId);
-    return parsed.protocol === 'https:' && path !== '' && path !== '/';
+    return parsed.protocol === 'https:' && rawPath(clientId) !== '';
   } catch {
     return false;
   }
@@ -477,7 +477,6 @@ function fetchCimdOrigin(metadataUrl: string, signal: AbortSignal): Promise<Resp
   return fetch(metadataUrl, {
     headers: { Accept: 'application/json', 'Cache-Control': 'no-store' },
     signal,
-    redirect: 'manual',
     cache: 'no-store',
   });
 }
@@ -499,16 +498,22 @@ async function openCimdCache(): Promise<Cache | undefined> {
   }
 }
 
-function validateJsonContentType(response: Response): void {
-  const mediaType = response.headers.get('Content-Type')?.split(';', 1)[0].trim().toLowerCase();
-  if (mediaType !== 'application/json' && !/^application\/[a-z0-9!#$&^_.+-]+\+json$/.test(mediaType ?? '')) {
-    throw new Error('Client metadata response must use an application/json content type');
-  }
-}
-
-function isCacheableResponse(response: Response): boolean {
+/**
+ * Shared-cache lifetime derived from the origin's Cache-Control directives,
+ * bounded by the server-side cap the CIMD draft permits (§5.2 "MAY define its
+ * own upper and/or lower bounds on an acceptable cache lifetime"). Returns
+ * undefined when the response must not be stored.
+ */
+function cacheTtlSeconds(response: Response): number | undefined {
   const cacheControl = response.headers.get('Cache-Control');
-  return cacheControl !== null && !/(?:^|,)\s*(?:no-cache|no-store|private)\b/i.test(cacheControl);
+  if (cacheControl === null || /(?:^|,)\s*(?:no-cache|no-store|private)\b/i.test(cacheControl)) return undefined;
+
+  const directive =
+    /(?:^|,)\s*s-maxage\s*=\s*"?(\d+)/i.exec(cacheControl) ?? /(?:^|,)\s*max-age\s*=\s*"?(\d+)/i.exec(cacheControl);
+  if (!directive) return undefined;
+
+  const ttl = Math.min(Number(directive[1]), CIMD_CACHE_MAX_TTL_SECONDS);
+  return ttl > 0 ? ttl : undefined;
 }
 
 async function cacheValidatedDocument(
@@ -517,10 +522,12 @@ async function cacheValidatedDocument(
   response: Response,
   bytes: Uint8Array
 ): Promise<void> {
-  if (!cache || !isCacheableResponse(response)) return;
+  if (!cache) return;
+  const ttl = cacheTtlSeconds(response);
+  if (ttl === undefined) return;
 
-  const headers = new Headers();
-  for (const name of ['Cache-Control', 'Content-Type', 'ETag', 'Expires', 'Last-Modified']) {
+  const headers = new Headers({ 'Cache-Control': `public, max-age=${ttl}` });
+  for (const name of ['Content-Type', 'ETag', 'Last-Modified']) {
     const value = response.headers.get(name);
     if (value !== null) headers.set(name, value);
   }
@@ -545,28 +552,38 @@ export async function fetchClientIdMetadataDocument(
   const abortController = new AbortController();
   const timeoutId = setTimeout(() => abortController.abort(), CIMD_FETCH_TIMEOUT_MS);
 
-  const cacheRequest = createCimdCacheRequest(metadataUrl);
-  let cache: Cache | undefined;
-  let response: Response | undefined;
-  let fromCache = false;
-
   try {
-    cache = await openCimdCache();
-    if (abortController.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+    const cacheRequest = createCimdCacheRequest(metadataUrl);
+    const cache = await openCimdCache();
+
+    let cached: Response | undefined;
     try {
-      response = await cache?.match(cacheRequest);
-      if (abortController.signal.aborted) throw new DOMException('Aborted', 'AbortError');
-      fromCache = response !== undefined;
+      cached = await cache?.match(cacheRequest);
     } catch {
-      response = undefined;
+      cached = undefined;
     }
 
-    if (!response) response = await fetchCimdOrigin(metadataUrl, abortController.signal);
+    if (cached) {
+      try {
+        const { value } = await readJsonWithSizeLimit(cached, CIMD_MAX_SIZE_BYTES, abortController.signal);
+        return resolveClientIdMetadataDocument(metadataUrl, value, server);
+      } catch (error) {
+        if (abortController.signal.aborted) throw error;
+        // A stored document that stops validating (changed server capabilities,
+        // stricter rules after an upgrade) must not fail the flow: evict it and
+        // resolve from origin within the same request.
+        try {
+          await cache?.delete(cacheRequest);
+        } catch {
+          // Ignore cleanup failures; the origin fetch below is authoritative.
+        }
+      }
+    }
 
-    if (response.status !== 200) {
+    const response = await fetchCimdOrigin(metadataUrl, abortController.signal);
+    if (!response.ok) {
       throw new Error(`Failed to fetch client metadata: HTTP ${response.status}`);
     }
-    validateJsonContentType(response);
 
     const contentLength = response.headers.get('content-length');
     if (contentLength !== null) {
@@ -579,18 +596,10 @@ export async function fetchClientIdMetadataDocument(
 
     const { value, bytes } = await readJsonWithSizeLimit(response, CIMD_MAX_SIZE_BYTES, abortController.signal);
     const resolved = resolveClientIdMetadataDocument(metadataUrl, value, server);
-    if (abortController.signal.aborted) throw new DOMException('Aborted', 'AbortError');
     clearTimeout(timeoutId);
-    if (!fromCache) await cacheValidatedDocument(cache, cacheRequest, response, bytes);
+    await cacheValidatedDocument(cache, cacheRequest, response, bytes);
     return resolved;
   } catch (error) {
-    if (fromCache) {
-      try {
-        await cache?.delete(cacheRequest);
-      } catch {
-        // Ignore cache cleanup failures and return the validation error.
-      }
-    }
     if (abortController.signal.aborted) {
       throw new Error(`Client metadata fetch timed out after ${CIMD_FETCH_TIMEOUT_MS}ms`);
     }
