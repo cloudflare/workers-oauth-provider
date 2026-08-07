@@ -9,12 +9,8 @@ const CIMD_FETCH_TIMEOUT_MS = 10_000;
 const CIMD_CACHE_NAME = 'workers-oauth-provider:cimd:v1';
 const CIMD_CACHE_MAX_TTL_SECONDS = 7 * 24 * 60 * 60;
 
-/** Parsed, syntactically validated OAuth client metadata fields used by this package. */
-interface ParsedOAuthClientMetadata {
-  /** Client identifier supplied by a metadata document. */
-  clientId?: string;
-  /** Registered redirect URIs. */
-  redirectUris?: string[];
+/** Human-readable and key-discovery client metadata shared by DCR and CIMD clients. */
+interface OAuthClientDisplayMetadata {
   /** Human-readable client name. */
   clientName?: string;
   /** Client homepage URI. */
@@ -31,6 +27,14 @@ interface ParsedOAuthClientMetadata {
   i18n?: Record<string, string>;
   /** Client developer contacts. */
   contacts?: string[];
+}
+
+/** Parsed, syntactically validated OAuth client metadata fields used by this package. */
+interface ParsedOAuthClientMetadata extends OAuthClientDisplayMetadata {
+  /** Client identifier supplied by a metadata document. */
+  clientId?: string;
+  /** Registered redirect URIs. */
+  redirectUris?: string[];
   /** Advertised OAuth grant types. */
   grantTypes?: string[];
   /** Advertised OAuth response types. */
@@ -46,25 +50,9 @@ interface ParsedOAuthClientMetadata {
 }
 
 /** Effective metadata accepted by Dynamic Client Registration. */
-export interface ResolvedDynamicClientRegistrationMetadata {
+export interface ResolvedDynamicClientRegistrationMetadata extends OAuthClientDisplayMetadata {
   /** Registered redirect URIs. */
   redirectUris: string[];
-  /** Human-readable client name. */
-  clientName?: string;
-  /** Client homepage URI. */
-  clientUri?: string;
-  /** Client logo URI. */
-  logoUri?: string;
-  /** Client policy URI. */
-  policyUri?: string;
-  /** Client terms-of-service URI. */
-  tosUri?: string;
-  /** Client JSON Web Key Set URI. */
-  jwksUri?: string;
-  /** Internationalized human-readable metadata variants. */
-  i18n?: Record<string, string>;
-  /** Client developer contacts. */
-  contacts?: string[];
   /** Registered OAuth grant types. */
   grantTypes: string[];
   /** Registered OAuth response types. */
@@ -76,27 +64,13 @@ export interface ResolvedDynamicClientRegistrationMetadata {
 }
 
 /** Effective client metadata returned after resolving a Client ID Metadata Document. */
-export interface ResolvedClientIdMetadataDocument {
+export interface ResolvedClientIdMetadataDocument extends OAuthClientDisplayMetadata {
   /** Client identifier matching the fetched document URL. */
   clientId: string;
-  /** Registered redirect URIs. */
-  redirectUris: string[];
   /** Required human-readable client name. */
   clientName: string;
-  /** Client homepage URI. */
-  clientUri?: string;
-  /** Client logo URI. */
-  logoUri?: string;
-  /** Client policy URI. */
-  policyUri?: string;
-  /** Client terms-of-service URI. */
-  tosUri?: string;
-  /** Client JSON Web Key Set URI. */
-  jwksUri?: string;
-  /** Internationalized human-readable metadata variants. */
-  i18n?: Record<string, string>;
-  /** Client developer contacts. */
-  contacts?: string[];
+  /** Registered redirect URIs. */
+  redirectUris: string[];
   /** Mutually supported OAuth grant types. */
   grantTypes: string[];
   /** Mutually supported OAuth response types. */
@@ -233,6 +207,11 @@ function parseOAuthClientMetadata(value: unknown): ParsedOAuthClientMetadata {
   };
 }
 
+function pickDisplayMetadata(metadata: ParsedOAuthClientMetadata): OAuthClientDisplayMetadata {
+  const { clientName, clientUri, logoUri, policyUri, tosUri, jwksUri, i18n, contacts } = metadata;
+  return { clientName, clientUri, logoUri, policyUri, tosUri, jwksUri, i18n, contacts };
+}
+
 /**
  * Validates that a redirect URI has a scheme and does not use a dangerous
  * pseudo-scheme or contain control characters.
@@ -278,15 +257,8 @@ export function resolveDynamicClientRegistrationMetadata(
   for (const redirectUri of metadata.redirectUris) validateRedirectUriScheme(redirectUri);
 
   return {
+    ...pickDisplayMetadata(metadata),
     redirectUris: metadata.redirectUris,
-    clientName: metadata.clientName,
-    clientUri: metadata.clientUri,
-    logoUri: metadata.logoUri,
-    policyUri: metadata.policyUri,
-    tosUri: metadata.tosUri,
-    jwksUri: metadata.jwksUri,
-    i18n: metadata.i18n,
-    contacts: metadata.contacts,
     ...capabilities,
     authMethodExplicit:
       metadata.tokenEndpointAuthMethod !== undefined || metadata.tokenEndpointAuthMethodsSupported !== undefined,
@@ -393,16 +365,10 @@ function resolveClientIdMetadataDocument(
   });
 
   return {
+    ...pickDisplayMetadata(metadata),
     clientId: metadata.clientId,
-    redirectUris: metadata.redirectUris,
     clientName: metadata.clientName,
-    clientUri: metadata.clientUri,
-    logoUri: metadata.logoUri,
-    policyUri: metadata.policyUri,
-    tosUri: metadata.tosUri,
-    jwksUri: metadata.jwksUri,
-    i18n: metadata.i18n,
-    contacts: metadata.contacts,
+    redirectUris: metadata.redirectUris,
     ...capabilities,
   };
 }
