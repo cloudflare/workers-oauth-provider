@@ -11364,11 +11364,7 @@ describe('OAuthProvider', () => {
       const entries = new Map<string, Response>();
       const key = (request: RequestInfo | URL) => (request instanceof Request ? request.url : String(request));
       if (initial) {
-        const cacheUrl = new URL('https://client.example.com/.well-known/workers-oauth-provider-cimd-cache');
-        cacheUrl.search = new URLSearchParams({
-          client_id: 'https://client.example.com/oauth/metadata.json',
-        }).toString();
-        entries.set(cacheUrl.toString(), initial.clone());
+        entries.set('https://client.example.com/oauth/metadata.json', initial.clone());
       }
       const cache = {
         match: async (request: RequestInfo | URL) => entries.get(key(request))?.clone(),

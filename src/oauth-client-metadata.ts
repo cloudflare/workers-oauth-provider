@@ -481,14 +481,6 @@ function fetchCimdOrigin(metadataUrl: string, signal: AbortSignal): Promise<Resp
   });
 }
 
-function createCimdCacheRequest(metadataUrl: string): Request {
-  const cacheUrl = new URL(metadataUrl);
-  cacheUrl.pathname = '/.well-known/workers-oauth-provider-cimd-cache';
-  cacheUrl.search = new URLSearchParams({ client_id: metadataUrl }).toString();
-  cacheUrl.hash = '';
-  return new Request(cacheUrl, { headers: { Accept: 'application/json' } });
-}
-
 async function openCimdCache(): Promise<Cache | undefined> {
   if (typeof caches === 'undefined') return undefined;
   try {
@@ -518,7 +510,7 @@ function cacheTtlSeconds(response: Response): number | undefined {
 
 async function cacheValidatedDocument(
   cache: Cache | undefined,
-  request: Request,
+  metadataUrl: string,
   response: Response,
   bytes: Uint8Array
 ): Promise<void> {
@@ -533,7 +525,7 @@ async function cacheValidatedDocument(
   }
 
   try {
-    await cache.put(request, new Response(bytes, { status: 200, headers }));
+    await cache.put(metadataUrl, new Response(bytes, { status: 200, headers }));
   } catch {
     // Caching is an optimization; a cache write failure must not fail OAuth.
   }
@@ -553,12 +545,11 @@ export async function fetchClientIdMetadataDocument(
   const timeoutId = setTimeout(() => abortController.abort(), CIMD_FETCH_TIMEOUT_MS);
 
   try {
-    const cacheRequest = createCimdCacheRequest(metadataUrl);
     const cache = await openCimdCache();
 
     let cached: Response | undefined;
     try {
-      cached = await cache?.match(cacheRequest);
+      cached = await cache?.match(metadataUrl);
     } catch {
       cached = undefined;
     }
@@ -573,7 +564,7 @@ export async function fetchClientIdMetadataDocument(
         // stricter rules after an upgrade) must not fail the flow: evict it and
         // resolve from origin within the same request.
         try {
-          await cache?.delete(cacheRequest);
+          await cache?.delete(metadataUrl);
         } catch {
           // Ignore cleanup failures; the origin fetch below is authoritative.
         }
@@ -597,7 +588,7 @@ export async function fetchClientIdMetadataDocument(
     const { value, bytes } = await readJsonWithSizeLimit(response, CIMD_MAX_SIZE_BYTES, abortController.signal);
     const resolved = resolveClientIdMetadataDocument(metadataUrl, value, server);
     clearTimeout(timeoutId);
-    await cacheValidatedDocument(cache, cacheRequest, response, bytes);
+    await cacheValidatedDocument(cache, metadataUrl, response, bytes);
     return resolved;
   } catch (error) {
     if (abortController.signal.aborted) {
