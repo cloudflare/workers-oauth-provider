@@ -1,0 +1,19 @@
+src/oauth-client-metadata.ts
+  s_e595a515ab55a7::t_a411b963ea4495 268-273,275-277
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8e498101e739782ee7b135bba40fd34a65175c3b",
+  "prompts": {},
+  "sessions": {
+    "s_e595a515ab55a7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6eb18ba3-cefa-4ac2-b413-641e203ea1e1",
+        "model": "unknown"
+      },
+      "human_author": "Matt Carey <mcarey@cloudflare.com>"
+    }
+  }
+}
