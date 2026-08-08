@@ -138,7 +138,7 @@ Grant records store information about permissions a user has granted to an appli
 
 > **Note:** The grant record includes the hash of the authorization code initially, which is replaced by the hash of the refresh token after the code is exchanged. The record has a 10-minute TTL during authorization, which is replaced by the refresh token TTL when the code is exchanged.
 
-> **Note:** The optional `resource` field stores the RFC 8707 resource authorized for the grant. Grants created by older releases may not contain it. When neither the grant nor provider configuration supplies a resource, the grant remains unbound.
+> **Resource migration:** Grants written before 1.0 may have no `resource`. A combined `OAuthProvider`, or an authorization server with one registered resource, stores that sole canonical resource during the next valid code exchange or refresh. A multi-resource `OAuthAuthorizationServer` uses its server-controlled `legacyGrantResource`, when configured; it never lets the token request choose an audience for an unbound grant. A matching stored resource is inherited, while an unknown or different stored resource is rejected.
 
 ### Tokens
 
@@ -167,7 +167,7 @@ Token records store metadata about issued access tokens, including denormalized 
 
 > **Note:** The token format is `{userId}:{grantId}:{random-secret}` which embeds the identifiers needed for efficient lookups. The token key format includes the user ID and grant ID to enable efficient revocation of all tokens for a specific grant. The token record contains denormalized grant information to eliminate the need for a separate grant lookup during token validation. The token also carries a wrapped encryption key that can only be unwrapped using the actual token string, allowing decryption of the encrypted props.
 
-> **Note:** The optional `audience` field records the resource restriction for an access token. It may be absent when a legacy grant has no stored resource, no canonical resource is configured, and the token request omits `resource`.
+> **Audience safety:** Every access token issued by 1.0 carries exactly one registered canonical resource as its audience. Token exchange cannot change that audience. Persisted token types keep the field optional only so old KV records can be decoded; each protected-resource surface rejects records whose audience is missing or belongs to another resource. A client holding an unbound pre-1.0 access token should refresh or reconnect.
 
 **TTL:** Access tokens typically have a 1 hour (3600 seconds) TTL by default
 

@@ -44,9 +44,11 @@ import {
   validateIdJagClaims,
   validateIdJagHeader,
 } from './ema/validators';
+import { validateResourceUri } from './oauth-resource';
 
 export { AuthorizationError } from './oauth-capabilities';
 export type { AuthorizationErrorCode, AuthorizationErrorOptions } from './oauth-capabilities';
+export * from './oauth-resource-server';
 
 export type {
   EmaClaimsMapper,
@@ -60,6 +62,7 @@ export type {
 } from './ema/types';
 export type { EmaValidationError } from './ema/result';
 export { isValidOAuthScopeToken } from './oauth-capabilities';
+export { validateResourceUri } from './oauth-resource';
 
 const PROTECTED_RESOURCE_WELL_KNOWN_PREFIX = '/.well-known/oauth-protected-resource';
 const NO_CACHE_HEADERS = { 'Cache-Control': 'no-store', Pragma: 'no-cache' } as const;
@@ -111,9 +114,9 @@ type MutableExecutionContext = Omit<ExecutionContext, 'props'> & { props: any };
 /**
  * Aliases for either type of Handler that makes .fetch required
  */
-type ExportedHandlerWithFetch<Env = Cloudflare.Env> = ExportedHandler<Env> &
-  Pick<Required<ExportedHandler<Env>>, 'fetch'>;
-type WorkerEntrypointWithFetch<Env = Cloudflare.Env> = WorkerEntrypoint<Env> & {
+type ExportedHandlerWithFetch<Env = Cloudflare.Env, Props = unknown> = ExportedHandler<Env, unknown, unknown, Props> &
+  Pick<Required<ExportedHandler<Env, unknown, unknown, Props>>, 'fetch'>;
+type WorkerEntrypointWithFetch<Env = Cloudflare.Env, Props = {}> = WorkerEntrypoint<Env, Props> & {
   fetch: NonNullable<WorkerEntrypoint['fetch']>;
 };
 
@@ -123,11 +126,11 @@ type WorkerEntrypointWithFetch<Env = Cloudflare.Env> = WorkerEntrypoint<Env> & {
 type TypedHandler<Env = Cloudflare.Env> =
   | {
       type: HandlerType.EXPORTED_HANDLER;
-      handler: ExportedHandlerWithFetch<Env>;
+      handler: ExportedHandlerWithFetch<Env, any>;
     }
   | {
       type: HandlerType.WORKER_ENTRYPOINT;
-      handler: new (ctx: ExecutionContext, env: Env) => WorkerEntrypointWithFetch<Env>;
+      handler: new (ctx: ExecutionContext, env: Env) => WorkerEntrypointWithFetch<Env, any>;
     };
 
 /**
@@ -237,6 +240,9 @@ export interface TokenExchangeCallbackOptions {
    */
   requestedScope: string[];
 
+  /** Canonical protected resource selected for this grant and token. */
+  resource: string;
+
   /**
    * Application-specific properties currently associated with this grant
    */
@@ -323,12 +329,44 @@ export interface ResolveExternalTokenResult {
    *
    * A JWT may carry this value as an `aud` claim. For an opaque API token or
    * PAT, the callback can supply the local resource URI as policy after
-   * successful validation. When `resourceMetadata.resource` is configured,
-   * this value is required and must match it exactly.
+   * successful validation. This value is required and must exactly match the
+   * provider's configured `resourceMetadata.resource`.
    */
-  audience?: string | string[];
+  audience: string;
 }
 
+/** RFC 9728 metadata owned by one protected resource server. */
+export interface OAuthProtectedResourceMetadata {
+  /**
+   * The protected resource identifier HTTPS URL (RFC 9728 `resource` field).
+   * Configure an RFC 3986-safe HTTPS producer URL with lowercase scheme/host
+   * and no userinfo, default port, fragment, or dot segments.
+   */
+  resource: string;
+
+  /**
+   * Authorization server issuers that can issue tokens for this resource.
+   * In the legacy combined configuration this defaults to the token endpoint
+   * origin. In the role-based configuration it defaults to the configured AS
+   * issuer.
+   */
+  authorization_servers?: string[];
+
+  /** Minimal scopes required for basic protected-resource functionality. */
+  scopes_supported?: string[];
+
+  /** Methods by which bearer tokens can be presented. Defaults to `["header"]`. */
+  bearer_methods_supported?: string[];
+
+  /** Human-readable name for this resource. */
+  resource_name?: string;
+}
+
+/**
+ * Existing combined authorization-server and protected-resource configuration.
+ * This shape remains supported in 1.0 and is normalized to a one-resource
+ * role-based provider internally.
+ */
 export interface OAuthProviderOptions<Env = Cloudflare.Env> {
   /**
    * URL(s) for API routes. Requests with URLs starting with any of these prefixes
@@ -531,60 +569,106 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
   clientIdMetadataDocumentEnabled?: boolean;
 
   /**
-   * When true, requested-vs-granted resource validation compares origins only
-   * (scheme + host + port) instead of exact URIs. This allows an origin-only
-   * grant such as `https://server.com` to accept `https://server.com/mcp`, but
-   * also ignores path and query differences. Configured canonical resources
-   * always use exact matching.
-   *
-   * Defaults to false (strict exact matching per RFC 8707).
-   *
-   * @deprecated This comparison is unsafe for shared-origin multi-path or
-   * multi-tenant deployments. Prefer configuring `resourceMetadata.resource`.
+   * Metadata for RFC 9728 OAuth 2.0 Protected Resource Metadata.
+   * Controls the response served at /.well-known/oauth-protected-resource.
    */
-  resourceMatchOriginOnly?: boolean;
+  resourceMetadata: OAuthProtectedResourceMetadata;
+}
+
+/** The authorization-server role when one Worker hosts several MCP resources. */
+interface OAuthAuthorizationServerConfiguration {
+  /** Canonical RFC 8414 issuer. Its origin gates authorization-server routes. */
+  issuer: string;
+
+  /** Authorization endpoint advertised by the AS. A path is resolved against `issuer`. */
+  authorizeEndpoint: string;
+
+  /** Token and revocation endpoint implemented by the provider. */
+  tokenEndpoint: string;
+
+  /** Optional dynamic client registration endpoint. */
+  clientRegistrationEndpoint?: string;
 
   /**
-   * Optional metadata for RFC 9728 OAuth 2.0 Protected Resource Metadata.
-   * Controls the response served at /.well-known/oauth-protected-resource.
-   *
-   * If not provided, the endpoint will be automatically generated using the request origin
-   * as the resource identifier, and the token endpoint's origin as the authorization server.
+   * Resource selected when a new authorization request omits `resource`.
+   * Omit this in a multi-resource deployment to require clients to choose.
+   * A single-resource deployment automatically uses its sole resource.
    */
-  resourceMetadata?: {
-    /**
-     * The protected resource identifier URL (RFC 9728 `resource` field).
-     *
-     * Configuring this value pins grants and access-token audiences to this
-     * exact resource. An omitted authorization resource defaults to this value,
-     * and an omitted token-request resource inherits it from the grant. Without
-     * configuration, explicit RFC 8707 resource indicators are accepted and
-     * omission remains unbound for backwards compatibility.
-     */
-    resource?: string;
-    /**
-     * List of authorization server issuer URLs that can issue tokens for this resource.
-     * If not set, defaults to the token endpoint's origin (consistent with the issuer
-     * in authorization server metadata).
-     */
-    authorization_servers?: string[];
-    /**
-     * Minimal scopes required for basic protected resource functionality.
-     * These scopes are advertised in Protected Resource Metadata and used as
-     * baseline bearer challenge guidance. `offline_access` is omitted because
-     * refresh-token issuance is an authorization server capability.
-     */
-    scopes_supported?: string[];
-    /**
-     * Methods by which bearer tokens can be presented to this resource.
-     * Defaults to ["header"].
-     */
-    bearer_methods_supported?: string[];
-    /**
-     * Human-readable name for this resource.
-     */
-    resource_name?: string;
-  };
+  defaultResource?: string;
+
+  /**
+   * Server-controlled destination for grants created before resource binding.
+   * An unbound refresh token cannot choose a resource supplied by the client.
+   * A single-resource deployment automatically uses its sole resource.
+   */
+  legacyGrantResource?: string;
+}
+
+/** Internal input used when `protectResource()` registers one hosted role. */
+interface InternalProtectedResourceConfiguration<Env = Cloudflare.Env> {
+  resourceMetadata: OAuthProtectedResourceMetadata;
+  handler:
+    | ExportedHandlerWithFetch<Env, any>
+    | (new (ctx: ExecutionContext, env: Env) => WorkerEntrypointWithFetch<Env, any>);
+  resolveExternalToken?: (input: ResolveExternalTokenInput<Env>) => Promise<ResolveExternalTokenResult | null>;
+}
+
+/** Internal AS-only constructor shape behind the functional public API. */
+type InternalOAuthAuthorizationServerOptions<Env = Cloudflare.Env> = Omit<
+  OAuthProviderOptions<Env>,
+  | 'apiRoute'
+  | 'apiHandler'
+  | 'apiHandlers'
+  | 'authorizeEndpoint'
+  | 'tokenEndpoint'
+  | 'clientRegistrationEndpoint'
+  | 'resourceMetadata'
+> & {
+  authorizationServer: OAuthAuthorizationServerConfiguration;
+};
+
+/**
+ * Functional authorization-server surface used with `protectResource()`.
+ * The application owns the interactive authorization route and uses
+ * `getOAuthApi()` to parse and complete it; `fetch()` serves protocol-owned AS
+ * endpoints such as metadata, token, revocation, and optional registration.
+ */
+export type OAuthAuthorizationServerOptions<Env = Cloudflare.Env> = Omit<
+  OAuthProviderOptions<Env>,
+  'apiRoute' | 'apiHandler' | 'apiHandlers' | 'defaultHandler' | 'resourceMetadata' | 'resolveExternalToken'
+> & {
+  /** Canonical RFC 8414 issuer. */
+  issuer: string;
+
+  /** Resource selected for a new authorization request that omits `resource`. */
+  defaultResource?: string;
+
+  /** Migration destination for pre-resource grants. */
+  legacyGrantResource?: string;
+};
+
+/** Options passed to `OAuthAuthorizationServer.protectResource()`. */
+export interface ProtectResourceOptions<Env = Cloudflare.Env, Props = unknown> {
+  resourceMetadata: OAuthProtectedResourceMetadata;
+  handler:
+    | ExportedHandlerWithFetch<Env, Props>
+    | (new (ctx: ExecutionContext, env: Env) => WorkerEntrypointWithFetch<Env, Props>);
+  resolveExternalToken?: (input: ResolveExternalTokenInput<Env>) => Promise<ResolveExternalTokenResult | null>;
+}
+
+/** A protected-resource fetch surface created by an authorization server. */
+export interface OAuthProtectedResource<Env = Cloudflare.Env> {
+  fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response>;
+}
+
+/** Audience-checked token context suitable for a private Service Binding. */
+export interface ValidatedAccessToken<T = any> {
+  props: T;
+  audience: string;
+  expiresAt: number;
+  scope: string[];
+  userId: string;
+  clientId: string;
 }
 
 // Using ExportedHandler from Cloudflare Workers Types for both API and default handlers
@@ -716,9 +800,11 @@ export interface ExchangeTokenOptions {
   scope?: string[];
 
   /**
-   * Optional target audience/resource for the new token (maps to resource parameter per RFC 8707)
+   * Optional canonical target audience/resource for the new token (maps to the
+   * resource parameter per RFC 8707). When present, it must match the
+   * provider's configured resource.
    */
-  aud?: string | string[];
+  aud?: string;
 
   /**
    * Optional TTL override for the new token in seconds (must not exceed subject token's remaining lifetime)
@@ -766,9 +852,10 @@ export interface AuthRequest {
   codeChallengeMethod?: string;
 
   /**
-   * Resource parameter indicating target resource(s) (RFC 8707)
+   * Canonical target resource (RFC 8707). Parsed authorization requests
+   * always contain the provider's configured resource.
    */
-  resource?: string | string[];
+  resource?: string;
 
   /**
    * Authorization server issuer recorded while parsing this request.
@@ -1059,7 +1146,7 @@ interface TokenResponse {
    * Resource indicator(s) for the issued access token (RFC 8707 Section 2.2)
    * SHOULD be included to indicate the resource server(s) for which the token is valid
    */
-  resource?: string | string[];
+  resource: string;
 }
 
 /**
@@ -1289,6 +1376,9 @@ export interface GrantSummary {
    * Unix timestamp when the grant expires (if TTL is configured)
    */
   expiresAt?: number;
+
+  /** Canonical protected resource, absent only on a pre-resource legacy grant. */
+  resource?: string | string[];
 }
 
 /**
@@ -1331,14 +1421,30 @@ interface CreateAccessTokenOptions {
   expiresIn: number;
 
   /**
-   * Optional audience/resource
+   * Canonical audience/resource
    */
-  audience?: string | string[];
+  audience: string;
 
   /**
    * Cloudflare Worker environment variables
    */
   env: ProviderEnv;
+}
+
+type InternalOAuthProviderOptions<Env> = Omit<OAuthProviderOptions<Env>, 'resourceMetadata'> & {
+  resourceMetadata?: OAuthProtectedResourceMetadata;
+};
+
+interface NormalizedResourceServer<Env> {
+  resourceMetadata: OAuthProtectedResourceMetadata;
+  apiHandler?: TypedHandler<Env>;
+  resolveExternalToken?: (input: ResolveExternalTokenInput<Env>) => Promise<ResolveExternalTokenResult | null>;
+}
+
+interface NormalizedApiRoute<Env> {
+  route: string;
+  handler: TypedHandler<Env>;
+  resourceServer: NormalizedResourceServer<Env>;
 }
 
 /**
@@ -1383,6 +1489,83 @@ export class OAuthProvider<Env = Cloudflare.Env> {
 }
 
 /**
+ * Authorization-server role that can functionally compose multiple protected
+ * MCP resources in the same Worker. The application keeps control of routing
+ * by dispatching requests to this object or to the handles returned by
+ * `protectResource()`.
+ */
+export class OAuthAuthorizationServer<Env = Cloudflare.Env> {
+  #impl: OAuthProviderImpl<Env>;
+
+  constructor(options: OAuthAuthorizationServerOptions<Env>) {
+    const {
+      issuer,
+      defaultResource,
+      legacyGrantResource,
+      authorizeEndpoint,
+      tokenEndpoint,
+      clientRegistrationEndpoint,
+      ...commonOptions
+    } = options;
+    this.#impl = new OAuthProviderImpl<Env>({
+      ...commonOptions,
+      defaultHandler: {
+        fetch: () => new Response(null, { status: 404 }),
+      },
+      authorizationServer: {
+        issuer,
+        authorizeEndpoint,
+        tokenEndpoint,
+        clientRegistrationEndpoint,
+        defaultResource,
+        legacyGrantResource,
+      },
+    });
+  }
+
+  /** Register one audience and return its independently routable RS surface. */
+  protectResource<Props = unknown>(options: ProtectResourceOptions<Env, Props>): OAuthProtectedResource<Env> {
+    const resource = this.#impl.registerResourceServer({
+      resourceMetadata: options.resourceMetadata,
+      handler: options.handler,
+      resolveExternalToken: options.resolveExternalToken,
+    });
+    return {
+      fetch: (request, env, ctx) => this.#impl.fetchResourceServer(request, env as Env & ProviderEnv, ctx, resource),
+    };
+  }
+
+  /** Register an audience hosted by another Worker or service. */
+  registerResource(resource: string): this {
+    this.#impl.registerResourceIdentifier(resource);
+    return this;
+  }
+
+  /** Serve protocol-owned authorization-server endpoints, excluding the application authorization UI. */
+  fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    return this.#impl.fetchAuthorizationServer(request, env as Env & ProviderEnv, ctx);
+  }
+
+  /** Obtain helpers for scheduled jobs or custom code outside a fetch dispatch. */
+  getOAuthApi(env: Env): OAuthHelpers {
+    return this.#impl.createOAuthHelpers(env as Env & ProviderEnv);
+  }
+
+  /**
+   * Validate an opaque token for one fixed registered audience. A separate
+   * Worker can expose a resource-specific wrapper around this method over a
+   * private Service Binding.
+   */
+  validateToken<T = any>(token: string, resource: string, env: Env): Promise<ValidatedAccessToken<T> | null> {
+    return this.#impl.validateAccessToken<T>(token, resource, env as Env & ProviderEnv);
+  }
+
+  purgeExpiredData(env: Env, options?: PurgeOptions): Promise<PurgeResult> {
+    return this.#impl.createOAuthHelpers(env as Env & ProviderEnv).purgeExpiredData(options);
+  }
+}
+
+/**
  * Gets OAuthHelpers for the given environment
  * @param options - Configuration options for the OAuth provider
  * @param env - Cloudflare Worker environment variables
@@ -1405,7 +1588,19 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   /**
    * Configuration options for the provider
    */
-  options: OAuthProviderOptions<Env>;
+  options: InternalOAuthProviderOptions<Env>;
+
+  /** Explicit issuer used by the role-based multi-resource configuration. */
+  private readonly explicitIssuer: string | undefined;
+
+  /** Every protected-resource role hosted by this provider. */
+  private readonly resourceServers: NormalizedResourceServer<Env>[];
+
+  /** Resource chosen when a new authorization request omits RFC 8707 `resource`. */
+  private readonly configuredDefaultAuthorizationResource: string | undefined;
+
+  /** Server-controlled migration destination for pre-resource grants. */
+  private readonly configuredLegacyGrantResource: string | undefined;
 
   /**
    * Represents the validated type of a handler (ExportedHandler or WorkerEntrypoint)
@@ -1417,7 +1612,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * In the simple case, this will be a single entry with the route and handler from options.apiRoute/apiHandler
    * In the advanced case, this will contain entries from options.apiHandlers
    */
-  private typedApiHandlers: Array<[string, TypedHandler<Env>]>;
+  private typedApiHandlers: NormalizedApiRoute<Env>[];
 
   /** Capabilities shared by discovery and client metadata validation. */
   readonly serverCapabilities: OAuthServerCapabilities;
@@ -1432,58 +1627,37 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * Creates a new OAuth provider instance
    * @param options - Configuration options for the provider
    */
-  constructor(options: OAuthProviderOptions<Env>) {
-    // Initialize typedApiHandlers as an array
+  constructor(options: OAuthProviderOptions<Env> | InternalOAuthAuthorizationServerOptions<Env>) {
     this.typedApiHandlers = [];
-
-    // Check if we have incompatible configuration
-    const hasSingleHandlerConfig = !!(options.apiRoute && options.apiHandler);
-    const hasMultiHandlerConfig = !!options.apiHandlers;
-
-    if (hasSingleHandlerConfig && hasMultiHandlerConfig) {
-      throw new TypeError(
-        'Cannot use both apiRoute/apiHandler and apiHandlers. ' +
-          'Use either apiRoute + apiHandler OR apiHandlers, not both.'
-      );
-    }
-
-    if (!hasSingleHandlerConfig && !hasMultiHandlerConfig) {
-      throw new TypeError(
-        'Must provide either apiRoute + apiHandler OR apiHandlers. ' + 'No API route configuration provided.'
-      );
-    }
-
-    // Validate default handler
     this.typedDefaultHandler = this.validateHandler(options.defaultHandler, 'defaultHandler');
 
-    // Process and validate the API handlers
-    if (hasSingleHandlerConfig) {
-      // Single handler mode with apiRoute + apiHandler
-      const apiHandler = this.validateHandler(options.apiHandler!, 'apiHandler');
+    const roleBased = 'authorizationServer' in options;
+    let normalizedOptions: InternalOAuthProviderOptions<Env>;
+    let configuredResourceServers: Array<{
+      resourceMetadata: OAuthProtectedResourceMetadata;
+      resolveExternalToken?: InternalProtectedResourceConfiguration<Env>['resolveExternalToken'];
+    }>;
 
-      // For single handler mode, process the apiRoute(s) and map them all to the single apiHandler
-      if (Array.isArray(options.apiRoute)) {
-        options.apiRoute.forEach((route, index) => {
-          this.validateEndpoint(route, `apiRoute[${index}]`);
-          this.typedApiHandlers.push([route, apiHandler]);
-        });
-      } else {
-        this.validateEndpoint(options.apiRoute!, 'apiRoute');
-        this.typedApiHandlers.push([options.apiRoute!, apiHandler]);
-      }
+    if (roleBased) {
+      const { authorizationServer, ...commonOptions } = options;
+      this.validateAuthorizationServerIssuer(authorizationServer.issuer);
+      this.explicitIssuer = authorizationServer.issuer;
+      normalizedOptions = {
+        ...(commonOptions as Omit<InternalOAuthProviderOptions<Env>, 'authorizeEndpoint' | 'tokenEndpoint'>),
+        authorizeEndpoint: authorizationServer.authorizeEndpoint,
+        tokenEndpoint: authorizationServer.tokenEndpoint,
+        clientRegistrationEndpoint: authorizationServer.clientRegistrationEndpoint,
+      };
+      configuredResourceServers = [];
     } else {
-      // Multiple handlers mode with apiHandlers map
-      for (const [route, handler] of Object.entries(options.apiHandlers!)) {
-        this.validateEndpoint(route, `apiHandlers key: ${route}`);
-        this.typedApiHandlers.push([route, this.validateHandler(handler, `apiHandlers[${route}]`)]);
-      }
-    }
-
-    // Validate that the oauth endpoints are either absolute paths or full URLs
-    this.validateEndpoint(options.authorizeEndpoint, 'authorizeEndpoint');
-    this.validateEndpoint(options.tokenEndpoint, 'tokenEndpoint');
-    if (options.clientRegistrationEndpoint) {
-      this.validateEndpoint(options.clientRegistrationEndpoint, 'clientRegistrationEndpoint');
+      this.explicitIssuer = undefined;
+      normalizedOptions = options;
+      configuredResourceServers = [
+        {
+          resourceMetadata: options.resourceMetadata,
+          resolveExternalToken: options.resolveExternalToken,
+        },
+      ];
     }
 
     this.options = {
@@ -1492,16 +1666,72 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       clientRegistrationTTL: DEFAULT_CLIENT_REGISTRATION_TTL,
       onError: ({ status, code, description }) =>
         console.warn(`OAuth error response: ${status} ${code} - ${description}`),
-      ...options,
+      ...normalizedOptions,
     };
+
+    this.validateEndpoint(this.options.authorizeEndpoint, 'authorizeEndpoint');
+    this.validateEndpoint(this.options.tokenEndpoint, 'tokenEndpoint');
+    if (this.options.clientRegistrationEndpoint) {
+      this.validateEndpoint(this.options.clientRegistrationEndpoint, 'clientRegistrationEndpoint');
+    }
+    if (roleBased) {
+      this.validateAuthorizationServerRouteIsolation();
+    }
+
+    this.resourceServers = configuredResourceServers.map(({ resourceMetadata, resolveExternalToken }) => {
+      const metadata = this.snapshotResourceMetadata(resourceMetadata);
+      this.validateResourceMetadataOptions(metadata);
+      return {
+        resourceMetadata: metadata,
+        resolveExternalToken,
+      };
+    });
+
+    if (!roleBased) {
+      const legacyOptions = options as OAuthProviderOptions<Env>;
+      const hasSingleHandlerConfig = !!(legacyOptions.apiRoute && legacyOptions.apiHandler);
+      const hasMultiHandlerConfig = !!legacyOptions.apiHandlers;
+
+      if (hasSingleHandlerConfig && hasMultiHandlerConfig) {
+        throw new TypeError(
+          'Cannot use both apiRoute/apiHandler and apiHandlers. ' +
+            'Use either apiRoute + apiHandler OR apiHandlers, not both.'
+        );
+      }
+      if (!hasSingleHandlerConfig && !hasMultiHandlerConfig) {
+        throw new TypeError(
+          'Must provide either apiRoute + apiHandler OR apiHandlers. No API route configuration provided.'
+        );
+      }
+
+      const resourceServer = this.resourceServers[0];
+      if (hasSingleHandlerConfig) {
+        const handler = this.validateHandler(legacyOptions.apiHandler!, 'apiHandler');
+        resourceServer.apiHandler = handler;
+        const routes = Array.isArray(legacyOptions.apiRoute) ? legacyOptions.apiRoute : [legacyOptions.apiRoute!];
+        routes.forEach((route, index) => {
+          this.validateEndpoint(route, Array.isArray(legacyOptions.apiRoute) ? `apiRoute[${index}]` : 'apiRoute');
+          this.typedApiHandlers.push({ route, handler, resourceServer });
+        });
+      } else {
+        for (const [route, rawHandler] of Object.entries(legacyOptions.apiHandlers!)) {
+          this.validateEndpoint(route, `apiHandlers key: ${route}`);
+          const handler = this.validateHandler(rawHandler, `apiHandlers[${route}]`);
+          this.typedApiHandlers.push({ route, handler, resourceServer });
+        }
+      }
+    }
+
+    const resources = this.resourceServers.map((server) => server.resourceMetadata.resource);
+    const soleResource = resources.length === 1 ? resources[0] : undefined;
+    const authorizationServer = roleBased ? options.authorizationServer : undefined;
+    this.configuredDefaultAuthorizationResource = authorizationServer?.defaultResource ?? soleResource;
+    this.configuredLegacyGrantResource = authorizationServer?.legacyGrantResource ?? soleResource;
 
     // Cloudflare KV rejects token writes whose expiration is less than 60 seconds in the
     // future, so an access token TTL below that would make every token issuance fail with
     // an opaque KV 400 at runtime. Reject it at construction with a clear, actionable error.
-    if (
-      !Number.isInteger(this.options.accessTokenTTL) ||
-      this.options.accessTokenTTL! < KV_MIN_EXPIRATION_TTL_SECONDS
-    ) {
+    if (!isValidAccessTokenTTL(this.options.accessTokenTTL!)) {
       throw new TypeError(
         `accessTokenTTL must be an integer of at least ${KV_MIN_EXPIRATION_TTL_SECONDS} seconds (Cloudflare KV's minimum expiration window).`
       );
@@ -1514,7 +1744,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       enterpriseManagedAuthorization: !!this.options.enterpriseManagedAuthorization,
     });
     validateAuthorizationServerScopes(this.options.scopesSupported);
-    this.validateResourceMetadataOptions(this.options.resourceMetadata);
     this.validateEmaOptions(this.options.enterpriseManagedAuthorization);
 
     if (this.options.enterpriseManagedAuthorization) {
@@ -1537,14 +1766,115 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       if (!endpoint.startsWith('/')) {
         throw new TypeError(`${name} path must be an absolute path starting with /`);
       }
+      if (this.explicitIssuer && new URL(endpoint, new URL(this.explicitIssuer).origin).hash) {
+        throw new TypeError(`${name} must not contain a fragment`);
+      }
     } else {
       // It should be a valid URL
+      let parsed: URL;
       try {
-        new URL(endpoint);
+        parsed = new URL(endpoint);
       } catch (e) {
         throw new TypeError(`${name} must be either an absolute path starting with / or a valid URL`);
       }
+      if (this.explicitIssuer && (parsed.protocol !== 'https:' || parsed.username || parsed.password || parsed.hash)) {
+        throw new TypeError(`${name} must be an absolute HTTPS URL without userinfo or a fragment`);
+      }
     }
+  }
+
+  /** Validate the explicit issuer used to host-gate the role-based AS. */
+  private validateAuthorizationServerIssuer(issuer: string): void {
+    let parsed: URL;
+    try {
+      parsed = new URL(issuer);
+    } catch {
+      throw new TypeError('authorizationServer.issuer must be a canonical absolute HTTPS URL');
+    }
+    if (
+      !validateResourceUri(issuer) ||
+      parsed.protocol !== 'https:' ||
+      parsed.username ||
+      parsed.password ||
+      parsed.search ||
+      parsed.hash ||
+      foldResourceSchemeAndHost(issuer) !== issuer ||
+      (parsed.href !== issuer && parsed.origin !== issuer)
+    ) {
+      throw new TypeError('authorizationServer.issuer must be a canonical absolute HTTPS URL');
+    }
+  }
+
+  /** Reject exact collisions between protocol endpoints owned by the AS fetch surface. */
+  private validateAuthorizationServerRouteIsolation(): void {
+    const issuerUrl = new URL(this.explicitIssuer!);
+    const discoveryEndpoint = this.getAuthorizationServerMetadataUrl(issuerUrl);
+    const tokenUrl = new URL(this.getFullEndpointUrl(this.options.tokenEndpoint, issuerUrl));
+
+    if (this.matchEndpoint(tokenUrl, discoveryEndpoint)) {
+      throw new TypeError('tokenEndpoint must not collide with the authorization server metadata endpoint');
+    }
+
+    if (!this.options.clientRegistrationEndpoint) return;
+    const registrationUrl = new URL(this.getFullEndpointUrl(this.options.clientRegistrationEndpoint, issuerUrl));
+    if (this.matchEndpoint(registrationUrl, this.options.tokenEndpoint)) {
+      throw new TypeError('clientRegistrationEndpoint must not collide with tokenEndpoint');
+    }
+    if (this.matchEndpoint(registrationUrl, discoveryEndpoint)) {
+      throw new TypeError(
+        'clientRegistrationEndpoint must not collide with the authorization server metadata endpoint'
+      );
+    }
+  }
+
+  /** Reject resource and route layouts where dispatch could choose the wrong audience. */
+  private validateResourceRouteIsolation(): void {
+    for (let left = 0; left < this.resourceServers.length; left++) {
+      for (let right = left + 1; right < this.resourceServers.length; right++) {
+        const leftResource = this.resourceServers[left].resourceMetadata.resource;
+        const rightResource = this.resourceServers[right].resourceMetadata.resource;
+        if (isExactResource(leftResource, rightResource)) {
+          throw new TypeError(`resourceServers must use unique resources; duplicate ${leftResource}`);
+        }
+      }
+    }
+
+    for (let left = 0; left < this.typedApiHandlers.length; left++) {
+      for (let right = left + 1; right < this.typedApiHandlers.length; right++) {
+        const a = this.typedApiHandlers[left];
+        const b = this.typedApiHandlers[right];
+        if (a.resourceServer === b.resourceServer) continue;
+        const aUrl = new URL(a.route);
+        const bUrl = new URL(b.route);
+        if (aUrl.origin !== bUrl.origin) continue;
+        if (pathsOverlapOnBoundary(aUrl.pathname, bUrl.pathname)) {
+          throw new TypeError(`API routes for different resources must not overlap: ${a.route} and ${b.route}`);
+        }
+      }
+    }
+  }
+
+  /** Resolve a configured policy value to the registry's canonical spelling. */
+  private resolveConfiguredResourceDefault(resource: string | undefined, name: string): string | undefined {
+    if (resource === undefined) return undefined;
+    const configured = this.findConfiguredResource(resource);
+    if (!configured) {
+      throw new TypeError(`${name} must name one of the configured protected resources`);
+    }
+    return configured;
+  }
+
+  private getDefaultAuthorizationResource(): string | undefined {
+    const sole = this.resourceServers.length === 1 ? this.resourceServers[0].resourceMetadata.resource : undefined;
+    return this.resolveConfiguredResourceDefault(
+      this.configuredDefaultAuthorizationResource ?? sole,
+      'defaultResource'
+    );
+  }
+
+  private getLegacyGrantResource(): string | undefined {
+    const sole = this.resourceServers.length === 1 ? this.resourceServers[0].resourceMetadata.resource : undefined;
+    return this.resolveConfiguredResourceDefault(this.configuredLegacyGrantResource ?? sole, 'legacyGrantResource');
   }
 
   /**
@@ -1570,12 +1900,35 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     );
   }
 
-  /** Validate configured RFC 9728 protected resource metadata. */
-  private validateResourceMetadataOptions(options: OAuthProviderOptions<Env>['resourceMetadata']): void {
-    if (!options) return;
+  /** Snapshot caller-owned metadata so later mutation cannot change routing or policy. */
+  private snapshotResourceMetadata(metadata: OAuthProtectedResourceMetadata): OAuthProtectedResourceMetadata {
+    return {
+      ...metadata,
+      ...(metadata?.authorization_servers ? { authorization_servers: [...metadata.authorization_servers] } : {}),
+      ...(metadata?.scopes_supported ? { scopes_supported: [...metadata.scopes_supported] } : {}),
+      ...(metadata?.bearer_methods_supported
+        ? { bearer_methods_supported: [...metadata.bearer_methods_supported] }
+        : {}),
+    };
+  }
 
-    if (options.resource !== undefined && !validateResourceUri(options.resource)) {
-      throw new TypeError('resourceMetadata.resource must be an absolute HTTP(S) URI without a fragment');
+  /** Validate configured RFC 9728 protected resource metadata. */
+  private validateResourceMetadataOptions(options: OAuthProtectedResourceMetadata): void {
+    if (!options || !validateResourceUri(options.resource) || new URL(options.resource).protocol !== 'https:') {
+      throw new TypeError('resourceMetadata.resource is required and must be an absolute HTTPS URI without a fragment');
+    }
+    if (foldResourceSchemeAndHost(options.resource) !== options.resource) {
+      throw new TypeError('resourceMetadata.resource must use a lowercase HTTPS scheme and lowercase host');
+    }
+    const parsedResource = new URL(options.resource);
+    if (
+      parsedResource.username ||
+      parsedResource.password ||
+      (parsedResource.href !== options.resource && parsedResource.origin !== options.resource)
+    ) {
+      throw new TypeError(
+        'resourceMetadata.resource must use canonical URL serialization without userinfo, a default port, or dot segments'
+      );
     }
 
     if (options.authorization_servers !== undefined) {
@@ -1589,7 +1942,16 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         } catch {
           throw new TypeError('resourceMetadata.authorization_servers must contain valid HTTPS issuer URLs');
         }
-        if (parsed.protocol !== 'https:' || parsed.search || parsed.hash) {
+        if (
+          !validateResourceUri(issuer) ||
+          parsed.protocol !== 'https:' ||
+          parsed.username ||
+          parsed.password ||
+          foldResourceSchemeAndHost(issuer) !== issuer ||
+          (parsed.href !== issuer && parsed.origin !== issuer) ||
+          issuer.includes('?') ||
+          issuer.includes('#')
+        ) {
           throw new TypeError('resourceMetadata.authorization_servers must contain valid HTTPS issuer URLs');
         }
       }
@@ -1627,13 +1989,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       throw new TypeError('enterpriseManagedAuthorization.mapClaims must be a function');
     }
 
-    // Defense-in-depth: an EMA-configured provider without a declared
-    // resource would accept any RFC-8707-shaped `resource` claim, sidestepping
-    // the AS-side resource pinning. Require it explicitly.
-    if (!this.options.resourceMetadata?.resource) {
-      throw new TypeError('enterpriseManagedAuthorization requires resourceMetadata.resource to be configured');
-    }
-
     if (options.jwksCacheTtlSeconds !== undefined && options.jwksCacheTtlSeconds <= 0) {
       throw new TypeError('enterpriseManagedAuthorization.jwksCacheTtlSeconds must be greater than 0');
     }
@@ -1654,17 +2009,52 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @returns A Promise resolving to an HTTP Response
    */
   async fetch(request: Request, env: Env & ProviderEnv, ctx: ExecutionContext): Promise<Response> {
+    return this.fetchForRoles(request, env, ctx, 'combined');
+  }
+
+  async fetchAuthorizationServer(request: Request, env: Env & ProviderEnv, ctx: ExecutionContext): Promise<Response> {
+    return this.fetchForRoles(request, env, ctx, 'authorization-server');
+  }
+
+  async fetchResourceServer(
+    request: Request,
+    env: Env & ProviderEnv,
+    ctx: ExecutionContext,
+    resource: string
+  ): Promise<Response> {
+    const resourceServer = this.resourceServers.find((server) => server.resourceMetadata.resource === resource);
+    if (!resourceServer) throw new TypeError(`No protected resource is registered for ${resource}`);
+    return this.fetchForRoles(request, env, ctx, resourceServer);
+  }
+
+  private async fetchForRoles(
+    request: Request,
+    env: Env & ProviderEnv,
+    ctx: ExecutionContext,
+    role: 'combined' | 'authorization-server' | NormalizedResourceServer<Env>
+  ): Promise<Response> {
     const url = new URL(request.url);
+
+    const servesAuthorizationServer = role === 'combined' || role === 'authorization-server';
+    const servesProtectedResources = role !== 'authorization-server';
+    const metadataResourceServer = servesProtectedResources
+      ? this.findResourceServerForMetadataUrl(url, typeof role === 'object' ? role : undefined)
+      : undefined;
+    const matchedApiRoute = servesProtectedResources ? this.findApiRouteForUrl(url) : undefined;
+    const apiRoute =
+      matchedApiRoute && (typeof role !== 'object' || matchedApiRoute.resourceServer === role)
+        ? matchedApiRoute
+        : undefined;
 
     // Special handling for OPTIONS requests (CORS preflight)
     if (request.method === 'OPTIONS') {
       // For API routes and OAuth endpoints, respond with CORS headers
       if (
-        this.isApiRequest(url) ||
-        url.pathname === '/.well-known/oauth-authorization-server' ||
-        this.isProtectedResourceMetadataRequest(url) ||
-        this.isTokenEndpoint(url) ||
-        (this.options.clientRegistrationEndpoint && this.isClientRegistrationEndpoint(url))
+        apiRoute !== undefined ||
+        (servesAuthorizationServer && this.isAuthorizationServerMetadataRequest(url)) ||
+        metadataResourceServer !== undefined ||
+        (servesAuthorizationServer && this.isTokenEndpoint(url)) ||
+        (servesAuthorizationServer && this.options.clientRegistrationEndpoint && this.isClientRegistrationEndpoint(url))
       ) {
         // Create an empty 204 No Content response with CORS headers
         return this.addCorsHeaders(
@@ -1680,20 +2070,42 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     // Handle .well-known/oauth-authorization-server
-    if (url.pathname === '/.well-known/oauth-authorization-server') {
+    if (servesAuthorizationServer && this.isAuthorizationServerMetadataRequest(url)) {
+      if (request.method !== 'GET') {
+        return this.addCorsHeaders(
+          new Response(null, {
+            status: 405,
+            headers: { Allow: 'GET' },
+          }),
+          request
+        );
+      }
       const response = await this.handleMetadataDiscovery(url);
       return this.addCorsHeaders(response, request);
     }
 
-    // Handle .well-known/oauth-protected-resource (RFC 9728)
-    // Supports both root resource (no path suffix) and path-based resources per RFC 9728 §3.1
-    if (this.isProtectedResourceMetadataRequest(url)) {
-      const response = this.handleProtectedResourceMetadata(url);
+    // Handle .well-known/oauth-protected-resource (RFC 9728). A document at
+    // any alias would identify a different resource than the URL used to fetch
+    // it, so reserve the namespace and return 404 for noncanonical variants.
+    if (servesProtectedResources && this.isProtectedResourceMetadataPath(url)) {
+      if (!metadataResourceServer) {
+        return this.addCorsHeaders(new Response(null, { status: 404 }), request);
+      }
+      if (request.method !== 'GET') {
+        return this.addCorsHeaders(
+          new Response(null, {
+            status: 405,
+            headers: { Allow: 'GET' },
+          }),
+          request
+        );
+      }
+      const response = this.handleProtectedResourceMetadata(url, metadataResourceServer);
       return this.addCorsHeaders(response, request);
     }
 
     // Handle token endpoint (including revocation)
-    if (this.isTokenEndpoint(url)) {
+    if (servesAuthorizationServer && this.isTokenEndpoint(url)) {
       const parsed = await this.parseTokenEndpointRequest(request, env);
 
       // If parsing failed, return the error response
@@ -1712,15 +2124,23 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     // Handle client registration endpoint
-    if (this.options.clientRegistrationEndpoint && this.isClientRegistrationEndpoint(url)) {
+    if (
+      servesAuthorizationServer &&
+      this.options.clientRegistrationEndpoint &&
+      this.isClientRegistrationEndpoint(url)
+    ) {
       const response = await this.handleClientRegistration(request, env);
       return this.addCorsHeaders(response, request);
     }
 
     // Check if it's an API request
-    if (this.isApiRequest(url)) {
-      const response = await this.handleApiRequest(request, env, ctx);
+    if (apiRoute) {
+      const response = await this.handleApiRequest(request, env, ctx, apiRoute);
       return this.addCorsHeaders(response, request);
+    }
+
+    if (typeof role === 'object') {
+      return new Response(null, { status: 404 });
     }
 
     // Inject OAuth helpers into env if not already present
@@ -1792,6 +2212,27 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     };
   }
 
+  async validateAccessToken<T = any>(
+    token: string,
+    resource: string,
+    env: Env & ProviderEnv
+  ): Promise<ValidatedAccessToken<T> | null> {
+    const configuredResource = this.findConfiguredResource(resource);
+    if (!configuredResource) {
+      throw new TypeError('resource must name one registered protected resource');
+    }
+    const summary = await this.unwrapToken<T>(token, env);
+    if (!summary || !isExactResource(summary.audience, configuredResource)) return null;
+    return {
+      props: summary.grant.props,
+      audience: configuredResource,
+      expiresAt: summary.expiresAt,
+      scope: summary.scope,
+      userId: summary.userId,
+      clientId: summary.grant.clientId,
+    };
+  }
+
   /**
    * Determines if an endpoint configuration is a path or a full URL
    * @param endpoint - The endpoint configuration
@@ -1807,15 +2248,31 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @param endpoint - The endpoint pattern (full URL or path)
    * @returns True if the URL matches the endpoint pattern
    */
-  private matchEndpoint(url: URL, endpoint: string): boolean {
-    if (this.isPath(endpoint)) {
-      // It's a path - match only the pathname
+  private matchEndpoint(url: URL, endpoint: string, allowAdditionalQuery = false): boolean {
+    if (this.isPath(endpoint) && !this.explicitIssuer) {
+      // Preserve legacy path-only matching. The new role-based shape resolves
+      // paths against its explicit issuer and therefore host-gates them.
       return url.pathname === endpoint;
-    } else {
-      // It's a full URL - match the entire URL including hostname
-      const endpointUrl = new URL(endpoint);
-      return url.hostname === endpointUrl.hostname && url.pathname === endpointUrl.pathname;
     }
+    const endpointUrl = new URL(this.getFullEndpointUrl(endpoint, url));
+    if (url.origin !== endpointUrl.origin || url.pathname !== endpointUrl.pathname) return false;
+
+    const unmatchedActualQuery = [...url.searchParams.entries()];
+    const configuredQueryNames = new Set<string>();
+    for (const [name, value] of endpointUrl.searchParams) {
+      configuredQueryNames.add(name);
+      const match = unmatchedActualQuery.findIndex(([actualName, actualValue]) => {
+        return actualName === name && actualValue === value;
+      });
+      if (match === -1) return false;
+      unmatchedActualQuery.splice(match, 1);
+    }
+    if (!allowAdditionalQuery) return unmatchedActualQuery.length === 0;
+
+    // OAuth parameters may be appended to an authorization endpoint's static
+    // query, but a second value for a configured key could change what
+    // application code sees through URLSearchParams.get().
+    return unmatchedActualQuery.every(([name]) => !configuredQueryNames.has(name));
   }
 
   /**
@@ -1825,6 +2282,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    */
   private isTokenEndpoint(url: URL): boolean {
     return this.matchEndpoint(url, this.options.tokenEndpoint);
+  }
+
+  isAuthorizationEndpointRequest(url: URL): boolean {
+    // The endpoint's configured query is retained while OAuth request
+    // parameters are added by the client.
+    return this.matchEndpoint(url, this.options.authorizeEndpoint, true);
   }
 
   /**
@@ -1839,30 +2302,39 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
   /**
    * Checks if a URL is a request for OAuth Protected Resource Metadata (RFC 9728).
-   * Matches both the root well-known path and path-suffixed variants per RFC 9728 §3.1.
+   * Only the well-known URL constructed from the configured canonical resource
+   * may return its document; aliases would violate RFC 9728 §3.3.
    */
-  private isProtectedResourceMetadataRequest(url: URL): boolean {
+  private findResourceServerForMetadataUrl(
+    url: URL,
+    onlyResourceServer?: NormalizedResourceServer<Env>
+  ): NormalizedResourceServer<Env> | undefined {
+    const candidates = onlyResourceServer ? [onlyResourceServer] : this.resourceServers;
+    return candidates.find((server) =>
+      isExactResource(url.href, this.getConfiguredResourceMetadataUrl(server.resourceMetadata.resource))
+    );
+  }
+
+  /** Exact RFC 8414 discovery location for the configured issuer. */
+  private getAuthorizationServerMetadataUrl(requestUrl: URL): string {
+    if (!this.explicitIssuer) return `${requestUrl.origin}/.well-known/oauth-authorization-server`;
+    const issuer = new URL(this.explicitIssuer);
+    // RFC 8414 inserts the well-known suffix before a non-root issuer path,
+    // after removing its terminating slashes.
+    const issuerPath = issuer.pathname === '/' ? '' : issuer.pathname.replace(/\/+$/, '');
+    return `${issuer.origin}/.well-known/oauth-authorization-server${issuerPath}`;
+  }
+
+  private isAuthorizationServerMetadataRequest(url: URL): boolean {
+    return url.href === this.getAuthorizationServerMetadataUrl(url);
+  }
+
+  /** Whether a URL is in the RFC 9728 protected-resource metadata namespace. */
+  private isProtectedResourceMetadataPath(url: URL): boolean {
     return (
       url.pathname === PROTECTED_RESOURCE_WELL_KNOWN_PREFIX ||
       url.pathname.startsWith(PROTECTED_RESOURCE_WELL_KNOWN_PREFIX + '/')
     );
-  }
-
-  /**
-   * Derives the resource identifier from a protected resource metadata well-known URL.
-   * Per RFC 9728 §3.1, the well-known URI is inserted after the authority and before the path,
-   * so the resource identifier is reconstructed by removing the well-known prefix.
-   *
-   * Examples:
-   *   /.well-known/oauth-protected-resource       → origin (e.g. https://example.com)
-   *   /.well-known/oauth-protected-resource/mcp   → origin + /mcp (e.g. https://example.com/mcp)
-   */
-  private deriveResourceIdentifier(requestUrl: URL): string {
-    const suffix = requestUrl.pathname.slice(PROTECTED_RESOURCE_WELL_KNOWN_PREFIX.length);
-    if (!suffix || suffix === '/') {
-      return requestUrl.origin;
-    }
-    return `${requestUrl.origin}${suffix}`;
   }
 
   private createInvalidClientResponse(
@@ -2080,17 +2552,21 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @returns True if the URL matches the API route
    */
   private matchApiRoute(url: URL, route: string): boolean {
+    const pathMatches = (configuredPath: string, rootMatchesDescendants: boolean): boolean => {
+      if (configuredPath === '/') return rootMatchesDescendants || url.pathname === '/';
+      const normalized = configuredPath.endsWith('/') ? configuredPath.slice(0, -1) : configuredPath;
+      return url.pathname === normalized || url.pathname.startsWith(normalized + '/');
+    };
+
     if (this.isPath(route)) {
-      // It's a path - match only the pathname
-      // Special case: '/' should match exactly, not all paths (which would break OAuth routes)
-      if (route === '/') {
-        return url.pathname === '/';
-      }
-      return url.pathname.startsWith(route);
+      return pathMatches(route, false);
     } else {
-      // It's a full URL - match the entire URL including hostname
       const apiUrl = new URL(route);
-      return url.hostname === apiUrl.hostname && url.pathname.startsWith(apiUrl.pathname);
+      return (
+        url.origin === apiUrl.origin &&
+        pathMatches(apiUrl.pathname, true) &&
+        (!apiUrl.search || url.search === apiUrl.search)
+      );
     }
   }
 
@@ -2100,13 +2576,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @returns True if the URL matches any of the API routes
    */
   private isApiRequest(url: URL): boolean {
-    // Check each route in our array of validated API handlers
-    for (const [route, _] of this.typedApiHandlers) {
-      if (this.matchApiRoute(url, route)) {
-        return true;
-      }
-    }
-    return false;
+    return this.findApiRouteForUrl(url) !== undefined;
   }
 
   /**
@@ -2114,14 +2584,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @param url - The URL to find a handler for
    * @returns The TypedHandler for the URL, or undefined if no handler matches
    */
-  private findApiHandlerForUrl(url: URL): TypedHandler<Env> | undefined {
-    // Check each route in our array of validated API handlers
-    for (const [route, handler] of this.typedApiHandlers) {
-      if (this.matchApiRoute(url, route)) {
-        return handler;
-      }
-    }
-    return undefined;
+  private findApiRouteForUrl(url: URL): NormalizedApiRoute<Env> | undefined {
+    return this.typedApiHandlers
+      .filter(({ route }) => this.matchApiRoute(url, route))
+      .sort(
+        (left, right) =>
+          new URL(right.route, url.origin).pathname.length - new URL(left.route, url.origin).pathname.length
+      )[0];
   }
 
   /**
@@ -2133,8 +2602,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    */
   private getFullEndpointUrl(endpoint: string, requestUrl: URL): string {
     if (this.isPath(endpoint)) {
-      // It's a path - use the request URL's origin
-      return `${requestUrl.origin}${endpoint}`;
+      // Role-based endpoints are always scoped to the explicit AS origin.
+      const origin = this.explicitIssuer ? new URL(this.explicitIssuer).origin : requestUrl.origin;
+      return `${origin}${endpoint}`;
     } else {
       // It's already a full URL
       return endpoint;
@@ -2145,6 +2615,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * Gets the authorization server issuer using the same derivation as RFC 8414 metadata.
    */
   getAuthorizationServerIssuer(requestUrl: URL): string {
+    if (this.explicitIssuer) return this.explicitIssuer;
     const tokenEndpoint = this.getFullEndpointUrl(this.options.tokenEndpoint, requestUrl);
     return new URL(tokenEndpoint).origin;
   }
@@ -2173,6 +2644,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     newResponse.headers.set('Access-Control-Allow-Methods', '*');
     // Include Authorization explicitly since it's not included in * for security reasons
     newResponse.headers.set('Access-Control-Allow-Headers', 'Authorization, *');
+    appendHeaderValue(newResponse.headers, 'Vary', 'Origin');
 
     // Browser-based OAuth/MCP clients need these non-safelisted response
     // headers for authorization discovery, step-up challenges, and backoff.
@@ -2199,6 +2671,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @returns Response with OAuth server metadata
    */
   private async handleMetadataDiscovery(requestUrl: URL): Promise<Response> {
+    if (this.resourceServers.length === 0) {
+      throw new TypeError(
+        'The authorization server has no protected resources; call registerResource() or protectResource() first'
+      );
+    }
     // For endpoints specified as paths, use the request URL's origin
     const tokenEndpoint = this.getFullEndpointUrl(this.options.tokenEndpoint, requestUrl);
     const authorizeEndpoint = this.getFullEndpointUrl(this.options.authorizeEndpoint, requestUrl);
@@ -2215,9 +2692,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       : [];
 
     const metadata = {
-      issuer: new URL(tokenEndpoint).origin,
+      issuer: this.getAuthorizationServerIssuer(requestUrl),
       authorization_endpoint: authorizeEndpoint,
       token_endpoint: tokenEndpoint,
+      // RFC 9728 §4. The provider's resource registry is finite and enumerable.
+      // Each individual grant/token still receives exactly one of these audiences.
+      protected_resources: this.resourceServers.map((server) => server.resourceMetadata.resource),
       // not implemented: jwks_uri
       registration_endpoint: registrationEndpoint,
       scopes_supported: this.options.scopesSupported,
@@ -2254,8 +2734,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   }
 
   /** Scopes that are baseline requirements of the protected resource itself. */
-  private getProtectedResourceScopes(): string[] {
-    return this.normalizeProtectedResourceScopes(this.options.resourceMetadata?.scopes_supported ?? []);
+  private getProtectedResourceScopes(resourceServer: NormalizedResourceServer<Env>): string[] {
+    return this.normalizeProtectedResourceScopes(resourceServer.resourceMetadata.scopes_supported ?? []);
   }
 
   /** Deduplicate resource-facing scopes and remove authorization-server-only capabilities. */
@@ -2269,22 +2749,18 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @param requestUrl - The URL of the incoming request
    * @returns Response with protected resource metadata
    */
-  private handleProtectedResourceMetadata(requestUrl: URL): Response {
-    const rm = this.options.resourceMetadata;
-
-    // Derive authorization server from token endpoint, same as issuer in auth server metadata
-    const tokenEndpointUrl = this.getFullEndpointUrl(this.options.tokenEndpoint, requestUrl);
-    const authServerOrigin = new URL(tokenEndpointUrl).origin;
-
-    const resourceScopes = this.getProtectedResourceScopes();
+  private handleProtectedResourceMetadata(requestUrl: URL, resourceServer: NormalizedResourceServer<Env>): Response {
+    const rm = resourceServer.resourceMetadata;
+    const authorizationServer = this.getAuthorizationServerIssuer(requestUrl);
+    const resourceScopes = this.getProtectedResourceScopes(resourceServer);
     const metadata: Record<string, unknown> = {
-      resource: rm?.resource ?? this.deriveResourceIdentifier(requestUrl),
-      authorization_servers: rm?.authorization_servers ?? [authServerOrigin],
+      resource: rm.resource,
+      authorization_servers: rm.authorization_servers ?? [authorizationServer],
       ...(resourceScopes.length > 0 ? { scopes_supported: resourceScopes } : {}),
-      bearer_methods_supported: rm?.bearer_methods_supported ?? ['header'],
+      bearer_methods_supported: rm.bearer_methods_supported ?? ['header'],
     };
 
-    if (rm?.resource_name) {
+    if (rm.resource_name) {
       metadata.resource_name = rm.resource_name;
     }
 
@@ -2315,6 +2791,19 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // surface as `500 Internal Server Error` and stay visible.
     try {
       const grantType = body.grant_type;
+      const supportedGrant =
+        grantType === GrantType.AUTHORIZATION_CODE ||
+        grantType === GrantType.REFRESH_TOKEN ||
+        (grantType === GrantType.TOKEN_EXCHANGE && !!this.options.allowTokenExchangeGrant) ||
+        (grantType === GrantType.JWT_BEARER && !!this.options.enterpriseManagedAuthorization);
+
+      if (!supportedGrant) {
+        return this.createErrorResponse('unsupported_grant_type', { description: 'Grant type not supported' });
+      }
+
+      // Validate an explicit resource before any grant-specific callbacks or
+      // mutations. Tolerate legacy omission and inherit the configured resource.
+      this.validateTokenRequestResourceIndicator(body.resource);
 
       if (grantType === GrantType.AUTHORIZATION_CODE) {
         return await this.handleAuthorizationCodeGrant(body, clientInfo, env);
@@ -2324,9 +2813,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         return await this.handleTokenExchangeGrant(body, clientInfo, env);
       } else if (grantType === GrantType.JWT_BEARER) {
         return await this.handleJwtBearerGrant(body, clientInfo, env, requestUrl, request);
-      } else {
-        return this.createErrorResponse('unsupported_grant_type', { description: 'Grant type not supported' });
       }
+
+      // Exhaustive at runtime because unsupported grants returned above.
+      throw new Error('Unreachable supported grant type');
     } catch (error) {
       const response = this.createOAuthErrorResponse(error);
       if (response) return response;
@@ -2353,7 +2843,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * bearer failures receive an RFC 6750 / RFC 9728 challenge unless the caller
    * supplied one. Other errors retain the pre-existing behavior and are re-thrown.
    */
-  private createExternalTokenErrorResponse(error: unknown, resourceMetadataUrl: string): Response | undefined {
+  private createExternalTokenErrorResponse(
+    error: unknown,
+    resourceMetadataUrl: string | undefined,
+    resourceServer: NormalizedResourceServer<Env>
+  ): Response | undefined {
     if (!(error instanceof ExternalTokenError)) return undefined;
 
     const headers = error.headers ?? {};
@@ -2370,7 +2864,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       }
       challengeHeaders = {
         ...headers,
-        'WWW-Authenticate': this.buildWwwAuthenticateHeader(resourceMetadataUrl, error.code, undefined, requiredScopes),
+        'WWW-Authenticate': this.buildWwwAuthenticateHeader(
+          resourceMetadataUrl,
+          error.code,
+          undefined,
+          requiredScopes,
+          resourceServer
+        ),
       };
     }
 
@@ -2508,7 +3008,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     // Resolve the token audience before consuming the authorization code.
-    const audience = this.resolveTokenResource(body.resource, grantData.resource);
+    const resourceResolution = this.resolveTokenResource(body.resource, grantData);
+    const audience = resourceResolution.audience;
 
     // Define the access token TTL, may be updated by callback if provided
     let accessTokenTTL = this.options.accessTokenTTL!;
@@ -2543,6 +3044,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         grantId: grantId,
         scope: grantData.scope,
         requestedScope: tokenScopes,
+        resource: audience,
         props: decryptedProps,
       };
 
@@ -2598,6 +3100,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       }
     }
 
+    // Reject callback-provided TTLs before consuming the authorization code,
+    // backfilling its grant resource, or writing any grant/token state.
+    if (!isValidAccessTokenTTL(accessTokenTTL)) {
+      return this.createErrorResponse('invalid_request', {
+        description: 'Requested token lifetime must be at least 60 seconds',
+      });
+    }
+
     // Calculate the access token expiration time (after callback might have updated TTL)
     const now = Math.floor(Date.now() / 1000);
 
@@ -2633,6 +3143,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       grantData.expiresAt = expiresAt;
     }
 
+    if (resourceResolution.grantResourceBackfill) {
+      grantData.resource = resourceResolution.grantResourceBackfill;
+    }
+
     // Save the updated grant with TTL matching refresh token expiration (if any)
     await this.saveGrantWithTTL(env, grantKey, grantData, now);
 
@@ -2655,15 +3169,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       token_type: 'bearer',
       expires_in: accessTokenTTL,
       scope: tokenScopes.join(' '),
+      resource: audience,
     };
 
     if (refreshToken) {
       tokenResponse.refresh_token = refreshToken;
-    }
-
-    // RFC 8707 Section 2.2: SHOULD return resource parameter in response
-    if (audience) {
-      tokenResponse.resource = audience;
     }
 
     // RFC 6749 §5.1 — responses containing tokens must not be cached.
@@ -2733,7 +3243,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     // Resolve the token audience before callbacks, rotation, or storage writes.
-    const audience = this.resolveTokenResource(body.resource, grantData.resource);
+    const resourceResolution = this.resolveTokenResource(body.resource, grantData);
+    const audience = resourceResolution.audience;
 
     // Generate new access token with embedded user and grant IDs
     const accessTokenSecret = generateRandomString(TOKEN_LENGTH);
@@ -2782,6 +3293,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         grantId: grantId,
         scope: grantData.scope,
         requestedScope: tokenScopes,
+        resource: audience,
         props: decryptedProps,
       };
 
@@ -2876,7 +3388,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // when under 60 seconds. With the re-check above the grant has >=60s remaining, so the
     // only way to land here is a tokenExchangeCallback returning an `accessTokenTTL` below
     // the minimum. Reject before rotating/saving the grant rather than crashing on the write.
-    if (accessTokenTTL < KV_MIN_EXPIRATION_TTL_SECONDS) {
+    if (!isValidAccessTokenTTL(accessTokenTTL)) {
       return this.createErrorResponse('invalid_request', {
         description: 'Requested token lifetime must be at least 60 seconds',
       });
@@ -2910,6 +3422,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // The newly-generated token becomes the new "current" token.
     grantData.refreshTokenId = newRefreshTokenId;
     grantData.refreshTokenWrappedKey = newRefreshTokenWrappedKey;
+
+    if (resourceResolution.grantResourceBackfill) {
+      grantData.resource = resourceResolution.grantResourceBackfill;
+    }
 
     // Save the updated grant with TTL if applicable
     await this.saveGrantWithTTL(env, grantKey, grantData, now);
@@ -2948,12 +3464,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       expires_in: accessTokenTTL,
       refresh_token: newRefreshToken,
       scope: tokenScopes.join(' '),
+      resource: audience,
     };
-
-    // RFC 8707 Section 2.2: SHOULD return resource parameter in response
-    if (audience) {
-      tokenResponse.resource = audience;
-    }
 
     // RFC 6749 §5.1 — responses containing tokens must not be cached.
     return new Response(JSON.stringify(tokenResponse), {
@@ -2969,7 +3481,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * module-private.
    * @param subjectToken - The subject token to exchange
    * @param requestedScopes - Optional requested scopes, limited to the subject token's scopes
-   * @param requestedResource - Optional resource/audience (must be subset of original if original had resource)
+   * @param requestedResource - Optional resource/audience; when present, it must match the configured canonical resource
    * @param expiresIn - Optional TTL override in seconds
    * @param clientInfo - The client making the exchange request
    * @param env - Cloudflare Worker environment variables
@@ -3000,20 +3512,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // An exchanged token inherits the subject token's scopes unless a narrower subset is requested.
     let tokenScopes: string[] = this.downscope(requestedScopes, tokenSummary.scope);
 
-    const configuredResource = this.options.resourceMetadata?.resource;
-    if (configuredResource && !isExactResource(tokenSummary.audience, configuredResource)) {
-      throw new OAuthError('invalid_target', {
-        description: 'Subject token is not bound to the configured resource',
-      });
-    }
-    // v0.8.2 inherited the subject token's audience when token exchange omitted
-    // `resource`. Re-resolving omission from the backing grant can drop an
-    // audience carried only by a legacy token, or expand a downscoped subject
-    // back to the grant's broader resource set.
-    const newAudience =
-      requestedResource === undefined
-        ? tokenSummary.audience
-        : this.resolveTokenResource(requestedResource, grantData.resource);
+    const newAudience = this.resolveTokenExchangeResource(requestedResource, tokenSummary.audience);
 
     // Determine TTL for new token
     const now = Math.floor(Date.now() / 1000);
@@ -3070,6 +3569,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         grantId: tokenSummary.grantId,
         scope: tokenSummary.grant.scope,
         requestedScope: tokenScopes,
+        resource: newAudience,
         props: decryptedProps,
       };
 
@@ -3112,7 +3612,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // A client-requested `expires_in` (or a callback-supplied `accessTokenTTL`) may be
     // below KV's 60-second minimum even when the subject token has ample life remaining.
     // Reject rather than attempting an unstorable write that KV would reject with a 400.
-    if (accessTokenTTL < KV_MIN_EXPIRATION_TTL_SECONDS) {
+    if (!isValidAccessTokenTTL(accessTokenTTL)) {
       throw new OAuthError('invalid_request', {
         description: 'Requested token lifetime must be at least 60 seconds',
       });
@@ -3138,12 +3638,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       token_type: 'bearer',
       expires_in: accessTokenTTL,
       scope: tokenScopes.join(' '),
+      resource: newAudience,
     };
-
-    // RFC 8707 Section 2.2: SHOULD return resource parameter in response
-    if (newAudience) {
-      tokenResponse.resource = newAudience;
-    }
 
     return tokenResponse;
   }
@@ -3303,10 +3799,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   }): Promise<Result<TokenResponse, EmaValidationError>> {
     const { body, clientInfo, env, requestUrl, request, enterpriseOptions } = args;
     const { jwksProvider, jtiStore } = this;
-    const configuredResource = this.options.resourceMetadata?.resource;
-    // Unreachable: handleJwtBearerGrant short-circuits when enterpriseOptions is absent,
-    // and validateEmaOptions enforces these invariants at construction time.
-    if (!jwksProvider || !jtiStore || !configuredResource) {
+    const configuredResource = this.resolveNewTokenResource(body.resource);
+    // Unreachable: handleJwtBearerGrant short-circuits when enterpriseOptions is absent.
+    if (!jwksProvider || !jtiStore) {
       throw new Error('EMA pipeline invoked without configured adapters');
     }
     const now = Math.floor(Date.now() / 1000);
@@ -3343,7 +3838,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       expectedAudience: trustedIssuer.value.audience ?? this.getAuthorizationServerIssuer(requestUrl),
       clientId: clientInfo.clientId,
       configuredResource,
-      matchOriginOnly: !!this.options.resourceMatchOriginOnly,
+      // The signed resource claim must always match the configured canonical
+      // identifier exactly.
+      matchOriginOnly: false,
       now,
       clockSkewSeconds: enterpriseOptions.clockSkewSeconds ?? EMA_DEFAULT_CLOCK_SKEW_SECONDS,
       maxAssertionLifetimeSeconds:
@@ -3372,7 +3869,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       mapperOutput = await enterpriseOptions.mapClaims({
         claims: claims.value.claims,
         clientInfo,
-        resource: claims.value.resource,
+        resource: configuredResource,
         requestedScope: requestedScope.value,
         request: args.request,
         env,
@@ -3405,7 +3902,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         mapperProps: mapped.value.props,
         mapperMetadata: mapped.value.metadata,
         assertionScopes: claims.value.assertionScopes,
-        resource: claims.value.resource,
+        resource: configuredResource,
         accessTokenTTLSeconds: ttl.value,
         env,
         now: issueNow,
@@ -3813,11 +4310,19 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @param ctx - Cloudflare Worker execution context
    * @returns Response from the API handler or error
    */
-  private async handleApiRequest(request: Request, env: Env & ProviderEnv, ctx: ExecutionContext): Promise<Response> {
+  private async handleApiRequest(
+    request: Request,
+    env: Env & ProviderEnv,
+    ctx: ExecutionContext,
+    apiRoute: NormalizedApiRoute<Env>
+  ): Promise<Response> {
     const url = new URL(request.url);
-    // Per RFC 9728 §5.1, include the request path so the resource_metadata URL
-    // points to the correct path-suffixed well-known endpoint (RFC 9728 §3.1)
-    const resourceMetadataUrl = `${url.origin}/.well-known/oauth-protected-resource${url.pathname}`;
+    const { resourceServer } = apiRoute;
+    const configuredResource = resourceServer.resourceMetadata.resource;
+    const externalTokenResolver = resourceServer.resolveExternalToken;
+    const resourceMetadataUrl = this.getResourceMetadataUrlForRequest(url, resourceServer);
+    const challenge = (error?: string, description?: string, scopes: string[] = []) =>
+      this.buildWwwAuthenticateHeader(resourceMetadataUrl, error, description, scopes, resourceServer);
 
     // Get access token from Authorization header
     const authHeader = request.headers.get('Authorization');
@@ -3829,7 +4334,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         status: 401,
         headers: {
           ...NO_CACHE_HEADERS,
-          'WWW-Authenticate': this.buildWwwAuthenticateHeader(resourceMetadataUrl),
+          'WWW-Authenticate': challenge(),
         },
       });
     }
@@ -3850,25 +4355,24 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     // No internal token found in KV and no external token validator provided
-    if (!tokenData && !this.options.resolveExternalToken) {
+    if (!tokenData && !externalTokenResolver) {
       return this.createErrorResponse('invalid_token', {
         description: 'Invalid access token',
         statusCode: 401,
         headers: {
-          'WWW-Authenticate': this.buildWwwAuthenticateHeader(resourceMetadataUrl, 'invalid_token'),
+          'WWW-Authenticate': challenge('invalid_token'),
         },
       });
     }
 
     // Internal token data was found in KV, so we check for expiration and set the context props
     if (tokenData) {
-      const configuredResource = this.options.resourceMetadata?.resource;
-      if (configuredResource && !isExactResource(tokenData.audience, configuredResource)) {
+      if (!isExactResource(tokenData.audience, configuredResource)) {
         return this.createErrorResponse('invalid_token', {
           description: 'Access token is not bound to the configured resource',
           statusCode: 401,
           headers: {
-            'WWW-Authenticate': this.buildWwwAuthenticateHeader(resourceMetadataUrl, 'invalid_token'),
+            'WWW-Authenticate': challenge('invalid_token'),
           },
         });
       }
@@ -3880,7 +4384,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
           description: 'Access token expired',
           statusCode: 401,
           headers: {
-            'WWW-Authenticate': this.buildWwwAuthenticateHeader(resourceMetadataUrl, 'invalid_token'),
+            'WWW-Authenticate': challenge('invalid_token'),
           },
         });
       }
@@ -3900,11 +4404,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
             description: 'Token audience does not match resource server',
             statusCode: 401,
             headers: {
-              'WWW-Authenticate': this.buildWwwAuthenticateHeader(
-                resourceMetadataUrl,
-                'invalid_token',
-                'Invalid audience'
-              ),
+              'WWW-Authenticate': challenge('invalid_token', 'Invalid audience'),
             },
           });
         }
@@ -3918,15 +4418,15 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
       // Set the decrypted props on the context object
       (ctx as MutableExecutionContext).props = decryptedProps;
-    } else if (this.options.resolveExternalToken) {
+    } else if (externalTokenResolver) {
       // No token data was found, so we validate the provided token with the provided validator.
       // Convert only the package's exported ExternalTokenError into a structured response;
       // every other thrown value retains the pre-existing failure behavior.
       let ext: ResolveExternalTokenResult | null;
       try {
-        ext = await this.options.resolveExternalToken({ token: accessToken, request, env });
+        ext = await externalTokenResolver({ token: accessToken, request, env });
       } catch (error) {
-        const response = this.createExternalTokenErrorResponse(error, resourceMetadataUrl);
+        const response = this.createExternalTokenErrorResponse(error, resourceMetadataUrl, resourceServer);
         if (response) return response;
         throw error;
       }
@@ -3937,18 +4437,17 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
           description: 'Invalid access token',
           statusCode: 401,
           headers: {
-            'WWW-Authenticate': this.buildWwwAuthenticateHeader(resourceMetadataUrl, 'invalid_token'),
+            'WWW-Authenticate': challenge('invalid_token'),
           },
         });
       }
 
-      const configuredResource = this.options.resourceMetadata?.resource;
-      if (configuredResource && !isExactResource(ext.audience, configuredResource)) {
+      if (!isExactResource(ext.audience, configuredResource)) {
         return this.createErrorResponse('invalid_token', {
           description: 'External access token is not bound to the configured resource',
           statusCode: 401,
           headers: {
-            'WWW-Authenticate': this.buildWwwAuthenticateHeader(resourceMetadataUrl, 'invalid_token'),
+            'WWW-Authenticate': challenge('invalid_token'),
           },
         });
       }
@@ -3966,11 +4465,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
             description: 'Token audience does not match resource server',
             statusCode: 401,
             headers: {
-              'WWW-Authenticate': this.buildWwwAuthenticateHeader(
-                resourceMetadataUrl,
-                'invalid_token',
-                'Invalid audience'
-              ),
+              'WWW-Authenticate': challenge('invalid_token', 'Invalid audience'),
             },
           });
         }
@@ -3985,17 +4480,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       (env as Record<string, unknown>).OAUTH_PROVIDER = this.createOAuthHelpers(env);
     }
 
-    // Find the appropriate API handler for this URL
-    const apiHandler = this.findApiHandlerForUrl(url);
-
-    if (!apiHandler) {
-      // This shouldn't happen since we already checked with isApiRequest,
-      // but handle it gracefully just in case
-      return this.createErrorResponse('invalid_request', {
-        description: 'No handler found for API route',
-        statusCode: 404,
-      });
-    }
+    const apiHandler = apiRoute.handler;
 
     // Call the API handler based on its type
     if (apiHandler.type === HandlerType.EXPORTED_HANDLER) {
@@ -4015,6 +4500,56 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    */
   public createOAuthHelpers(env: Env & ProviderEnv): OAuthHelpers {
     return new OAuthHelpersImpl<Env>(env, this);
+  }
+
+  /** Add an AS audience without hosting that resource in this Worker. */
+  registerResourceIdentifier(resource: string): void {
+    this.validateResourceMetadataOptions({ resource });
+    if (this.findConfiguredResource(resource)) {
+      throw new TypeError(`A protected resource is already registered for ${resource}`);
+    }
+    this.resourceServers.push({ resourceMetadata: { resource } });
+  }
+
+  /** Register a protected-resource role during module initialization. */
+  registerResourceServer(configuration: InternalProtectedResourceConfiguration<Env>): string {
+    const resourceMetadata = this.snapshotResourceMetadata(configuration.resourceMetadata);
+    this.validateResourceMetadataOptions(resourceMetadata);
+    const resource = resourceMetadata.resource;
+    if (this.findConfiguredResource(resource)) {
+      throw new TypeError(`A protected resource is already registered for ${resource}`);
+    }
+    if (
+      this.explicitIssuer &&
+      resourceMetadata.authorization_servers &&
+      !resourceMetadata.authorization_servers.some((issuer) => resourceMatches(issuer, this.explicitIssuer!, false))
+    ) {
+      throw new TypeError(`resourceMetadata.authorization_servers for ${resource} must include ${this.explicitIssuer}`);
+    }
+
+    const resourceServer: NormalizedResourceServer<Env> = {
+      resourceMetadata,
+      apiHandler: this.validateHandler(configuration.handler, 'handler'),
+      resolveExternalToken: configuration.resolveExternalToken,
+    };
+    const newRoutes = [
+      {
+        route: resource,
+        handler: resourceServer.apiHandler!,
+        resourceServer,
+      },
+    ];
+
+    this.resourceServers.push(resourceServer);
+    this.typedApiHandlers.push(...newRoutes);
+    try {
+      this.validateResourceRouteIsolation();
+    } catch (error) {
+      this.resourceServers.pop();
+      this.typedApiHandlers.splice(this.typedApiHandlers.length - newRoutes.length, newRoutes.length);
+      throw error;
+    }
+    return resource;
   }
 
   /**
@@ -4107,63 +4642,132 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     return env.OAUTH_KV.get(clientKey, { type: 'json' });
   }
 
+  /** Resolve a value to the registry's canonical spelling, requiring one value. */
+  findConfiguredResource(value: string | string[] | undefined): string | undefined {
+    const singular = Array.isArray(value) ? (value.length === 1 ? value[0] : undefined) : value;
+    if (typeof singular !== 'string' || !validateResourceUri(singular)) return undefined;
+    return this.resourceServers
+      .map((server) => server.resourceMetadata.resource)
+      .find((configured) => isExactResource(singular, configured));
+  }
+
+  /** Select the audience for a new interactive authorization. */
+  resolveAuthorizationRequestResource(requestedResource: string | string[] | undefined): string {
+    if (requestedResource === undefined) {
+      const defaultResource = this.getDefaultAuthorizationResource();
+      if (defaultResource) return defaultResource;
+      throw new AuthorizationError('invalid_target', {
+        description: 'The resource parameter is required when the authorization server has multiple resources',
+      });
+    }
+    const configured = this.findConfiguredResource(requestedResource);
+    if (!configured) {
+      throw new AuthorizationError('invalid_target', {
+        description: 'The resource parameter must name exactly one configured protected resource',
+      });
+    }
+    return configured;
+  }
+
+  /** Whether an existing grant belongs to the replacement bucket for a resource. */
+  shouldReplaceGrantForResource(grantResource: string | string[] | undefined, resource: string): boolean {
+    if (grantResource === undefined) return this.getLegacyGrantResource() === resource;
+    return isExactResource(grantResource, resource);
+  }
+
+  /** Select the audience for a new non-interactive grant such as EMA. */
+  private resolveNewTokenResource(requestedResource: string | string[] | undefined): string {
+    try {
+      return this.resolveAuthorizationRequestResource(requestedResource);
+    } catch (error) {
+      if (error instanceof AuthorizationError) {
+        throw new OAuthError('invalid_target', { description: error.description });
+      }
+      throw error;
+    }
+  }
+
+  /** Validate explicit resource syntax and configured-resource policy. */
+  private validateTokenRequestResourceIndicator(requestedResource: string | string[] | undefined): void {
+    if (requestedResource === undefined) return;
+    if (!this.findConfiguredResource(requestedResource)) {
+      throw new OAuthError('invalid_target', {
+        description: 'The resource parameter must name exactly one configured protected resource',
+      });
+    }
+  }
+
+  /** Resolve token exchange strictly within the subject token's audience ceiling. */
+  private resolveTokenExchangeResource(
+    requestedResource: string | string[] | undefined,
+    subjectResource: string | string[] | undefined
+  ): string {
+    const subjectAudience = this.findConfiguredResource(subjectResource);
+    if (!subjectAudience) {
+      throw new OAuthError('invalid_target', {
+        description: 'Subject token is not bound to a configured resource',
+      });
+    }
+
+    const resourceWasProvided = requestedResource !== undefined;
+    const requestedAudience = resourceWasProvided ? this.findConfiguredResource(requestedResource) : undefined;
+    if (resourceWasProvided && (!requestedAudience || requestedAudience !== subjectAudience)) {
+      throw new OAuthError('invalid_target', {
+        description: 'The requested resource must exactly match the subject token audience',
+      });
+    }
+    return subjectAudience;
+  }
+
   /**
    * Resolves an access-token audience from a token request and its authorization grant.
-   * A configured canonical resource is inherited when omitted but cannot be overridden.
-   * Without configuration, RFC 8707 downscoping is allowed, omission inherits a
-   * bound grant, and a legacy unbound grant retains the v0.8.2 behavior.
+   * The configured canonical resource is inherited when omitted and cannot be overridden.
    */
   private resolveTokenResource(
     requestedResource: string | string[] | undefined,
-    grantedResource: string | string[] | undefined
-  ): string | string[] | undefined {
+    grant: Pick<Grant, 'resource'>
+  ): {
+    audience: string;
+    grantResourceBackfill?: string;
+  } {
+    const grantedResource = grant.resource;
     const resourceWasProvided = requestedResource !== undefined;
-    const requestedAudience = parseResourceParameter(requestedResource);
-    if (resourceWasProvided && !requestedAudience) {
-      throw new OAuthError('invalid_target', {
-        description: 'The resource parameter must be a valid absolute URI without a fragment',
-      });
-    }
     const grantResourceWasStored = grantedResource !== undefined;
-    const grantedAudience = parseResourceParameter(grantedResource);
-    if (grantResourceWasStored && !grantedAudience) {
+    const canonicalGrantResource = this.findConfiguredResource(grantedResource);
+    const canonicalRequestedResource = resourceWasProvided ? this.findConfiguredResource(requestedResource) : undefined;
+
+    if (grantResourceWasStored && !canonicalGrantResource) {
       throw new OAuthError('invalid_target', {
-        description: 'The authorization grant contains an invalid resource',
+        description: 'The authorization grant is not bound to a configured resource',
       });
     }
-
-    const configuredResource = this.options.resourceMetadata?.resource;
-    if (configuredResource) {
-      if (resourceWasProvided && !isExactResource(requestedResource, configuredResource)) {
+    if (canonicalGrantResource) {
+      if (resourceWasProvided && canonicalRequestedResource !== canonicalGrantResource) {
         throw new OAuthError('invalid_target', {
-          description: `The resource parameter must exactly match ${configuredResource}`,
+          description: 'The requested resource does not match the authorization grant',
         });
       }
-      if (isExactResource(grantedResource, configuredResource)) {
-        return configuredResource;
-      }
-      if (!grantResourceWasStored) {
-        return configuredResource;
-      }
+      return {
+        audience: canonicalGrantResource,
+        ...(grantedResource === canonicalGrantResource ? {} : { grantResourceBackfill: canonicalGrantResource }),
+      };
+    }
+
+    const legacyGrantResource = this.getLegacyGrantResource();
+    if (!legacyGrantResource) {
       throw new OAuthError('invalid_target', {
-        description: 'The authorization grant is not bound to the configured resource',
+        description: 'This legacy authorization grant has no resource binding and must be reauthorized',
       });
     }
-
-    const originOnly = !!this.options.resourceMatchOriginOnly;
-    if (resourceWasProvided && grantResourceWasStored) {
-      const requestedResources = Array.isArray(requestedResource) ? requestedResource : [requestedResource];
-      const grantedResources = Array.isArray(grantedResource) ? grantedResource : [grantedResource];
-      for (const requested of requestedResources) {
-        if (!grantedResources.some((granted) => resourceMatches(requested, granted, originOnly))) {
-          throw new OAuthError('invalid_target', {
-            description: 'Requested resource was not included in the authorization request',
-          });
-        }
-      }
+    if (resourceWasProvided && canonicalRequestedResource !== legacyGrantResource) {
+      throw new OAuthError('invalid_target', {
+        description: 'The requested resource does not match the server legacy-grant migration policy',
+      });
     }
-
-    return requestedAudience ?? grantedAudience;
+    return {
+      audience: legacyGrantResource,
+      grantResourceBackfill: legacyGrantResource,
+    };
   }
 
   /**
@@ -4178,7 +4782,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // below 60 seconds, so a TTL derived from a callback override or a near-expiry source
     // must not reach the write. Callers that clamp to a source's remaining lifetime should
     // already have rejected this case with a more specific error; this is the backstop.
-    if (expiresIn < KV_MIN_EXPIRATION_TTL_SECONDS) {
+    if (!isValidAccessTokenTTL(expiresIn)) {
       throw new OAuthError('invalid_request', {
         description: 'Requested token lifetime must be at least 60 seconds',
       });
@@ -4264,19 +4868,23 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * Builds a WWW-Authenticate header value with resource_metadata per RFC 9728 §5.1
    */
   private buildWwwAuthenticateHeader(
-    resourceMetadataUrl: string,
+    resourceMetadataUrl: string | undefined,
     error?: string,
     errorDescription?: string,
-    requiredScopes: string[] = []
+    requiredScopes: string[] = [],
+    resourceServer: NormalizedResourceServer<Env> = this.resourceServers[0]
   ): string {
-    let header = `Bearer realm="OAuth", resource_metadata="${resourceMetadataUrl}"`;
+    let header = 'Bearer realm="OAuth"';
+    if (resourceMetadataUrl) {
+      header += `, resource_metadata="${resourceMetadataUrl}"`;
+    }
     if (error) {
       header += `, error="${error}"`;
     }
     const challengeScopes =
       requiredScopes.length > 0
         ? this.normalizeProtectedResourceScopes(requiredScopes)
-        : this.getProtectedResourceScopes();
+        : this.getProtectedResourceScopes(resourceServer);
     if (challengeScopes.length > 0) {
       header += `, scope="${challengeScopes.join(' ')}"`;
     }
@@ -4284,6 +4892,41 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       header += `, error_description="${errorDescription}"`;
     }
     return header;
+  }
+
+  /** Build the RFC 9728 well-known URL for the configured canonical resource. */
+  private getConfiguredResourceMetadataUrl(resource: string): string {
+    const authorityStart = resource.indexOf('://') + 3;
+    const suffixOffset = resource.slice(authorityStart).search(/[/?]/);
+    const suffixStart = suffixOffset === -1 ? resource.length : authorityStart + suffixOffset;
+    let suffix = resource.slice(suffixStart);
+    if (suffix === '/') suffix = '';
+    if (suffix.startsWith('/?')) suffix = suffix.slice(1);
+    return resource.slice(0, suffixStart) + PROTECTED_RESOURCE_WELL_KNOWN_PREFIX + suffix;
+  }
+
+  /**
+   * RFC 9728 §3.3 requires metadata fetched from a challenge to identify the
+   * original protected-resource URL. Descendant and alias routes can still use
+   * a base audience, but must not advertise a document for a different URL.
+   */
+  private getResourceMetadataUrlForRequest(
+    requestUrl: URL,
+    resourceServer: NormalizedResourceServer<Env>
+  ): string | undefined {
+    const configuredResource = resourceServer.resourceMetadata.resource;
+    if (isExactResource(requestUrl.href, configuredResource)) {
+      return this.getConfiguredResourceMetadataUrl(configuredResource);
+    }
+
+    // HTTP serializes an origin request with `/` even when the configured root
+    // resource was written without it. This is the one unavoidable spelling
+    // equivalence for matching an actual Request URL.
+    if (configuredResource === requestUrl.origin && requestUrl.pathname === '/' && requestUrl.search === '') {
+      return this.getConfiguredResourceMetadataUrl(configuredResource);
+    }
+
+    return undefined;
   }
 
   /**
@@ -4547,6 +5190,10 @@ const DEFAULT_CLIENT_REGISTRATION_TTL = 90 * 24 * 60 * 60;
  */
 const KV_MIN_EXPIRATION_TTL_SECONDS = 60;
 
+function isValidAccessTokenTTL(value: number): boolean {
+  return Number.isInteger(value) && value >= KV_MIN_EXPIRATION_TTL_SECONDS;
+}
+
 /**
  * Safety margin (seconds) added on top of `KV_MIN_EXPIRATION_TTL_SECONDS` when clamping an
  * absolute KV expiration. Absolute expirations are validated against KV's clock at the
@@ -4592,41 +5239,6 @@ const TOKEN_LENGTH = 32;
 
 // Helper Functions
 /**
- * Validates a resource URI per RFC 8707 Section 2
- * @param uri - The URI string to validate
- * @returns true if valid, false otherwise
- */
-export function validateResourceUri(uri: string): boolean {
-  if (!uri || typeof uri !== 'string') {
-    return false;
-  }
-
-  try {
-    const parsed = new URL(uri);
-
-    // RFC 8707: MUST be absolute URI (has protocol)
-    if (!parsed.protocol) {
-      return false;
-    }
-
-    // RFC 8707: MUST NOT include a fragment component
-    if (parsed.hash) {
-      return false;
-    }
-
-    // Must be http or https for security
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-      return false;
-    }
-
-    return true;
-  } catch {
-    // Invalid URI format
-    return false;
-  }
-}
-
-/**
  * Checks if a resource server matches an audience claim.
  * Uses origin comparison (case-insensitive hostname via URL normalization)
  * and path-prefix matching on path boundaries for RFC 8707 resource indicators.
@@ -4659,59 +5271,88 @@ function audienceMatches(resourceServerUrl: string, audienceValue: string): bool
     // Path-aware audience: prefix match on path boundary (RFC 8707)
     // e.g. audience "/api" matches request "/api", "/api/", "/api/users"
     // but does NOT match "/api-v2" or "/apiary"
-    return resource.pathname === audience.pathname || resource.pathname.startsWith(audience.pathname + '/');
+    const descendantPrefix = audience.pathname.endsWith('/') ? audience.pathname : audience.pathname + '/';
+    return resource.pathname === audience.pathname || resource.pathname.startsWith(descendantPrefix);
   } catch {
     return false;
   }
 }
 
-/**
- * Parses and validates the resource parameter from a token request (RFC 8707)
- * Handles single string or array of strings (from multiple form parameters)
- * @param value - The resource parameter value from the request body
- * @returns The validated value as string, string array, or undefined if validation fails
- */
-function parseResourceParameter(value: string | string[] | undefined): string | string[] | undefined {
-  if (!value) {
-    return undefined;
-  }
-
-  // Validate all URIs (RFC 8707 Section 2)
-  const uris = Array.isArray(value) ? value : [value];
-  if (uris.length === 0) {
-    return undefined;
-  }
-  for (const uri of uris) {
-    if (typeof uri !== 'string' || !validateResourceUri(uri)) {
-      // Invalid resource URI - return undefined to trigger error
-      return undefined;
-    }
-  }
-
-  return value;
+/** Whether either URL path is the other path or one of its descendants. */
+function pathsOverlapOnBoundary(leftPath: string, rightPath: string): boolean {
+  const normalize = (path: string) => (path === '/' ? '/' : path.replace(/\/$/, ''));
+  const left = normalize(leftPath);
+  const right = normalize(rightPath);
+  if (left === right || left === '/' || right === '/') return true;
+  return left.startsWith(right + '/') || right.startsWith(left + '/');
 }
 
-/** Whether a request or audience names one exact configured resource. */
+function appendHeaderValue(headers: Headers, name: string, value: string): void {
+  const values = (headers.get(name) ?? '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+  if (!values.some((item) => item.toLowerCase() === value.toLowerCase())) values.push(value);
+  headers.set(name, values.join(', '));
+}
+
+/** Whether a request or audience names one canonical configured resource. */
 function isExactResource(value: string | string[] | undefined, configuredResource: string): boolean {
-  return (
-    value === configuredResource || (Array.isArray(value) && value.length === 1 && value[0] === configuredResource)
-  );
+  const resource = Array.isArray(value) ? (value.length === 1 ? value[0] : undefined) : value;
+  return typeof resource === 'string' && resourceMatches(resource, configuredResource, false);
 }
 
 /**
  * Checks if a requested resource matches a granted resource.
  * When originOnly is true, compares only the origin (scheme + host + port),
  * allowing path-aware resources to match origin-only grants.
+ * Otherwise only ASCII case in the URI scheme and host is ignored. Port,
+ * path, query, trailing slash, user information, and all other bytes remain
+ * significant.
  */
 export function resourceMatches(requested: string, granted: string, originOnly: boolean): boolean {
   if (!originOnly) {
-    return requested === granted;
+    const foldedRequested = foldResourceSchemeAndHost(requested);
+    return foldedRequested !== undefined && foldedRequested === foldResourceSchemeAndHost(granted);
   }
   try {
     return new URL(requested).origin === new URL(granted).origin;
   } catch {
     return requested === granted;
   }
+}
+
+/** Fold only the URI components whose comparison is ASCII case-insensitive. */
+function foldResourceSchemeAndHost(resource: string): string | undefined {
+  const schemeSeparator = resource.indexOf('://');
+  if (schemeSeparator <= 0) return undefined;
+
+  const authorityStart = schemeSeparator + 3;
+  const authorityEndOffset = resource.slice(authorityStart).search(/[/?#]/);
+  const authorityEnd = authorityEndOffset === -1 ? resource.length : authorityStart + authorityEndOffset;
+  const authority = resource.slice(authorityStart, authorityEnd);
+  const userInfoEnd = authority.lastIndexOf('@');
+  const hostStart = userInfoEnd + 1;
+
+  let hostEnd: number;
+  if (authority[hostStart] === '[') {
+    const closingBracket = authority.indexOf(']', hostStart + 1);
+    if (closingBracket === -1) return undefined;
+    hostEnd = closingBracket + 1;
+  } else {
+    const portSeparator = authority.indexOf(':', hostStart);
+    hostEnd = portSeparator === -1 ? authority.length : portSeparator;
+  }
+
+  const asciiLower = (value: string) => value.replace(/[A-Z]/g, (character) => character.toLowerCase());
+  return (
+    asciiLower(resource.slice(0, schemeSeparator)) +
+    '://' +
+    authority.slice(0, hostStart) +
+    asciiLower(authority.slice(hostStart, hostEnd)) +
+    authority.slice(hostEnd) +
+    resource.slice(authorityEnd)
+  );
 }
 
 /**
@@ -5121,6 +5762,11 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
    */
   async parseAuthRequest(request: Request): Promise<AuthRequest> {
     const url = new URL(request.url);
+    if (!this.provider.isAuthorizationEndpointRequest(url)) {
+      throw new AuthorizationError('invalid_request', {
+        description: 'Authorization request was sent to an unconfigured endpoint',
+      });
+    }
     const responseType = url.searchParams.get('response_type') || '';
     const clientId = url.searchParams.get('client_id') || '';
     const redirectUri = url.searchParams.get('redirect_uri') || '';
@@ -5158,25 +5804,12 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
 
     // Resource, response type, and PKCE errors are redirectable only after the
     // exact client redirect URI above has been validated.
-    const resourceWasProvided = resourceParam !== undefined;
-    let resource = parseResourceParameter(resourceParam);
-    if (resourceWasProvided && !resource) {
-      withRedirect(
-        new AuthorizationError('invalid_target', {
-          description: 'The resource parameter must be a valid absolute URI without a fragment',
-        })
-      );
-    }
-    const configuredResource = this.provider.options.resourceMetadata?.resource;
-    if (configuredResource) {
-      if (resourceWasProvided && !isExactResource(resource, configuredResource)) {
-        withRedirect(
-          new AuthorizationError('invalid_target', {
-            description: `The resource parameter must exactly match ${configuredResource}`,
-          })
-        );
-      }
-      resource = configuredResource;
+    let resource: string;
+    try {
+      resource = this.provider.resolveAuthorizationRequestResource(resourceParam);
+    } catch (error) {
+      if (error instanceof AuthorizationError) withRedirect(error);
+      throw error;
     }
 
     try {
@@ -5249,27 +5882,9 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
       clientInfo.responseTypes
     );
 
-    // completeAuthorization() is a public helper and callers can pass a
-    // reconstructed AuthRequest rather than one returned directly by
-    // parseAuthRequest(). Re-apply configured resource policy here before
-    // creating any grant. A configured canonical resource is the RFC 8707
-    // default when the caller omitted the wire parameter. For an unconfigured
-    // provider, retain an explicit resource and preserve omission for backwards
-    // compatibility with v0.8.2 grants and callers.
-    const configuredResource = this.provider.options.resourceMetadata?.resource;
-    const resourceWasProvided = options.request.resource !== undefined;
-    const parsedResource = parseResourceParameter(options.request.resource);
-    if (resourceWasProvided && !parsedResource) {
-      throw new AuthorizationError('invalid_target', {
-        description: 'The resource parameter must be a valid absolute URI without a fragment',
-      });
-    }
-    if (configuredResource && resourceWasProvided && !isExactResource(parsedResource, configuredResource)) {
-      throw new AuthorizationError('invalid_target', {
-        description: `The resource parameter must exactly match ${configuredResource}`,
-      });
-    }
-    const effectiveResource = configuredResource ?? parsedResource;
+    // Callers can pass a reconstructed AuthRequest rather than one returned by
+    // parseAuthRequest(), so re-apply registry selection before any mutation.
+    const effectiveResource = this.provider.resolveAuthorizationRequestResource(options.request.resource);
 
     // Re-apply PKCE policy after client, redirect, response-type, and resource
     // validation, preserving their established error precedence while still
@@ -5285,7 +5900,10 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
       do {
         const page = await this.listUserGrants(options.userId, { cursor, limit: batchSize });
         for (const grant of page.items) {
-          if (grant.clientId === clientId) {
+          if (
+            grant.clientId === clientId &&
+            this.provider.shouldReplaceGrantForResource(grant.resource, effectiveResource)
+          ) {
             grantsToRevoke.push(grant.id);
           }
         }
@@ -5318,11 +5936,8 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
       // Wrap the encryption key with the access token
       const accessTokenWrappedKey = await wrapKeyWithToken(accessToken, encryptionKey);
 
-      // Parse and validate resource parameter (RFC 8707) for implicit flow
-      const audience = parseResourceParameter(effectiveResource);
-      if (effectiveResource && !audience) {
-        throw new Error('The resource parameter must be a valid absolute URI without a fragment');
-      }
+      // Resource selection was validated before any grant or token mutation.
+      const audience = effectiveResource;
 
       // Store the grant without an auth code (will be referenced by the access token)
       const grant: Grant = {
@@ -5371,6 +5986,7 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
       fragment.set('token_type', 'bearer');
       fragment.set('expires_in', accessTokenTTL.toString());
       fragment.set('scope', options.scope.join(' '));
+      fragment.set('resource', effectiveResource);
 
       if (options.request.state) {
         fragment.set('state', options.request.state);
@@ -5691,6 +6307,7 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
           metadata: grantData.metadata,
           createdAt: grantData.createdAt,
           expiresAt: grantData.expiresAt,
+          resource: grantData.resource,
         };
         grantSummaries.push(summary);
       }

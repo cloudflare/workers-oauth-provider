@@ -3,6 +3,7 @@ import { MCP_AUTH_REVISIONS, clientResourceForRevision } from './spec-versions';
 import {
   CLIENT_REDIRECT_URI,
   CONFORMANCE_ORIGIN,
+  MCP_RESOURCE,
   McpOAuthClient,
   createMcpOAuthClient,
   READ_SCOPE,
@@ -13,6 +14,7 @@ interface AuthorizationServerMetadata {
   issuer: string;
   authorization_endpoint: string;
   token_endpoint: string;
+  protected_resources: string[];
   registration_endpoint?: string;
   revocation_endpoint: string;
   response_types_supported: string[];
@@ -41,6 +43,7 @@ describe.each(MCP_AUTH_REVISIONS)('MCP %s authorization server conformance', (re
       issuer: CONFORMANCE_ORIGIN,
       authorization_endpoint: `${CONFORMANCE_ORIGIN}/authorize`,
       token_endpoint: `${CONFORMANCE_ORIGIN}/oauth/token`,
+      protected_resources: [MCP_RESOURCE],
       registration_endpoint: `${CONFORMANCE_ORIGIN}/oauth/register`,
       revocation_endpoint: `${CONFORMANCE_ORIGIN}/oauth/token`,
       response_types_supported: ['code'],
@@ -71,7 +74,7 @@ describe.each(MCP_AUTH_REVISIONS)('MCP %s authorization server conformance', (re
     expect(tokens.token_type.toLowerCase()).toBe('bearer');
     expect(tokens.expires_in).toBeGreaterThan(0);
     expect(tokens.scope).toBe(READ_SCOPE);
-    expect(tokens.resource).toBe(clientResourceForRevision(revision));
+    expect(tokens.resource).toBe(MCP_RESOURCE);
 
     const protectedResponse = await oauth.request('/mcp', {
       headers: { Authorization: `Bearer ${tokens.access_token}` },

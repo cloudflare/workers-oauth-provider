@@ -147,7 +147,7 @@ describe.each(MCP_AUTH_REVISIONS)('MCP %s authorization security conformance', (
 
 describe('canonical resource policy compatibility boundary', () => {
   it('defaults and inherits the canonical resource for a 2025-03-26 client that omits it', async () => {
-    const oauth = await createMcpOAuthClient('2025-03-26', { resourcePolicy: 'canonical' });
+    const oauth = await createMcpOAuthClient('2025-03-26');
     const client = await oauth.createClient('none');
     const { tokens } = await oauth.completeAuthorizationCodeFlow(client);
 
@@ -159,7 +159,7 @@ describe.each(mcpAuthRevisionsSince('2025-06-18'))('MCP %s Resource Indicator au
   let oauth: McpOAuthClient;
 
   beforeEach(async () => {
-    oauth = await createMcpOAuthClient(revision, { resourcePolicy: 'canonical' });
+    oauth = await createMcpOAuthClient(revision);
   });
 
   it('defaults an omitted authorization resource to the configured canonical resource', async () => {
