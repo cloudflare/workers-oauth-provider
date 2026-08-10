@@ -248,6 +248,8 @@ A typical flow has three steps:
 
 `completeAuthorization()` stores a new grant and, by default, revokes existing grants for the same user and client after the new grant is safely stored. Set `revokeExistingGrants: false` only when the application intentionally allows concurrent grants for the same user and client.
 
+For Client ID Metadata Document clients, whose client_id is the metadata URL shared by every installation, default revocation is additionally scoped to grants created from the same redirect URI, so one installation's re-authorization does not revoke another's. Grants created before the redirect URI was recorded are never auto-revoked by CIMD clients.
+
 For users with many grants, `revokeExistingGrantsBatchSize` controls the KV page size used during that scan. It defaults to `50` and is capped at KV's maximum page size of `1000`.
 
 ### Authorization response issuer
