@@ -437,6 +437,19 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
   allowPlainPKCE?: boolean;
 
   /**
+   * Temporary compatibility flag. Defaults to false.
+   * When true, the authorization server metadata omits the
+   * `authorization_response_iss_parameter_supported` (RFC 9207) advertisement entirely.
+   * The `iss` parameter itself is STILL included on every authorization response
+   * regardless of this flag, so conforming clients retain authorization-server
+   * mix-up protection.
+   * Known affected client: Codex CLI (0.143 and later, at the time of writing) drops
+   * the `iss` callback parameter before validating it (openai/codex#31573). Enable
+   * this only if you must support such a client, and remove it once clients update.
+   */
+  issParameterCompat?: boolean;
+
+  /**
    * Controls whether OAuth 2.0 Token Exchange (RFC 8693) is allowed.
    * When false, the token exchange grant type will not be advertised in metadata
    * and token exchange requests will be rejected.
@@ -2241,7 +2254,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       // not implemented: introspection_endpoint_auth_methods_supported
       // not implemented: introspection_endpoint_auth_signing_alg_values_supported
       code_challenge_methods_supported: this.serverCapabilities.codeChallengeMethods,
-      authorization_response_iss_parameter_supported: true,
+      // RFC 9207 advertisement. Omitted entirely when issParameterCompat is set, for clients
+      // that mishandle the advertisement; the iss parameter itself is still always sent.
+      ...(this.options.issParameterCompat ? {} : { authorization_response_iss_parameter_supported: true }),
       // MCP Client ID Metadata Document support (CIMD)
       // Only enabled when global_fetch_strictly_public compat flag is set (for SSRF protection)
       client_id_metadata_document_supported:

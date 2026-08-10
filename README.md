@@ -428,6 +428,7 @@ Deleting a client through `OAuthHelpers.deleteClient()` also revokes its grants 
 | `clientIdMetadataDocumentEnabled`  | Enable CIMD lookup and advertisement                     | `false`                                     |
 | `allowPlainPKCE`                   | Permit the legacy plain PKCE method                      | `false`                                     |
 | `allowImplicitFlow`                | Enable implicit token responses                          | `false`                                     |
+| `issParameterCompat`               | Omit the RFC 9207 advertisement (`iss` is still sent)    | `false`                                     |
 | `disallowPublicClientRegistration` | Reject public clients at DCR                             | `false`                                     |
 | `clientRegistrationCallback`       | Apply application policy before storing a DCR client     | None                                        |
 | `allowTokenExchangeGrant`          | Enable RFC 8693                                          | `false`                                     |

@@ -358,6 +358,24 @@ describe('OAuthProvider', () => {
       expect(metadata.authorization_response_iss_parameter_supported).toBe(true);
     });
 
+    it('should omit the RFC 9207 advertisement when issParameterCompat is enabled', async () => {
+      const providerWithIssCompat = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        issParameterCompat: true,
+      });
+      const request = createMockRequest('https://example.com/.well-known/oauth-authorization-server');
+      const response = await providerWithIssCompat.fetch(request, mockEnv, mockCtx);
+
+      expect(response.status).toBe(200);
+
+      const metadata = await response.json<any>();
+      expect(metadata).not.toHaveProperty('authorization_response_iss_parameter_supported');
+    });
+
     it('should not include token response type when implicit flow is disabled', async () => {
       // Create a provider with implicit flow disabled
       const providerWithoutImplicit = new OAuthProvider({
@@ -1399,6 +1417,35 @@ describe('OAuthProvider', () => {
       // Verify a grant was created in KV
       const grants = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
       expect(grants.keys.length).toBe(1);
+    });
+
+    it('should still include the iss parameter on redirects when issParameterCompat is enabled', async () => {
+      const providerWithIssCompat = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        scopesSupported: ['read', 'write', 'profile'],
+        issParameterCompat: true,
+      });
+
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123`
+      );
+
+      const response = await providerWithIssCompat.fetch(authRequest, mockEnv, mockCtx);
+
+      expect(response.status).toBe(302);
+
+      // The compat flag only hides the metadata advertisement — the authorization
+      // response must still carry the iss parameter (RFC 9207 mix-up protection).
+      const location = response.headers.get('Location');
+      const url = new URL(location!);
+      expect(url.searchParams.get('code')).not.toBeNull();
+      expect(url.searchParams.get('iss')).toBe('https://example.com');
     });
 
     it.each([
