@@ -1043,6 +1043,14 @@ export interface Grant {
    * Indicates the protected resource(s) for which access is requested
    */
   resource?: string | string[];
+
+  /**
+   * The exact redirect URI used in the authorization request that created this grant
+   * Recorded so that default grant revocation can be scoped to a single installation
+   * of a CIMD client (whose client_id is shared across all installations). Absent on
+   * grants created before this field was introduced.
+   */
+  redirectUri?: string;
 }
 
 /**
@@ -1289,6 +1297,14 @@ export interface GrantSummary {
    * Unix timestamp when the grant expires (if TTL is configured)
    */
   expiresAt?: number;
+
+  /**
+   * The exact redirect URI used in the authorization request that created this grant
+   * Recorded so that default grant revocation can be scoped to a single installation
+   * of a CIMD client (whose client_id is shared across all installations). Absent on
+   * grants created before this field was introduced.
+   */
+  redirectUri?: string;
 }
 
 /**
@@ -5280,12 +5296,18 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
     // This avoids a data-loss window where the user has no grants if creation fails.
     let grantsToRevoke: string[] = [];
     if (options.revokeExistingGrants !== false) {
+      // A CIMD client_id is the metadata document URL, shared across all installations of
+      // the client, so revoking by clientId alone would log the user out everywhere. The
+      // redirect URI identifies the installation, so scope revocation to it. Legacy grants
+      // without a stored redirectUri never match and are left alone — the bug being fixed
+      // is over-revocation, so not revoking is the safe direction.
+      const isCimdClient = this.provider.isClientMetadataUrl(clientId);
       const batchSize = getRevokeExistingGrantsBatchSize(options.revokeExistingGrantsBatchSize);
       let cursor: string | undefined;
       do {
         const page = await this.listUserGrants(options.userId, { cursor, limit: batchSize });
         for (const grant of page.items) {
-          if (grant.clientId === clientId) {
+          if (grant.clientId === clientId && (!isCimdClient || grant.redirectUri === options.request.redirectUri)) {
             grantsToRevoke.push(grant.id);
           }
         }
@@ -5334,6 +5356,7 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
         encryptedProps: encryptedData,
         createdAt: now,
         resource: effectiveResource,
+        redirectUri: options.request.redirectUri,
       };
 
       // Store the grant with a key that includes the user ID
@@ -5417,6 +5440,7 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
         codeChallenge: options.request.codeChallenge,
         codeChallengeMethod: options.request.codeChallengeMethod,
         resource: effectiveResource,
+        redirectUri: options.request.redirectUri,
       };
 
       // Store the grant with a key that includes the user ID
@@ -5691,6 +5715,7 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
           metadata: grantData.metadata,
           createdAt: grantData.createdAt,
           expiresAt: grantData.expiresAt,
+          redirectUri: grantData.redirectUri,
         };
         grantSummaries.push(summary);
       }

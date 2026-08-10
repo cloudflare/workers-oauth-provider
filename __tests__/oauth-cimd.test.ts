@@ -1199,4 +1199,163 @@ describe('Client ID Metadata Document (CIMD)', () => {
       );
     });
   });
+
+  describe('Grant Revocation Scoping', () => {
+    // A CIMD client_id is the metadata document URL, shared by every installation of
+    // the client. Two loopback redirect URIs stand in for two installations (devices).
+    const cimdUrl = 'https://client.example.com/oauth/metadata.json';
+    const installA = 'http://127.0.0.1:49152/callback';
+    const installB = 'http://127.0.0.1:49153/callback';
+    const cimdMetadata = {
+      client_id: cimdUrl,
+      client_name: 'Multi-Install CIMD Client',
+      redirect_uris: [installA, installB],
+      token_endpoint_auth_method: 'none',
+    };
+    const codeVerifier = 'grant-scoping-code-verifier-that-is-at-least-43-characters';
+    let codeChallenge: string;
+
+    beforeEach(async () => {
+      const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(codeVerifier));
+      codeChallenge = btoa(String.fromCharCode(...new Uint8Array(digest)))
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=/g, '');
+    });
+
+    async function authorizeAndGetCode(clientId: string, redirectUri: string): Promise<string> {
+      const authResponse = await oauthProvider.fetch(
+        createMockRequest(
+          `https://example.com/authorize?client_id=${encodeURIComponent(clientId)}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&state=test-state&code_challenge=${codeChallenge}&code_challenge_method=S256`,
+          'GET'
+        ),
+        mockEnv,
+        mockCtx
+      );
+      expect(authResponse.status).toBe(302);
+      return new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
+    }
+
+    async function exchangeCodeForTokens(clientId: string, code: string, redirectUri: string): Promise<any> {
+      const tokenResponse = await oauthProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          `grant_type=authorization_code&code=${encodeURIComponent(code)}&client_id=${encodeURIComponent(clientId)}&redirect_uri=${encodeURIComponent(redirectUri)}&code_verifier=${codeVerifier}`
+        ),
+        mockEnv,
+        mockCtx
+      );
+      expect(tokenResponse.status).toBe(200);
+      return tokenResponse.json<any>();
+    }
+
+    async function callApi(accessToken: string): Promise<number> {
+      const apiResponse = await oauthProvider.fetch(
+        createMockRequest('https://example.com/api/test', 'GET', { Authorization: `Bearer ${accessToken}` }),
+        mockEnv,
+        mockCtx
+      );
+      return apiResponse.status;
+    }
+
+    it('should keep grants from other installations of the same CIMD client', async () => {
+      globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(createMockFetchResponse(cimdMetadata)));
+
+      const codeA = await authorizeAndGetCode(cimdUrl, installA);
+      const tokensA = await exchangeCodeForTokens(cimdUrl, codeA, installA);
+
+      const codeB = await authorizeAndGetCode(cimdUrl, installB);
+      const tokensB = await exchangeCodeForTokens(cimdUrl, codeB, installB);
+
+      // Installation A's grant survives installation B's authorization.
+      expect(await callApi(tokensA.access_token)).toBe(200);
+      expect(await callApi(tokensB.access_token)).toBe(200);
+
+      const grants = await mockEnv.OAUTH_PROVIDER!.listUserGrants('test-user-123');
+      expect(grants.items.length).toBe(2);
+      expect(grants.items.map((grant) => grant.redirectUri).sort()).toEqual([installA, installB]);
+    });
+
+    it('should revoke the previous grant when the same installation re-authorizes', async () => {
+      globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(createMockFetchResponse(cimdMetadata)));
+
+      const codeA = await authorizeAndGetCode(cimdUrl, installA);
+      const tokensA = await exchangeCodeForTokens(cimdUrl, codeA, installA);
+      expect(await callApi(tokensA.access_token)).toBe(200);
+
+      // Same installation authorizes again with the same redirect URI.
+      const codeB = await authorizeAndGetCode(cimdUrl, installA);
+      const tokensB = await exchangeCodeForTokens(cimdUrl, codeB, installA);
+
+      expect(await callApi(tokensA.access_token)).toBe(401);
+      expect(await callApi(tokensB.access_token)).toBe(200);
+
+      const grants = await mockEnv.OAUTH_PROVIDER!.listUserGrants('test-user-123');
+      expect(grants.items.length).toBe(1);
+    });
+
+    it('should leave grants recorded before redirectUri existed untouched', async () => {
+      // A grant persisted by a release that predates the redirectUri field.
+      await mockEnv.OAUTH_KV.put(
+        'grant:test-user-123:legacygrant1',
+        JSON.stringify({
+          id: 'legacygrant1',
+          clientId: cimdUrl,
+          userId: 'test-user-123',
+          scope: ['read'],
+          metadata: {},
+          encryptedProps: 'legacy-ciphertext',
+          createdAt: 1700000000,
+        })
+      );
+      globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(createMockFetchResponse(cimdMetadata)));
+
+      const code = await authorizeAndGetCode(cimdUrl, installA);
+      expect(code).toBeTruthy();
+
+      const grants = await mockEnv.OAUTH_PROVIDER!.listUserGrants('test-user-123');
+      expect(grants.items.length).toBe(2);
+      expect(grants.items.some((grant) => grant.id === 'legacygrant1')).toBe(true);
+    });
+
+    it('should still revoke by client alone for non-CIMD clients with a different redirect URI', async () => {
+      const registerResponse = await oauthProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify({
+            redirect_uris: [
+              'https://dcr-client.example.com/callback-one',
+              'https://dcr-client.example.com/callback-two',
+            ],
+            client_name: 'DCR Test Client',
+            token_endpoint_auth_method: 'none',
+          })
+        ),
+        mockEnv,
+        mockCtx
+      );
+      const { client_id: dcrClientId } = await registerResponse.json<any>();
+
+      const codeOne = await authorizeAndGetCode(dcrClientId, 'https://dcr-client.example.com/callback-one');
+      const tokensOne = await exchangeCodeForTokens(
+        dcrClientId,
+        codeOne,
+        'https://dcr-client.example.com/callback-one'
+      );
+      expect(await callApi(tokensOne.access_token)).toBe(200);
+
+      // A DCR client_id is unique to one installation, so a re-authorization from a
+      // different redirect URI still revokes the existing grant.
+      const codeTwo = await authorizeAndGetCode(dcrClientId, 'https://dcr-client.example.com/callback-two');
+      expect(codeTwo).toBeTruthy();
+
+      expect(await callApi(tokensOne.access_token)).toBe(401);
+      const grants = await mockEnv.OAUTH_PROVIDER!.listUserGrants('test-user-123');
+      expect(grants.items.length).toBe(1);
+    });
+  });
 });
