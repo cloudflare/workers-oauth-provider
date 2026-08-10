@@ -1,5 +1,11 @@
 # @cloudflare/workers-oauth-provider
 
+## 0.10.3
+
+### Patch Changes
+
+- [#299](https://github.com/cloudflare/workers-oauth-provider/pull/299) [`dc63ec8`](https://github.com/cloudflare/workers-oauth-provider/commit/dc63ec8664c2f6c4e0f02fefebcb2a873b91ed0a) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Scope default grant revocation to the authorizing redirect URI for Client ID Metadata Document clients. A CIMD client_id is the metadata document URL shared by every installation of the client, so `completeAuthorization()`'s default revocation logged the user out of all their other devices; it now revokes only grants created from the same redirect URI. Grants now record the redirect URI that created them, and grants created before this release are never auto-revoked by CIMD clients. Revocation for pre-registered and dynamically registered clients is unchanged.
+
 ## 0.10.2
 
 ### Patch Changes
