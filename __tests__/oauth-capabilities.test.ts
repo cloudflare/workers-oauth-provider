@@ -165,16 +165,14 @@ describe('CIMD token endpoint authentication negotiation', () => {
     ['defaults an omitted method', undefined, undefined, 'none'],
     ['keeps an implemented preference', 'none', undefined, 'none'],
     ['selects an implemented choice', undefined, ['private_key_jwt', 'none'], 'none'],
-    ['falls back from an unsupported preference', 'private_key_jwt', ['none', 'private_key_jwt'], 'none'],
+    ['keeps the public fallback when both methods are offered', 'private_key_jwt', ['none', 'private_key_jwt'], 'none'],
+    ['accepts private_key_jwt without choices', 'private_key_jwt', undefined, 'private_key_jwt'],
+    ['selects private_key_jwt when it is the only choice', undefined, ['private_key_jwt'], 'private_key_jwt'],
   ])('%s', (_label, preferred, choices, expected) => {
     expect(negotiateAuthMethod(preferred, choices)).toBe(expected);
   });
 
-  it.each([
-    ['an unsupported preference without choices', 'private_key_jwt', undefined],
-    ['unsupported choices without a preference', undefined, ['private_key_jwt']],
-    ['an empty choice list', undefined, []],
-  ])('rejects %s', (_label, preferred, choices) => {
+  it.each([['an empty choice list', undefined, []]])('rejects %s', (_label, preferred, choices) => {
     expect(() => negotiateAuthMethod(preferred, choices)).toThrow(
       'CIMD client does not support an accepted token endpoint authentication method'
     );

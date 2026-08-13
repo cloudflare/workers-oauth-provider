@@ -13,6 +13,66 @@ let oauthProvider: OAuthProvider<TestEnv>;
 let mockEnv: TestEnv;
 let mockCtx: MockExecutionContext;
 
+type TestJsonWebKey = JsonWebKey & { kid?: string };
+
+function bytesToBase64Url(bytes: Uint8Array): string {
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+}
+
+function jsonToBase64Url(value: Record<string, unknown>): string {
+  return bytesToBase64Url(new TextEncoder().encode(JSON.stringify(value)));
+}
+
+async function createRsaClientKey(kid: string): Promise<{ privateKey: CryptoKey; publicJwk: TestJsonWebKey }> {
+  const keyPair = (await crypto.subtle.generateKey(
+    {
+      name: 'RSASSA-PKCS1-v1_5',
+      modulusLength: 2048,
+      publicExponent: new Uint8Array([1, 0, 1]),
+      hash: 'SHA-256',
+    },
+    true,
+    ['sign', 'verify']
+  )) as CryptoKeyPair;
+  const publicJwk = (await crypto.subtle.exportKey('jwk', keyPair.publicKey)) as TestJsonWebKey;
+  return {
+    privateKey: keyPair.privateKey,
+    publicJwk: { ...publicJwk, kid, alg: 'RS256', use: 'sig', key_ops: ['verify'] },
+  };
+}
+
+async function createEcClientKey(kid: string): Promise<{ privateKey: CryptoKey; publicJwk: TestJsonWebKey }> {
+  const keyPair = (await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, [
+    'sign',
+    'verify',
+  ])) as CryptoKeyPair;
+  const publicJwk = (await crypto.subtle.exportKey('jwk', keyPair.publicKey)) as TestJsonWebKey;
+  return {
+    privateKey: keyPair.privateKey,
+    publicJwk: { ...publicJwk, kid, alg: 'ES256', use: 'sig', key_ops: ['verify'] },
+  };
+}
+
+async function signClientAssertion(
+  privateKey: CryptoKey,
+  claims: Record<string, unknown>,
+  kid: string,
+  headerOverrides: Record<string, unknown> = {}
+): Promise<string> {
+  const header = { alg: 'RS256', typ: 'JWT', kid, ...headerOverrides };
+  const encodedHeader = jsonToBase64Url(header);
+  const encodedClaims = jsonToBase64Url(claims);
+  const signingInput = `${encodedHeader}.${encodedClaims}`;
+  const signature = await crypto.subtle.sign(
+    header.alg === 'ES256' ? { name: 'ECDSA', hash: 'SHA-256' } : { name: 'RSASSA-PKCS1-v1_5' },
+    privateKey,
+    new TextEncoder().encode(signingInput)
+  );
+  return `${signingInput}.${bytesToBase64Url(new Uint8Array(signature))}`;
+}
+
 beforeEach(() => {
   vi.resetAllMocks();
   mockEnv = createMockEnv();
@@ -132,6 +192,8 @@ describe('Client ID Metadata Document (CIMD)', () => {
       const metadata = await metadataResponse.json<any>();
 
       expect(metadata.client_id_metadata_document_supported).toBe(true);
+      expect(metadata.token_endpoint_auth_methods_supported).toContain('private_key_jwt');
+      expect(metadata.token_endpoint_auth_signing_alg_values_supported).toEqual(['RS256', 'ES256']);
     });
 
     it('should accept a CIMD document with localized metadata variants', async () => {
@@ -408,7 +470,7 @@ describe('Client ID Metadata Document (CIMD)', () => {
       });
     });
 
-    it('should reject private_key_jwt until token-endpoint assertion validation is implemented', async () => {
+    it('should accept private_key_jwt metadata with a public JWKS URI', async () => {
       const cimdUrl = 'https://client.example.com/oauth/metadata.json';
       const validMetadata = {
         client_id: cimdUrl,
@@ -425,7 +487,249 @@ describe('Client ID Metadata Document (CIMD)', () => {
         'GET'
       );
 
-      await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(CimdFetchError);
+      const response = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      expect(response.status).toBe(302);
+    });
+  });
+
+  describe('private_key_jwt Token Endpoint Authentication', () => {
+    const cimdUrl = 'https://client.example.com/oauth/metadata.json';
+    const redirectUri = 'https://client.example.com/callback';
+    const tokenEndpoint = 'https://example.com/oauth/token';
+    const assertionType = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer';
+    const codeVerifier = 'private-key-jwt-verifier-that-is-at-least-43-characters';
+    let codeChallenge: string;
+    let signingKey: Awaited<ReturnType<typeof createRsaClientKey>>;
+
+    beforeEach(async () => {
+      signingKey = await createRsaClientKey('client-key-1');
+      const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(codeVerifier));
+      codeChallenge = bytesToBase64Url(new Uint8Array(digest));
+    });
+
+    function inlineMetadata(publicJwk: TestJsonWebKey = signingKey.publicJwk) {
+      return {
+        client_id: cimdUrl,
+        client_name: 'Private Key CIMD Client',
+        redirect_uris: [redirectUri],
+        token_endpoint_auth_method: 'private_key_jwt',
+        token_endpoint_auth_signing_alg: 'RS256',
+        jwks: { keys: [publicJwk] },
+      };
+    }
+
+    function installInlineMetadata(publicJwk?: TestJsonWebKey): void {
+      globalThis.fetch = vi
+        .fn()
+        .mockImplementation(() => Promise.resolve(createMockFetchResponse(inlineMetadata(publicJwk))));
+    }
+
+    async function authorizeAndGetCode(): Promise<string> {
+      const response = await oauthProvider.fetch(
+        createMockRequest(
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}` +
+            `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+            `&response_type=code&state=test-state&code_challenge=${codeChallenge}&code_challenge_method=S256`,
+          'GET'
+        ),
+        mockEnv,
+        mockCtx
+      );
+      expect(response.status).toBe(302);
+      return new URL(response.headers.get('Location')!).searchParams.get('code')!;
+    }
+
+    async function createAssertion(
+      overrides: Record<string, unknown> = {},
+      key = signingKey,
+      kid = key.publicJwk.kid!,
+      headerOverrides: Record<string, unknown> = {}
+    ): Promise<string> {
+      const now = Math.floor(Date.now() / 1000);
+      return signClientAssertion(
+        key.privateKey,
+        {
+          iss: cimdUrl,
+          sub: cimdUrl,
+          aud: tokenEndpoint,
+          exp: now + 300,
+          iat: now,
+          jti: crypto.randomUUID(),
+          ...overrides,
+        },
+        kid,
+        headerOverrides
+      );
+    }
+
+    async function exchangeCode(code: string, assertion: string, includeClientId = false): Promise<Response> {
+      const params = new URLSearchParams({
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: redirectUri,
+        code_verifier: codeVerifier,
+        client_assertion_type: assertionType,
+        client_assertion: assertion,
+      });
+      if (includeClientId) params.set('client_id', cimdUrl);
+      return oauthProvider.fetch(
+        createMockRequest(
+          tokenEndpoint,
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          params.toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+    }
+
+    it('authenticates an authorization-code exchange from an inline JWKS', async () => {
+      installInlineMetadata();
+      const code = await authorizeAndGetCode();
+      const response = await exchangeCode(code, await createAssertion());
+
+      expect(response.status).toBe(200);
+      expect(await response.json<any>()).toMatchObject({ token_type: 'bearer' });
+    });
+
+    it('authenticates an ES256 client assertion', async () => {
+      const ecKey = await createEcClientKey('client-ec-key');
+      signingKey = ecKey;
+      globalThis.fetch = vi.fn().mockImplementation(() =>
+        Promise.resolve(
+          createMockFetchResponse({
+            ...inlineMetadata(ecKey.publicJwk),
+            token_endpoint_auth_signing_alg: 'ES256',
+          })
+        )
+      );
+      const code = await authorizeAndGetCode();
+      const response = await exchangeCode(
+        code,
+        await createAssertion({}, ecKey, ecKey.publicJwk.kid!, { alg: 'ES256' })
+      );
+
+      expect(response.status).toBe(200);
+      expect(await response.json<any>()).toMatchObject({ token_type: 'bearer' });
+    });
+
+    it('rejects an assertion replay before processing the grant again', async () => {
+      installInlineMetadata();
+      const code = await authorizeAndGetCode();
+      const assertion = await createAssertion({ jti: 'one-time-assertion' });
+
+      expect((await exchangeCode(code, assertion)).status).toBe(200);
+      const replay = await exchangeCode(code, assertion);
+      expect(replay.status).toBe(401);
+      expect(await replay.json<any>()).toEqual({
+        error: 'invalid_client',
+        error_description: 'Client authentication failed',
+      });
+    });
+
+    it.each([
+      ['a different issuer', { iss: 'https://other.example.com/client.json' }],
+      ['a different subject', { sub: 'https://other.example.com/client.json' }],
+      ['a different audience', { aud: 'https://other.example.com/oauth/token' }],
+      ['an expired timestamp', { exp: 1 }],
+      ['no unique identifier', { jti: undefined }],
+    ])('rejects an assertion with %s', async (_label, overrides) => {
+      installInlineMetadata();
+      const code = await authorizeAndGetCode();
+      const response = await exchangeCode(code, await createAssertion(overrides), true);
+
+      expect(response.status).toBe(401);
+      expect(await response.json<any>()).toMatchObject({ error: 'invalid_client' });
+    });
+
+    it('rejects an assertion signed by an unknown key', async () => {
+      installInlineMetadata();
+      const code = await authorizeAndGetCode();
+      const unknownKey = await createRsaClientKey('unknown-key');
+      const response = await exchangeCode(code, await createAssertion({}, unknownKey));
+
+      expect(response.status).toBe(401);
+      expect(await response.json<any>()).toMatchObject({ error: 'invalid_client' });
+    });
+
+    it('rejects a malformed assertion', async () => {
+      installInlineMetadata();
+      const code = await authorizeAndGetCode();
+      const response = await exchangeCode(code, 'not.a.jwt', true);
+
+      expect(response.status).toBe(401);
+      expect(await response.json<any>()).toMatchObject({ error: 'invalid_client' });
+    });
+
+    it('rejects unsupported critical JOSE extensions', async () => {
+      installInlineMetadata();
+      const code = await authorizeAndGetCode();
+      const assertion = await createAssertion({}, signingKey, signingKey.publicJwk.kid!, {
+        crit: ['example'],
+        example: true,
+      });
+      const response = await exchangeCode(code, assertion);
+
+      expect(response.status).toBe(401);
+      expect(await response.json<any>()).toMatchObject({ error: 'invalid_client' });
+    });
+
+    it('rejects an assertion algorithm excluded by client metadata', async () => {
+      globalThis.fetch = vi.fn().mockImplementation(() =>
+        Promise.resolve(
+          createMockFetchResponse({
+            ...inlineMetadata(),
+            token_endpoint_auth_signing_alg: 'ES256',
+          })
+        )
+      );
+      const code = await authorizeAndGetCode();
+      const response = await exchangeCode(code, await createAssertion());
+
+      expect(response.status).toBe(401);
+      expect(await response.json<any>()).toMatchObject({ error: 'invalid_client' });
+    });
+
+    it('loads a rotated key from a protected HTTPS jwks_uri', async () => {
+      const jwksUri = 'https://client.example.com/.well-known/jwks.json';
+      let activeKey = signingKey;
+      const metadata = { ...inlineMetadata(), jwks: undefined, jwks_uri: jwksUri };
+      globalThis.fetch = vi.fn().mockImplementation((input: RequestInfo | URL) => {
+        const url = input instanceof Request ? input.url : String(input);
+        return Promise.resolve(createMockFetchResponse(url === jwksUri ? { keys: [activeKey.publicJwk] } : metadata));
+      });
+
+      const firstCode = await authorizeAndGetCode();
+      expect((await exchangeCode(firstCode, await createAssertion())).status).toBe(200);
+
+      activeKey = await createRsaClientKey('client-key-2');
+      signingKey = activeKey;
+      const secondCode = await authorizeAndGetCode();
+      expect((await exchangeCode(secondCode, await createAssertion())).status).toBe(200);
+    });
+
+    it('rejects a non-HTTPS jwks_uri before authorization', async () => {
+      globalThis.fetch = vi.fn().mockResolvedValue(
+        createMockFetchResponse({
+          ...inlineMetadata(),
+          jwks: undefined,
+          jwks_uri: 'http://127.0.0.1/jwks.json',
+        })
+      );
+
+      await expect(authorizeAndGetCode()).rejects.toThrow(CimdFetchError);
+    });
+
+    it('rejects an empty inline JWKS before authorization', async () => {
+      globalThis.fetch = vi.fn().mockResolvedValue(
+        createMockFetchResponse({
+          ...inlineMetadata(),
+          jwks: { keys: [] },
+        })
+      );
+
+      await expect(authorizeAndGetCode()).rejects.toThrow(CimdFetchError);
     });
   });
 
@@ -930,9 +1234,13 @@ describe('Client ID Metadata Document (CIMD)', () => {
 
       const metadataRequest = createMockRequest('https://example.com/.well-known/oauth-authorization-server', 'GET');
       const response = await oauthProvider.fetch(metadataRequest, mockEnv, mockCtx);
-      const metadata = (await response.json()) as { client_id_metadata_document_supported: boolean };
+      const metadata = (await response.json()) as {
+        client_id_metadata_document_supported: boolean;
+        token_endpoint_auth_methods_supported: string[];
+      };
 
       expect(metadata.client_id_metadata_document_supported).toBe(false);
+      expect(metadata.token_endpoint_auth_methods_supported).not.toContain('private_key_jwt');
     });
 
     it('should report client_id_metadata_document_supported as false when Cloudflare global is undefined', async () => {
