@@ -8,6 +8,7 @@
  * the practical attack window.
  */
 
+import { EMA_JTI_MIN_TTL_SECONDS } from './constants';
 import { err, ok } from './result';
 import type { EmaJtiStore } from './types';
 import { sha256Hex } from './util';
@@ -19,7 +20,9 @@ const EMA_JTI_KV_PREFIX = 'enterprise-jti:';
 export function createKvJtiStore(): EmaJtiStore {
   return {
     async markUsed({ issuer, jti, exp, now, env }) {
-      const ttl = Math.max(1, exp - now);
+      // KV rejects a sub-60s expirationTtl and an assertion in its last minute is
+      // still valid; a marker outliving its assertion only tightens replay detection.
+      const ttl = Math.max(EMA_JTI_MIN_TTL_SECONDS, exp - now);
       const jtiHash = await sha256Hex(`${issuer}\n${jti}`);
       const key = `${EMA_JTI_KV_PREFIX}${jtiHash}`;
       const existing = await env.OAUTH_KV.get(key);

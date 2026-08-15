@@ -4571,6 +4571,15 @@ describe('OAuthProvider', () => {
       expect(defaultMetadata.authorization_grant_profiles_supported).toBeUndefined();
     });
 
+    it("should exchange an ID-JAG whose remaining lifetime is under KV's minimum expiration", async () => {
+      const now = Math.floor(Date.now() / 1000);
+      const tokenResponse = await exchangeAssertion(await createAssertion({ iat: now, exp: now + 30 }));
+
+      expect(tokenResponse.status).toBe(200);
+      const tokens = await tokenResponse.json<any>();
+      expect(tokens.access_token).toBeDefined();
+    });
+
     it('should exchange a valid ID-JAG for an access token with mapped props', async () => {
       const tokenResponse = await exchangeAssertion(await createAssertion());
       expect(tokenResponse.status).toBe(200);
