@@ -40,6 +40,9 @@ export const EMA_DEFAULT_MAX_ASSERTION_LIFETIME_SECONDS = 5 * 60;
  */
 export const EMA_JWKS_FORCE_REFRESH_COOLDOWN_SECONDS = 30;
 
+/** Floor for the `jti` replay marker's KV TTL; KV rejects a sub-60s expiration. */
+export const EMA_JTI_MIN_TTL_SECONDS = 60;
+
 /** Default JWT signing algorithm assumed for a trusted issuer. */
 export const EMA_DEFAULT_JWT_ALGORITHM = 'RS256';
 
