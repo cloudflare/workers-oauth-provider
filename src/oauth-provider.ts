@@ -19,6 +19,7 @@ import {
   requireJsonObject,
   resolveDynamicClientRegistrationMetadata,
   validateRedirectUriScheme,
+  type OAuthClientJsonWebKeySet,
   type ResolvedDynamicClientRegistrationMetadata,
 } from './oauth-client-metadata';
 import {
@@ -44,6 +45,11 @@ import {
   validateIdJagClaims,
   validateIdJagHeader,
 } from './ema/validators';
+import {
+  JWT_BEARER_CLIENT_ASSERTION_TYPE,
+  authenticatePrivateKeyJwt,
+  readPrivateKeyJwtClientId,
+} from './private-key-jwt';
 
 export { AuthorizationError } from './oauth-capabilities';
 export type { AuthorizationErrorCode, AuthorizationErrorOptions } from './oauth-capabilities';
@@ -826,6 +832,21 @@ export interface ClientInfo {
    * URL to the client's JSON Web Key Set for validating signatures
    */
   jwksUri?: string;
+
+  /**
+   * Inline public JSON Web Key Set for validating client assertions.
+   */
+  jwks?: OAuthClientJsonWebKeySet;
+
+  /**
+   * Required signing algorithm for JWT client authentication.
+   */
+  tokenEndpointAuthSigningAlg?: string;
+
+  /**
+   * JWT client-authentication signing algorithms supported by the client.
+   */
+  tokenEndpointAuthSigningAlgValuesSupported?: string[];
 
   /**
    * RFC 7591 §2.2 internationalized variants of the human-readable client
@@ -1969,11 +1990,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Get client credentials from HTTP Basic auth or form parameters.
     const basicAuthorization = parseBasicAuthorizationHeader(request.headers.get('Authorization'));
     const basicAuthenticationAttempted = basicAuthorization.kind !== 'not-basic';
+    const clientAssertionAttempted = formData.has('client_assertion') || formData.has('client_assertion_type');
     let clientId = '';
     let clientSecret = '';
 
     if (basicAuthenticationAttempted) {
-      if (formData.has('client_id') || formData.has('client_secret')) {
+      if (formData.has('client_id') || formData.has('client_secret') || clientAssertionAttempted) {
         return this.createErrorResponse('invalid_request', {
           description: 'Client must not use multiple authentication methods',
           statusCode: 400,
@@ -1989,6 +2011,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
       clientId = basicAuthorization.clientId;
       clientSecret = basicAuthorization.clientSecret;
+    } else if (clientAssertionAttempted) {
+      if (formData.has('client_secret')) {
+        return this.createErrorResponse('invalid_request', {
+          description: 'Client must not use multiple authentication methods',
+          statusCode: 400,
+        });
+      }
+      clientId = body.client_id || readPrivateKeyJwtClientId(body.client_assertion) || '';
     } else {
       clientId = body.client_id;
       clientSecret = body.client_secret || '';
@@ -2030,9 +2060,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // presence rather than truthiness so an empty secret still counts as a POST attempt.
     const presentedAuthMethod = basicAuthenticationAttempted
       ? 'client_secret_basic'
-      : formData.has('client_secret')
-        ? 'client_secret_post'
-        : 'none';
+      : clientAssertionAttempted
+        ? 'private_key_jwt'
+        : formData.has('client_secret')
+          ? 'client_secret_post'
+          : 'none';
     const registeredAuthMethod = clientInfo.tokenEndpointAuthMethod;
     if (
       !isClientAuthMethodAllowed(
@@ -2052,8 +2084,32 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       });
     }
 
-    // For confidential clients, validate the secret
-    if (presentedAuthMethod !== 'none') {
+    if (presentedAuthMethod === 'private_key_jwt') {
+      if (body.client_assertion_type !== JWT_BEARER_CLIENT_ASSERTION_TYPE) {
+        return this.createInvalidClientResponse('Client authentication failed', basicAuthenticationAttempted);
+      }
+
+      const result = await authenticatePrivateKeyJwt({
+        assertion: body.client_assertion,
+        client: clientInfo,
+        tokenEndpoint: this.getFullEndpointUrl(this.options.tokenEndpoint, new URL(request.url)),
+        now: Math.floor(Date.now() / 1000),
+        env,
+      });
+      if (!result.ok) {
+        return this.createInvalidClientResponse(
+          'Client authentication failed',
+          basicAuthenticationAttempted,
+          {
+            category: 'client-authentication',
+            reason: 'private_key_jwt_validation_failed',
+            detail: { clientId: clientInfo.clientId, reason: result.reason },
+          },
+          request
+        );
+      }
+    } else if (presentedAuthMethod !== 'none') {
+      // For shared-secret methods, validate the stored secret.
       if (!clientSecret) {
         return this.createInvalidClientResponse(
           'Client authentication failed: missing client_secret',
@@ -2244,8 +2300,15 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       ...(authorizationGrantProfilesSupported.length > 0
         ? { authorization_grant_profiles_supported: authorizationGrantProfilesSupported }
         : {}),
-      token_endpoint_auth_methods_supported: this.serverCapabilities.tokenEndpointAuthMethods,
-      // not implemented: token_endpoint_auth_signing_alg_values_supported
+      token_endpoint_auth_methods_supported: [
+        ...this.serverCapabilities.tokenEndpointAuthMethods,
+        ...(this.options.clientIdMetadataDocumentEnabled && this.hasGlobalFetchStrictlyPublic()
+          ? ['private_key_jwt']
+          : []),
+      ],
+      ...(this.options.clientIdMetadataDocumentEnabled && this.hasGlobalFetchStrictlyPublic()
+        ? { token_endpoint_auth_signing_alg_values_supported: ['RS256', 'ES256'] }
+        : {}),
       // not implemented: service_documentation
       // not implemented: ui_locales_supported
       // not implemented: op_policy_uri

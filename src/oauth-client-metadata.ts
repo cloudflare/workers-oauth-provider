@@ -8,6 +8,16 @@ const CIMD_MAX_SIZE_BYTES = 5 * 1024;
 const CIMD_FETCH_TIMEOUT_MS = 10_000;
 const CIMD_CACHE_NAME = 'workers-oauth-provider:cimd:v1';
 const CIMD_CACHE_MAX_TTL_SECONDS = 7 * 24 * 60 * 60;
+const PRIVATE_KEY_JWT_SIGNING_ALGORITHMS = new Set(['RS256', 'ES256']);
+
+/** Public JSON Web Key supplied by an OAuth client. */
+export type OAuthClientJsonWebKey = JsonWebKey & { kid?: string };
+
+/** Public JSON Web Key Set supplied by an OAuth client. */
+export interface OAuthClientJsonWebKeySet {
+  /** Public keys that may verify client-signed assertions. */
+  keys: OAuthClientJsonWebKey[];
+}
 
 /** Human-readable and key-discovery client metadata shared by DCR and CIMD clients. */
 interface OAuthClientDisplayMetadata {
@@ -43,6 +53,8 @@ interface ParsedOAuthClientMetadata extends OAuthClientDisplayMetadata {
   tokenEndpointAuthMethod?: string;
   /** Token endpoint authentication methods supported by the client. */
   tokenEndpointAuthMethodsSupported?: string[];
+  /** Inline client JSON Web Key Set. */
+  jwks?: OAuthClientJsonWebKeySet;
   /** Preferred signing algorithm for JWT client authentication. */
   tokenEndpointAuthSigningAlg?: string;
   /** JWT client-authentication signing algorithms supported by the client. */
@@ -77,6 +89,12 @@ export interface ResolvedClientIdMetadataDocument extends OAuthClientDisplayMeta
   responseTypes: string[];
   /** Mutually supported token endpoint authentication method. */
   tokenEndpointAuthMethod: string;
+  /** Inline client JSON Web Key Set. */
+  jwks?: OAuthClientJsonWebKeySet;
+  /** Required signing algorithm for JWT client authentication. */
+  tokenEndpointAuthSigningAlg?: string;
+  /** JWT client-authentication signing algorithms supported by the client. */
+  tokenEndpointAuthSigningAlgValuesSupported?: string[];
 }
 
 export function requireJsonObject(value: unknown): Record<string, unknown> {
@@ -121,6 +139,25 @@ function optionalHttpUri(value: unknown, fieldName: string): string | undefined 
   }
 
   return uri;
+}
+
+function optionalPublicJwks(value: unknown): OAuthClientJsonWebKeySet | undefined {
+  if (value === undefined) return undefined;
+
+  const jwks = requireJsonObject(value);
+  if (!Array.isArray(jwks.keys)) throw new Error('Invalid jwks: keys must be an array');
+
+  const privateMembers = new Set(['d', 'p', 'q', 'dp', 'dq', 'qi', 'oth', 'k']);
+  const keys = jwks.keys.map((value) => {
+    const key = requireJsonObject(value);
+    if (typeof key.kty !== 'string' || key.kty.length === 0) throw new Error('Invalid jwks: key kty is required');
+    if (Object.keys(key).some((member) => privateMembers.has(member))) {
+      throw new Error('CIMD documents must not contain private or symmetric key material');
+    }
+    return { ...key } as unknown as OAuthClientJsonWebKey;
+  });
+
+  return { keys };
 }
 
 const I18N_FIELDS: Record<string, 'string' | 'uri'> = {
@@ -195,6 +232,7 @@ function parseOAuthClientMetadata(raw: Record<string, unknown>): ParsedOAuthClie
     policyUri: optionalHttpUri(raw.policy_uri, 'policy_uri'),
     tosUri: optionalHttpUri(raw.tos_uri, 'tos_uri'),
     jwksUri: optionalHttpUri(raw.jwks_uri, 'jwks_uri'),
+    jwks: optionalPublicJwks(raw.jwks),
     i18n: extractI18nFields(raw),
     contacts: optionalStringArray(raw.contacts, 'contacts'),
     grantTypes: optionalStringArray(raw.grant_types, 'grant_types'),
@@ -330,19 +368,6 @@ export function isClientIdMetadataDocumentUrl(clientId: string): boolean {
   }
 }
 
-function containsPrivateJwkMaterial(value: unknown): boolean {
-  if (value === undefined) return false;
-  const jwks = requireJsonObject(value);
-  if (!Array.isArray(jwks.keys)) throw new Error('Invalid jwks: keys must be an array');
-
-  const privateMembers = new Set(['d', 'p', 'q', 'dp', 'dq', 'qi', 'oth', 'k']);
-  for (const value of jwks.keys) {
-    const key = requireJsonObject(value);
-    if (Object.keys(key).some((member) => privateMembers.has(member))) return true;
-  }
-  return false;
-}
-
 function resolveClientIdMetadataDocument(
   metadataUrl: string,
   value: unknown,
@@ -360,9 +385,7 @@ function resolveClientIdMetadataDocument(
   if ('client_secret' in raw || 'client_secret_expires_at' in raw) {
     throw new Error('CIMD documents must not contain client secrets');
   }
-  if (containsPrivateJwkMaterial(raw.jwks)) {
-    throw new Error('CIMD documents must not contain private key material');
-  }
+  if (metadata.jwks && metadata.jwksUri) throw new Error('jwks and jwks_uri must not both be present');
 
   const capabilities = negotiateCimdClientCapabilities(server, {
     tokenEndpointAuthMethod: metadata.tokenEndpointAuthMethod,
@@ -371,8 +394,43 @@ function resolveClientIdMetadataDocument(
     responseTypes: metadata.responseTypes ?? ['code'],
   });
 
+  if (capabilities.tokenEndpointAuthMethod === 'private_key_jwt') {
+    if (!metadata.jwks && !metadata.jwksUri) {
+      throw new Error('private_key_jwt requires jwks or jwks_uri');
+    }
+    if (metadata.jwks && metadata.jwks.keys.length === 0) {
+      throw new Error('private_key_jwt jwks must contain at least one public key');
+    }
+    if (metadata.jwksUri) {
+      const jwksUrl = new URL(metadata.jwksUri);
+      if (jwksUrl.protocol !== 'https:') throw new Error('private_key_jwt jwks_uri must use HTTPS');
+      if (jwksUrl.username || jwksUrl.password) throw new Error('private_key_jwt jwks_uri must not contain userinfo');
+      if (jwksUrl.hash) throw new Error('private_key_jwt jwks_uri must not contain a fragment');
+    }
+    if (metadata.tokenEndpointAuthSigningAlg === 'none') {
+      throw new Error('token_endpoint_auth_signing_alg must not be none');
+    }
+    if (
+      metadata.tokenEndpointAuthSigningAlg &&
+      !PRIVATE_KEY_JWT_SIGNING_ALGORITHMS.has(metadata.tokenEndpointAuthSigningAlg)
+    ) {
+      throw new Error(`Unsupported token_endpoint_auth_signing_alg: ${metadata.tokenEndpointAuthSigningAlg}`);
+    }
+    if (
+      metadata.tokenEndpointAuthSigningAlgValuesSupported &&
+      !metadata.tokenEndpointAuthSigningAlgValuesSupported.some((algorithm) =>
+        PRIVATE_KEY_JWT_SIGNING_ALGORITHMS.has(algorithm)
+      )
+    ) {
+      throw new Error('Client does not support an accepted token endpoint authentication signing algorithm');
+    }
+  }
+
   return {
     ...pickDisplayMetadata(metadata),
+    jwks: metadata.jwks,
+    tokenEndpointAuthSigningAlg: metadata.tokenEndpointAuthSigningAlg,
+    tokenEndpointAuthSigningAlgValuesSupported: metadata.tokenEndpointAuthSigningAlgValuesSupported,
     clientId: metadata.clientId,
     clientName: metadata.clientName,
     redirectUris,

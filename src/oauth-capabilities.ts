@@ -167,10 +167,16 @@ function negotiateCimdTokenEndpointAuthMethod(
   const acceptedMethods = server.tokenEndpointAuthMethods.filter(
     (method) => !SHARED_SECRET_TOKEN_ENDPOINT_AUTH_METHODS.has(method)
   );
+  acceptedMethods.push('private_key_jwt');
+  // Preserve the existing public-client path when a CIMD client offers it.
+  // This keeps clients such as ChatGPT, which prefer private_key_jwt but also
+  // advertise none, compatible while enabling clients that require a key.
+  const effectivePreference =
+    preferredMethod === 'private_key_jwt' && supportedMethods?.includes('none') ? undefined : preferredMethod;
   return negotiateTokenEndpointAuthMethod({
     acceptedMethods,
     defaultMethod: 'none',
-    preferredMethod,
+    preferredMethod: effectivePreference,
     supportedMethods,
     context: 'CIMD client',
   });
@@ -214,6 +220,10 @@ export function negotiateCimdClientCapabilities(
   server: OAuthServerCapabilities,
   client: ClientMetadataCapabilities
 ): { grantTypes: string[]; responseTypes: string[]; tokenEndpointAuthMethod: string } {
+  const cimdServer = {
+    ...server,
+    tokenEndpointAuthMethods: [...server.tokenEndpointAuthMethods, 'private_key_jwt'],
+  };
   const effective = {
     grantTypes: client.grantTypes.filter((grantType) => server.grantTypes.includes(grantType)),
     responseTypes: client.responseTypes.filter((responseType) => server.responseTypes.includes(responseType)),
@@ -224,7 +234,7 @@ export function negotiateCimdClientCapabilities(
     ),
   };
 
-  validateClientCapabilities(server, effective);
+  validateClientCapabilities(cimdServer, effective);
   return effective;
 }
 

@@ -306,11 +306,13 @@ CIMD validation follows [draft-ietf-oauth-client-id-metadata-document-00](https:
 - Exact authorization-request redirect URI validation, with RFC 8252 loopback port handling.
 - A 5 KB response size limit and a 10 second timeout covering both headers and body.
 - Valid UTF-8 JSON object syntax and safe URI schemes for client metadata fields.
-- No embedded client secrets or private JWK material.
+- No embedded client secrets or private or symmetric JWK material.
 
 Validated documents are cached according to their `Cache-Control` headers, capped at 7 days. Error responses and invalid documents are never cached, and a cached document that stops validating is evicted and re-resolved from origin within the same request.
 
-CIMD token endpoint authentication is negotiated from `token_endpoint_auth_method` and the OpenID RP Metadata Choices field `token_endpoint_auth_methods_supported`. The provider currently implements only `none`: a client may prefer `private_key_jwt` while also offering `none`, in which case the provider selects `none` and applies public-client PKCE requirements. A client that offers only `private_key_jwt` is rejected until assertion validation is implemented.
+CIMD token endpoint authentication is negotiated from `token_endpoint_auth_method` and the OpenID RP Metadata Choices field `token_endpoint_auth_methods_supported`. The provider supports `none` and `private_key_jwt`. When a client offers both methods, the provider retains the public-client `none` path; clients that require `private_key_jwt` use signed assertions.
+
+Clients using `private_key_jwt` must publish exactly one of `jwks` or an HTTPS `jwks_uri`. Assertions may use `RS256` or `ES256`; `iss` and `sub` must equal the CIMD `client_id`, `aud` must include the token endpoint URL, and `exp` must still be valid. A non-empty `jti` makes each assertion single-use. Remote JWKS responses have a 64 KB limit and a 10 second timeout, and their fetches are protected by the same `global_fetch_strictly_public` requirement as the metadata document.
 
 When a CIMD document cannot be fetched or validated, the token endpoint returns a generic `invalid_client` response and reports diagnostics through `onError.internal`. `OAuthHelpers` methods that resolve a CIMD client throw the exported `CimdFetchError`, allowing applications to distinguish an upstream metadata failure from a client that does not exist. See [Advanced configuration](https://github.com/cloudflare/workers-oauth-provider/blob/main/docs/advanced-configuration.md#cimd-fetch-errors) for an example.
 
