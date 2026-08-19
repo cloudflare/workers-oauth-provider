@@ -1,5 +1,13 @@
 # @cloudflare/workers-oauth-provider
 
+## 0.10.4
+
+### Patch Changes
+
+- [#303](https://github.com/cloudflare/workers-oauth-provider/pull/303) [`742e222`](https://github.com/cloudflare/workers-oauth-provider/commit/742e222c55f5adbd8975c964f2248ea8a1670770) Thanks [@kanywst](https://github.com/kanywst)! - Fix uncaught 500 when an ID-JAG assertion has under 60 seconds left. The EMA replay marker
+  took its KV TTL straight from the assertion's remaining lifetime, so KV rejected the write
+  and the request crashed instead of exchanging. The marker's TTL is now floored at 60s.
+
 ## 0.10.3
 
 ### Patch Changes
