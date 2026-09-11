@@ -1,6 +1,6 @@
 # OAuth KV Storage Schema
 
-This document describes the schema used in the OAUTH_KV storage for the OAuth 2.0 provider library. The library uses Cloudflare Workers KV to store all OAuth-related data, including client registrations, authorization grants, and tokens.
+This document describes the schema used in the OAUTH_KV storage for the OAuth 2.0 provider library. By default the library uses Cloudflare Workers KV to store all OAuth-related data, including client registrations, authorization grants, and tokens. The Workers KV storage provider preserves this layout exactly; other providers such as the Durable Object SQLite adapter store the same canonical JSON values under their own physical layout, described in [docs/storage-providers.md](docs/storage-providers.md).
 
 ## Overview
 

@@ -781,7 +781,7 @@ For a multi-resource `OAuthAuthorizationServer`, `defaultResource` and `legacyGr
 
 Both values must name a declared resource and are checked at construction. If a multi-resource server omits `legacyGrantResource`, an old unbound grant cannot be migrated safely. A stored grant already bound to a registered resource keeps that resource, and a stored 0.x array that contains the registered resource resolves to it. A grant bound only to unregistered values fails its refresh with `invalid_grant`, which conformant clients answer by starting a new authorization.
 
-Previously issued access tokens with no audience keep working until they expire. They are treated as bound to the server-selected migration resource (the sole resource, or `legacyGrantResource`), and refresh binds the grant and returns a bound replacement token. A multi-resource server without `legacyGrantResource` has no safe destination, so it rejects such tokens and their refresh grants must be reauthorized. Multiple resources can share the same authorization server, provider implementation, and KV namespace; separate storage is an optional deployment boundary, not a resource-binding requirement.
+Previously issued access tokens with no audience are rejected by 1.0's protected-resource check, but an eligible refresh grant can acquire the server-selected migration resource on refresh. Multiple resources can share the same authorization server, provider implementation, and KV namespace; separate storage is an optional deployment boundary, not a resource-binding requirement.
 
 The 1.0 API removes `resourceMatchOriginOnly`, and a configuration that still sets it fails at construction. Canonical matching with scheme/host case tolerance replaces it.
 
@@ -841,6 +841,39 @@ export default {
 The default batch size is 50. `result.done` reports whether both key spaces were scanned completely during that invocation.
 
 Deleting a client through `OAuthHelpers.deleteClient()` also revokes its grants and associated tokens across users.
+
+### Storage providers
+
+Clients, grants, tokens, and replay markers are read and written through a storage provider. Omitting `storage` keeps the `OAUTH_KV` binding and its physical key layout, so existing deployments need no migration. The explicit form is:
+
+```ts
+import { workersKvStorage } from '@cloudflare/workers-oauth-provider/storage/kv';
+
+new OAuthProvider({
+  // ...
+  storage: workersKvStorage<Env>({ binding: (env) => env.OAUTH_KV }),
+});
+```
+
+Workers KV is eventually consistent and has no compare-and-swap, so it is a compatibility backend: a freshly issued token may not be visible at every location immediately, and two concurrent refreshes of the same token both succeed. The Durable Object SQLite provider serializes each user's grants, tokens, and refresh rotations inside one object with strong read-after-write, and bounds grant replacement during `completeAuthorization()` with a per-client index instead of scanning every grant the user holds:
+
+```ts
+import {
+  durableObjectSqliteStorage,
+  OAuthStorageObject,
+} from '@cloudflare/workers-oauth-provider/storage/durable-object';
+
+// wrangler.jsonc: durable_objects.bindings = [{ name: 'OAUTH_STORAGE', class_name: 'OAuthStorageObject' }]
+// and a migration with new_sqlite_classes = ['OAuthStorageObject'].
+export { OAuthStorageObject };
+
+new OAuthProvider({
+  // ...
+  storage: durableObjectSqliteStorage<Env>({ binding: (env) => env.OAUTH_STORAGE }),
+});
+```
+
+The Durable Object provider keeps no global index, so `listClients()`, `deleteClient()`, and `purgeExpiredData()` reject with an `unsupported_operation` storage error; expired records are removed by each object's alarm. Custom providers implement the contract exported from `@cloudflare/workers-oauth-provider/storage`; see [docs/storage-providers.md](https://github.com/cloudflare/workers-oauth-provider/blob/main/docs/storage-providers.md).
 
 ## Configuration reference
 
