@@ -164,6 +164,24 @@ describe('authorization code flow', () => {
 });
 
 describe('authorization errors', () => {
+  it('answers a malformed approval form with 400 rather than a Worker error', async () => {
+    const client = await registerPublicClient();
+    const query = new URLSearchParams({
+      response_type: 'code',
+      client_id: client.client_id,
+      redirect_uri: REDIRECT_URI,
+      state: 'e2e-state',
+      code_challenge: await codeChallenge(CODE_VERIFIER),
+      code_challenge_method: 'S256',
+    });
+    const response = await authorizationServer.fetch(`${AUTH_ISSUER}/authorize?${query}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'multipart/form-data; boundary=missing' },
+      body: 'not a multipart body',
+    });
+    expect(response.status).toBe(400);
+  });
+
   it('renders locally rather than redirecting an unvalidated URI', async () => {
     // An unknown client means no verified redirect URI, so reporting the error by
     // redirect would be an open redirect.

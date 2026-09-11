@@ -62,7 +62,13 @@ async function handleAuthorize(request: Request, oauth: OAuthHelpers<McpProps>):
     return renderLoginPage(url, clientName, scope, authRequest.resource ?? '');
   }
 
-  const form = await request.formData();
+  let form: FormData;
+  try {
+    form = await request.formData();
+  } catch {
+    // Client-controlled malformed input is a 400, not a Worker error.
+    return new Response('Malformed form submission', { status: 400 });
+  }
   if (form.get('action') !== 'approve') {
     // A denial is a normal OAuth outcome, not an error page: report it on the client's
     // redirect URI so the client stops waiting.
@@ -73,18 +79,23 @@ async function handleAuthorize(request: Request, oauth: OAuthHelpers<McpProps>):
   // before this point; the loopback guard above is all that stops this from running there.
   const userId = String(form.get('username') ?? '').trim() || 'demo';
 
-  const { redirectTo } = await oauth.completeAuthorization({
-    request: authRequest,
-    userId,
-    metadata: { clientName },
-    scope,
-    // Props are encrypted and stored on the grant, then handed back to the protected
-    // handler as `ctx.props`. The granted scope is copied in here, and the
-    // `tokenExchangeCallback` in `index.ts` keeps it equal to each token's effective scope.
-    props: { userId, clientId: authRequest.clientId, scopes: scope } satisfies McpProps,
-  });
-
-  return Response.redirect(redirectTo, 302);
+  // completeAuthorization() looks the client up once more before writing the grant, so a
+  // CIMD client's metadata fetch can fail here too; it gets the same controlled failure.
+  try {
+    const { redirectTo } = await oauth.completeAuthorization({
+      request: authRequest,
+      userId,
+      metadata: { clientName },
+      scope,
+      // Props are encrypted and stored on the grant, then handed back to the protected
+      // handler as `ctx.props`. The granted scope is copied in here, and the
+      // `tokenExchangeCallback` in `index.ts` keeps it equal to each token's effective scope.
+      props: { userId, clientId: authRequest.clientId, scopes: scope } satisfies McpProps,
+    });
+    return Response.redirect(redirectTo, 302);
+  } catch (error) {
+    return renderAuthorizationFailure(error);
+  }
 }
 
 /**
