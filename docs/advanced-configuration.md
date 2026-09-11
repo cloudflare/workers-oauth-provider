@@ -310,7 +310,7 @@ new OAuthProvider({
 
 The callback can:
 
-- Return `{ props, audience }` to authenticate. The audience is required and must identify the configured canonical `resourceMetadata.resource`; scheme and host comparisons are ASCII case-insensitive, while port, path, query, trailing slash, and array cardinality are strict.
+- Return `{ props, audience }` to authenticate. The audience is required, must be a single string, and must identify the configured canonical `resourceMetadata.resource`; scheme and host comparisons are ASCII case-insensitive and an empty path equals `/`, while port, path, query, and trailing slash are strict. An array is rejected.
 - Return `null` for a generic `401 invalid_token` response.
 - Throw the exported `ExternalTokenError` for an intentional structured response.
 

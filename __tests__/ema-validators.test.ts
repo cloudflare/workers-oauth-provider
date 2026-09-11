@@ -58,7 +58,6 @@ const claimsArgs = {
   expectedAudience: 'https://as.example.com',
   clientId: 'client-xyz',
   configuredResource: 'https://mcp.example.com',
-  matchOriginOnly: false,
   now: 1_999_999_800,
   clockSkewSeconds: 60,
   maxAssertionLifetimeSeconds: 300,

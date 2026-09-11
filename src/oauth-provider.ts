@@ -44,7 +44,14 @@ import {
   validateIdJagClaims,
   validateIdJagHeader,
 } from './ema/validators';
-import { hasAcceptedCanonicalScheme, isLoopbackHostname, validateResourceUri } from './oauth-resource';
+import {
+  foldResourceSchemeAndHost,
+  hasAcceptedCanonicalScheme,
+  isLoopbackHostname,
+  requestCarriesResourceQuery,
+  resourceMatches,
+  validateResourceUri,
+} from './oauth-resource';
 
 export { AuthorizationError } from './oauth-capabilities';
 export type { AuthorizationErrorCode, AuthorizationErrorOptions } from './oauth-capabilities';
@@ -62,7 +69,7 @@ export type {
 } from './ema/types';
 export type { EmaValidationError } from './ema/result';
 export { isValidOAuthScopeToken } from './oauth-capabilities';
-export { validateResourceUri } from './oauth-resource';
+export { resourceMatches, validateResourceUri } from './oauth-resource';
 
 const PROTECTED_RESOURCE_WELL_KNOWN_PREFIX = '/.well-known/oauth-protected-resource';
 const NO_CACHE_HEADERS = { 'Cache-Control': 'no-store', Pragma: 'no-cache' } as const;
@@ -346,8 +353,10 @@ export interface ResolveExternalTokenResult {
    *
    * A JWT may carry this value as an `aud` claim. For an opaque API token or
    * PAT, the callback can supply the local resource URI as policy after
-   * successful validation. This value is required and must exactly match the
-   * provider's configured `resourceMetadata.resource`.
+   * successful validation. This value is required and must identify the
+   * configured canonical `resourceMetadata.resource`: ASCII case in the scheme
+   * and host is folded and an empty path equals `/`, while port, path, query,
+   * and trailing slash are compared exactly.
    */
   audience: string;
 }
@@ -1975,7 +1984,28 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    */
   private assertRouteCoveredByResource(route: string, resource: string): void {
     const resourceUrl = new URL(resource);
-    const routePath = this.isPath(route) ? route.split('?')[0] : new URL(route).pathname;
+    let routePath: string;
+    if (this.isPath(route)) {
+      routePath = route.split('?')[0];
+    } else {
+      const routeUrl = new URL(route);
+      if (routeUrl.origin !== resourceUrl.origin) {
+        throw new TypeError(
+          `API route ${route} is not covered by resourceMetadata.resource ${resource}. An absolute protected route must be on the resource's origin.`
+        );
+      }
+      // A route whose static query names another value for one of the resource's own
+      // parameters can only ever receive requests for a different resource.
+      for (const [name, value] of resourceUrl.searchParams) {
+        const routeValues = routeUrl.searchParams.getAll(name);
+        if (routeValues.length > 0 && !routeValues.includes(value)) {
+          throw new TypeError(
+            `API route ${route} is not covered by resourceMetadata.resource ${resource}. An absolute protected route must carry the resource's query parameters.`
+          );
+        }
+      }
+      routePath = routeUrl.pathname;
+    }
     if (isPathDescendant(routePath, resourceUrl.pathname)) return;
     throw new TypeError(
       `API route ${route} is not covered by resourceMetadata.resource ${resource}. Protected routes must be the canonical resource path or a descendant of it; use ${resourceUrl.origin} as the resource to cover every path on that origin.`
@@ -2465,9 +2495,16 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     onlyResourceServer?: NormalizedResourceServer<Env>
   ): NormalizedResourceServer<Env> | undefined {
     const candidates = onlyResourceServer ? [onlyResourceServer] : this.resourceServers;
-    return candidates.find((server) =>
-      isExactResource(url.href, this.getConfiguredResourceMetadataUrl(server.resourceMetadata.resource))
-    );
+    return candidates.find((server) => {
+      // RFC 9728 §3 fixes the origin and path; a cache-busting query must not hide the
+      // document, while a resource's own query parameters must still be present.
+      const expected = new URL(this.getConfiguredResourceMetadataUrl(server.resourceMetadata.resource));
+      return (
+        url.origin === expected.origin &&
+        url.pathname === expected.pathname &&
+        requestCarriesResourceQuery(url, expected)
+      );
+    });
   }
 
   /** Exact RFC 8414 discovery location for the configured issuer. */
@@ -2535,7 +2572,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   > {
     // Only accept POST requests
     if (request.method !== 'POST') {
-      return this.createErrorResponse('invalid_request', { description: 'Method not allowed', statusCode: 405 });
+      return this.createErrorResponse('invalid_request', {
+        description: 'Method not allowed',
+        statusCode: 405,
+        headers: { Allow: 'POST, OPTIONS' },
+      });
     }
 
     const contentType = request.headers.get('Content-Type') || '';
@@ -2725,9 +2766,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     } else {
       const apiUrl = new URL(route);
       return (
-        url.origin === apiUrl.origin &&
-        pathMatches(apiUrl.pathname, true) &&
-        (!apiUrl.search || url.search === apiUrl.search)
+        url.origin === apiUrl.origin && pathMatches(apiUrl.pathname, true) && requestCarriesResourceQuery(url, apiUrl)
       );
     }
   }
@@ -3149,6 +3188,15 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Verify redirect URI if provided
     if (redirectUri && !isValidRedirectUri(redirectUri, clientInfo.redirectUris)) {
       return this.createErrorResponse('invalid_grant', { description: 'Invalid redirect URI' });
+    }
+
+    // OAuth 2.1 §4.1.3: a redirect_uri on the token request must be identical to the one
+    // the authorization request used. Grants written before the redirect URI was recorded
+    // keep only the registered-list check above.
+    if (redirectUri && grantData.redirectUri !== undefined && redirectUri !== grantData.redirectUri) {
+      return this.createErrorResponse('invalid_grant', {
+        description: 'redirect_uri does not match the authorization request',
+      });
     }
 
     // Reject if code_verifier is provided but PKCE wasn't used in authorization
@@ -4033,7 +4081,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       configuredResource,
       // The signed resource claim must always match the configured canonical
       // identifier exactly.
-      matchOriginOnly: false,
       now,
       clockSkewSeconds: enterpriseOptions.clockSkewSeconds ?? EMA_DEFAULT_CLOCK_SKEW_SECONDS,
       maxAssertionLifetimeSeconds:
@@ -4336,7 +4383,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Check method
     if (request.method !== 'POST') {
-      return this.createErrorResponse('invalid_request', { description: 'Method not allowed', statusCode: 405 });
+      return this.createErrorResponse('invalid_request', {
+        description: 'Method not allowed',
+        statusCode: 405,
+        headers: { Allow: 'POST, OPTIONS' },
+      });
     }
 
     // Check content length to ensure it's not too large (1 MiB limit)
@@ -4639,7 +4690,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         });
       }
 
-      if (!isExactResource(ext.audience, configuredResource)) {
+      // The resolver contract is one string; a stored 0.x array is tolerated only for
+      // the provider's own token records.
+      if (typeof ext.audience !== 'string' || !isExactResource(ext.audience, configuredResource)) {
         return this.createErrorResponse('invalid_token', {
           description: 'External access token is not bound to the configured resource',
           statusCode: 401,
@@ -4720,7 +4773,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     if (
       this.explicitIssuer &&
       resourceMetadata.authorization_servers &&
-      !resourceMetadata.authorization_servers.some((issuer) => resourceMatches(issuer, this.explicitIssuer!, false))
+      !resourceMetadata.authorization_servers.some((issuer) => resourceMatches(issuer, this.explicitIssuer!))
     ) {
       throw new TypeError(
         `resourceMetadata.authorization_servers for ${canonical} must include ${this.explicitIssuer}`
@@ -4849,7 +4902,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   }
 
   findConfiguredResource(value: string | string[] | undefined): string | undefined {
-    const singular = Array.isArray(value) ? (value.length === 1 ? value[0] : undefined) : value;
+    // RFC 8707 §2.1 lets a request repeat the parameter; identical repetitions name one resource.
+    const distinct = Array.isArray(value) ? [...new Set(value)] : [value];
+    const singular = distinct.length === 1 ? distinct[0] : undefined;
     if (typeof singular !== 'string' || !validateResourceUri(singular)) return undefined;
     return this.resourceServers
       .map((server) => server.resourceMetadata.resource)
@@ -5129,11 +5184,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // RFC 9728 §5.1 permits the canonical document on any request the resource covers.
     // A canonical path is the base audience for its path-boundary descendants, so a 401
     // at /mcp/messages still points clients at the metadata for /mcp. A resource with a
-    // query is matched only exactly.
+    // query covers only requests that carry that query.
     const resourceUrl = new URL(configuredResource);
     if (
       requestUrl.origin === resourceUrl.origin &&
-      !resourceUrl.search &&
+      requestCarriesResourceQuery(requestUrl, resourceUrl) &&
       isPathDescendant(requestUrl.pathname, resourceUrl.pathname)
     ) {
       return this.getConfiguredResourceMetadataUrl(configuredResource);
@@ -5469,10 +5524,9 @@ function audienceMatches(resourceServerUrl: string, audienceValue: string): bool
       return false;
     }
 
-    // A query-bearing resource identifier names a more specific resource.
-    // Requests may add a query when the audience omits one, but must preserve
-    // the configured query when it is part of the audience.
-    if (audience.search && resource.search !== audience.search) {
+    // A query-bearing resource identifier names a more specific resource. A request
+    // may add parameters of its own but must preserve the audience's.
+    if (!requestCarriesResourceQuery(resource, audience)) {
       return false;
     }
 
@@ -5514,9 +5568,9 @@ function isExactResource(value: string | string[] | undefined, configuredResourc
   // A stored 0.x record may carry an array audience; it is bound to a configured resource
   // when that resource appears in it. New tokens always carry exactly one audience.
   if (Array.isArray(value)) {
-    return value.some((entry) => typeof entry === 'string' && resourceMatches(entry, configuredResource, false));
+    return value.some((entry) => typeof entry === 'string' && resourceMatches(entry, configuredResource));
   }
-  return typeof value === 'string' && resourceMatches(value, configuredResource, false);
+  return typeof value === 'string' && resourceMatches(value, configuredResource);
 }
 
 /** RFC 9110 §9.3.2: a HEAD response carries the GET headers and no body. */
@@ -5527,64 +5581,11 @@ function withoutBodyForHead(request: Request, response: Response): Response {
 
 /** Whether `candidate` is `base` or a path-boundary descendant of it (trailing slashes ignored). */
 function isPathDescendant(candidate: string, base: string): boolean {
-  const normalize = (path: string) => path.replace(/\/+$/, '') || '/';
-  const normalizedBase = normalize(base);
-  const normalizedCandidate = normalize(candidate);
-  if (normalizedBase === '/') return true;
-  return normalizedCandidate === normalizedBase || normalizedCandidate.startsWith(`${normalizedBase}/`);
-}
-
-/**
- * Checks if a requested resource matches a granted resource.
- * When originOnly is true, compares only the origin (scheme + host + port),
- * allowing path-aware resources to match origin-only grants.
- * Otherwise only ASCII case in the URI scheme and host is ignored. Port,
- * path, query, trailing slash, user information, and all other bytes remain
- * significant.
- */
-export function resourceMatches(requested: string, granted: string, originOnly: boolean): boolean {
-  if (!originOnly) {
-    const foldedRequested = foldResourceSchemeAndHost(requested);
-    return foldedRequested !== undefined && foldedRequested === foldResourceSchemeAndHost(granted);
-  }
-  try {
-    return new URL(requested).origin === new URL(granted).origin;
-  } catch {
-    return requested === granted;
-  }
-}
-
-/** Fold only the URI components whose comparison is ASCII case-insensitive. */
-function foldResourceSchemeAndHost(resource: string): string | undefined {
-  const schemeSeparator = resource.indexOf('://');
-  if (schemeSeparator <= 0) return undefined;
-
-  const authorityStart = schemeSeparator + 3;
-  const authorityEndOffset = resource.slice(authorityStart).search(/[/?#]/);
-  const authorityEnd = authorityEndOffset === -1 ? resource.length : authorityStart + authorityEndOffset;
-  const authority = resource.slice(authorityStart, authorityEnd);
-  const userInfoEnd = authority.lastIndexOf('@');
-  const hostStart = userInfoEnd + 1;
-
-  let hostEnd: number;
-  if (authority[hostStart] === '[') {
-    const closingBracket = authority.indexOf(']', hostStart + 1);
-    if (closingBracket === -1) return undefined;
-    hostEnd = closingBracket + 1;
-  } else {
-    const portSeparator = authority.indexOf(':', hostStart);
-    hostEnd = portSeparator === -1 ? authority.length : portSeparator;
-  }
-
-  const asciiLower = (value: string) => value.replace(/[A-Z]/g, (character) => character.toLowerCase());
-  return (
-    asciiLower(resource.slice(0, schemeSeparator)) +
-    '://' +
-    authority.slice(0, hostStart) +
-    asciiLower(authority.slice(hostStart, hostEnd)) +
-    authority.slice(hostEnd) +
-    resource.slice(authorityEnd)
-  );
+  if (base === '' || base === '/') return true;
+  // A trailing slash is significant in a resource identifier, as it is for the audience
+  // check: "/mcp/" covers "/mcp/" and "/mcp/x" but not "/mcp".
+  if (base.endsWith('/')) return candidate.startsWith(base);
+  return candidate === base || candidate.startsWith(`${base}/`);
 }
 
 /**

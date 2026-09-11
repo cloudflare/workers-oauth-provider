@@ -1,4 +1,9 @@
-import { hasAcceptedCanonicalScheme, validateResourceUri } from './oauth-resource';
+import {
+  hasAcceptedCanonicalScheme,
+  requestCarriesResourceQuery,
+  resourceMatches,
+  validateResourceUri,
+} from './oauth-resource';
 
 const PROTECTED_RESOURCE_WELL_KNOWN_PREFIX = '/.well-known/oauth-protected-resource';
 const NO_CACHE_HEADERS = { 'Cache-Control': 'no-store', Pragma: 'no-cache' } as const;
@@ -272,7 +277,7 @@ function isExactUrl(actual: URL, expected: URL): boolean {
 
 function isCanonicalResourceRequest(requestUrl: URL, resourceUrl: URL): boolean {
   if (requestUrl.origin !== resourceUrl.origin) return false;
-  if (resourceUrl.search && requestUrl.search !== resourceUrl.search) return false;
+  if (!requestCarriesResourceQuery(requestUrl, resourceUrl)) return false;
 
   const resourcePath = resourceUrl.pathname;
   if (requestUrl.pathname === resourcePath) return true;
@@ -293,7 +298,7 @@ function isValidTokenValidation<Props>(
   canonicalResource: string
 ): validation is OAuthResourceTokenValidation<Props> {
   if (!validation || typeof validation !== 'object') return false;
-  if (validation.audience !== canonicalResource) return false;
+  if (typeof validation.audience !== 'string' || !resourceMatches(validation.audience, canonicalResource)) return false;
   if (!Object.prototype.hasOwnProperty.call(validation, 'props')) return false;
 
   if (validation.expiresAt !== undefined) {

@@ -402,6 +402,121 @@ describe('createOAuthResourceServer', () => {
     expect(authorized.status).toBe(200);
   });
 
+  it('answers OPTIONS on the metadata URL and rejects other methods with Allow', async () => {
+    const server = createTestServer();
+    const preflight = await server.fetch(
+      new Request(METADATA_URL, { method: 'OPTIONS', headers: { Origin: 'https://spa.example.com' } }),
+      env,
+      new MockExecutionContext()
+    );
+    expect(preflight.status).toBe(204);
+    expect(preflight.headers.get('Access-Control-Allow-Origin')).toBe('https://spa.example.com');
+
+    const post = await server.fetch(new Request(METADATA_URL, { method: 'POST' }), env, new MockExecutionContext());
+    expect(post.status).toBe(405);
+    expect(post.headers.get('Allow')).toBe('GET, HEAD, OPTIONS');
+  });
+
+  it('protects every path of a bare-origin resource', async () => {
+    const server = createTestServer({
+      resourceMetadata: { resource: 'https://mcp.example.com', authorization_servers: ['https://auth.example.com'] },
+      validateToken: async () => ({ props: { userId: 'user-123', scopes: [] }, audience: 'https://mcp.example.com' }),
+    });
+    const challenge = await server.fetch(
+      new Request('https://mcp.example.com/anything/deep'),
+      env,
+      new MockExecutionContext()
+    );
+    expect(challenge.status).toBe(401);
+    expect(challenge.headers.get('WWW-Authenticate')).toContain(
+      'resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource"'
+    );
+    const served = await server.fetch(
+      new Request('https://mcp.example.com/anything/deep', { headers: { Authorization: 'Bearer token' } }),
+      env,
+      new MockExecutionContext()
+    );
+    expect(served.status).toBe(200);
+  });
+
+  it('accepts a validated audience that names the resource with an empty path or different host case', async () => {
+    const server = createTestServer({
+      resourceMetadata: { resource: 'https://mcp.example.com', authorization_servers: ['https://auth.example.com'] },
+      // RFC 3986 §6.2: scheme and host case-fold, and an empty path equals "/".
+      validateToken: async () => ({ props: { userId: 'user-123', scopes: [] }, audience: 'HTTPS://MCP.example.com/' }),
+    });
+    const served = await server.fetch(
+      new Request('https://mcp.example.com/tools', { headers: { Authorization: 'Bearer token' } }),
+      env,
+      new MockExecutionContext()
+    );
+    expect(served.status).toBe(200);
+  });
+
+  it('covers descendants of a query-bearing resource that carry its query', async () => {
+    const resource = 'https://mcp.example.com/mcp?tenant=acme';
+    const server = createTestServer({
+      resourceMetadata: { resource, authorization_servers: ['https://auth.example.com'] },
+      validateToken: async () => ({ props: { userId: 'user-123', scopes: [] }, audience: resource }),
+    });
+    const covered = await server.fetch(
+      new Request('https://mcp.example.com/mcp/messages?tenant=acme&sessionId=abc'),
+      env,
+      new MockExecutionContext()
+    );
+    expect(covered.status).toBe(401);
+    expect(covered.headers.get('WWW-Authenticate')).toContain(
+      'resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource/mcp?tenant=acme"'
+    );
+    const served = await server.fetch(
+      new Request('https://mcp.example.com/mcp/messages?tenant=acme&sessionId=abc', {
+        headers: { Authorization: 'Bearer token' },
+      }),
+      env,
+      new MockExecutionContext()
+    );
+    expect(served.status).toBe(200);
+    const otherTenant = await server.fetch(
+      new Request('https://mcp.example.com/mcp/messages?tenant=other'),
+      env,
+      new MockExecutionContext()
+    );
+    expect(otherTenant.status).toBe(404);
+  });
+
+  it('rejects unsupported bearer methods and malformed scopes at construction', () => {
+    expect(() =>
+      createTestServer({
+        resourceMetadata: {
+          resource: RESOURCE,
+          authorization_servers: ['https://auth.example.com'],
+          bearer_methods_supported: ['body'],
+        },
+      })
+    ).toThrow(TypeError);
+    expect(() =>
+      createTestServer({
+        resourceMetadata: {
+          resource: RESOURCE,
+          authorization_servers: ['https://auth.example.com'],
+          scopes_supported: ['scope with spaces'],
+        },
+      })
+    ).toThrow(TypeError);
+  });
+
+  it('rejects a validation result without props', async () => {
+    const server = createTestServer({
+      validateToken: async () => ({ audience: RESOURCE }) as unknown as OAuthResourceTokenValidation<TestProps>,
+    });
+    const response = await server.fetch(
+      new Request(RESOURCE, { headers: { Authorization: 'Bearer token' } }),
+      env,
+      new MockExecutionContext()
+    );
+    expect(response.status).toBe(401);
+  });
+
   it('rejects http identifiers on non-loopback hosts', () => {
     expect(() =>
       createTestServer({
