@@ -29,6 +29,7 @@ class MockExecutionContext<Props = unknown> implements ExecutionContext<Props> {
 
   waitUntil(_promise: Promise<unknown>): void {}
   passThroughOnException(): void {}
+  abort(): void {}
 }
 
 function createTestServer(

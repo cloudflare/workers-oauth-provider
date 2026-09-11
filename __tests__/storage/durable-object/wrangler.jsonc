@@ -1,0 +1,10 @@
+{
+  "$schema": "../../../node_modules/wrangler/config-schema.json",
+  "name": "oauth-storage-durable-object-tests",
+  "main": "worker.ts",
+  "compatibility_date": "2026-07-29",
+  "durable_objects": {
+    "bindings": [{ "name": "OAUTH_STORAGE", "class_name": "OAuthStorageObject" }],
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["OAuthStorageObject"] }],
+}
