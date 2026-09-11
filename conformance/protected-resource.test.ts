@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { MCP_AUTH_REVISIONS, mcpAuthRevisionsSince, clientResourceForRevision } from './spec-versions';
+import { FOREIGN_AUDIENCE_TOKEN } from './shared';
 import {
   CONFORMANCE_ORIGIN,
   INSUFFICIENT_SCOPE_TOKEN,
@@ -79,19 +80,16 @@ describe.each(mcpAuthRevisionsSince('2025-06-18'))('MCP %s protected-resource co
     expect(challenge).toContain(`resource_metadata="${CONFORMANCE_ORIGIN}/.well-known/oauth-protected-resource/mcp"`);
   });
 
-  it('rejects a valid token at a resource outside its audience', async () => {
-    const client = await oauth.createClient('none');
-    const { tokens } = await oauth.completeAuthorizationCodeFlow(client);
-
-    const response = await oauth.request('/other-resource', {
-      headers: { Authorization: `Bearer ${tokens.access_token}` },
+  it('rejects a valid token whose audience is another resource', async () => {
+    const response = await oauth.request('/mcp', {
+      headers: { Authorization: `Bearer ${FOREIGN_AUDIENCE_TOKEN}` },
     });
 
     expect(response.status).toBe(401);
     expect(response.headers.get('WWW-Authenticate')).toContain('error="invalid_token"');
     expect(await readJson<OAuthErrorBody>(response)).toMatchObject({
       error: 'invalid_token',
-      error_description: expect.stringContaining('audience'),
+      error_description: expect.stringContaining('resource'),
     });
   });
 

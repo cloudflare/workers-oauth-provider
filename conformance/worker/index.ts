@@ -10,6 +10,8 @@ import {
 import {
   CLIENT_REDIRECT_URI,
   DENIED_SCOPE,
+  FOREIGN_AUDIENCE_TOKEN,
+  FOREIGN_RESOURCE,
   INSUFFICIENT_SCOPE_TOKEN,
   OFFLINE_ACCESS_SCOPE,
   READ_SCOPE,
@@ -35,7 +37,7 @@ const apiHandler = {
 
 function createProviderOptions(configuration: WorkerConfiguration): OAuthProviderOptions<ConformanceWorkerEnv> {
   return {
-    apiRoute: ['/mcp', '/other-resource'],
+    apiRoute: ['/mcp'],
     apiHandler,
     defaultHandler: {
       fetch: async (request, env) => {
@@ -77,13 +79,16 @@ function createProviderOptions(configuration: WorkerConfiguration): OAuthProvide
     scopesSupported: [READ_SCOPE, WRITE_SCOPE, OFFLINE_ACCESS_SCOPE],
     clientIdMetadataDocumentEnabled: true,
     resourceMetadata: {
-      ...(configuration.resource ? { resource: configuration.resource } : {}),
+      resource: configuration.resource,
       authorization_servers: [configuration.origin],
       scopes_supported: configuration.resourceScopes,
       bearer_methods_supported: ['header'],
       resource_name: 'MCP auth conformance server',
     },
     resolveExternalToken: async ({ token }) => {
+      // A valid upstream credential issued for another resource: the provider must reject it
+      // because its audience is not this server's canonical resource.
+      if (token === FOREIGN_AUDIENCE_TOKEN) return { props: { userId: 'foreign-user' }, audience: FOREIGN_RESOURCE };
       if (token !== INSUFFICIENT_SCOPE_TOKEN) return null;
       throw new ExternalTokenError('insufficient_scope', {
         description: 'A write scope is required',

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { CimdFetchError, OAuthProvider } from '../src/oauth-provider';
+import { CimdFetchError, OAuthProvider as BaseOAuthProvider, type OAuthProviderOptions } from '../src/oauth-provider';
 import {
   MockExecutionContext,
   TestApiHandler,
@@ -8,6 +8,26 @@ import {
   testDefaultHandler,
   type TestEnv,
 } from './test-helpers';
+
+const TEST_RESOURCE = 'https://example.com';
+
+type TestProviderOptions<Env> = Omit<OAuthProviderOptions<Env>, 'resourceMetadata'> & {
+  resourceMetadata?: Partial<OAuthProviderOptions<Env>['resourceMetadata']>;
+};
+
+/** Supply the canonical resource required by 1.0 unless a test overrides it. */
+class OAuthProvider<Env = Cloudflare.Env> extends BaseOAuthProvider<Env> {
+  constructor(options: TestProviderOptions<Env>) {
+    const { resourceMetadata, ...providerOptions } = options;
+    super({
+      ...providerOptions,
+      resourceMetadata: {
+        resource: TEST_RESOURCE,
+        ...resourceMetadata,
+      },
+    });
+  }
+}
 
 let oauthProvider: OAuthProvider<TestEnv>;
 let mockEnv: TestEnv;
@@ -37,7 +57,7 @@ describe('Client ID Metadata Document (CIMD)', () => {
     };
     // Enable CIMD for the CIMD test suite
     oauthProvider = new OAuthProvider({
-      apiRoute: ['/api/', 'https://api.example.com/'],
+      apiRoute: ['/api/', 'https://example.com/v2/'],
       apiHandler: TestApiHandler,
       defaultHandler: testDefaultHandler,
       authorizeEndpoint: '/authorize',
@@ -950,7 +970,7 @@ describe('Client ID Metadata Document (CIMD)', () => {
     it('should fall through to KV lookup for URL client_id when CIMD is not enabled', async () => {
       // Create provider WITHOUT clientIdMetadataDocumentEnabled
       const providerWithoutCimd = new OAuthProvider({
-        apiRoute: ['/api/', 'https://api.example.com/'],
+        apiRoute: ['/api/', 'https://example.com/v2/'],
         apiHandler: TestApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
@@ -978,7 +998,7 @@ describe('Client ID Metadata Document (CIMD)', () => {
 
     it('should report client_id_metadata_document_supported as false when option is not set', async () => {
       const providerWithoutCimd = new OAuthProvider({
-        apiRoute: ['/api/', 'https://api.example.com/'],
+        apiRoute: ['/api/', 'https://example.com/v2/'],
         apiHandler: TestApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',

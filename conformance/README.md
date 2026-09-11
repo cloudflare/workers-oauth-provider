@@ -23,7 +23,7 @@ The matrix follows every dated authorization revision represented by the officia
 
 Requirements are enabled from the revision that introduced them. Shared OAuth behavior is exercised against every revision, with the target revision sent in the `MCP-Protocol-Version` header.
 
-These are compatibility profiles, not server-side protocol negotiation. The common server profile stays fixed while client request behavior changes by revision: `2025-03-26` omits the RFC 8707 `resource` parameter, while `2025-06-18` and later include it in authorization and token requests. Canonical-resource pinning is tested separately: omission defaults to or inherits the configured canonical value, while explicit malformed or mismatched values fail with `invalid_target`.
+These are client compatibility profiles, not server-side protocol negotiation. This test fixture always uses one fixed canonical resource. Only client wire behavior changes by revision: the legacy `2025-03-26` profile omits the RFC 8707 `resource` parameter, while `2025-06-18` and later include it in authorization and token requests as required. The provider deliberately tolerates legacy omission by defaulting to or inheriting the same canonical value, while explicit malformed or mismatched values fail with `invalid_target`.
 
 ## Coverage and traceability
 
@@ -78,9 +78,9 @@ The upstream authorization-code scenario does not send RFC 8707 `resource`. The 
 - the `global_fetch_strictly_public` compatibility flag used by CIMD;
 - an application-owned authorization handler that grants synthetic consent;
 - a protected `/mcp` handler that exposes only authenticated props; and
-- the canonical resource `https://mcp.example.com/mcp` where the revision requires Resource Indicators.
+- the canonical resource `https://mcp.example.com/mcp` for every revision.
 
-`support/oauth-client.ts` is the OAuth HTTP client around the test harness. A typed Worker RPC selects either the fixed backwards-compatible profile or the canonical-resource profile and pre-registers clients through `OAuthHelpers`; DCR and every OAuth flow run over HTTP. The harness recreates local storage after each test.
+`support/oauth-client.ts` is the OAuth HTTP client around the test harness. A typed Worker RPC configures the fixed canonical server profile and pre-registers clients through `OAuthHelpers`; only the client's Resource Indicator behavior varies by revision. DCR and every OAuth flow run over HTTP. The harness recreates local storage after each test.
 
 Tests assert only observable HTTP responses, redirects, metadata, challenges, and token behavior. They do not access provider internals or stored records.
 
