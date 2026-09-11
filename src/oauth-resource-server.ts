@@ -1,4 +1,4 @@
-import { hasAcceptedCanonicalScheme, isLoopbackHostname, validateResourceUri } from './oauth-resource';
+import { hasAcceptedCanonicalScheme, validateResourceUri } from './oauth-resource';
 
 const PROTECTED_RESOURCE_WELL_KNOWN_PREFIX = '/.well-known/oauth-protected-resource';
 const NO_CACHE_HEADERS = { 'Cache-Control': 'no-store', Pragma: 'no-cache' } as const;
@@ -50,11 +50,6 @@ export interface OAuthResourceServerOptions<Env = Cloudflare.Env, Props = unknow
   resourceMetadata: OAuthResourceMetadata;
   /** Application handler for the canonical resource URL and its path descendants. */
   handler: OAuthResourceHandler<Env, Props>;
-  /**
-   * Accept plain `http` for `resource` and `authorization_servers`. OAuth 2.1 requires
-   * `https`, so set this only in a local development configuration. Defaults to false.
-   */
-  allowHttp?: boolean;
   /**
    * Validate a presented bearer token using application-selected infrastructure.
    *
@@ -176,12 +171,10 @@ function validateOptions<Env, Props>(options: OAuthResourceServerOptions<Env, Pr
   }
 
   const resource = options.resourceMetadata?.resource;
-  const allowHttp = options.allowHttp === true;
-  const resourceUrl = parseCanonicalUrl(resource, allowHttp);
-  if (resourceUrl) warnIfCleartextRemote(resourceUrl, 'resourceMetadata.resource');
+  const resourceUrl = parseCanonicalUrl(resource);
   if (!resourceUrl) {
     throw new TypeError(
-      'resourceMetadata.resource must be a canonical absolute HTTPS URI without a fragment (set allowHttp: true to accept http in development)'
+      'resourceMetadata.resource must be a canonical absolute HTTPS URI without a fragment (http is accepted only on a loopback host)'
     );
   }
 
@@ -190,11 +183,10 @@ function validateOptions<Env, Props>(options: OAuthResourceServerOptions<Env, Pr
     throw new TypeError('resourceMetadata.authorization_servers must contain at least one issuer');
   }
   for (const issuer of authorizationServers) {
-    const issuerUrl = parseCanonicalUrl(issuer, allowHttp);
-    if (issuerUrl) warnIfCleartextRemote(issuerUrl, 'resourceMetadata.authorization_servers');
+    const issuerUrl = parseCanonicalUrl(issuer);
     if (!issuerUrl || issuerUrl.search || issuerUrl.hash) {
       throw new TypeError(
-        'resourceMetadata.authorization_servers must contain canonical HTTPS issuer URLs (set allowHttp: true to accept http in development)'
+        'resourceMetadata.authorization_servers must contain canonical HTTPS issuer URLs (http is accepted only on a loopback host)'
       );
     }
   }
@@ -226,15 +218,7 @@ function validateOptions<Env, Props>(options: OAuthResourceServerOptions<Env, Pr
   };
 }
 
-/** `allowHttp` is for loopback development; an http identifier elsewhere means cleartext tokens. */
-function warnIfCleartextRemote(url: URL, name: string): void {
-  if (url.protocol !== 'http:' || isLoopbackHostname(url.hostname)) return;
-  console.warn(
-    `allowHttp: ${name} ${url.href} uses plain http on a non-loopback host. OAuth 2.1 requires https; tokens will travel in cleartext.`
-  );
-}
-
-function parseCanonicalUrl(value: unknown, allowHttp: boolean): URL | null {
+function parseCanonicalUrl(value: unknown): URL | null {
   if (typeof value !== 'string' || !validateResourceUri(value)) {
     return null;
   }
@@ -247,7 +231,7 @@ function parseCanonicalUrl(value: unknown, allowHttp: boolean): URL | null {
   }
 
   if (
-    !hasAcceptedCanonicalScheme(parsed, allowHttp) ||
+    !hasAcceptedCanonicalScheme(parsed) ||
     parsed.username ||
     parsed.password ||
     parsed.protocol !== parsed.protocol.toLowerCase() ||

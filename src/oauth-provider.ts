@@ -586,15 +586,6 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
   clientIdMetadataDocumentEnabled?: boolean;
 
   /**
-   * Accept plain `http` for the canonical resource, `authorization_servers`, the explicit
-   * authorization server issuer, and absolute endpoint URLs. OAuth 2.1 requires `https`
-   * for all of these, so leave it unset in production and set it only in a local
-   * development configuration such as `wrangler dev` on http://localhost.
-   * Defaults to false.
-   */
-  allowHttp?: boolean;
-
-  /**
    * Metadata for RFC 9728 OAuth 2.0 Protected Resource Metadata.
    * Controls the response served at /.well-known/oauth-protected-resource.
    */
@@ -1679,20 +1670,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
   /** Explicit issuer used by the role-based multi-resource configuration. */
   private readonly explicitIssuer: string | undefined;
-  /** Whether plain `http` identifiers are accepted (development only). */
-  private readonly allowHttp: boolean;
-
-  /**
-   * `allowHttp` exists for `wrangler dev` on a loopback host. An http identifier on any
-   * other host means authorization codes and bearer tokens travel in cleartext, which is
-   * almost always a production misconfiguration, so say so at construction.
-   */
-  private warnIfCleartextRemote(url: URL, name: string): void {
-    if (url.protocol !== 'http:' || isLoopbackHostname(url.hostname)) return;
-    console.warn(
-      `allowHttp: ${name} ${url.href} uses plain http on a non-loopback host. OAuth 2.1 requires https; tokens and authorization codes will travel in cleartext.`
-    );
-  }
 
   /** Every protected-resource role hosted by this provider. */
   private readonly resourceServers: NormalizedResourceServer<Env>[];
@@ -1729,7 +1706,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @param options - Configuration options for the provider
    */
   constructor(options: OAuthProviderOptions<Env> | InternalOAuthAuthorizationServerOptions<Env>) {
-    this.allowHttp = options.allowHttp === true;
     this.typedApiHandlers = [];
     this.typedDefaultHandler = this.validateHandler(options.defaultHandler, 'defaultHandler');
 
@@ -1905,13 +1881,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       } catch (e) {
         throw new TypeError(`${name} must be either an absolute path starting with / or a valid URL`);
       }
-      if (this.explicitIssuer) this.warnIfCleartextRemote(parsed, name);
       if (
         this.explicitIssuer &&
-        (!hasAcceptedCanonicalScheme(parsed, this.allowHttp) || parsed.username || parsed.password || parsed.hash)
+        (!hasAcceptedCanonicalScheme(parsed) || parsed.username || parsed.password || parsed.hash)
       ) {
         throw new TypeError(
-          `${name} must be an absolute HTTPS URL without userinfo or a fragment (set allowHttp: true to accept http in development)`
+          `${name} must be an absolute HTTPS URL without userinfo or a fragment (http is accepted only on a loopback host)`
         );
       }
     }
@@ -1927,7 +1902,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
     if (
       !validateResourceUri(issuer) ||
-      !hasAcceptedCanonicalScheme(parsed, this.allowHttp) ||
+      !hasAcceptedCanonicalScheme(parsed) ||
       parsed.username ||
       parsed.password ||
       parsed.search ||
@@ -1936,10 +1911,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       (parsed.href !== issuer && parsed.origin !== issuer)
     ) {
       throw new TypeError(
-        'authorizationServer.issuer must be a canonical absolute HTTPS URL (set allowHttp: true to accept http in development)'
+        'authorizationServer.issuer must be a canonical absolute HTTPS URL (http is accepted only on a loopback host)'
       );
     }
-    this.warnIfCleartextRemote(parsed, 'authorizationServer.issuer');
   }
 
   /** Reject exact collisions between protocol endpoints owned by the AS fetch surface. */
@@ -2086,20 +2060,15 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
   /** Validate configured RFC 9728 protected resource metadata. */
   private validateResourceMetadataOptions(options: OAuthProtectedResourceMetadata): void {
-    if (
-      !options ||
-      !validateResourceUri(options.resource) ||
-      !hasAcceptedCanonicalScheme(new URL(options.resource), this.allowHttp)
-    ) {
+    if (!options || !validateResourceUri(options.resource) || !hasAcceptedCanonicalScheme(new URL(options.resource))) {
       throw new TypeError(
-        'resourceMetadata.resource is required and must be an absolute HTTPS URI without a fragment (set allowHttp: true to accept http in development)'
+        'resourceMetadata.resource is required and must be an absolute HTTPS URI without a fragment (http is accepted only on a loopback host)'
       );
     }
     if (foldResourceSchemeAndHost(options.resource) !== options.resource) {
       throw new TypeError('resourceMetadata.resource must use a lowercase scheme and lowercase host');
     }
     const parsedResource = new URL(options.resource);
-    this.warnIfCleartextRemote(parsedResource, 'resourceMetadata.resource');
     if (
       parsedResource.username ||
       parsedResource.password ||
@@ -2123,7 +2092,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         }
         if (
           !validateResourceUri(issuer) ||
-          !hasAcceptedCanonicalScheme(parsed, this.allowHttp) ||
+          !hasAcceptedCanonicalScheme(parsed) ||
           parsed.username ||
           parsed.password ||
           foldResourceSchemeAndHost(issuer) !== issuer ||
@@ -2132,10 +2101,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
           issuer.includes('#')
         ) {
           throw new TypeError(
-            'resourceMetadata.authorization_servers must contain valid HTTPS issuer URLs (set allowHttp: true to accept http in development)'
+            'resourceMetadata.authorization_servers must contain valid HTTPS issuer URLs (http is accepted only on a loopback host)'
           );
         }
-        this.warnIfCleartextRemote(parsed, 'resourceMetadata.authorization_servers');
       }
     }
 

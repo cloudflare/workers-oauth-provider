@@ -487,16 +487,15 @@ describe('OAuthProvider', () => {
       ).toThrow('resourceMetadata.resource must use a lowercase scheme and lowercase host');
     });
 
-    it('accepts http resource and issuer identifiers when allowHttp is set', async () => {
+    it('accepts http resource and issuer identifiers on loopback hosts for local development', async () => {
       const resource = 'http://localhost:8787/mcp';
-      const authorizationServers = ['http://127.0.0.1:8787', 'http://auth.internal:8787'];
+      const authorizationServers = ['http://127.0.0.1:8787', 'http://[::1]:8787'];
       const provider = new OAuthProvider({
         apiRoute: ['/mcp'],
         apiHandler: TestApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
-        allowHttp: true,
         resourceMetadata: { resource, authorization_servers: authorizationServers },
       });
       const metadata = await provider.fetch(
@@ -509,54 +508,26 @@ describe('OAuthProvider', () => {
       await expect(metadata.json()).resolves.toMatchObject({ resource, authorization_servers: authorizationServers });
     });
 
-    it.each(['http://localhost:8787/mcp', 'http://mcp.example.com/mcp'])(
-      'rejects the http resource identifier %s without allowHttp',
-      (resource) => {
-        expect(
-          () =>
-            new OAuthProvider({
-              apiRoute: ['/mcp'],
-              apiHandler: TestApiHandler,
-              defaultHandler: testDefaultHandler,
-              authorizeEndpoint: '/authorize',
-              tokenEndpoint: '/oauth/token',
-              resourceMetadata: { resource },
-            })
-        ).toThrow('resourceMetadata.resource is required and must be an absolute HTTPS URI');
-      }
-    );
-
-    it('warns when allowHttp admits an http identifier on a non-loopback host', () => {
-      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-      try {
-        new OAuthProvider({
-          apiRoute: ['/mcp'],
-          apiHandler: TestApiHandler,
-          defaultHandler: testDefaultHandler,
-          authorizeEndpoint: '/authorize',
-          tokenEndpoint: '/oauth/token',
-          allowHttp: true,
-          resourceMetadata: { resource: 'http://localhost:8787/mcp', authorization_servers: ['http://localhost:8787'] },
-        });
-        expect(warn).not.toHaveBeenCalled();
-
-        new OAuthProvider({
-          apiRoute: ['/mcp'],
-          apiHandler: TestApiHandler,
-          defaultHandler: testDefaultHandler,
-          authorizeEndpoint: '/authorize',
-          tokenEndpoint: '/oauth/token',
-          allowHttp: true,
-          resourceMetadata: { resource: 'http://mcp.example.com/mcp' },
-        });
-        expect(warn).toHaveBeenCalledTimes(1);
-        expect(warn.mock.calls[0][0]).toContain('http://mcp.example.com/mcp uses plain http on a non-loopback host');
-      } finally {
-        warn.mockRestore();
-      }
+    it.each([
+      'http://mcp.example.com/mcp',
+      'http://localhost.example.com/mcp',
+      'http://127.0.0.1.example.com/mcp',
+      'http://[::2]/mcp',
+    ])('rejects the http resource identifier %s because its host is not loopback', (resource) => {
+      expect(
+        () =>
+          new OAuthProvider({
+            apiRoute: ['/mcp'],
+            apiHandler: TestApiHandler,
+            defaultHandler: testDefaultHandler,
+            authorizeEndpoint: '/authorize',
+            tokenEndpoint: '/oauth/token',
+            resourceMetadata: { resource },
+          })
+      ).toThrow('resourceMetadata.resource is required and must be an absolute HTTPS URI');
     });
 
-    it('rejects an http authorization server issuer without allowHttp', () => {
+    it('rejects an http authorization server issuer on a non-loopback host', () => {
       expect(
         () =>
           new OAuthProvider({
@@ -567,7 +538,7 @@ describe('OAuthProvider', () => {
             tokenEndpoint: '/oauth/token',
             resourceMetadata: {
               resource: 'https://mcp.example.com/mcp',
-              authorization_servers: ['http://localhost:8787'],
+              authorization_servers: ['http://auth.example.com'],
             },
           })
       ).toThrow('resourceMetadata.authorization_servers must contain valid HTTPS issuer URLs');
@@ -13493,7 +13464,7 @@ describe('functional authorization-server and resource-server composition', () =
     }
   );
 
-  it('accepts an http issuer, endpoints, and registered resource when allowHttp is set', async () => {
+  it('accepts an http issuer, endpoints, and declared resource on loopback hosts for local development', async () => {
     const localIssuer = 'http://localhost:8787';
     const localResource = 'http://localhost:8788/mcp';
     const authorizationServer = new OAuthAuthorizationServer<TestEnv>({
@@ -13501,7 +13472,6 @@ describe('functional authorization-server and resource-server composition', () =
       resources: [localResource],
       authorizeEndpoint: '/authorize',
       tokenEndpoint: 'http://localhost:8787/oauth/token',
-      allowHttp: true,
     });
 
     const response = await authorizationServer.fetch(
@@ -13520,7 +13490,7 @@ describe('functional authorization-server and resource-server composition', () =
     expect(
       () =>
         new OAuthAuthorizationServer<TestEnv>({
-          issuer: 'http://localhost:8787',
+          issuer: 'http://auth.example.com',
           resources: [calendarResource],
           authorizeEndpoint: '/authorize',
           tokenEndpoint: '/oauth/token',

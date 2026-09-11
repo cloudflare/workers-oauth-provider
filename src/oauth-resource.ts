@@ -11,11 +11,13 @@ export function isLoopbackHostname(hostname: string): boolean {
 
 /**
  * Whether a canonical resource, issuer, or endpoint URL uses an accepted
- * scheme. OAuth 2.1 requires `https`; a deployment opts in to plain `http`
- * for local development with `allowHttp: true`.
+ * scheme: `https`, or `http` on a loopback host so `wrangler dev` works on
+ * http://localhost. Workers are always served over `https`, so there is no
+ * deployment in which cleartext OAuth traffic to a remote host is correct,
+ * and no option exists to allow it.
  */
-export function hasAcceptedCanonicalScheme(url: URL, allowHttp: boolean): boolean {
-  return url.protocol === 'https:' || (allowHttp && url.protocol === 'http:');
+export function hasAcceptedCanonicalScheme(url: URL): boolean {
+  return url.protocol === 'https:' || (url.protocol === 'http:' && isLoopbackHostname(url.hostname));
 }
 
 /** Validate an RFC 3986-safe HTTP(S) resource identifier for RFC 8707. */
