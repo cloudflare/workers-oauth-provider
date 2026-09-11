@@ -3942,6 +3942,152 @@ describe('OAuthProvider', () => {
     });
   });
 
+  describe('Token exchange client binding and registered grant types', () => {
+    const EXCHANGE_GRANT = 'urn:ietf:params:oauth:grant-type:token-exchange';
+
+    function createExchangeProvider(tokenExchangeCallback?: OAuthProviderOptions<TestEnv>['tokenExchangeCallback']) {
+      return new OAuthProvider<TestEnv>({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        scopesSupported: ['read', 'write'],
+        allowTokenExchangeGrant: true,
+        ...(tokenExchangeCallback ? { tokenExchangeCallback } : {}),
+      });
+    }
+
+    async function register(provider: OAuthProvider<TestEnv>, grantTypes?: string[]) {
+      const response = await provider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify({
+            redirect_uris: ['https://client.example.com/callback'],
+            token_endpoint_auth_method: 'client_secret_post',
+            ...(grantTypes ? { grant_types: grantTypes } : {}),
+          })
+        ),
+        mockEnv,
+        mockCtx
+      );
+      expect(response.status).toBe(201);
+      return response.json<any>();
+    }
+
+    async function authorize(provider: OAuthProvider<TestEnv>, client: any) {
+      const authResponse = await provider.fetch(
+        createMockRequest(
+          `https://example.com/authorize?response_type=code&client_id=${client.client_id}` +
+            `&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&scope=read%20write&state=s`
+        ),
+        mockEnv,
+        mockCtx
+      );
+      const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
+      const params = new URLSearchParams({
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: 'https://client.example.com/callback',
+        client_id: client.client_id,
+        client_secret: client.client_secret,
+      });
+      const tokenResponse = await provider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          params.toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+      expect(tokenResponse.status).toBe(200);
+      return tokenResponse.json<any>();
+    }
+
+    function tokenRequest(provider: OAuthProvider<TestEnv>, client: any, fields: Record<string, string>) {
+      const params = new URLSearchParams({
+        client_id: client.client_id,
+        client_secret: client.client_secret,
+        ...fields,
+      });
+      return provider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          params.toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+    }
+
+    const exchange = (provider: OAuthProvider<TestEnv>, client: any, subjectToken: string) =>
+      tokenRequest(provider, client, {
+        grant_type: EXCHANGE_GRANT,
+        subject_token: subjectToken,
+        subject_token_type: 'urn:ietf:params:oauth:token-type:access_token',
+      });
+
+    it('lets the client that holds a grant exchange and refresh its own tokens', async () => {
+      const provider = createExchangeProvider();
+      const client = await register(provider, ['authorization_code', 'refresh_token', EXCHANGE_GRANT]);
+      const tokens = await authorize(provider, client);
+
+      expect((await exchange(provider, client, tokens.access_token)).status).toBe(200);
+      expect(
+        (await tokenRequest(provider, client, { grant_type: 'refresh_token', refresh_token: tokens.refresh_token }))
+          .status
+      ).toBe(200);
+    });
+
+    it('rejects a cross-client exchange unless the callback allows it', async () => {
+      const provider = createExchangeProvider();
+      const owner = await register(provider, ['authorization_code', 'refresh_token', EXCHANGE_GRANT]);
+      const other = await register(provider, ['authorization_code', 'refresh_token', EXCHANGE_GRANT]);
+      const tokens = await authorize(provider, owner);
+
+      const denied = await exchange(provider, other, tokens.access_token);
+      expect(denied.status).toBe(400);
+      await expect(denied.json()).resolves.toMatchObject({
+        error: 'invalid_request',
+        error_description: 'The subject token was issued to a different client',
+      });
+
+      const seen: Array<{ clientId: string; subjectClientId: string }> = [];
+      const silentCallback = createExchangeProvider((options) => {
+        seen.push({ clientId: options.clientId, subjectClientId: options.subjectClientId });
+        return {};
+      });
+      const stillDenied = await exchange(silentCallback, other, tokens.access_token);
+      expect(stillDenied.status).toBe(400);
+      expect(seen).toEqual([{ clientId: other.client_id, subjectClientId: owner.client_id }]);
+
+      const allowing = createExchangeProvider(() => ({ allowCrossClientExchange: true }));
+      expect((await exchange(allowing, other, tokens.access_token)).status).toBe(200);
+    });
+
+    it('rejects the exchange grant for a client that did not register it, while refresh is implied by authorization_code', async () => {
+      const provider = createExchangeProvider();
+      const client = await register(provider); // RFC 7591 default: authorization_code only
+      const tokens = await authorize(provider, client);
+
+      const exchanged = await exchange(provider, client, tokens.access_token);
+      expect(exchanged.status).toBe(400);
+      await expect(exchanged.json()).resolves.toMatchObject({ error: 'unauthorized_client' });
+
+      expect(
+        (await tokenRequest(provider, client, { grant_type: 'refresh_token', refresh_token: tokens.refresh_token }))
+          .status
+      ).toBe(200);
+    });
+  });
+
   describe('Token Exchange Flow', () => {
     let clientId: string;
     let clientSecret: string;
@@ -3949,11 +4095,30 @@ describe('OAuthProvider', () => {
     let originalClientId: string;
     let originalClientSecret: string;
 
+    beforeEach(() => {
+      // These tests exchange a token issued to one client from a second client. The
+      // provider rejects that by default; the deployment opts in through its callback.
+      oauthProvider = new OAuthProvider({
+        apiRoute: ['/api/', 'https://api.example.com/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        scopesSupported: ['read', 'write', 'profile'],
+        accessTokenTTL: 3600,
+        allowImplicitFlow: true,
+        allowTokenExchangeGrant: true,
+        tokenExchangeCallback: () => ({ allowCrossClientExchange: true }),
+      });
+    });
+
     // Helper to get an access token for testing
     async function getAccessToken() {
       // Create the original client (the one that got the token)
       const originalClientData = {
         redirect_uris: ['https://original.example.com/callback'],
+        grant_types: ['authorization_code', 'refresh_token', 'urn:ietf:params:oauth:grant-type:token-exchange'],
         client_name: 'Original Client',
         token_endpoint_auth_method: 'client_secret_post',
       };
@@ -4005,6 +4170,7 @@ describe('OAuthProvider', () => {
     async function createExchangeClient() {
       const clientData = {
         redirect_uris: ['https://exchange.example.com/callback'],
+        grant_types: ['authorization_code', 'refresh_token', 'urn:ietf:params:oauth:grant-type:token-exchange'],
         client_name: 'Exchange Client',
         token_endpoint_auth_method: 'client_secret_basic',
       };
@@ -4243,7 +4409,7 @@ describe('OAuthProvider', () => {
 
       expect(exchangeResponse.status).toBe(400);
       const error = await exchangeResponse.json<any>();
-      expect(error.error).toBe('invalid_grant');
+      expect(error.error).toBe('invalid_request');
       expect(error.error_description).toBe('Subject token is too close to expiry to exchange');
     });
 
@@ -4295,7 +4461,7 @@ describe('OAuthProvider', () => {
       expect(exchangeResponse.status).toBe(400);
 
       const error = await exchangeResponse.json<any>();
-      expect(error.error).toBe('invalid_grant');
+      expect(error.error).toBe('invalid_request');
     });
 
     it('should reject token exchange without subject_token', async () => {
@@ -4485,6 +4651,8 @@ describe('OAuthProvider', () => {
           callbackOptions = options;
           return {
             accessTokenProps: { ...options.props, exchanged: true },
+            // The exchanging client differs from the grant's client in this test.
+            allowCrossClientExchange: true,
           };
         },
       });
@@ -7238,7 +7406,7 @@ describe('OAuthProvider', () => {
   });
 
   describe('Sensitive response cache headers (RFC 6749 §5.1)', () => {
-    async function registerClient(): Promise<{ client: any; response: Response }> {
+    async function registerClient(grantTypes?: string[]): Promise<{ client: any; response: Response }> {
       const response = await oauthProvider.fetch(
         createMockRequest(
           'https://example.com/oauth/register',
@@ -7246,6 +7414,7 @@ describe('OAuthProvider', () => {
           { 'Content-Type': 'application/json' },
           JSON.stringify({
             redirect_uris: ['https://client.example.com/callback'],
+            ...(grantTypes ? { grant_types: grantTypes } : {}),
             client_name: 'Cache Header Test Client',
             token_endpoint_auth_method: 'client_secret_post',
           })
@@ -7340,7 +7509,11 @@ describe('OAuthProvider', () => {
     });
 
     it('adds no-store and no-cache to token exchange responses', async () => {
-      const { client } = await registerClient();
+      const { client } = await registerClient([
+        'authorization_code',
+        'refresh_token',
+        'urn:ietf:params:oauth:grant-type:token-exchange',
+      ]);
       const { tokens } = await exchangeAuthorizationCode(client);
       const params = new URLSearchParams();
       params.append('grant_type', 'urn:ietf:params:oauth:grant-type:token-exchange');
@@ -8713,6 +8886,7 @@ describe('OAuthProvider', () => {
         if (options.grantType === 'urn:ietf:params:oauth:grant-type:token-exchange') {
           tokenExchangeCount++;
           return {
+            allowCrossClientExchange: true,
             accessTokenScope: tokenExchangeCount === 1 ? ['read'] : ['read', 'write', 'profile'],
           };
         }
@@ -8751,6 +8925,7 @@ describe('OAuthProvider', () => {
         { 'Content-Type': 'application/json' },
         JSON.stringify({
           redirect_uris: ['https://exchange.example.com/callback'],
+          grant_types: ['authorization_code', 'refresh_token', 'urn:ietf:params:oauth:grant-type:token-exchange'],
           client_name: 'Exchange',
           token_endpoint_auth_method: 'client_secret_basic',
         })
@@ -8932,13 +9107,14 @@ describe('OAuthProvider', () => {
       });
     }
 
-    async function registerClient(provider: OAuthProvider<TestEnv>) {
+    async function registerClient(provider: OAuthProvider<TestEnv>, grantTypes?: string[]) {
       const registerRequest = createMockRequest(
         'https://example.com/oauth/register',
         'POST',
         { 'Content-Type': 'application/json' },
         JSON.stringify({
           redirect_uris: [redirectUri],
+          ...(grantTypes ? { grant_types: grantTypes } : {}),
           client_name: 'Test Client',
           token_endpoint_auth_method: 'client_secret_post',
         })
@@ -9194,7 +9370,11 @@ describe('OAuthProvider', () => {
         }
         return undefined;
       });
-      await registerClient(provider);
+      await registerClient(provider, [
+        'authorization_code',
+        'refresh_token',
+        'urn:ietf:params:oauth:grant-type:token-exchange',
+      ]);
       const { accessToken } = await getRefreshToken(provider);
 
       const tokenResponse = await exchangeAccessToken(provider, accessToken);

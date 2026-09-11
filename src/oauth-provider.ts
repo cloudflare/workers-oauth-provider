@@ -200,6 +200,14 @@ export interface TokenExchangeCallbackResult {
    * scopes are used.
    */
   accessTokenScope?: string[];
+
+  /**
+   * Permit a token exchange whose authenticated client differs from the client the
+   * subject token's grant was issued to. Cross-client exchange is rejected with
+   * `invalid_request` unless the callback returns `true` here, so impersonation
+   * across clients is always a deliberate policy decision.
+   */
+  allowCrossClientExchange?: boolean;
 }
 
 /**
@@ -212,9 +220,18 @@ export interface TokenExchangeCallbackOptions {
   grantType: GrantType;
 
   /**
-   * Client that received this grant
+   * Client authenticated on this token request. For `authorization_code` and
+   * `refresh_token` it is always the grant's client. For token exchange it is the
+   * exchanging client, which may differ from {@link subjectClientId}.
    */
   clientId: string;
+
+  /**
+   * Client the underlying grant was issued to. Equal to `clientId` except during a
+   * cross-client token exchange, which the callback must explicitly allow with
+   * {@link TokenExchangeCallbackResult.allowCrossClientExchange}.
+   */
+  subjectClientId: string;
 
   /**
    * User who authorized this grant
@@ -2950,6 +2967,22 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         return this.createErrorResponse('unsupported_grant_type', { description: 'Grant type not supported' });
       }
 
+      // RFC 7591 §2 and RFC 6749 §10.6: a client may use only the grant types it registered.
+      // refresh_token is implied by authorization_code, because this server issues a refresh
+      // token with every authorization-code grant and RFC 7591 clients commonly register only
+      // the latter. jwt-bearer stays gated by the enterprise-managed-authorization configuration.
+      if (grantType !== GrantType.JWT_BEARER && Array.isArray(clientInfo.grantTypes)) {
+        const registered = clientInfo.grantTypes;
+        const permitted =
+          registered.includes(grantType) ||
+          (grantType === GrantType.REFRESH_TOKEN && registered.includes(GrantType.AUTHORIZATION_CODE));
+        if (!permitted) {
+          return this.createErrorResponse('unauthorized_client', {
+            description: 'The client is not registered for this grant type',
+          });
+        }
+      }
+
       // Validate an explicit resource before any grant-specific callbacks or
       // mutations. Tolerate legacy omission and inherit the configured resource.
       this.validateTokenRequestResourceIndicator(body.resource);
@@ -3189,6 +3222,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       const callbackOptions: TokenExchangeCallbackOptions = {
         grantType: GrantType.AUTHORIZATION_CODE,
         clientId: clientInfo.clientId,
+        subjectClientId: grantData.clientId,
         userId: userId,
         grantId: grantId,
         scope: grantData.scope,
@@ -3438,6 +3472,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       const callbackOptions: TokenExchangeCallbackOptions = {
         grantType: GrantType.REFRESH_TOKEN,
         clientId: clientInfo.clientId,
+        subjectClientId: grantData.clientId,
         userId: userId,
         grantId: grantId,
         scope: grantData.scope,
@@ -3646,16 +3681,27 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     env: Env & ProviderEnv
   ): Promise<TokenResponse & { issued_token_type?: string }> {
     // Unwrap and validate the subject token
+    // RFC 8693 §2.2.2: an invalid or unacceptable subject token is `invalid_request`.
     const tokenSummary = await this.unwrapToken(subjectToken, env);
     if (!tokenSummary) {
-      throw new OAuthError('invalid_grant', { description: 'Invalid or expired subject token' });
+      throw new OAuthError('invalid_request', { description: 'Invalid or expired subject token' });
     }
 
     // Get the grant to access resource information
     const grantKey = `grant:${tokenSummary.userId}:${tokenSummary.grantId}`;
     const grantData: Grant | null = await env.OAUTH_KV.get(grantKey, { type: 'json' });
     if (!grantData) {
-      throw new OAuthError('invalid_grant', { description: 'Grant not found' });
+      throw new OAuthError('invalid_request', { description: 'Grant not found' });
+    }
+
+    // A token is exchanged by the client it was issued to unless the deployment's
+    // tokenExchangeCallback explicitly allows the cross-client case (RFC 8693 §1.1
+    // impersonation is policy, never the default).
+    const crossClientExchange = grantData.clientId !== clientInfo.clientId;
+    const crossClientRejection = () =>
+      new OAuthError('invalid_request', { description: 'The subject token was issued to a different client' });
+    if (crossClientExchange && !this.options.tokenExchangeCallback) {
+      throw crossClientRejection();
     }
 
     // An exchanged token inherits the subject token's scopes unless a narrower subset is requested.
@@ -3672,7 +3718,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // subject token in its final <60s would produce an unstorable access token and an
     // uncaught 500. Treat such a near-expiry subject token as not exchangeable instead.
     if (subjectTokenRemainingLifetime < KV_MIN_EXPIRATION_TTL_SECONDS) {
-      throw new OAuthError('invalid_grant', {
+      throw new OAuthError('invalid_request', {
         description: 'Subject token is too close to expiry to exchange',
       });
     }
@@ -3697,7 +3743,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     );
 
     if (!subjectTokenData) {
-      throw new OAuthError('invalid_grant', { description: 'Subject token data not found' });
+      throw new OAuthError('invalid_request', { description: 'Subject token data not found' });
     }
 
     // Unwrap the encryption key from the subject token
@@ -3714,6 +3760,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       const callbackOptions: TokenExchangeCallbackOptions = {
         grantType: GrantType.TOKEN_EXCHANGE,
         clientId: clientInfo.clientId,
+        subjectClientId: grantData.clientId,
         userId: tokenSummary.userId,
         grantId: tokenSummary.grantId,
         scope: tokenSummary.grant.scope,
@@ -3723,6 +3770,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       };
 
       const callbackResult = await Promise.resolve(this.options.tokenExchangeCallback(callbackOptions));
+      if (crossClientExchange && callbackResult?.allowCrossClientExchange !== true) {
+        throw crossClientRejection();
+      }
 
       if (callbackResult) {
         let accessTokenProps = decryptedProps;
