@@ -361,7 +361,7 @@ Protected resource metadata and authorization server metadata serve different ro
 
 ### Protected resource metadata
 
-Every protected resource needs its own `resourceMetadata.resource`. Configure each canonical HTTPS identifier with a lowercase scheme and host (plain `http` is accepted only on a loopback host such as `http://localhost:8787`, for `wrangler dev`):
+Every protected resource needs its own `resourceMetadata.resource`. Configure each canonical HTTPS identifier with a lowercase scheme and host (plain `http` is accepted only when `allowHttp: true` is set, for local development):
 
 ```ts
 resourceMetadata: {
@@ -383,7 +383,7 @@ That document returns the configured canonical `resource`. The discovery URL is 
 
 RFC 9728 requires challenge-discovered metadata to identify the original requested resource URL. The provider therefore includes `resource_metadata` only when the protected request URL is the canonical resource itself. A canonical path may still be a base audience for descendants: a token for `https://mcp.example.com/mcp` is accepted at `/mcp/tools`, but a request to that descendant does not advertise a mismatched metadata document. If clients must discover authorization from multiple entry paths, register a distinct canonical resource for each entry point and route its protected-resource handle explicitly.
 
-`authorization_servers` may contain more than one issuer. Each value must use canonical HTTPS issuer spelling: lowercase scheme and host, with no userinfo, default port, dot segments, query, or fragment. As with resources, `http` is accepted only on a loopback host. OAuth issuer comparison is exact. The MCP client chooses an authorization server and must keep credentials and tokens separate for each issuer. A resource registered with `OAuthAuthorizationServer.protectResource()` defaults this list to that server's configured `issuer`; the standalone `createOAuthResourceServer()` requires it explicitly.
+`authorization_servers` may contain more than one issuer. Each value must use canonical HTTPS issuer spelling: lowercase scheme and host, with no userinfo, default port, dot segments, query, or fragment. As with resources, `http` is accepted only when `allowHttp: true` is set. OAuth issuer comparison is exact. The MCP client chooses an authorization server and must keep credentials and tokens separate for each issuer. A resource registered with `OAuthAuthorizationServer.protectResource()` defaults this list to that server's configured `issuer`; the standalone `createOAuthResourceServer()` requires it explicitly.
 
 ### Authorization server metadata
 
@@ -527,7 +527,7 @@ The provider owns `tokenEndpoint`. It exchanges authorization codes for tokens, 
 
 An authorization server may register one or more protected resources. Each resource has one canonical `resourceMetadata.resource`: an absolute HTTPS URI without a fragment, with lowercase `https` and a lowercase host, and an RFC 3986-safe producer serialization. Userinfo, default ports, dot-segment paths, and an empty path before a query are rejected because `Request` would rewrite them before RFC 9728 comparison. A bare origin is the only empty-path exception; use `/` before a query. Query components are supported but discouraged by RFC 9728.
 
-For local development, `http` is accepted for resources, `authorization_servers`, the explicit `OAuthAuthorizationServer` issuer, and absolute endpoint URLs only when the host is a loopback address: `localhost`, `127.0.0.0/8`, or `::1`. That keeps plain `wrangler dev` working at `http://localhost:8787`. Any other host must use `https`.
+For local development, set `allowHttp: true` to accept `http` for resources, `authorization_servers`, the explicit `OAuthAuthorizationServer` issuer, and absolute endpoint URLs, for example `wrangler dev` at `http://localhost:8787`. OAuth 2.1 requires `https` for all of these, so leave the option unset in production. `createOAuthResourceServer()` takes the same option for its own metadata.
 
 Every authorization grant and access token is bound to exactly one registered resource. A central authorization server can therefore issue separate Calendar and Drive tokens from one KV namespace, but it never turns those into one multi-audience bearer token. Completing a new authorization for Drive does not replace the same user and client's Calendar grant.
 
@@ -630,6 +630,7 @@ The existing `OAuthProvider` combined configuration uses these options:
 | `scopesSupported`                  | Publish authorization server scopes                      | Omitted                                  |
 | `resourceMetadata.resource`        | Canonical HTTPS resource and token audience              | Required                                 |
 | `clientIdMetadataDocumentEnabled`  | Enable CIMD lookup and advertisement                     | `false`                                  |
+| `allowHttp`                        | Accept plain `http` identifiers for local development    | `false`                                  |
 | `allowPlainPKCE`                   | Permit the legacy plain PKCE method                      | `false`                                  |
 | `allowImplicitFlow`                | Enable implicit token responses                          | `false`                                  |
 | `disallowPublicClientRegistration` | Reject public clients at DCR                             | `false`                                  |

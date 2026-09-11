@@ -487,15 +487,16 @@ describe('OAuthProvider', () => {
       ).toThrow('resourceMetadata.resource must use a lowercase scheme and lowercase host');
     });
 
-    it('accepts http resource and issuer identifiers on loopback hosts for local development', async () => {
+    it('accepts http resource and issuer identifiers when allowHttp is set', async () => {
       const resource = 'http://localhost:8787/mcp';
-      const authorizationServers = ['http://127.0.0.1:8787', 'http://[::1]:8787'];
+      const authorizationServers = ['http://127.0.0.1:8787', 'http://auth.internal:8787'];
       const provider = new OAuthProvider({
         apiRoute: ['/mcp'],
         apiHandler: TestApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
+        allowHttp: true,
         resourceMetadata: { resource, authorization_servers: authorizationServers },
       });
       const metadata = await provider.fetch(
@@ -508,26 +509,24 @@ describe('OAuthProvider', () => {
       await expect(metadata.json()).resolves.toMatchObject({ resource, authorization_servers: authorizationServers });
     });
 
-    it.each([
-      'http://localhost.example.com/mcp',
-      'http://127.0.0.1.example.com/mcp',
-      'http://mcp.example.com/mcp',
-      'http://[::2]/mcp',
-    ])('rejects the http resource identifier %s because its host is not loopback', (resource) => {
-      expect(
-        () =>
-          new OAuthProvider({
-            apiRoute: ['/mcp'],
-            apiHandler: TestApiHandler,
-            defaultHandler: testDefaultHandler,
-            authorizeEndpoint: '/authorize',
-            tokenEndpoint: '/oauth/token',
-            resourceMetadata: { resource },
-          })
-      ).toThrow('resourceMetadata.resource is required and must be an absolute HTTPS URI');
-    });
+    it.each(['http://localhost:8787/mcp', 'http://mcp.example.com/mcp'])(
+      'rejects the http resource identifier %s without allowHttp',
+      (resource) => {
+        expect(
+          () =>
+            new OAuthProvider({
+              apiRoute: ['/mcp'],
+              apiHandler: TestApiHandler,
+              defaultHandler: testDefaultHandler,
+              authorizeEndpoint: '/authorize',
+              tokenEndpoint: '/oauth/token',
+              resourceMetadata: { resource },
+            })
+        ).toThrow('resourceMetadata.resource is required and must be an absolute HTTPS URI');
+      }
+    );
 
-    it('rejects an http authorization server issuer on a non-loopback host', () => {
+    it('rejects an http authorization server issuer without allowHttp', () => {
       expect(
         () =>
           new OAuthProvider({
@@ -537,8 +536,8 @@ describe('OAuthProvider', () => {
             authorizeEndpoint: '/authorize',
             tokenEndpoint: '/oauth/token',
             resourceMetadata: {
-              resource: 'http://localhost:8787/mcp',
-              authorization_servers: ['http://auth.example.com'],
+              resource: 'https://mcp.example.com/mcp',
+              authorization_servers: ['http://localhost:8787'],
             },
           })
       ).toThrow('resourceMetadata.authorization_servers must contain valid HTTPS issuer URLs');
@@ -6980,7 +6979,7 @@ describe('OAuthProvider', () => {
 
       const response = await refresh(provider, client, tokens.refresh_token);
       expect(response.status).toBe(400);
-      await expect(response.json()).resolves.toMatchObject({ error: 'invalid_target' });
+      await expect(response.json()).resolves.toMatchObject({ error: 'invalid_grant' });
       expect(await mockEnv.OAUTH_KV.get(key)).toBe(grantBefore);
     });
 
@@ -7026,7 +7025,7 @@ describe('OAuthProvider', () => {
 
       const response = await refresh(provider, client, tokens.refresh_token);
       expect(response.status).toBe(400);
-      await expect(response.json()).resolves.toMatchObject({ error: 'invalid_target' });
+      await expect(response.json()).resolves.toMatchObject({ error: 'invalid_grant' });
       expect(await mockEnv.OAUTH_KV.get(key)).toBe(grantBefore);
     });
 
@@ -7041,7 +7040,7 @@ describe('OAuthProvider', () => {
 
       const blocked = await refresh(provider, client, tokens.refresh_token);
       expect(blocked.status).toBe(400);
-      await expect(blocked.json()).resolves.toMatchObject({ error: 'invalid_target' });
+      await expect(blocked.json()).resolves.toMatchObject({ error: 'invalid_grant' });
       expect(await mockEnv.OAUTH_KV.get(key)).toBe(grantBefore);
     });
 
@@ -13184,13 +13183,14 @@ describe('functional authorization-server and resource-server composition', () =
     }
   );
 
-  it('accepts an http issuer, endpoints, and registered resource on loopback hosts for local development', async () => {
+  it('accepts an http issuer, endpoints, and registered resource when allowHttp is set', async () => {
     const localIssuer = 'http://localhost:8787';
     const localResource = 'http://localhost:8788/mcp';
     const authorizationServer = new OAuthAuthorizationServer<TestEnv>({
       issuer: localIssuer,
       authorizeEndpoint: '/authorize',
       tokenEndpoint: 'http://localhost:8787/oauth/token',
+      allowHttp: true,
     });
     authorizationServer.registerResource(localResource);
 
@@ -13210,7 +13210,7 @@ describe('functional authorization-server and resource-server composition', () =
     expect(
       () =>
         new OAuthAuthorizationServer<TestEnv>({
-          issuer: 'http://auth.example.com',
+          issuer: 'http://localhost:8787',
           authorizeEndpoint: '/authorize',
           tokenEndpoint: '/oauth/token',
         })

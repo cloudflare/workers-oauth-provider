@@ -51,6 +51,11 @@ export interface OAuthResourceServerOptions<Env = Cloudflare.Env, Props = unknow
   /** Application handler for the canonical resource URL and its path descendants. */
   handler: OAuthResourceHandler<Env, Props>;
   /**
+   * Accept plain `http` for `resource` and `authorization_servers`. OAuth 2.1 requires
+   * `https`, so set this only in a local development configuration. Defaults to false.
+   */
+  allowHttp?: boolean;
+  /**
    * Validate a presented bearer token using application-selected infrastructure.
    *
    * This can call an RFC 7662 endpoint, a Worker over a Service Binding, or a
@@ -172,10 +177,11 @@ function validateOptions<Env, Props>(options: OAuthResourceServerOptions<Env, Pr
   }
 
   const resource = options.resourceMetadata?.resource;
-  const resourceUrl = parseCanonicalUrl(resource);
+  const allowHttp = options.allowHttp === true;
+  const resourceUrl = parseCanonicalUrl(resource, allowHttp);
   if (!resourceUrl) {
     throw new TypeError(
-      'resourceMetadata.resource must be a canonical absolute HTTPS URI without a fragment (http is accepted only on a loopback host)'
+      'resourceMetadata.resource must be a canonical absolute HTTPS URI without a fragment (set allowHttp: true to accept http in development)'
     );
   }
 
@@ -184,10 +190,10 @@ function validateOptions<Env, Props>(options: OAuthResourceServerOptions<Env, Pr
     throw new TypeError('resourceMetadata.authorization_servers must contain at least one issuer');
   }
   for (const issuer of authorizationServers) {
-    const issuerUrl = parseCanonicalUrl(issuer);
+    const issuerUrl = parseCanonicalUrl(issuer, allowHttp);
     if (!issuerUrl || issuerUrl.search || issuerUrl.hash) {
       throw new TypeError(
-        'resourceMetadata.authorization_servers must contain canonical HTTPS issuer URLs (http is accepted only on a loopback host)'
+        'resourceMetadata.authorization_servers must contain canonical HTTPS issuer URLs (set allowHttp: true to accept http in development)'
       );
     }
   }
@@ -219,7 +225,7 @@ function validateOptions<Env, Props>(options: OAuthResourceServerOptions<Env, Pr
   };
 }
 
-function parseCanonicalUrl(value: unknown): URL | null {
+function parseCanonicalUrl(value: unknown, allowHttp: boolean): URL | null {
   if (typeof value !== 'string' || !validateResourceUri(value)) {
     return null;
   }
@@ -232,7 +238,7 @@ function parseCanonicalUrl(value: unknown): URL | null {
   }
 
   if (
-    !hasAcceptedCanonicalScheme(parsed) ||
+    !hasAcceptedCanonicalScheme(parsed, allowHttp) ||
     parsed.username ||
     parsed.password ||
     parsed.protocol !== parsed.protocol.toLowerCase() ||

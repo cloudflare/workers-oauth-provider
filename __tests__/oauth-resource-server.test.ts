@@ -364,9 +364,10 @@ describe('createOAuthResourceServer', () => {
     ).toThrow('resourceMetadata.authorization_servers must contain canonical HTTPS issuer URLs');
   });
 
-  it('accepts http resource and issuer identifiers on loopback hosts for local development', async () => {
+  it('accepts http resource and issuer identifiers when allowHttp is set', async () => {
     const localResource = 'http://localhost:8788/mcp';
     const server = createTestServer({
+      allowHttp: true,
       resourceMetadata: { resource: localResource, authorization_servers: ['http://localhost:8787'] },
       validateToken: async () => ({
         props: { userId: 'user-123', scopes: ['mcp:read'] },
@@ -400,11 +401,11 @@ describe('createOAuthResourceServer', () => {
     expect(authorized.status).toBe(200);
   });
 
-  it('rejects http identifiers on non-loopback hosts', () => {
+  it('rejects http identifiers without allowHttp', () => {
     expect(() =>
       createTestServer({
         resourceMetadata: {
-          resource: 'http://mcp.example.com/mcp',
+          resource: 'http://localhost:8788/mcp',
           authorization_servers: ['https://auth.example.com'],
         },
       })
@@ -412,7 +413,7 @@ describe('createOAuthResourceServer', () => {
 
     expect(() =>
       createTestServer({
-        resourceMetadata: { resource: RESOURCE, authorization_servers: ['http://auth.example.com'] },
+        resourceMetadata: { resource: RESOURCE, authorization_servers: ['http://localhost:8787'] },
       })
     ).toThrow('resourceMetadata.authorization_servers must contain canonical HTTPS issuer URLs');
   });

@@ -569,6 +569,15 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
   clientIdMetadataDocumentEnabled?: boolean;
 
   /**
+   * Accept plain `http` for the canonical resource, `authorization_servers`, the explicit
+   * authorization server issuer, and absolute endpoint URLs. OAuth 2.1 requires `https`
+   * for all of these, so leave it unset in production and set it only in a local
+   * development configuration such as `wrangler dev` on http://localhost.
+   * Defaults to false.
+   */
+  allowHttp?: boolean;
+
+  /**
    * Metadata for RFC 9728 OAuth 2.0 Protected Resource Metadata.
    * Controls the response served at /.well-known/oauth-protected-resource.
    */
@@ -1607,6 +1616,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
   /** Explicit issuer used by the role-based multi-resource configuration. */
   private readonly explicitIssuer: string | undefined;
+  /** Whether plain `http` identifiers are accepted (development only). */
+  private readonly allowHttp: boolean;
 
   /** Every protected-resource role hosted by this provider. */
   private readonly resourceServers: NormalizedResourceServer<Env>[];
@@ -1643,6 +1654,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @param options - Configuration options for the provider
    */
   constructor(options: OAuthProviderOptions<Env> | InternalOAuthAuthorizationServerOptions<Env>) {
+    this.allowHttp = options.allowHttp === true;
     this.typedApiHandlers = [];
     this.typedDefaultHandler = this.validateHandler(options.defaultHandler, 'defaultHandler');
 
@@ -1794,10 +1806,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       }
       if (
         this.explicitIssuer &&
-        (!hasAcceptedCanonicalScheme(parsed) || parsed.username || parsed.password || parsed.hash)
+        (!hasAcceptedCanonicalScheme(parsed, this.allowHttp) || parsed.username || parsed.password || parsed.hash)
       ) {
         throw new TypeError(
-          `${name} must be an absolute HTTPS URL without userinfo or a fragment (http is accepted only on a loopback host)`
+          `${name} must be an absolute HTTPS URL without userinfo or a fragment (set allowHttp: true to accept http in development)`
         );
       }
     }
@@ -1813,7 +1825,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
     if (
       !validateResourceUri(issuer) ||
-      !hasAcceptedCanonicalScheme(parsed) ||
+      !hasAcceptedCanonicalScheme(parsed, this.allowHttp) ||
       parsed.username ||
       parsed.password ||
       parsed.search ||
@@ -1822,7 +1834,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       (parsed.href !== issuer && parsed.origin !== issuer)
     ) {
       throw new TypeError(
-        'authorizationServer.issuer must be a canonical absolute HTTPS URL (http is accepted only on a loopback host)'
+        'authorizationServer.issuer must be a canonical absolute HTTPS URL (set allowHttp: true to accept http in development)'
       );
     }
   }
@@ -1950,9 +1962,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
   /** Validate configured RFC 9728 protected resource metadata. */
   private validateResourceMetadataOptions(options: OAuthProtectedResourceMetadata): void {
-    if (!options || !validateResourceUri(options.resource) || !hasAcceptedCanonicalScheme(new URL(options.resource))) {
+    if (
+      !options ||
+      !validateResourceUri(options.resource) ||
+      !hasAcceptedCanonicalScheme(new URL(options.resource), this.allowHttp)
+    ) {
       throw new TypeError(
-        'resourceMetadata.resource is required and must be an absolute HTTPS URI without a fragment (http is accepted only on a loopback host)'
+        'resourceMetadata.resource is required and must be an absolute HTTPS URI without a fragment (set allowHttp: true to accept http in development)'
       );
     }
     if (foldResourceSchemeAndHost(options.resource) !== options.resource) {
@@ -1982,7 +1998,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         }
         if (
           !validateResourceUri(issuer) ||
-          !hasAcceptedCanonicalScheme(parsed) ||
+          !hasAcceptedCanonicalScheme(parsed, this.allowHttp) ||
           parsed.username ||
           parsed.password ||
           foldResourceSchemeAndHost(issuer) !== issuer ||
@@ -1991,7 +2007,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
           issuer.includes('#')
         ) {
           throw new TypeError(
-            'resourceMetadata.authorization_servers must contain valid HTTPS issuer URLs (http is accepted only on a loopback host)'
+            'resourceMetadata.authorization_servers must contain valid HTTPS issuer URLs (set allowHttp: true to accept http in development)'
           );
         }
       }
@@ -4779,7 +4795,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const canonicalRequestedResource = resourceWasProvided ? this.findConfiguredResource(requestedResource) : undefined;
 
     if (grantResourceWasStored && !canonicalGrantResource) {
-      throw new OAuthError('invalid_target', {
+      // A grant defect, not a request defect: `invalid_grant` makes conformant clients
+      // discard their tokens and re-authorize, where `invalid_target` would make them fail.
+      throw new OAuthError('invalid_grant', {
         description: 'The authorization grant is not bound to a configured resource',
       });
     }
@@ -4797,7 +4815,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     const legacyGrantResource = this.getLegacyGrantResource();
     if (!legacyGrantResource) {
-      throw new OAuthError('invalid_target', {
+      throw new OAuthError('invalid_grant', {
         description: 'This legacy authorization grant has no resource binding and must be reauthorized',
       });
     }
