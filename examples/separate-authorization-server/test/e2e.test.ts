@@ -1,5 +1,13 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { createTestHarness } from 'wrangler';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { UnauthorizedError, type OAuthClientProvider } from '@modelcontextprotocol/sdk/client/auth.js';
+import type {
+  OAuthClientInformationMixed,
+  OAuthClientMetadata,
+  OAuthTokens,
+} from '@modelcontextprotocol/sdk/shared/auth.js';
 
 /**
  * The harness runs the same build as `npm run dev:auth` and `npm run dev:mcp`, so the
@@ -399,6 +407,119 @@ interface RegisteredClient {
   client_secret?: string;
   redirect_uris: string[];
   token_endpoint_auth_method: string;
+}
+
+describe('a real MCP SDK client', () => {
+  it('discovers, registers, authorizes, calls tools, and refreshes through the SDK', async () => {
+    // The same client library Claude Code uses, driven the way a browser flow would be:
+    // the SDK discovers the protected resource and authorization server, registers
+    // dynamically, opens the authorization request, and exchanges the code; the provider
+    // below plays the user agent against the placeholder login.
+    const provider = new SdkClientProvider();
+    const transportOptions = { authProvider: provider, fetch: routedFetch };
+    const client = new Client({ name: 'sdk-e2e', version: '1.0.0' });
+    let transport = new StreamableHTTPClientTransport(new URL(MCP_RESOURCE), transportOptions);
+    await expect(client.connect(transport)).rejects.toBeInstanceOf(UnauthorizedError);
+    expect(provider.authorizationCode).toBeDefined();
+    expect(provider.issuer).toBe(AUTH_ISSUER);
+    expect(provider.requestedResource).toBe(MCP_RESOURCE);
+
+    await transport.finishAuth(provider.authorizationCode!);
+    transport = new StreamableHTTPClientTransport(new URL(MCP_RESOURCE), transportOptions);
+    await client.connect(transport);
+    expect(client.getServerVersion()?.name).toBe('example-mcp-server');
+    expect(provider.tokens()?.scope).toBe('mcp:read mcp:write');
+
+    const tools = await client.listTools();
+    expect(tools.tools.map((tool) => tool.name).sort()).toEqual(['add', 'whoami']);
+    const whoami = await client.callTool({ name: 'whoami', arguments: {} });
+    expect(JSON.parse(textOf(whoami))).toMatchObject({ userId: 'ada', scopes: ['mcp:read', 'mcp:write'] });
+
+    // A dead access token is refreshed transparently rather than surfacing as an error.
+    const before = provider.tokens()!.access_token;
+    provider.corruptAccessToken();
+    const add = await client.callTool({ name: 'add', arguments: { a: 40, b: 2 } });
+    expect(textOf(add)).toBe('42');
+    expect(provider.tokens()!.access_token).not.toBe(before);
+    await client.close();
+  });
+});
+
+/** Routes the SDK's requests to the harness Workers instead of the network. */
+const routedFetch = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+  const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+  const target = url.port === '8788' ? mcpServer : authorizationServer;
+  return (await target.fetch(url.href, init as Parameters<typeof target.fetch>[1])) as unknown as Response;
+};
+
+function textOf(result: Awaited<ReturnType<Client['callTool']>>): string {
+  return (result.content as Array<{ type: string; text: string }>)[0].text;
+}
+
+/** An `OAuthClientProvider` that approves the placeholder login itself and keeps state in memory. */
+class SdkClientProvider implements OAuthClientProvider {
+  private client: OAuthClientInformationMixed | undefined;
+  private storedTokens: OAuthTokens | undefined;
+  private verifier = '';
+  private readonly stateValue = crypto.randomUUID();
+  authorizationCode: string | undefined;
+  issuer: string | null = null;
+  requestedResource: string | null = null;
+
+  get redirectUrl(): string {
+    return REDIRECT_URI;
+  }
+  get clientMetadata(): OAuthClientMetadata {
+    return {
+      redirect_uris: [REDIRECT_URI],
+      client_name: 'sdk-e2e',
+      grant_types: ['authorization_code', 'refresh_token'],
+      response_types: ['code'],
+      token_endpoint_auth_method: 'none',
+    };
+  }
+  state(): string {
+    return this.stateValue;
+  }
+  clientInformation(): OAuthClientInformationMixed | undefined {
+    return this.client;
+  }
+  saveClientInformation(information: OAuthClientInformationMixed): void {
+    this.client = information;
+  }
+  tokens(): OAuthTokens | undefined {
+    return this.storedTokens;
+  }
+  saveTokens(tokens: OAuthTokens): void {
+    this.storedTokens = tokens;
+  }
+  saveCodeVerifier(verifier: string): void {
+    this.verifier = verifier;
+  }
+  codeVerifier(): string {
+    return this.verifier;
+  }
+  corruptAccessToken(): void {
+    this.storedTokens = { ...this.storedTokens!, access_token: 'no-longer-valid' };
+  }
+  async redirectToAuthorization(authorizationUrl: URL): Promise<void> {
+    this.requestedResource = authorizationUrl.searchParams.get('resource');
+    const page = await routedFetch(authorizationUrl);
+    expect(page.status).toBe(200);
+    // The harness follows redirects unless told not to; the code is on the Location header.
+    const approval = await routedFetch(authorizationUrl, {
+      method: 'POST',
+      redirect: 'manual',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ username: 'ada', action: 'approve' }).toString(),
+    });
+    expect(approval.status).toBe(302);
+    const location = new URL(approval.headers.get('Location')!);
+    expect(location.href.startsWith(REDIRECT_URI)).toBe(true);
+    expect(location.searchParams.get('state')).toBe(this.stateValue);
+    this.authorizationCode = location.searchParams.get('code') ?? undefined;
+    this.issuer = location.searchParams.get('iss');
+  }
 }
 
 async function registerPublicClient(): Promise<RegisteredClient> {
