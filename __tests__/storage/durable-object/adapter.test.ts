@@ -66,10 +66,14 @@ async function userStub(userId: string) {
 describe('Durable Object SQLite storage adapter', () => {
   it("stores each user's grants and tokens in that user's object", async () => {
     const userId = user();
-    await storage.grants.put(grant({ userId }), now() + 600);
-    await storage.accessTokens.put(token({ userId }));
-    expect(await storage.grants.get({ userId, grantId: 'grant-1' })).toEqual(grant({ userId }));
-    expect(await storage.accessTokens.get({ userId, grantId: 'grant-1', tokenId: HASH_B })).toEqual(token({ userId }));
+    // Build each fixture once: they carry now()-based timestamps, so a second fixture built
+    // for the comparison could straddle a second boundary.
+    const storedGrant = grant({ userId });
+    const storedToken = token({ userId });
+    await storage.grants.put(storedGrant, now() + 600);
+    await storage.accessTokens.put(storedToken);
+    expect(await storage.grants.get({ userId, grantId: 'grant-1' })).toEqual(storedGrant);
+    expect(await storage.accessTokens.get({ userId, grantId: 'grant-1', tokenId: HASH_B })).toEqual(storedToken);
     expect(await storage.accessTokens.get({ userId: 'someone-else', grantId: 'grant-1', tokenId: HASH_B })).toBeNull();
 
     const kinds = await runInDurableObject(await userStub(userId), (_instance: OAuthStorageObject, state) =>
