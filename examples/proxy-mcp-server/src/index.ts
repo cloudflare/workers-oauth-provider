@@ -13,7 +13,6 @@ import { McpApiHandler } from './mcp';
  * it per environment. See "Run locally" in the README.
  */
 declare const MCP_RESOURCE: string;
-declare const ALLOW_HTTP: boolean;
 
 /**
  * One Worker, both roles. Every request to `/mcp` is proxied through the provider, which
@@ -33,10 +32,6 @@ export default new OAuthProvider<Env>({
   // as the compatibility path that existing MCP clients use.
   clientRegistrationEndpoint: '/oauth/register',
   clientIdMetadataDocumentEnabled: true,
-
-  // Local development runs on http://localhost. OAuth 2.1 requires https everywhere else,
-  // so the production environment inlines `false`. See "Run locally" in the README.
-  allowHttp: ALLOW_HTTP,
 
   scopesSupported: SCOPES_SUPPORTED,
 

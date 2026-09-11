@@ -13,14 +13,14 @@
   // The canonical resource identifier has to exist before the first request, so it is
   // inlined at build time. These values serve `npm run dev` and `npm test`, which
   // both run the Worker on localhost:8787.
-  "define": { "MCP_RESOURCE": "\"http://localhost:8787/mcp\"", "ALLOW_HTTP": "true" },
+  "define": { "MCP_RESOURCE": "\"http://localhost:8787/mcp\"" },
 
   "env": {
     "production": {
       "routes": [{ "pattern": "mcp.example.com", "custom_domain": true }],
       // `define`, `kv_namespaces`, and `routes` are all non-inheritable: an environment
       // has to repeat everything it needs.
-      "define": { "MCP_RESOURCE": "\"https://mcp.example.com/mcp\"", "ALLOW_HTTP": "false" },
+      "define": { "MCP_RESOURCE": "\"https://mcp.example.com/mcp\"" },
       "kv_namespaces": [{ "binding": "OAUTH_KV", "id": "<replace-with-your-kv-id>" }],
     },
   },
