@@ -6823,14 +6823,13 @@ class OAuthHelpersImpl<Env = Cloudflare.Env, Props = any> implements OAuthHelper
     }
 
     // Exchanged access tokens owned by this client can live below a source grant owned by
-    // another client. Ordinary tokens were already removed by revokeGrant() above, and
-    // cross-client tokens exist only when token exchange is enabled.
-    if (this.provider.options.allowTokenExchangeGrant) {
-      for (const keyName of await this.listAllKeys('token:')) {
-        const tokenData: Token | null = await this.env.OAUTH_KV.get(keyName, { type: 'json' });
-        if (tokenData?.grant?.clientId === clientId) {
-          await this.env.OAUTH_KV.delete(keyName);
-        }
+    // another client. Ordinary tokens were already removed by revokeGrant() above. The sweep
+    // does not consult the current allowTokenExchangeGrant setting: tokens issued while
+    // exchange was enabled must not outlive their client once it is switched off.
+    for (const keyName of await this.listAllKeys('token:')) {
+      const tokenData: Token | null = await this.env.OAUTH_KV.get(keyName, { type: 'json' });
+      if (tokenData?.grant?.clientId === clientId) {
+        await this.env.OAUTH_KV.delete(keyName);
       }
     }
   }

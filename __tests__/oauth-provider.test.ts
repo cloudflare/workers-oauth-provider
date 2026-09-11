@@ -14904,6 +14904,57 @@ describe('functional authorization-server and resource-server composition', () =
     await exchangeServer.getOAuthApi(env).deleteClient(exchangeClient.client_id);
     expect(await tokenStatus(tokenForClientDeletion.access_token)).toBe(401);
     expect(await tokenStatus(subject.access_token)).toBe(200);
+
+    // The sweep does not consult the current exchange setting: a token exchanged while
+    // exchange was enabled must still die with its client after exchange is switched off.
+    const laterRegistration = await exchangeServer.fetch(
+      createMockRequest(
+        `${issuer}/oauth/register`,
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify({
+          redirect_uris: ['https://client.example.com/callback'],
+          token_endpoint_auth_method: 'client_secret_post',
+          grant_types: ['authorization_code', 'refresh_token', 'urn:ietf:params:oauth:grant-type:token-exchange'],
+        })
+      ),
+      env,
+      ctx
+    );
+    expect(laterRegistration.status).toBe(201);
+    const laterClient = await laterRegistration.json<any>();
+    const laterExchange = await exchangeServer.fetch(
+      createMockRequest(
+        `${issuer}/oauth/token`,
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        new URLSearchParams({
+          grant_type: 'urn:ietf:params:oauth:grant-type:token-exchange',
+          subject_token: subject.access_token,
+          subject_token_type: 'urn:ietf:params:oauth:token-type:access_token',
+          resource: calendarResource,
+          client_id: laterClient.client_id,
+          client_secret: laterClient.client_secret,
+        }).toString()
+      ),
+      env,
+      ctx
+    );
+    expect(laterExchange.status).toBe(200);
+    const laterToken = await laterExchange.json<any>();
+    expect(await tokenStatus(laterToken.access_token)).toBe(200);
+    const exchangeDisabled = new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>({
+      issuer,
+      resources: [calendarResource],
+      authorizeEndpoint: '/authorize',
+      tokenEndpoint: '/oauth/token',
+      clientRegistrationEndpoint: '/oauth/register',
+      scopesSupported: ['calendar:read'],
+      accessTokens: exchangeTokens,
+    });
+    await exchangeDisabled.getOAuthApi(env).deleteClient(laterClient.client_id);
+    expect(await tokenStatus(laterToken.access_token)).toBe(401);
+    expect(await tokenStatus(subject.access_token)).toBe(200);
   });
 
   it('fails the refresh of an unbound old grant with invalid_grant when no legacy resource is configured', async () => {
