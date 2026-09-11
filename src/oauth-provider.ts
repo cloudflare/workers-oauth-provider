@@ -2493,22 +2493,25 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Publish the public signing keys used by RFC 9068 JWT access tokens.
     if (servesAuthorizationServer && this.jwtAccessTokens && this.isJwksEndpoint(url)) {
-      if (request.method !== 'GET') {
+      if (request.method !== 'GET' && request.method !== 'HEAD') {
         return this.addCorsHeaders(
           new Response(null, {
             status: 405,
-            headers: { Allow: 'GET' },
+            headers: { Allow: 'GET, HEAD, OPTIONS' },
           }),
           request
         );
       }
       const jwks = await this.jwtAccessTokens.getJwks(env);
       return this.addCorsHeaders(
-        Response.json(jwks, {
-          headers: {
-            'Cache-Control': 'public, max-age=300',
-          },
-        }),
+        withoutBodyForHead(
+          request,
+          Response.json(jwks, {
+            headers: {
+              'Cache-Control': 'public, max-age=300',
+            },
+          })
+        ),
         request
       );
     }
