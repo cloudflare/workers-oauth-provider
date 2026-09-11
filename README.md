@@ -855,7 +855,7 @@ new OAuthProvider({
 });
 ```
 
-Workers KV is eventually consistent and has no compare-and-swap, so it is a compatibility backend: a freshly issued token may not be visible at every location immediately, and two concurrent refreshes of the same token both succeed. The Durable Object SQLite provider serializes each user's grants, tokens, and refresh rotations inside one object with strong read-after-write, and bounds grant replacement during `completeAuthorization()` with a per-client index instead of scanning every grant the user holds:
+Workers KV is eventually consistent and has no compare-and-swap, so it is a compatibility backend: a freshly issued token may not be visible at every location immediately, and two concurrent refreshes of the same token both succeed. The Durable Object SQLite provider (experimental) serializes each user's grants, tokens, and refresh rotations inside one object with strong read-after-write, and bounds grant replacement during `completeAuthorization()` with a per-client index instead of scanning every grant the user holds:
 
 ```ts
 import {
@@ -873,7 +873,7 @@ new OAuthProvider({
 });
 ```
 
-The Durable Object provider keeps no global index, so `listClients()`, `deleteClient()`, and `purgeExpiredData()` reject with an `unsupported_operation` storage error; expired records are removed by each object's alarm. Custom providers implement the contract exported from `@cloudflare/workers-oauth-provider/storage`; see [docs/storage-providers.md](https://github.com/cloudflare/workers-oauth-provider/blob/main/docs/storage-providers.md).
+The Durable Object provider keeps no global index, so `listClients()`, `deleteClient()`, and `purgeExpiredData()` reject with an `unsupported_operation` storage error; expired records are removed by each object's alarm. The Durable Object provider is experimental: it is new in this release and its object schema may change in a minor release, so Workers KV remains the stable default. Custom providers implement the contract exported from `@cloudflare/workers-oauth-provider/storage`; see [docs/storage-providers.md](https://github.com/cloudflare/workers-oauth-provider/blob/main/docs/storage-providers.md).
 
 ## Configuration reference
 

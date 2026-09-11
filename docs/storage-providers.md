@@ -6,6 +6,12 @@ configuration or migration. The Durable Object SQLite provider serializes each
 user's grants and tokens in one object and is the right choice when concurrent
 code exchanges or refresh rotations for the same user must not race.
 
+**Status.** The Durable Object SQLite provider is experimental. It is new in
+this release with no production mileage, `listClients()`, `deleteClient()`, and
+`purgeExpiredData()` are unsupported on it, and its object schema may change in
+a minor release. Workers KV is the stable default and the migration path for
+every existing deployment.
+
 ## Configuring the Durable Object provider
 
 Export the storage class from your Worker, bind it as a SQLite-backed Durable

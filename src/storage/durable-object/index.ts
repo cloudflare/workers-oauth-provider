@@ -59,6 +59,13 @@ export interface DurableObjectSqliteStorageOptions<Env> {
   readonly binding: (env: Env) => OAuthStorageObjectNamespace;
 }
 
+/**
+ * Durable Object SQLite storage provider.
+ *
+ * @experimental New in this release with no production mileage. `listClients()`,
+ * `deleteClient()`, and `purgeExpiredData()` are unsupported on it, and its object
+ * schema may change in a minor release. Workers KV is the stable default.
+ */
 export function durableObjectSqliteStorage<Env>(
   options: DurableObjectSqliteStorageOptions<Env>
 ): OAuthStorageProvider<Env> {
