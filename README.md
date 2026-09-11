@@ -552,7 +552,7 @@ The existing combined `OAuthProvider` configuration has one `resourceMetadata.re
 For a multi-resource `OAuthAuthorizationServer`, `defaultResource` and `legacyGrantResource` solve different compatibility problems:
 
 - `defaultResource` selects the resource for a new authorization request that omits `resource`.
-- `legacyGrantResource` is the server-controlled migration destination for an old stored grant that has no resource. A client-supplied token-request parameter cannot choose or change this destination.
+- `legacyGrantResource` is the server-controlled migration destination for an old stored grant or access token that has no resource. A client-supplied token-request parameter cannot choose or change this destination. It is deployment policy rather than an issuance-time claim, so changing it re-targets every surviving unbound record; keep it fixed for the migration window.
 
 Both values must name a declared resource and are checked at construction. If a multi-resource server omits `legacyGrantResource`, an old unbound grant cannot be migrated safely. A stored grant already bound to a registered resource keeps that resource, and a stored 0.x array that contains the registered resource resolves to it. A grant bound only to unregistered values fails its refresh with `invalid_grant`, which conformant clients answer by starting a new authorization.
 

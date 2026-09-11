@@ -681,7 +681,10 @@ export type OAuthAuthorizationServerOptions<Env = Cloudflare.Env> = Omit<
   /** Resource selected for a new authorization request that omits `resource`. */
   defaultResource?: string;
 
-  /** Migration destination for pre-resource grants. */
+  /**
+   * Migration destination for pre-resource grants and access tokens. Changing it
+   * re-targets every surviving unbound record, so keep it fixed for the migration window.
+   */
   legacyGrantResource?: string;
 };
 
@@ -1679,6 +1682,18 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   /** Whether plain `http` identifiers are accepted (development only). */
   private readonly allowHttp: boolean;
 
+  /**
+   * `allowHttp` exists for `wrangler dev` on a loopback host. An http identifier on any
+   * other host means authorization codes and bearer tokens travel in cleartext, which is
+   * almost always a production misconfiguration, so say so at construction.
+   */
+  private warnIfCleartextRemote(url: URL, name: string): void {
+    if (url.protocol !== 'http:' || isLoopbackHostname(url.hostname)) return;
+    console.warn(
+      `allowHttp: ${name} ${url.href} uses plain http on a non-loopback host. OAuth 2.1 requires https; tokens and authorization codes will travel in cleartext.`
+    );
+  }
+
   /** Every protected-resource role hosted by this provider. */
   private readonly resourceServers: NormalizedResourceServer<Env>[];
 
@@ -1890,6 +1905,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       } catch (e) {
         throw new TypeError(`${name} must be either an absolute path starting with / or a valid URL`);
       }
+      if (this.explicitIssuer) this.warnIfCleartextRemote(parsed, name);
       if (
         this.explicitIssuer &&
         (!hasAcceptedCanonicalScheme(parsed, this.allowHttp) || parsed.username || parsed.password || parsed.hash)
@@ -1923,6 +1939,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         'authorizationServer.issuer must be a canonical absolute HTTPS URL (set allowHttp: true to accept http in development)'
       );
     }
+    this.warnIfCleartextRemote(parsed, 'authorizationServer.issuer');
   }
 
   /** Reject exact collisions between protocol endpoints owned by the AS fetch surface. */
@@ -1967,6 +1984,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         const aUrl = new URL(a.route);
         const bUrl = new URL(b.route);
         if (aUrl.origin !== bUrl.origin) continue;
+        // Two resources on one path that differ by query are dispatched by exact query
+        // match, so they do not overlap. A query-less route would match any query.
+        if (aUrl.search && bUrl.search && aUrl.search !== bUrl.search) continue;
         if (pathsOverlapOnBoundary(aUrl.pathname, bUrl.pathname)) {
           throw new TypeError(`API routes for different resources must not overlap: ${a.route} and ${b.route}`);
         }
@@ -2020,6 +2040,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * refresh binds its grant and returns a bound replacement. The client never
    * chooses this destination. Without a migration resource the token is
    * treated as unbound and rejected.
+   *
+   * The destination is deployment policy, not an issuance-time claim: changing
+   * `legacyGrantResource` re-targets every surviving unbound token and grant.
+   * Keep it fixed for the length of the migration window.
    */
   private resolveStoredTokenAudience(audience: string | string[] | undefined): string | string[] | undefined {
     return audience === undefined ? this.getLegacyGrantResource() : audience;
@@ -2075,6 +2099,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       throw new TypeError('resourceMetadata.resource must use a lowercase scheme and lowercase host');
     }
     const parsedResource = new URL(options.resource);
+    this.warnIfCleartextRemote(parsedResource, 'resourceMetadata.resource');
     if (
       parsedResource.username ||
       parsedResource.password ||
@@ -2110,6 +2135,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
             'resourceMetadata.authorization_servers must contain valid HTTPS issuer URLs (set allowHttp: true to accept http in development)'
           );
         }
+        this.warnIfCleartextRemote(parsed, 'resourceMetadata.authorization_servers');
       }
     }
 
@@ -4526,7 +4552,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Get access token from Authorization header
     const authHeader = request.headers.get('Authorization');
 
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    // RFC 7235 §2.1: the authentication scheme is case-insensitive, so `bearer` and
+    // `BEARER` are as valid as `Bearer`.
+    const bearerMatch = authHeader ? /^Bearer[\t ]+([^\s,]+)$/i.exec(authHeader) : null;
+    if (!bearerMatch) {
       // OAuth 2.1 §5.3.2: when authentication information is absent or uses an
       // unsupported scheme, challenge without an error code or description.
       return new Response(null, {
@@ -4538,7 +4567,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       });
     }
 
-    const accessToken = authHeader.substring(7);
+    const accessToken = bearerMatch[1];
     const parts = accessToken.split(':');
     const isPossiblyInternalFormat = parts.length === 3;
 

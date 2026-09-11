@@ -526,6 +526,36 @@ describe('OAuthProvider', () => {
       }
     );
 
+    it('warns when allowHttp admits an http identifier on a non-loopback host', () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        new OAuthProvider({
+          apiRoute: ['/mcp'],
+          apiHandler: TestApiHandler,
+          defaultHandler: testDefaultHandler,
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: '/oauth/token',
+          allowHttp: true,
+          resourceMetadata: { resource: 'http://localhost:8787/mcp', authorization_servers: ['http://localhost:8787'] },
+        });
+        expect(warn).not.toHaveBeenCalled();
+
+        new OAuthProvider({
+          apiRoute: ['/mcp'],
+          apiHandler: TestApiHandler,
+          defaultHandler: testDefaultHandler,
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: '/oauth/token',
+          allowHttp: true,
+          resourceMetadata: { resource: 'http://mcp.example.com/mcp' },
+        });
+        expect(warn).toHaveBeenCalledTimes(1);
+        expect(warn.mock.calls[0][0]).toContain('http://mcp.example.com/mcp uses plain http on a non-loopback host');
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
     it('rejects an http authorization server issuer without allowHttp', () => {
       expect(
         () =>
@@ -13913,6 +13943,58 @@ describe('functional authorization-server and resource-server composition', () =
     await expect(
       authorizationServer.resource(driveResource).validateToken(tokens.access_token, env)
     ).resolves.toBeNull();
+  });
+
+  it('accepts the Bearer scheme case-insensitively at a hosted resource', async () => {
+    const { authorizationServer, calendar } = createRoles();
+    const client = await registerClient(authorizationServer);
+    const tokens = await issueTokens(authorizationServer, client, calendarResource);
+    for (const scheme of ['Bearer', 'bearer', 'BEARER']) {
+      const response = await calendar.fetch(
+        createMockRequest(calendarResource, 'GET', { Authorization: `${scheme} ${tokens.access_token}` }),
+        env,
+        ctx
+      );
+      expect(response.status).toBe(200);
+    }
+    const wrongScheme = await calendar.fetch(
+      createMockRequest(calendarResource, 'GET', { Authorization: `Basic ${tokens.access_token}` }),
+      env,
+      ctx
+    );
+    expect(wrongScheme.status).toBe(401);
+  });
+
+  it('hosts resources that share a path and differ only by query', async () => {
+    const tenantA = 'https://calendar.example.com/mcp?tenant=a';
+    const tenantB = 'https://calendar.example.com/mcp?tenant=b';
+    const authorizationServer = new OAuthAuthorizationServer<TestEnv>({
+      issuer,
+      resources: [tenantA, tenantB],
+      authorizeEndpoint: '/authorize',
+      tokenEndpoint: '/oauth/token',
+    });
+    const a = authorizationServer.protectResource({
+      resourceMetadata: { resource: tenantA },
+      handler: resourceHandler('a'),
+    });
+    const b = authorizationServer.protectResource({
+      resourceMetadata: { resource: tenantB },
+      handler: resourceHandler('b'),
+    });
+
+    const metadataA = await a.fetch(
+      createMockRequest('https://calendar.example.com/.well-known/oauth-protected-resource/mcp?tenant=a'),
+      env,
+      ctx
+    );
+    await expect(metadataA.json()).resolves.toMatchObject({ resource: tenantA });
+    const metadataB = await b.fetch(
+      createMockRequest('https://calendar.example.com/.well-known/oauth-protected-resource/mcp?tenant=b'),
+      env,
+      ctx
+    );
+    await expect(metadataB.json()).resolves.toMatchObject({ resource: tenantB });
   });
 
   it('declares remote audiences without hosting their handlers', async () => {

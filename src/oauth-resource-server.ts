@@ -1,4 +1,4 @@
-import { hasAcceptedCanonicalScheme, validateResourceUri } from './oauth-resource';
+import { hasAcceptedCanonicalScheme, isLoopbackHostname, validateResourceUri } from './oauth-resource';
 
 const PROTECTED_RESOURCE_WELL_KNOWN_PREFIX = '/.well-known/oauth-protected-resource';
 const NO_CACHE_HEADERS = { 'Cache-Control': 'no-store', Pragma: 'no-cache' } as const;
@@ -178,6 +178,7 @@ function validateOptions<Env, Props>(options: OAuthResourceServerOptions<Env, Pr
   const resource = options.resourceMetadata?.resource;
   const allowHttp = options.allowHttp === true;
   const resourceUrl = parseCanonicalUrl(resource, allowHttp);
+  if (resourceUrl) warnIfCleartextRemote(resourceUrl, 'resourceMetadata.resource');
   if (!resourceUrl) {
     throw new TypeError(
       'resourceMetadata.resource must be a canonical absolute HTTPS URI without a fragment (set allowHttp: true to accept http in development)'
@@ -190,6 +191,7 @@ function validateOptions<Env, Props>(options: OAuthResourceServerOptions<Env, Pr
   }
   for (const issuer of authorizationServers) {
     const issuerUrl = parseCanonicalUrl(issuer, allowHttp);
+    if (issuerUrl) warnIfCleartextRemote(issuerUrl, 'resourceMetadata.authorization_servers');
     if (!issuerUrl || issuerUrl.search || issuerUrl.hash) {
       throw new TypeError(
         'resourceMetadata.authorization_servers must contain canonical HTTPS issuer URLs (set allowHttp: true to accept http in development)'
@@ -222,6 +224,14 @@ function validateOptions<Env, Props>(options: OAuthResourceServerOptions<Env, Pr
         : {}),
     },
   };
+}
+
+/** `allowHttp` is for loopback development; an http identifier elsewhere means cleartext tokens. */
+function warnIfCleartextRemote(url: URL, name: string): void {
+  if (url.protocol !== 'http:' || isLoopbackHostname(url.hostname)) return;
+  console.warn(
+    `allowHttp: ${name} ${url.href} uses plain http on a non-loopback host. OAuth 2.1 requires https; tokens will travel in cleartext.`
+  );
 }
 
 function parseCanonicalUrl(value: unknown, allowHttp: boolean): URL | null {
