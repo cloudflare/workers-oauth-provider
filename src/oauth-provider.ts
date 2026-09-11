@@ -1860,7 +1860,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   private readonly storageProvider: OAuthStorageProvider<Env>;
 
   /** Stores opened for each Worker environment. Opening is cheap and stateless, so this only avoids re-instantiation. */
-  private readonly openedStorage = new WeakMap<object, OAuthStorage>();
 
   /**
    * Creates a new OAuth provider instance
@@ -5237,15 +5236,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     return canonical;
   }
 
-  /** Resolves the stores for a Worker environment. */
+  /**
+   * Resolves the stores for a Worker environment. The provider contract makes `open`
+   * cheap and per operation, so nothing is cached here: a provider that resolves
+   * bindings per request always sees the current environment.
+   */
   openStorage(env: Env & ProviderEnv): OAuthStorage {
-    const key = env as unknown as object;
-    let storage = this.openedStorage.get(key);
-    if (!storage) {
-      storage = this.storageProvider.open(env);
-      this.openedStorage.set(key, storage);
-    }
-    return storage;
+    return this.storageProvider.open(env);
   }
 
   /** Physical expiry applied to registered-client writes, when a registration TTL is configured. */
