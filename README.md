@@ -388,7 +388,7 @@ const calendar = authorizationServer.protectResource({
 });
 ```
 
-The authorization server publishes `jwks_uri` in its RFC 8414 metadata and serves the resolver's public keys at that exact URL. It also retains the encrypted token-context record in KV. Consequently, resources returned by `protectResource()`, `authorizationServer.validateToken()`, token exchange, and revocation keep their stateful behavior and can use the full confidential `ctx.props`; the JWT is not the source of those props.
+The authorization server publishes `jwks_uri` in its RFC 8414 metadata and serves the resolver's public keys at that exact URL. It also retains the encrypted token-context record in KV. Consequently, resources returned by `protectResource()`, `authorizationServer.resource(uri).validateToken()`, token exchange, and revocation keep their stateful behavior and can use the full confidential `ctx.props`; the JWT is not the source of those props.
 
 A separate resource Worker that needs only public data can validate the JWT locally. List that remote audience in the authorization server's `resources` without calling `protectResource()`; the declaration advertises and permits the audience but does not attach a handler. `createJwtAccessTokenValidator()` validates the package-specific profile emitted by `createJwtAccessTokens()`, including its provider grant-ID claim; it is not a generic verifier for arbitrary RFC 9068 issuers. The resource Worker's verifier pins the issuer, audience, allowed algorithm, and trusted key source. `mapClaimsToProps` receives verified claims and must validate the application-specific public claim before exposing it to the handler:
 
@@ -396,6 +396,7 @@ A separate resource Worker that needs only public data can validate the JWT loca
 import {
   createJwtAccessTokenValidator,
   createOAuthResourceServer,
+  type JwtAccessTokenKeyHint,
   type JwtAccessTokenPublicKey,
   type ValidatedAccessToken,
 } from '@cloudflare/workers-oauth-provider';
@@ -426,8 +427,16 @@ interface CalendarProps {
 
 let cachedJwks: { keys: JwtAccessTokenPublicKey[]; expiresAt: number } | undefined;
 
-async function loadTrustedAccessTokenKeys(env: CalendarEnv): Promise<JwtAccessTokenPublicKey[]> {
-  if (cachedJwks && cachedJwks.expiresAt > Date.now()) return cachedJwks.keys;
+async function loadTrustedAccessTokenKeys(
+  env: CalendarEnv,
+  hint: JwtAccessTokenKeyHint
+): Promise<JwtAccessTokenPublicKey[]> {
+  // A cached key set is reused until it expires, unless the token names a `kid` it
+  // does not hold: that is what a freshly rotated signing key looks like, so refresh
+  // once instead of rejecting the token.
+  if (cachedJwks && cachedJwks.expiresAt > Date.now()) {
+    if (!hint.kid || cachedJwks.keys.some((key) => key.kid === hint.kid)) return cachedJwks.keys;
+  }
 
   // Fetch only the configured URI over the AS Service Binding. Never follow a
   // key URL supplied by a token.
@@ -480,7 +489,7 @@ export default createOAuthResourceServer<CalendarEnv, CalendarProps>({
 });
 ```
 
-Offline verification cannot observe deletion of a token or grant record. Use short access-token lifetimes, or make `mapClaimsToProps` perform an application status check when immediate revocation is required. If a separate Worker needs confidential props, individual-token revocation, or grant revocation without waiting for expiry, use the private Service Binding and `authorizationServer.validateToken()` pattern above instead.
+Offline verification cannot observe deletion of a token or grant record. Use short access-token lifetimes, or make `mapClaimsToProps` perform an application status check when immediate revocation is required. If a separate Worker needs confidential props, individual-token revocation, or grant revocation without waiting for expiry, use the private Service Binding and `authorizationServer.resource(uri).validateToken()` pattern above instead.
 
 During migration, a separate Worker can try offline JWT validation first and fall back only to its resource-pinned authorization-server binding for old opaque tokens:
 
@@ -516,13 +525,14 @@ Rotate keys in this order:
 3. Promote the new private key to `current`, remove its now-duplicate public JWK from `verificationKeys`, and add the old current key's public JWK there.
 4. Keep the old public JWK until the last token signed with it has passed the maximum effective access-token lifetime, plus JWKS cache time and clock skew; then remove it.
 
-Resource Workers should fetch only the configured `jwks_uri`, never cache longer than its response allows, and select exactly one key by `kid` and pinned algorithm.
+Resource Workers should fetch only the configured `jwks_uri`, never cache longer than its response allows, and select exactly one key by `kid` and pinned algorithm. `maxTokenBytes` is a paired setting: a validator drops any token larger than its own limit before looking at it, so raise it on every offline validator before raising it on the issuer.
 
 Roll this out reader before writer. `accessTokens` installs the JWT reader, signer, and JWKS; `accessTokenFormat` controls only the representation of each newly issued access token:
 
 ```ts
 const authorizationServer = new OAuthAuthorizationServer<Env, AuthProps>({
   issuer: AUTH_ISSUER,
+  resources: [CALENDAR_RESOURCE],
   authorizeEndpoint: '/authorize',
   tokenEndpoint: '/oauth/token',
   accessTokens: jwtAccessTokens,

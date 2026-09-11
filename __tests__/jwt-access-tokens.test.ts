@@ -93,6 +93,73 @@ async function signCustomJwt(
 }
 
 describe('JWT access tokens', () => {
+  it('passes the token kid and alg to the keys resolver so a rotated key can be fetched', async () => {
+    const key = await createKey('RS256', 'rotated-key');
+    const accessTokens = createJwtAccessTokens<{}, TestProps>({
+      issuer: ISSUER,
+      jwksUri: JWKS_URI,
+      keys: () => ({
+        current: { kid: 'rotated-key', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
+      }),
+    });
+    const issued = await accessTokens.issue(
+      issueInput({ userId: 'user-123', tenantId: 'tenant-1', upstreamAccessToken: 'secret' })
+    );
+    // A resolver that only holds the key the token names, as a cache refreshed on a miss would.
+    const keys = vi.fn((_env: {}, hint: { kid?: string; alg: string }) =>
+      hint.kid === 'rotated-key' ? [key.publicJwk] : []
+    );
+    const validate = createJwtAccessTokenValidator<{}, { userId: string }>({
+      issuer: ISSUER,
+      audience: RESOURCE,
+      keys,
+      mapClaimsToProps: ({ userId }) => ({ userId }),
+    });
+    await expect(validate({ token: issued.token, request: new Request(RESOURCE), env: {} })).resolves.toMatchObject({
+      props: { userId: 'user-123' },
+    });
+    expect(keys).toHaveBeenCalledWith({}, { kid: 'rotated-key', alg: 'RS256' });
+  });
+
+  it('rejects an RSA public key whose exponent makes signatures forgeable', async () => {
+    const key = await createKey('RS256', 'weak-exponent');
+    const accessTokens = createJwtAccessTokens<{}, TestProps>({
+      issuer: ISSUER,
+      jwksUri: JWKS_URI,
+      keys: () => ({
+        current: { kid: 'weak-exponent', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
+      }),
+    });
+    const issued = await accessTokens.issue(
+      issueInput({ userId: 'user-123', tenantId: 'tenant-1', upstreamAccessToken: 'secret' })
+    );
+    // e = 1 and e = 2: WebCrypto imports both, and PKCS#1 v1.5 verification under them is trivial.
+    for (const e of ['AQ', 'Ag']) {
+      const validate = createJwtAccessTokenValidator<{}, { userId: string }>({
+        issuer: ISSUER,
+        audience: RESOURCE,
+        keys: () => [{ ...key.publicJwk, e }],
+        mapClaimsToProps: ({ userId }) => ({ userId }),
+      });
+      await expect(validate({ token: issued.token, request: new Request(RESOURCE), env: {} })).rejects.toThrow(
+        'odd public exponent of at least 3'
+      );
+      const publisher = createJwtAccessTokens<{}, TestProps>({
+        issuer: ISSUER,
+        jwksUri: JWKS_URI,
+        keys: () => ({
+          current: {
+            kid: 'weak-exponent',
+            alg: 'RS256',
+            privateKey: key.privateKey,
+            publicJwk: { ...key.publicJwk, e },
+          },
+        }),
+      });
+      await expect(publisher.getJwks({})).rejects.toThrow('odd public exponent of at least 3');
+    }
+  });
+
   it('accepts an http issuer, JWKS URI, and audience on loopback hosts for local development', async () => {
     const localIssuer = 'http://localhost:8787';
     const localResource = 'http://localhost:8788/mcp';
