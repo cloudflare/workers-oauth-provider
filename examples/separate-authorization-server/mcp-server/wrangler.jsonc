@@ -1,0 +1,41 @@
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "example-mcp-server",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-29",
+  // nodejs_compat: the MCP TypeScript SDK pulls in Node built-ins. This Worker does no
+  // client authentication, so it does not need global_fetch_strictly_public.
+  "compatibility_flags": ["nodejs_compat"],
+  "dev": { "port": 8788 },
+
+  // Token validation is an RPC to a named entrypoint on the authorization server. The
+  // binding is private: there is no public route to it.
+  "services": [
+    { "binding": "AUTHORIZATION_SERVER", "service": "example-authorization-server", "entrypoint": "McpTokenValidator" },
+  ],
+
+  // Must match the authorization server's values byte for byte.
+  "define": {
+    "AUTH_ISSUER": "\"http://localhost:8787\"",
+    "MCP_RESOURCE": "\"http://localhost:8788/mcp\"",
+  },
+
+  "env": {
+    "production": {
+      "routes": [{ "pattern": "mcp.example.com", "custom_domain": true }],
+      // Non-inheritable, and `wrangler deploy --env production` suffixes the Worker name,
+      // so the bound service name has to carry the same suffix.
+      "services": [
+        {
+          "binding": "AUTHORIZATION_SERVER",
+          "service": "example-authorization-server-production",
+          "entrypoint": "McpTokenValidator",
+        },
+      ],
+      "define": {
+        "AUTH_ISSUER": "\"https://auth.example.com\"",
+        "MCP_RESOURCE": "\"https://mcp.example.com/mcp\"",
+      },
+    },
+  },
+}

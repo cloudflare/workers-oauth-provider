@@ -1,0 +1,162 @@
+import {
+  AuthorizationError,
+  CimdFetchError,
+  type AuthRequest,
+  type OAuthHelpers,
+} from '@cloudflare/workers-oauth-provider';
+import { SCOPES_SUPPORTED, type Env, type McpProps } from './config';
+import { renderLoginPage } from './login-page';
+
+/**
+ * The `defaultHandler`: every request the provider does not serve itself. Here that is
+ * the interactive authorization endpoint, plus a 404 for anything else.
+ */
+export const authorizeHandler: ExportedHandler<Env> = {
+  fetch(request, env) {
+    if (new URL(request.url).pathname !== '/authorize') {
+      return new Response('Not found', { status: 404 });
+    }
+    // The provider injects its own API into `env` under the `OAUTH_PROVIDER` binding.
+    return handleAuthorize(request, env.OAUTH_PROVIDER);
+  },
+};
+
+/**
+ * The interactive authorization endpoint: the one route an OAuth authorization server
+ * cannot implement for an application, because only the application knows who the user
+ * is and what they agreed to.
+ */
+async function handleAuthorize(request: Request, oauth: OAuthHelpers<McpProps>): Promise<Response> {
+  const url = new URL(request.url);
+  if (request.method !== 'GET' && request.method !== 'POST') {
+    return new Response('Method not allowed', { status: 405, headers: { Allow: 'GET, POST' } });
+  }
+
+  // PLACEHOLDER AUTHENTICATION, part one. This endpoint believes whatever username the
+  // form sends, so it refuses to run anywhere but on a loopback host: deploying the example
+  // unchanged cannot mint grants for arbitrary users. Replace the placeholder before
+  // deploying; see "Before production" in the README.
+  if (!isLoopbackHost(url.hostname)) {
+    return new Response('The placeholder login only runs on localhost. Replace it before deploying.', {
+      status: 501,
+    });
+  }
+
+  // Nothing about the request is trusted until parseAuthRequest() has validated it, so a
+  // failure here renders locally.
+  let authRequest: AuthRequest;
+  try {
+    authRequest = await oauth.parseAuthRequest(request);
+  } catch (error) {
+    return renderAuthorizationFailure(error);
+  }
+
+  // Only the display name is needed from the client record. For a CIMD client this can
+  // fetch the metadata document again; the redirect URI is validated by now, so a failure
+  // goes back to the client as an OAuth error.
+  let clientName: string;
+  try {
+    const client = await oauth.lookupClient(authRequest.clientId);
+    clientName = client?.clientName ?? authRequest.clientId;
+  } catch (error) {
+    return renderAuthorizationFailure(error, authRequest);
+  }
+
+  // The consent screen and the grant must describe the same thing, so both are built
+  // from the filtered list rather than from what the client asked for.
+  const scope = grantableScopes(authRequest.scope);
+
+  if (request.method === 'GET') {
+    return renderLoginPage(url, clientName, scope, authRequest.resource ?? '');
+  }
+
+  let form: FormData;
+  try {
+    form = await request.formData();
+  } catch {
+    // Client-controlled malformed input is a 400, not a Worker error.
+    return new Response('Malformed form submission', { status: 400 });
+  }
+  if (form.get('action') !== 'approve') {
+    // A denial is a normal OAuth outcome, not an error page: report it on the client's
+    // redirect URI so the client stops waiting.
+    return redirectToClient(authRequest, { error: 'access_denied', error_description: 'The user denied the request' });
+  }
+
+  // PLACEHOLDER AUTHENTICATION, part two. Production code must establish who the user is
+  // before this point; the loopback guard above is all that stops this from running there.
+  const userId = String(form.get('username') ?? '').trim() || 'demo';
+
+  // completeAuthorization() looks the client up once more before writing the grant, so a
+  // CIMD client's metadata fetch can fail here too; it gets the same controlled failure.
+  try {
+    const { redirectTo } = await oauth.completeAuthorization({
+      request: authRequest,
+      userId,
+      metadata: { clientName },
+      scope,
+      // Props are encrypted and stored on the grant, then handed back to the protected
+      // handler as `ctx.props`. The granted scope is copied in here, and the
+      // `tokenExchangeCallback` in `index.ts` keeps it equal to each token's effective scope.
+      props: { userId, clientId: authRequest.clientId, scopes: scope } satisfies McpProps,
+    });
+    return Response.redirect(redirectTo, 302);
+  } catch (error) {
+    return renderAuthorizationFailure(error, authRequest);
+  }
+}
+
+/**
+ * RFC 6749 section 3.3 lets the authorization server grant less than was requested. The
+ * provider advertises `scopesSupported` but never enforces it, so an unfiltered
+ * `authRequest.scope` would mint a token carrying scopes this server never offered. A
+ * real deployment decides per user and per client; dropping the unadvertised ones is the
+ * floor, not a policy.
+ */
+function grantableScopes(requested: string[]): string[] {
+  return requested.filter((scope) => SCOPES_SUPPORTED.includes(scope));
+}
+
+/**
+ * `parseAuthRequest()` rejects a bad request in two ways, and a failure to fetch a client
+ * ID metadata document is a third. Without a validated `redirectUri` the error has to be
+ * rendered locally, because redirecting an unvalidated URI is an open redirect. Once the
+ * request has been validated, a later metadata fetch failure goes back to the client as an
+ * OAuth error with `state` and `iss` (RFC 6749 §4.1.2.1), so the client stops waiting.
+ */
+function renderAuthorizationFailure(error: unknown, authRequest?: AuthRequest): Response {
+  if (error instanceof CimdFetchError) {
+    if (authRequest) {
+      return redirectToClient(authRequest, {
+        error: 'temporarily_unavailable',
+        error_description: 'The client ID metadata document could not be fetched',
+      });
+    }
+    return new Response('The client ID metadata document could not be fetched', { status: 400 });
+  }
+  if (!(error instanceof AuthorizationError)) throw error;
+  if (!error.redirectUri) {
+    return new Response(error.description, { status: 400 });
+  }
+  const redirect = new URL(error.redirectUri);
+  redirect.searchParams.set('error', error.code);
+  redirect.searchParams.set('error_description', error.description);
+  if (error.state) redirect.searchParams.set('state', error.state);
+  // RFC 9207: the client must be able to tell which server answered.
+  if (error.issuer) redirect.searchParams.set('iss', error.issuer);
+  return Response.redirect(redirect.toString(), 302);
+}
+
+function redirectToClient(authRequest: AuthRequest, params: Record<string, string>): Response {
+  const redirect = new URL(authRequest.redirectUri);
+  for (const [name, value] of Object.entries(params)) redirect.searchParams.set(name, value);
+  if (authRequest.state) redirect.searchParams.set('state', authRequest.state);
+  if (authRequest.issuer) redirect.searchParams.set('iss', authRequest.issuer);
+  return Response.redirect(redirect.toString(), 302);
+}
+
+/** `localhost`, `127.0.0.0/8`, or `::1`: the hosts `wrangler dev` serves. */
+function isLoopbackHost(hostname: string): boolean {
+  const host = hostname.replace(/^\[|\]$/g, '');
+  return host === 'localhost' || host === '::1' || /^127(\.\d{1,3}){3}$/.test(host);
+}
