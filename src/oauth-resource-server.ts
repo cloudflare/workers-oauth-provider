@@ -89,10 +89,6 @@ export function createOAuthResourceServer<Env = Cloudflare.Env, Props = unknown>
       const url = new URL(request.url);
 
       if (isProtectedResourceMetadataPath(url)) {
-        if (!isExactUrl(url, validated.metadataUrl)) {
-          return addCorsHeaders(new Response(null, { status: 404 }), request);
-        }
-
         if (request.method === 'OPTIONS') {
           return addCorsHeaders(
             new Response(null, {
@@ -103,20 +99,23 @@ export function createOAuthResourceServer<Env = Cloudflare.Env, Props = unknown>
           );
         }
 
-        if (request.method !== 'GET') {
+        if (!isExactUrl(url, validated.metadataUrl)) {
+          return addCorsHeaders(new Response(null, { status: 404 }), request);
+        }
+
+        if (request.method !== 'GET' && request.method !== 'HEAD') {
           return addCorsHeaders(
             new Response(null, {
               status: 405,
-              headers: { Allow: 'GET' },
+              headers: { Allow: 'GET, HEAD, OPTIONS' },
             }),
             request
           );
         }
 
+        const metadata = Response.json(validated.metadata, { headers: NO_CACHE_HEADERS });
         return addCorsHeaders(
-          Response.json(validated.metadata, {
-            headers: NO_CACHE_HEADERS,
-          }),
+          request.method === 'HEAD' ? new Response(null, { status: 200, headers: metadata.headers }) : metadata,
           request
         );
       }
@@ -317,7 +316,9 @@ function createBearerChallenge(
   invalidToken: boolean
 ): Response {
   let challenge = 'Bearer realm="OAuth"';
-  if (isExactResourceUrl(requestUrl, validated.resourceUrl)) {
+  // RFC 9728 §5.1: every request this resource covers, including path-boundary
+  // descendants of the canonical path, points at the one canonical document.
+  if (isCanonicalResourceRequest(requestUrl, validated.resourceUrl)) {
     challenge += `, resource_metadata="${validated.metadataUrl.href}"`;
   }
   if (invalidToken) {
@@ -338,16 +339,6 @@ function createValidationUnavailableResponse(): Response {
     status: 503,
     headers: NO_CACHE_HEADERS,
   });
-}
-
-function isExactResourceUrl(requestUrl: URL, resourceUrl: URL): boolean {
-  if (requestUrl.href === resourceUrl.href) return true;
-  return (
-    resourceUrl.href === resourceUrl.origin &&
-    requestUrl.origin === resourceUrl.origin &&
-    requestUrl.pathname === '/' &&
-    requestUrl.search === ''
-  );
 }
 
 function addCorsHeaders(response: Response, request: Request): Response {

@@ -1702,6 +1702,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     this.typedDefaultHandler = this.validateHandler(options.defaultHandler, 'defaultHandler');
 
     const roleBased = 'authorizationServer' in options;
+    if (!roleBased && 'resourceMatchOriginOnly' in (options as unknown as Record<string, unknown>)) {
+      throw new TypeError(
+        'resourceMatchOriginOnly was removed in 1.0. Configure resourceMetadata.resource; audiences are compared exactly against that canonical resource. See the migration guide.'
+      );
+    }
     let normalizedOptions: InternalOAuthProviderOptions<Env>;
     let configuredResourceServers: Array<{
       resourceMetadata: OAuthProtectedResourceMetadata;
@@ -1801,6 +1806,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
           const handler = this.validateHandler(rawHandler, `apiHandlers[${route}]`);
           this.typedApiHandlers.push({ route, handler, resourceServer });
         }
+      }
+      for (const { route } of this.typedApiHandlers) {
+        this.assertRouteCoveredByResource(route, resourceServer.resourceMetadata.resource);
       }
     }
 
@@ -1947,6 +1955,20 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         }
       }
     }
+  }
+
+  /**
+   * A protected route must be the canonical resource path or a path-boundary descendant of
+   * it. Anything else can never validate a token, because every token is bound to the
+   * canonical resource, so it would be a permanently 401 zone.
+   */
+  private assertRouteCoveredByResource(route: string, resource: string): void {
+    const resourceUrl = new URL(resource);
+    const routePath = this.isPath(route) ? route.split('?')[0] : new URL(route).pathname;
+    if (isPathDescendant(routePath, resourceUrl.pathname)) return;
+    throw new TypeError(
+      `API route ${route} is not covered by resourceMetadata.resource ${resource}. Protected routes must be the canonical resource path or a descendant of it; use ${resourceUrl.origin} as the resource to cover every path on that origin.`
+    );
   }
 
   /** Resolve a configured policy value to the registry's canonical spelling. */
@@ -2169,7 +2191,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       if (
         apiRoute !== undefined ||
         (servesAuthorizationServer && this.isAuthorizationServerMetadataRequest(url)) ||
-        metadataResourceServer !== undefined ||
+        (servesProtectedResources && this.isProtectedResourceMetadataPath(url)) ||
         (servesAuthorizationServer && this.isTokenEndpoint(url)) ||
         (servesAuthorizationServer && this.options.clientRegistrationEndpoint && this.isClientRegistrationEndpoint(url))
       ) {
@@ -2188,17 +2210,17 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Handle .well-known/oauth-authorization-server
     if (servesAuthorizationServer && this.isAuthorizationServerMetadataRequest(url)) {
-      if (request.method !== 'GET') {
+      if (request.method !== 'GET' && request.method !== 'HEAD') {
         return this.addCorsHeaders(
           new Response(null, {
             status: 405,
-            headers: { Allow: 'GET' },
+            headers: { Allow: 'GET, HEAD, OPTIONS' },
           }),
           request
         );
       }
       const response = await this.handleMetadataDiscovery(url);
-      return this.addCorsHeaders(response, request);
+      return this.addCorsHeaders(withoutBodyForHead(request, response), request);
     }
 
     // Handle .well-known/oauth-protected-resource (RFC 9728). A document at
@@ -2208,17 +2230,17 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       if (!metadataResourceServer) {
         return this.addCorsHeaders(new Response(null, { status: 404 }), request);
       }
-      if (request.method !== 'GET') {
+      if (request.method !== 'GET' && request.method !== 'HEAD') {
         return this.addCorsHeaders(
           new Response(null, {
             status: 405,
-            headers: { Allow: 'GET' },
+            headers: { Allow: 'GET, HEAD, OPTIONS' },
           }),
           request
         );
       }
       const response = this.handleProtectedResourceMetadata(url, metadataResourceServer);
-      return this.addCorsHeaders(response, request);
+      return this.addCorsHeaders(withoutBodyForHead(request, response), request);
     }
 
     // Handle token endpoint (including revocation)
@@ -2367,10 +2389,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @returns True if the URL matches the endpoint pattern
    */
   private matchEndpoint(url: URL, endpoint: string, allowAdditionalQuery = false): boolean {
-    if (this.isPath(endpoint) && !this.explicitIssuer) {
-      // Preserve legacy path-only matching. The new role-based shape resolves
-      // paths against its explicit issuer and therefore host-gates them.
-      return url.pathname === endpoint;
+    if (!this.explicitIssuer) {
+      // The combined OAuthProvider keeps its 0.x matching: a path matches on pathname
+      // only, a full URL on hostname and pathname, and the query is ignored either way.
+      // The role-based shape resolves paths against its explicit issuer and host-gates them.
+      if (this.isPath(endpoint)) return url.pathname === endpoint;
+      const legacyEndpoint = new URL(endpoint);
+      return url.hostname === legacyEndpoint.hostname && url.pathname === legacyEndpoint.pathname;
     }
     const endpointUrl = new URL(this.getFullEndpointUrl(endpoint, url));
     if (url.origin !== endpointUrl.origin || url.pathname !== endpointUrl.pathname) return false;
@@ -2399,7 +2424,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @returns True if the URL matches the token endpoint
    */
   private isTokenEndpoint(url: URL): boolean {
-    return this.matchEndpoint(url, this.options.tokenEndpoint);
+    // RFC 6749 §3.2 lets the endpoint URI carry a static query; a client may add its own.
+    return this.matchEndpoint(url, this.options.tokenEndpoint, true);
   }
 
   isAuthorizationEndpointRequest(url: URL): boolean {
@@ -2415,7 +2441,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    */
   private isClientRegistrationEndpoint(url: URL): boolean {
     if (!this.options.clientRegistrationEndpoint) return false;
-    return this.matchEndpoint(url, this.options.clientRegistrationEndpoint);
+    return this.matchEndpoint(url, this.options.clientRegistrationEndpoint, true);
   }
 
   /**
@@ -2444,7 +2470,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   }
 
   private isAuthorizationServerMetadataRequest(url: URL): boolean {
-    return url.href === this.getAuthorizationServerMetadataUrl(url);
+    // RFC 8414 §3 fixes the origin and path; a cache-busting query must not hide the document.
+    const expected = new URL(this.getAuthorizationServerMetadataUrl(url));
+    return url.origin === expected.origin && url.pathname === expected.pathname;
+  }
+
+  /** Whether this instance is the role-based authorization server with a fixed issuer. */
+  get hasExplicitIssuer(): boolean {
+    return this.explicitIssuer !== undefined;
   }
 
   /** Whether a URL is in the RFC 9728 protected-resource metadata namespace. */
@@ -4753,6 +4786,21 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   }
 
   /** Resolve a value to the registry's canonical spelling, requiring one value. */
+  /**
+   * Resolve a stored grant or token resource. A 0.x record may hold an array; it resolves
+   * when exactly one configured resource appears in it, so multi-audience grants for two
+   * resources this server still hosts are ambiguous and fail closed.
+   */
+  private findStoredConfiguredResource(value: string | string[] | undefined): string | undefined {
+    if (!Array.isArray(value)) return this.findConfiguredResource(value);
+    const matches = new Set<string>();
+    for (const entry of value) {
+      const configured = this.findConfiguredResource(entry);
+      if (configured) matches.add(configured);
+    }
+    return matches.size === 1 ? [...matches][0] : undefined;
+  }
+
   findConfiguredResource(value: string | string[] | undefined): string | undefined {
     const singular = Array.isArray(value) ? (value.length === 1 ? value[0] : undefined) : value;
     if (typeof singular !== 'string' || !validateResourceUri(singular)) return undefined;
@@ -4812,7 +4860,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     requestedResource: string | string[] | undefined,
     subjectResource: string | string[] | undefined
   ): string {
-    const subjectAudience = this.findConfiguredResource(this.resolveStoredTokenAudience(subjectResource));
+    const subjectAudience = this.findStoredConfiguredResource(this.resolveStoredTokenAudience(subjectResource));
     if (!subjectAudience) {
       throw new OAuthError('invalid_target', {
         description: 'Subject token is not bound to a configured resource',
@@ -4843,7 +4891,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const grantedResource = grant.resource;
     const resourceWasProvided = requestedResource !== undefined;
     const grantResourceWasStored = grantedResource !== undefined;
-    const canonicalGrantResource = this.findConfiguredResource(grantedResource);
+    const canonicalGrantResource = this.findStoredConfiguredResource(grantedResource);
     const canonicalRequestedResource = resourceWasProvided ? this.findConfiguredResource(requestedResource) : undefined;
 
     if (grantResourceWasStored && !canonicalGrantResource) {
@@ -5031,10 +5079,16 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       return this.getConfiguredResourceMetadataUrl(configuredResource);
     }
 
-    // HTTP serializes an origin request with `/` even when the configured root
-    // resource was written without it. This is the one unavoidable spelling
-    // equivalence for matching an actual Request URL.
-    if (configuredResource === requestUrl.origin && requestUrl.pathname === '/' && requestUrl.search === '') {
+    // RFC 9728 §5.1 permits the canonical document on any request the resource covers.
+    // A canonical path is the base audience for its path-boundary descendants, so a 401
+    // at /mcp/messages still points clients at the metadata for /mcp. A resource with a
+    // query is matched only exactly.
+    const resourceUrl = new URL(configuredResource);
+    if (
+      requestUrl.origin === resourceUrl.origin &&
+      !resourceUrl.search &&
+      isPathDescendant(requestUrl.pathname, resourceUrl.pathname)
+    ) {
       return this.getConfiguredResourceMetadataUrl(configuredResource);
     }
 
@@ -5410,8 +5464,27 @@ function appendHeaderValue(headers: Headers, name: string, value: string): void 
 
 /** Whether a request or audience names one canonical configured resource. */
 function isExactResource(value: string | string[] | undefined, configuredResource: string): boolean {
-  const resource = Array.isArray(value) ? (value.length === 1 ? value[0] : undefined) : value;
-  return typeof resource === 'string' && resourceMatches(resource, configuredResource, false);
+  // A stored 0.x record may carry an array audience; it is bound to a configured resource
+  // when that resource appears in it. New tokens always carry exactly one audience.
+  if (Array.isArray(value)) {
+    return value.some((entry) => typeof entry === 'string' && resourceMatches(entry, configuredResource, false));
+  }
+  return typeof value === 'string' && resourceMatches(value, configuredResource, false);
+}
+
+/** RFC 9110 §9.3.2: a HEAD response carries the GET headers and no body. */
+function withoutBodyForHead(request: Request, response: Response): Response {
+  if (request.method !== 'HEAD') return response;
+  return new Response(null, { status: response.status, headers: response.headers });
+}
+
+/** Whether `candidate` is `base` or a path-boundary descendant of it (trailing slashes ignored). */
+function isPathDescendant(candidate: string, base: string): boolean {
+  const normalize = (path: string) => path.replace(/\/+$/, '') || '/';
+  const normalizedBase = normalize(base);
+  const normalizedCandidate = normalize(candidate);
+  if (normalizedBase === '/') return true;
+  return normalizedCandidate === normalizedBase || normalizedCandidate.startsWith(`${normalizedBase}/`);
 }
 
 /**
@@ -5861,7 +5934,9 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
    */
   async parseAuthRequest(request: Request): Promise<AuthRequest> {
     const url = new URL(request.url);
-    if (!this.provider.isAuthorizationEndpointRequest(url)) {
+    // The combined OAuthProvider never checked which URL the application parsed from; the
+    // role-based server host-gates its authorize endpoint against the explicit issuer.
+    if (this.provider.hasExplicitIssuer && !this.provider.isAuthorizationEndpointRequest(url)) {
       throw new AuthorizationError('invalid_request', {
         description: 'Authorization request was sent to an unconfigured endpoint',
       });

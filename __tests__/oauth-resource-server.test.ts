@@ -127,12 +127,14 @@ describe('createOAuthResourceServer', () => {
     expect(response.headers.get('Pragma')).toBe('no-cache');
   });
 
-  it('does not advertise mismatched canonical metadata from a descendant challenge', async () => {
+  it('advertises the canonical metadata from a descendant challenge', async () => {
     const server = createTestServer();
     const response = await server.fetch(new Request(`${RESOURCE}/tools`), env, new MockExecutionContext());
 
+    // RFC 9728 §5.1: the canonical path is the base audience for its descendants, so a
+    // 401 at /mcp/tools still points the client at the one canonical document.
     expect(response.status).toBe(401);
-    expect(response.headers.get('WWW-Authenticate')).toBe('Bearer realm="OAuth"');
+    expect(response.headers.get('WWW-Authenticate')).toBe(`Bearer realm="OAuth", resource_metadata="${METADATA_URL}"`);
   });
 
   it('validates a bearer token and exposes validator props to the protected handler', async () => {

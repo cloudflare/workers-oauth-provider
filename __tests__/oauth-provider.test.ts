@@ -912,7 +912,7 @@ describe('OAuthProvider', () => {
       expect(response.status).toBe(404);
     });
 
-    it('should return 404 with CORS for OPTIONS on a noncanonical metadata alias', async () => {
+    it('answers OPTIONS preflight with 204 across the protected-resource metadata namespace', async () => {
       const preflightRequest = createMockRequest(
         'https://example.com/.well-known/oauth-protected-resource/mcp',
         'OPTIONS',
@@ -924,7 +924,7 @@ describe('OAuthProvider', () => {
 
       const response = await oauthProvider.fetch(preflightRequest, mockEnv, mockCtx);
 
-      expect(response.status).toBe(404);
+      expect(response.status).toBe(204);
       expect(response.headers.get('Access-Control-Allow-Origin')).toBe('https://spa.example.com');
     });
 
@@ -6334,7 +6334,9 @@ describe('OAuthProvider', () => {
       expect(apiResponse.status).toBe(401);
 
       const wwwAuth = apiResponse.headers.get('WWW-Authenticate');
-      expect(wwwAuth).toBe('Bearer realm="OAuth"');
+      expect(wwwAuth).toBe(
+        'Bearer realm="OAuth", resource_metadata="https://example.com/.well-known/oauth-protected-resource"'
+      );
     });
 
     it('should include correct resource_metadata for root API path', async () => {
@@ -6355,13 +6357,87 @@ describe('OAuthProvider', () => {
       expect(wwwAuth).toContain('resource_metadata="https://example.com/.well-known/oauth-protected-resource"');
     });
 
-    it('should keep resource_metadata canonical for nested API paths', async () => {
+    it('advertises the canonical resource_metadata on nested API paths', async () => {
       const apiRequest = createMockRequest('https://example.com/api/v1/deeply/nested/resource');
       const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
 
       expect(apiResponse.status).toBe(401);
       const wwwAuth = apiResponse.headers.get('WWW-Authenticate');
-      expect(wwwAuth).not.toContain('resource_metadata=');
+      expect(wwwAuth).toContain('resource_metadata="https://example.com/.well-known/oauth-protected-resource"');
+    });
+
+    it('serves discovery documents to HEAD and tolerates a query on the authorization server metadata URL', async () => {
+      const head = await oauthProvider.fetch(
+        createMockRequest('https://example.com/.well-known/oauth-authorization-server', 'HEAD'),
+        mockEnv,
+        mockCtx
+      );
+      expect(head.status).toBe(200);
+      expect(await head.text()).toBe('');
+
+      const cacheBusted = await oauthProvider.fetch(
+        createMockRequest('https://example.com/.well-known/oauth-authorization-server?v=2'),
+        mockEnv,
+        mockCtx
+      );
+      expect(cacheBusted.status).toBe(200);
+      await expect(cacheBusted.json()).resolves.toMatchObject({ issuer: 'https://example.com' });
+
+      const put = await oauthProvider.fetch(
+        createMockRequest('https://example.com/.well-known/oauth-protected-resource', 'PUT'),
+        mockEnv,
+        mockCtx
+      );
+      expect(put.status).toBe(405);
+      expect(put.headers.get('Allow')).toBe('GET, HEAD, OPTIONS');
+
+      const preflight = await oauthProvider.fetch(
+        createMockRequest('https://example.com/.well-known/oauth-protected-resource/not-canonical', 'OPTIONS', {
+          Origin: 'https://client.example.com',
+        }),
+        mockEnv,
+        mockCtx
+      );
+      expect(preflight.status).toBe(204);
+    });
+
+    it('rejects a leftover resourceMatchOriginOnly option and an API route the resource does not cover', () => {
+      expect(
+        () =>
+          new OAuthProvider({
+            apiRoute: ['/mcp'],
+            apiHandler: TestApiHandler,
+            defaultHandler: testDefaultHandler,
+            authorizeEndpoint: '/authorize',
+            tokenEndpoint: '/oauth/token',
+            resourceMetadata: { resource: 'https://mcp.example.com/mcp' },
+            ...({ resourceMatchOriginOnly: true } as object),
+          })
+      ).toThrow('resourceMatchOriginOnly was removed in 1.0');
+
+      expect(
+        () =>
+          new OAuthProvider({
+            apiRoute: ['/api'],
+            apiHandler: TestApiHandler,
+            defaultHandler: testDefaultHandler,
+            authorizeEndpoint: '/authorize',
+            tokenEndpoint: '/oauth/token',
+            resourceMetadata: { resource: 'https://mcp.example.com/mcp' },
+          })
+      ).toThrow('API route /api is not covered by resourceMetadata.resource https://mcp.example.com/mcp');
+
+      expect(
+        () =>
+          new OAuthProvider({
+            apiRoute: ['/mcp', '/mcp/tools/'],
+            apiHandler: TestApiHandler,
+            defaultHandler: testDefaultHandler,
+            authorizeEndpoint: '/authorize',
+            tokenEndpoint: '/oauth/token',
+            resourceMetadata: { resource: 'https://mcp.example.com/mcp' },
+          })
+      ).not.toThrow();
     });
 
     it('should use the configured resource host for cross-origin API routes', async () => {
@@ -6408,7 +6484,7 @@ describe('OAuthProvider', () => {
 
       expect(apiResponse.status).toBe(401);
       const wwwAuth = apiResponse.headers.get('WWW-Authenticate');
-      expect(wwwAuth).not.toContain('resource_metadata=');
+      expect(wwwAuth).toContain('resource_metadata="https://example.com/.well-known/oauth-protected-resource"');
     });
 
     it('should reject API requests with an invalid token', async () => {
@@ -6442,7 +6518,9 @@ describe('OAuthProvider', () => {
   describe('Canonical audience validation (RFC 7519 Section 4.1.3)', () => {
     function createExternalProvider(resource: string) {
       return new OAuthProvider({
-        apiRoute: ['/api/'],
+        // The protected route is the canonical path itself; a broader route would be
+        // rejected at construction because its other paths could never validate a token.
+        apiRoute: [new URL(resource).pathname],
         apiHandler: TestApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
@@ -6482,15 +6560,16 @@ describe('OAuthProvider', () => {
       );
     });
 
-    it('rejects sibling paths and non-boundary string prefixes', async () => {
+    it('leaves sibling paths and non-boundary string prefixes outside the protected route', async () => {
       const provider = createExternalProvider('https://example.com/api/parent');
 
-      expect((await provider.fetch(externalRequest('https://example.com/api/sibling'), mockEnv, mockCtx)).status).toBe(
-        401
-      );
-      expect(
-        (await provider.fetch(externalRequest('https://example.com/api/parentish'), mockEnv, mockCtx)).status
-      ).toBe(401);
+      // Dispatch and audience validation agree: a path the canonical resource does not
+      // cover is not a protected route at all, so it reaches the default handler instead
+      // of becoming a permanently unauthorized zone.
+      const sibling = await provider.fetch(externalRequest('https://example.com/api/sibling'), mockEnv, mockCtx);
+      expect(await sibling.text()).toBe('Default handler');
+      const prefix = await provider.fetch(externalRequest('https://example.com/api/parentish'), mockEnv, mockCtx);
+      expect(await prefix.text()).toBe('Default handler');
     });
 
     it('preserves a query component that is part of the canonical audience', async () => {
@@ -6965,23 +7044,39 @@ describe('OAuthProvider', () => {
       });
     });
 
-    it.each([
-      ['multiple', [configuredResource, configuredResource]],
-      ['mismatched', ['https://other.example.com/api']],
-    ])('rejects a stored %s resource array without mutating the grant', async (_label, storedResource) => {
+    it('migrates a stored resource array that contains the configured resource', async () => {
       const provider = createProvider();
       const client = await registerClient(provider);
       const tokens = await issueTokens(provider, client);
       const { key, grant } = await getOnlyGrant();
-      grant.resource = storedResource;
+      grant.resource = ['https://other.example.com/api', configuredResource];
       await mockEnv.OAUTH_KV.put(key, JSON.stringify(grant));
-      const grantBefore = await mockEnv.OAUTH_KV.get(key);
 
       const response = await refresh(provider, client, tokens.refresh_token);
-      expect(response.status).toBe(400);
-      await expect(response.json()).resolves.toMatchObject({ error: 'invalid_grant' });
-      expect(await mockEnv.OAUTH_KV.get(key)).toBe(grantBefore);
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toMatchObject({ resource: configuredResource });
+      await expect(mockEnv.OAUTH_KV.get(key, { type: 'json' })).resolves.toMatchObject({
+        resource: configuredResource,
+      });
     });
+
+    it.each([['mismatched', ['https://other.example.com/api']]])(
+      'rejects a stored %s resource array without mutating the grant',
+      async (_label, storedResource) => {
+        const provider = createProvider();
+        const client = await registerClient(provider);
+        const tokens = await issueTokens(provider, client);
+        const { key, grant } = await getOnlyGrant();
+        grant.resource = storedResource;
+        await mockEnv.OAUTH_KV.put(key, JSON.stringify(grant));
+        const grantBefore = await mockEnv.OAUTH_KV.get(key);
+
+        const response = await refresh(provider, client, tokens.refresh_token);
+        expect(response.status).toBe(400);
+        await expect(response.json()).resolves.toMatchObject({ error: 'invalid_grant' });
+        expect(await mockEnv.OAUTH_KV.get(key)).toBe(grantBefore);
+      }
+    );
 
     it('canonicalizes a v0.8.2 refresh grant that already stored the resource', async () => {
       const provider = createProvider();
@@ -9712,7 +9807,9 @@ describe('OAuthProvider', () => {
 
       expect(response.status).toBe(401);
       expect(response.headers.get('Cache-Control')).toBe('no-store');
-      expect(response.headers.get('WWW-Authenticate')).toBe('Bearer realm="OAuth", error="invalid_token"');
+      expect(response.headers.get('WWW-Authenticate')).toBe(
+        'Bearer realm="OAuth", resource_metadata="https://example.com/.well-known/oauth-protected-resource", error="invalid_token"'
+      );
       await expect(response.json()).resolves.toEqual({
         error: 'invalid_token',
         error_description: 'external token expired',
@@ -9747,7 +9844,7 @@ describe('OAuthProvider', () => {
       expect(response.status).toBe(403);
       expect(response.headers.get('X-Trace-Id')).toBe('trace-123');
       expect(response.headers.get('WWW-Authenticate')).toBe(
-        'Bearer realm="OAuth", error="insufficient_scope", scope="account:read profile:read"'
+        'Bearer realm="OAuth", resource_metadata="https://example.com/.well-known/oauth-protected-resource", error="insufficient_scope", scope="account:read profile:read"'
       );
       expect(response.headers.get('WWW-Authenticate')).not.toContain('baseline:read');
       expect(response.headers.get('WWW-Authenticate')).not.toContain('offline_access');
@@ -13090,7 +13187,7 @@ describe('functional authorization-server and resource-server composition', () =
       ctx
     );
     expect(metadataPost.status).toBe(405);
-    expect(metadataPost.headers.get('Allow')).toBe('GET');
+    expect(metadataPost.headers.get('Allow')).toBe('GET, HEAD, OPTIONS');
 
     const calendarMetadata = await calendar.fetch(
       createMockRequest('https://calendar.example.com/.well-known/oauth-protected-resource/mcp'),
@@ -13109,7 +13206,7 @@ describe('functional authorization-server and resource-server composition', () =
       ctx
     );
     expect(calendarMetadataPost.status).toBe(405);
-    expect(calendarMetadataPost.headers.get('Allow')).toBe('GET');
+    expect(calendarMetadataPost.headers.get('Allow')).toBe('GET, HEAD, OPTIONS');
 
     const driveMetadata = await drive.fetch(
       createMockRequest('https://drive.example.com/.well-known/oauth-protected-resource/mcp'),
