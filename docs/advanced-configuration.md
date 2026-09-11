@@ -80,7 +80,19 @@ await env.OAUTH_PROVIDER.exchangeToken({
 });
 ```
 
-The new token cannot exceed the subject token's scope ceiling or remaining lifetime. Its subject audience and any `aud` request value must resolve to the same registered resource.
+The new token cannot exceed the subject token's scope ceiling or remaining lifetime. Its subject audience and any `aud` request value must resolve to the same registered resource. Subject-token failures return `invalid_request`, as RFC 8693 §2.2.2 requires.
+
+A client must register `urn:ietf:params:oauth:grant-type:token-exchange` in its `grant_types` to use the grant at the token endpoint. A token is exchanged by the client its grant was issued to. Exchanging a token that another client obtained is rejected with `invalid_request` unless `tokenExchangeCallback` allows that specific exchange. The callback sees both parties, so the decision can be per client pair:
+
+```ts
+tokenExchangeCallback: (options) => {
+  if (options.grantType === 'urn:ietf:params:oauth:grant-type:token-exchange') {
+    // options.clientId is the exchanging client; options.subjectClientId issued the grant.
+    const trusted = options.subjectClientId === options.clientId || DELEGATES.has(options.clientId);
+    return { allowCrossClientExchange: trusted };
+  }
+},
+```
 
 ## Enterprise-managed authorization
 

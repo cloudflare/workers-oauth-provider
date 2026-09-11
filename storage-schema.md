@@ -167,7 +167,7 @@ Token records store metadata about issued access tokens, including denormalized 
 
 > **Note:** The token format is `{userId}:{grantId}:{random-secret}` which embeds the identifiers needed for efficient lookups. The token key format includes the user ID and grant ID to enable efficient revocation of all tokens for a specific grant. The token record contains denormalized grant information to eliminate the need for a separate grant lookup during token validation. The token also carries a wrapped encryption key that can only be unwrapped using the actual token string, allowing decryption of the encrypted props.
 
-> **Audience safety:** Every access token issued by 1.0 carries exactly one registered canonical resource as its audience. Token exchange cannot change that audience. Persisted token types keep the field optional only so old KV records can be decoded; each protected-resource surface rejects records whose audience is missing or belongs to another resource. A client holding an unbound pre-1.0 access token should refresh or reconnect.
+> **Audience safety:** Every access token issued by 1.0 carries exactly one registered canonical resource as its audience. Token exchange cannot change that audience. Persisted token types keep the field optional so old KV records can be decoded: a record with no audience is treated as bound to the server-selected migration resource (the sole resource, or `legacyGrantResource`) until it expires, a stored 0.x array is bound to the configured resource it contains, and a record whose audience belongs only to other resources is rejected. Refresh binds the grant and returns a replacement token with an explicit audience.
 
 **TTL:** Access tokens typically have a 1 hour (3600 seconds) TTL by default
 

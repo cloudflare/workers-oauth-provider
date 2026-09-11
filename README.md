@@ -382,7 +382,7 @@ https://mcp.example.com/.well-known/oauth-protected-resource/mcp
 
 That document returns the configured canonical `resource`. The discovery URL is built from the canonical resource: an origin uses `/.well-known/oauth-protected-resource`, and a path and query are inserted after the well-known prefix.
 
-RFC 9728 requires challenge-discovered metadata to identify the original requested resource URL. The provider therefore includes `resource_metadata` only when the protected request URL is the canonical resource itself. A canonical path may still be a base audience for descendants: a token for `https://mcp.example.com/mcp` is accepted at `/mcp/tools`, but a request to that descendant does not advertise a mismatched metadata document. If clients must discover authorization from multiple entry paths, register a distinct canonical resource for each entry point and route its protected-resource handle explicitly.
+A canonical path is the base audience for its path-boundary descendants: a token for `https://mcp.example.com/mcp` is accepted at `/mcp/tools`, and a challenge at `/mcp/tools` advertises the one canonical document for `/mcp`, as RFC 9728 §5.1 permits. A request on another origin, or one that the canonical resource does not cover, gets a challenge without `resource_metadata`. Every protected route must be the canonical resource path or a descendant of it; the provider rejects any other `apiRoute` or `apiHandlers` key at construction, because a token could never validate there.
 
 `authorization_servers` may contain more than one issuer. Each value must use canonical HTTPS issuer spelling: lowercase scheme and host, with no userinfo, default port, dot segments, query, or fragment. As with resources, `http` is accepted only when `allowHttp: true` is set. OAuth issuer comparison is exact. The MCP client chooses an authorization server and must keep credentials and tokens separate for each issuer. A resource registered with `OAuthAuthorizationServer.protectResource()` defaults this list to that server's configured `issuer`; the standalone `createOAuthResourceServer()` requires it explicitly.
 
@@ -496,7 +496,7 @@ clientRegistrationEndpoint: '/oauth/register';
 
 MCP 2026-07-28 deprecates DCR for new implementations in favor of CIMD. The endpoint remains useful for compatibility with clients that do not support CIMD.
 
-Registration accepts only authentication methods, grants, and response types implemented by the configured provider, and rejects inconsistent grant/response combinations before storage. Choice-valued `token_endpoint_auth_methods_supported` input is negotiated to one effective `token_endpoint_auth_method`; grant and response registrations remain strict. Omitted metadata uses the RFC 7591 defaults: `client_secret_basic`, `grant_types: ["authorization_code"]`, and `response_types: ["code"]`.
+Registration accepts only authentication methods, grants, and response types implemented by the configured provider, and rejects inconsistent grant/response combinations before storage. Choice-valued `token_endpoint_auth_methods_supported` input is negotiated to one effective `token_endpoint_auth_method`; grant and response registrations remain strict. Omitted metadata uses the RFC 7591 defaults: `client_secret_basic`, `grant_types: ["authorization_code"]`, and `response_types: ["code"]`. The token endpoint enforces each client's registered grant types with `unauthorized_client`; `refresh_token` is implied by `authorization_code`, and a client must register `urn:ietf:params:oauth:grant-type:token-exchange` to use token exchange.
 
 The effective `token_endpoint_auth_method` returned by registration is enforced exactly. When both authentication metadata fields are omitted, no explicit-method marker is stored and the client may use either `client_secret_basic` or `client_secret_post`, provided the same stored secret validates. Client records written by earlier releases have no marker and receive the same compatibility. This never crosses between `none` and a secret method and does not apply to CIMD clients.
 
@@ -541,7 +541,7 @@ Conforming MCP clients are required to send `resource` in authorization and toke
 
 ASCII case differences in the URI scheme and host are accepted, but port, path, query, trailing slash, and array cardinality remain strict. The authorization server always stores and returns the configured lowercase scheme-and-host spelling. The token response includes the selected resource, and the access-token audience contains that resource alone.
 
-Token exchange cannot change the resource. Both the subject-token audience and any explicit requested resource must resolve to the same registered canonical value. Internally and externally validated tokens are accepted at a protected route only when their audience matches that route's resource.
+Token exchange cannot change the resource. Both the subject-token audience and any explicit requested resource must resolve to the same registered canonical value. A token is exchanged by the client its grant was issued to unless `tokenExchangeCallback` returns `allowCrossClientExchange: true`. Internally and externally validated tokens are accepted at a protected route only when their audience matches that route's resource.
 
 Path-aware API validation uses path-boundary prefix matching. A canonical audience for `https://example.com/mcp` covers `/mcp` and `/mcp/tools`, but not `/mcp-other`. A canonical trailing slash remains significant.
 
@@ -554,11 +554,11 @@ For a multi-resource `OAuthAuthorizationServer`, `defaultResource` and `legacyGr
 - `defaultResource` selects the resource for a new authorization request that omits `resource`.
 - `legacyGrantResource` is the server-controlled migration destination for an old stored grant that has no resource. A client-supplied token-request parameter cannot choose or change this destination.
 
-Both values must name a registered resource. If a multi-resource server omits `legacyGrantResource`, an old unbound grant cannot be migrated safely and must be reauthorized. A stored grant already bound to a registered resource keeps that resource; a grant bound to an unregistered value fails closed.
+Both values must name a declared resource and are checked at construction. If a multi-resource server omits `legacyGrantResource`, an old unbound grant cannot be migrated safely. A stored grant already bound to a registered resource keeps that resource, and a stored 0.x array that contains the registered resource resolves to it. A grant bound only to unregistered values fails its refresh with `invalid_grant`, which conformant clients answer by starting a new authorization.
 
 Previously issued access tokens with no audience keep working until they expire. They are treated as bound to the server-selected migration resource (the sole resource, or `legacyGrantResource`), and refresh binds the grant and returns a bound replacement token. A multi-resource server without `legacyGrantResource` has no safe destination, so it rejects such tokens and their refresh grants must be reauthorized. Multiple resources can share the same authorization server, provider implementation, and KV namespace; separate storage is an optional deployment boundary, not a resource-binding requirement.
 
-The 1.0 API removes `resourceMatchOriginOnly`. Canonical matching with scheme/host case tolerance replaces it.
+The 1.0 API removes `resourceMatchOriginOnly`, and a configuration that still sets it fails at construction. Canonical matching with scheme/host case tolerance replaces it.
 
 ## Scopes and step-up authorization
 
