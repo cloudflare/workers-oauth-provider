@@ -65,9 +65,10 @@ and serves `npm run dev:auth`, `npm run dev:mcp` and `npm test`, while `env.prod
 names the deployed domains. The alternative is to build both objects lazily inside
 `fetch()` from `env` vars and memoize them. Either way these are protocol values rather
 than mere ports, so moving a Worker means editing the `define` map as well as `--port`, and
-the resource string is written in five places that must agree byte for byte:
-`registerResource()`, the pinned `validateToken()` call, `resourceMetadata.resource`, and
-the `define` map in each of the two configs.
+the resource string is written in four places that must agree byte for byte:
+`resources` on the authorization server, `resourceMetadata.resource` on the MCP Worker, and
+the `define` map in each of the two configs. The validator entrypoint is pinned through
+`authorizationServer.resource(MCP_RESOURCE)`, so it cannot drift.
 
 Wrangler's dev registry connects the Service Binding between the two sessions. Until the
 authorization server is running, the MCP Worker prints

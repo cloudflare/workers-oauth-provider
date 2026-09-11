@@ -27,12 +27,13 @@ export interface Env {
  * The library owns metadata, token, revocation, and registration. The application owns
  * `/authorize`, because only the application knows who the user is.
  *
- * `registerResource()` declares an audience hosted somewhere else. It has to run before
- * the first request: an authorization server with no registered resource cannot publish
- * useful metadata or issue a resource-bound grant.
+ * `resources` declares every audience this server issues tokens for, whether hosted here or
+ * by another Worker. The registry is fixed at construction, so `defaultResource` and the
+ * `resource()` handle below are checked before the first request.
  */
 const authorizationServer = new OAuthAuthorizationServer<Env, GrantProps>({
   issuer: AUTH_ISSUER,
+  resources: [MCP_RESOURCE, REPORTS_RESOURCE],
   authorizeEndpoint: '/authorize',
   tokenEndpoint: '/oauth/token',
 
@@ -50,9 +51,11 @@ const authorizationServer = new OAuthAuthorizationServer<Env, GrantProps>({
   // With more than one registered resource an authorization request must name exactly
   // one of them, which clients that predate RFC 8707 resource indicators do not do.
   defaultResource: MCP_RESOURCE,
-})
-  .registerResource(MCP_RESOURCE)
-  .registerResource(REPORTS_RESOURCE);
+});
+
+// A handle pinned to one declared resource. A misspelled identifier throws here, at module
+// initialization, instead of surfacing as a 503 across the Service Binding.
+const mcp = authorizationServer.resource(MCP_RESOURCE);
 
 /**
  * The MCP Worker's only view of this authorization server, reachable over a private
@@ -62,7 +65,7 @@ const authorizationServer = new OAuthAuthorizationServer<Env, GrantProps>({
  */
 export class McpTokenValidator extends WorkerEntrypoint<Env> {
   validateToken(token: string) {
-    return authorizationServer.validateToken(token, MCP_RESOURCE, this.env);
+    return mcp.validateToken(token, this.env);
   }
 }
 
