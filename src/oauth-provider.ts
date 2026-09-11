@@ -1566,6 +1566,14 @@ export interface GrantSummary {
 /**
  * Options for creating an access token
  */
+/** An access token built by `mintAccessToken()` but not yet written to KV. */
+interface MintedAccessToken {
+  accessToken: string;
+  key: string;
+  record: Token;
+  expiresIn: number;
+}
+
 interface CreateAccessTokenOptions<Env = Cloudflare.Env> {
   /** Prevalidated access-token representation selected before grant mutation. */
   format: AccessTokenFormat;
@@ -3633,11 +3641,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       grantData.resource = resourceResolution.grantResourceBackfill;
     }
 
-    // Save the updated grant with TTL matching refresh token expiration (if any)
-    await this.saveGrantWithTTL(env, grantKey, grantData, now);
-
-    // Create and store access token with potentially narrowed scopes
-    const accessToken = await this.createAccessToken({
+    // Mint (and for JWTs, sign) the access token before the grant write consumes the
+    // authorization code, so a signing or key-resolution failure leaves the code
+    // retryable instead of forcing the user to authorize again.
+    const minted = await this.mintAccessToken({
       format: accessTokenFormat,
       userId,
       grantId,
@@ -3649,6 +3656,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       audience,
       env,
     });
+
+    // Save the updated grant with TTL matching refresh token expiration (if any).
+    // This is the write that consumes the authorization code.
+    await this.saveGrantWithTTL(env, grantKey, grantData, now);
+
+    // Store the access token record with potentially narrowed scopes
+    await this.persistAccessToken(env, minted);
+    const accessToken = minted.accessToken;
 
     // Build the response
     const tokenResponse: TokenResponse = {
@@ -5324,6 +5339,17 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @returns The access token string
    */
   async createAccessToken(params: CreateAccessTokenOptions<Env>): Promise<string> {
+    const minted = await this.mintAccessToken(params);
+    await this.persistAccessToken(params.env, minted);
+    return minted.accessToken;
+  }
+
+  /**
+   * Build the access token and its state record without touching KV. A JWT signing or
+   * key-resolution failure therefore leaves every one-shot credential (authorization
+   * code, refresh token rotation) untouched and retryable.
+   */
+  async mintAccessToken(params: CreateAccessTokenOptions<Env>): Promise<MintedAccessToken> {
     const {
       format,
       userId,
@@ -5404,17 +5430,17 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       },
     };
 
-    // Save access token with TTL
+    return { accessToken, key: `token:${userId}:${grantId}:${accessTokenId}`, record: accessTokenData, expiresIn };
+  }
+
+  /** Write a minted access token's state record to KV. */
+  async persistAccessToken(env: Env & ProviderEnv, minted: MintedAccessToken): Promise<void> {
     try {
-      await env.OAUTH_KV.put(`token:${userId}:${grantId}:${accessTokenId}`, JSON.stringify(accessTokenData), {
-        expirationTtl: expiresIn,
-      });
+      await env.OAUTH_KV.put(minted.key, JSON.stringify(minted.record), { expirationTtl: minted.expiresIn });
     } catch (error) {
       this.throwRetryableTokenStorageErrorIfKvRateLimited(error);
       throw error;
     }
-
-    return accessToken;
   }
 
   /**
@@ -6782,60 +6808,43 @@ class OAuthHelpersImpl<Env = Cloudflare.Env, Props = any> implements OAuthHelper
    * @returns A Promise resolving when the deletion is confirmed.
    */
   async deleteClient(clientId: string): Promise<void> {
-    // Revoke all grants associated with this client across all users.
-    // Grants are keyed as grant:{userId}:{grantId}, so we scan all grants
-    // and check the clientId stored in each one.
-    let cursor: string | undefined;
-    let allProcessed = false;
-
-    while (!allProcessed) {
-      const listOptions: { prefix: string; cursor?: string } = { prefix: 'grant:' };
-      if (cursor) {
-        listOptions.cursor = cursor;
-      }
-
-      const result = await this.env.OAUTH_KV.list(listOptions);
-
-      for (const key of result.keys) {
-        const grantData: Grant | null = await this.env.OAUTH_KV.get(key.name, { type: 'json' });
-        if (grantData && grantData.clientId === clientId) {
-          await this.revokeGrant(grantData.id, grantData.userId);
-        }
-      }
-
-      if (result.list_complete) {
-        allProcessed = true;
-      } else {
-        cursor = result.cursor;
-      }
-    }
-
-    // Revoke exchanged access tokens owned by this client but stored below a
-    // source grant owned by another client. Ordinary tokens were already
-    // removed by revokeGrant() above.
-    cursor = undefined;
-    allProcessed = false;
-    while (!allProcessed) {
-      const listOptions: { prefix: string; cursor?: string } = { prefix: 'token:' };
-      if (cursor) listOptions.cursor = cursor;
-      const result = await this.env.OAUTH_KV.list(listOptions);
-
-      for (const key of result.keys) {
-        const tokenData: Token | null = await this.env.OAUTH_KV.get(key.name, { type: 'json' });
-        if (tokenData?.grant?.clientId === clientId) {
-          await this.env.OAUTH_KV.delete(key.name);
-        }
-      }
-
-      if (result.list_complete) {
-        allProcessed = true;
-      } else {
-        cursor = result.cursor;
-      }
-    }
-
-    // Delete the client record
+    // Remove the client record first so an interrupted sweep cannot leave a usable client
+    // whose grants and tokens were only partly revoked.
     await this.env.OAUTH_KV.delete(`client:${clientId}`);
+
+    // Revoke all grants associated with this client across all users. Grants are keyed as
+    // grant:{userId}:{grantId}, so scan every grant and check the stored clientId. Keys are
+    // collected before anything is deleted: deleting while paginating could skip records.
+    for (const keyName of await this.listAllKeys('grant:')) {
+      const grantData: Grant | null = await this.env.OAUTH_KV.get(keyName, { type: 'json' });
+      if (grantData && grantData.clientId === clientId) {
+        await this.revokeGrant(grantData.id, grantData.userId);
+      }
+    }
+
+    // Exchanged access tokens owned by this client can live below a source grant owned by
+    // another client. Ordinary tokens were already removed by revokeGrant() above, and
+    // cross-client tokens exist only when token exchange is enabled.
+    if (this.provider.options.allowTokenExchangeGrant) {
+      for (const keyName of await this.listAllKeys('token:')) {
+        const tokenData: Token | null = await this.env.OAUTH_KV.get(keyName, { type: 'json' });
+        if (tokenData?.grant?.clientId === clientId) {
+          await this.env.OAUTH_KV.delete(keyName);
+        }
+      }
+    }
+  }
+
+  /** Every key under a prefix, read to completion before the caller mutates anything. */
+  private async listAllKeys(prefix: string): Promise<string[]> {
+    const names: string[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await this.env.OAUTH_KV.list(cursor ? { prefix, cursor } : { prefix });
+      names.push(...page.keys.map((key) => key.name));
+      cursor = page.list_complete ? undefined : page.cursor;
+    } while (cursor);
+    return names;
   }
 
   /**
