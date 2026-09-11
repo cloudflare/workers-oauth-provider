@@ -13709,6 +13709,7 @@ describe('functional authorization-server and resource-server composition', () =
       () =>
         new OAuthAuthorizationServer<TestEnv>({
           issuer,
+          resources: [calendarResource],
           authorizeEndpoint: '/authorize',
           tokenEndpoint: '/oauth/token',
           accessTokens: collidingJwks,
@@ -13726,6 +13727,7 @@ describe('functional authorization-server and resource-server composition', () =
       () =>
         new OAuthAuthorizationServer<TestEnv>({
           issuer,
+          resources: [calendarResource],
           authorizeEndpoint: '/authorize',
           tokenEndpoint: '/oauth/token',
           accessTokens: authorizationQueryCollision,
@@ -13743,6 +13745,7 @@ describe('functional authorization-server and resource-server composition', () =
       () =>
         new OAuthAuthorizationServer<TestEnv>({
           issuer,
+          resources: [calendarResource],
           authorizeEndpoint: '/authorize',
           tokenEndpoint: '/oauth/token',
           accessTokens: wrongIssuerTokens,
@@ -13755,6 +13758,7 @@ describe('functional authorization-server and resource-server composition', () =
       () =>
         new OAuthAuthorizationServer<TestEnv>({
           issuer,
+          resources: [calendarResource],
           authorizeEndpoint: '/authorize',
           tokenEndpoint: '/oauth/token',
           accessTokenFormat: () => 'opaque',
@@ -13772,6 +13776,7 @@ describe('functional authorization-server and resource-server composition', () =
       () =>
         new OAuthAuthorizationServer<TestEnv>({
           issuer,
+          resources: [calendarResource],
           authorizeEndpoint: '/authorize',
           tokenEndpoint: '/oauth/token',
           accessTokens,
@@ -14196,6 +14201,7 @@ describe('functional authorization-server and resource-server composition', () =
       () =>
         new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>({
           issuer,
+          resources: [calendarResource],
           authorizeEndpoint: '/authorize',
           tokenEndpoint: '/oauth/token',
           accessTokens: { ...accessTokens },
@@ -14208,6 +14214,7 @@ describe('functional authorization-server and resource-server composition', () =
     }));
     const authorizationServer = new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>({
       issuer,
+      resources: [calendarResource],
       authorizeEndpoint: '/authorize',
       tokenEndpoint: '/oauth/token',
       clientRegistrationEndpoint: '/oauth/register',
@@ -14259,9 +14266,11 @@ describe('functional authorization-server and resource-server composition', () =
       ctx
     );
     expect(jwksPost.status).toBe(405);
-    expect(jwksPost.headers.get('Allow')).toBe('GET');
+    expect(jwksPost.headers.get('Allow')).toBe('GET, HEAD, OPTIONS');
 
-    await expect(authorizationServer.validateToken(tokens.access_token, calendarResource, env)).resolves.toMatchObject({
+    await expect(
+      authorizationServer.resource(calendarResource).validateToken(tokens.access_token, env)
+    ).resolves.toMatchObject({
       props: { userId: 'test-user-123', username: 'TestUser' },
       audience: calendarResource,
       clientId: client.client_id,
@@ -14294,7 +14303,9 @@ describe('functional authorization-server and resource-server composition', () =
       jti: payload.jti,
     });
     await env.OAUTH_KV.put(tokenKeys.keys[0].name, JSON.stringify({ ...storedToken, jti: 'corrupted' }));
-    await expect(authorizationServer.validateToken(tokens.access_token, calendarResource, env)).resolves.toBeNull();
+    await expect(
+      authorizationServer.resource(calendarResource).validateToken(tokens.access_token, env)
+    ).resolves.toBeNull();
     await env.OAUTH_KV.put(tokenKeys.keys[0].name, JSON.stringify(storedToken));
 
     const revocation = await authorizationServer.fetch(
@@ -14313,7 +14324,9 @@ describe('functional authorization-server and resource-server composition', () =
       ctx
     );
     expect(revocation.status).toBe(200);
-    await expect(authorizationServer.validateToken(tokens.access_token, calendarResource, env)).resolves.toBeNull();
+    await expect(
+      authorizationServer.resource(calendarResource).validateToken(tokens.access_token, env)
+    ).resolves.toBeNull();
   });
 
   it('rolls access tokens from opaque to JWT without invalidating tokens or refresh grants', async () => {
@@ -14334,6 +14347,7 @@ describe('functional authorization-server and resource-server composition', () =
     });
     const migrationServer = new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>({
       issuer,
+      resources: [calendarResource],
       authorizeEndpoint: '/authorize',
       tokenEndpoint: '/oauth/token',
       clientRegistrationEndpoint: '/oauth/register',
@@ -14428,6 +14442,7 @@ describe('functional authorization-server and resource-server composition', () =
     let selectedFormat = 'automatic';
     const authorizationServer = new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>({
       issuer,
+      resources: [calendarResource],
       authorizeEndpoint: '/authorize',
       tokenEndpoint: '/oauth/token',
       clientRegistrationEndpoint: '/oauth/register',
@@ -14491,6 +14506,7 @@ describe('functional authorization-server and resource-server composition', () =
       const accessTokenFormat = vi.fn(() => selectedFormat as 'opaque' | 'jwt');
       const authorizationServer = new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>({
         issuer,
+        resources: [calendarResource],
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
         clientRegistrationEndpoint: '/oauth/register',
@@ -14594,6 +14610,7 @@ describe('functional authorization-server and resource-server composition', () =
     const accessTokens = await createTestJwtAccessTokens();
     const issuerOptions = {
       issuer,
+      resources: [calendarResource],
       authorizeEndpoint: '/authorize',
       tokenEndpoint: '/oauth/token',
       clientRegistrationEndpoint: '/oauth/register',
@@ -14648,6 +14665,7 @@ describe('functional authorization-server and resource-server composition', () =
     const implicitFormat = vi.fn(() => 'opaque' as const);
     const implicitServer = new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>({
       issuer,
+      resources: [calendarResource],
       authorizeEndpoint: '/authorize',
       tokenEndpoint: '/oauth/token',
       allowImplicitFlow: true,
@@ -14704,11 +14722,14 @@ describe('functional authorization-server and resource-server composition', () =
     );
     const exchangeServer = new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>({
       issuer,
+      resources: [calendarResource],
       authorizeEndpoint: '/authorize',
       tokenEndpoint: '/oauth/token',
       clientRegistrationEndpoint: '/oauth/register',
       scopesSupported: ['calendar:read'],
       allowTokenExchangeGrant: true,
+      // The exchanging client differs from the subject token's client below.
+      tokenExchangeCallback: () => ({ allowCrossClientExchange: true }),
       accessTokens: exchangeTokens,
       accessTokenFormat: exchangeFormat,
     });
@@ -14719,7 +14740,23 @@ describe('functional authorization-server and resource-server composition', () =
     const subjectClient = await registerClient(exchangeServer);
     const subject = await issueTokens(exchangeServer, subjectClient, calendarResource);
     expect(subject.access_token.split(':')).toHaveLength(3);
-    const exchangeClient = await registerClient(exchangeServer);
+    // The exchanging client must register the token-exchange grant type.
+    const exchangeRegistration = await exchangeServer.fetch(
+      createMockRequest(
+        `${issuer}/oauth/register`,
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify({
+          redirect_uris: ['https://client.example.com/callback'],
+          token_endpoint_auth_method: 'client_secret_post',
+          grant_types: ['authorization_code', 'refresh_token', 'urn:ietf:params:oauth:grant-type:token-exchange'],
+        })
+      ),
+      env,
+      ctx
+    );
+    expect(exchangeRegistration.status).toBe(201);
+    const exchangeClient = await exchangeRegistration.json<any>();
     jwtClientId = exchangeClient.client_id;
     const exchangeSubject = async () => {
       const response = await exchangeServer.fetch(
