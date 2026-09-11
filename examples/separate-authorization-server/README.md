@@ -50,8 +50,8 @@ curl http://localhost:8788/.well-known/oauth-protected-resource/mcp
 curl -i http://localhost:8788/mcp    # 401 with WWW-Authenticate: Bearer ... resource_metadata="..."
 ```
 
-Plain `http` works here because the library accepts it only on loopback hosts (`localhost`,
-`127.0.0.0/8`, `::1`). Every other host, including production, must use `https`.
+Plain `http` works here because each Worker sets `allowHttp: true` from the top-level `define`
+map. The production environment inlines `false`: OAuth 2.1 requires `https` everywhere else.
 
 Both dev scripts pass `--inspector-port` because two `wrangler dev` sessions otherwise
 fight over the same debugger port and the second exits with `Address already in use`, so
@@ -60,7 +60,7 @@ ports 8787, 8788, 9229, and 9230 must all be free.
 The issuer and both resource identifiers are build-time constants, inlined by wrangler's
 `define` map, because each OAuth object is constructed once at module scope, before any
 request exists, and its constructor validates them. `define` is not inherited by a named
-environment, so each environment repeats it: the top level names the localhost URLs above
+environment, so each environment repeats it, together with `ALLOW_HTTP`: the top level names the localhost URLs above
 and serves `npm run dev:auth`, `npm run dev:mcp` and `npm test`, while `env.production`
 names the deployed domains. The alternative is to build both objects lazily inside
 `fetch()` from `env` vars and memoize them. Either way these are protocol values rather

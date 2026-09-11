@@ -46,13 +46,13 @@ curl http://localhost:8787/.well-known/oauth-authorization-server
 curl -i http://localhost:8787/mcp    # 401 with WWW-Authenticate: Bearer ... resource_metadata="..."
 ```
 
-Plain `http` works here because the library accepts it only on loopback hosts (`localhost`,
-`127.0.0.0/8`, `::1`). Every other host, including production, must use `https`.
+Plain `http` works here because each Worker sets `allowHttp: true` from the top-level `define`
+map. The production environment inlines `false`: OAuth 2.1 requires `https` everywhere else.
 
 The canonical resource is a build-time constant, inlined by wrangler's `define` map,
 because an `OAuthProvider` is constructed once at module scope, before any request exists,
 and its constructor validates the resource. `define` is not inherited by a named
-environment, so each environment repeats it:
+environment, so each environment repeats it, together with `ALLOW_HTTP`:
 
 | Environment      | `MCP_RESOURCE`                | Used by                   |
 | ---------------- | ----------------------------- | ------------------------- |

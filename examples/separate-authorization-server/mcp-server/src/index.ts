@@ -12,6 +12,7 @@ import { handleMcpRequest } from './mcp';
  */
 declare const AUTH_ISSUER: string;
 declare const MCP_RESOURCE: string;
+declare const ALLOW_HTTP: boolean;
 
 export interface Env {
   /**
@@ -28,6 +29,9 @@ export interface Env {
  * whether a presented token is live and issued for this resource.
  */
 const resourceServer = createOAuthResourceServer<Env, McpProps>({
+  // Local development runs on http://localhost. OAuth 2.1 requires https everywhere else,
+  // so the production environment inlines `false`. See "Run locally" in the README.
+  allowHttp: ALLOW_HTTP,
   resourceMetadata: {
     resource: MCP_RESOURCE,
     authorization_servers: [AUTH_ISSUER],

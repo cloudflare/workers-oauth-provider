@@ -17,6 +17,7 @@ import { handleAuthorize } from './authorize';
 declare const AUTH_ISSUER: string;
 declare const MCP_RESOURCE: string;
 declare const REPORTS_RESOURCE: string;
+declare const ALLOW_HTTP: boolean;
 
 export interface Env {
   OAUTH_KV: KVNamespace;
@@ -39,6 +40,10 @@ const authorizationServer = new OAuthAuthorizationServer<Env, GrantProps>({
   // as the compatibility path that existing MCP clients use.
   clientRegistrationEndpoint: '/oauth/register',
   clientIdMetadataDocumentEnabled: true,
+
+  // Local development runs on http://localhost. OAuth 2.1 requires https everywhere else,
+  // so the production environment inlines `false`. See "Run locally" in the README.
+  allowHttp: ALLOW_HTTP,
 
   scopesSupported: SCOPES_SUPPORTED,
 

@@ -18,6 +18,7 @@
   "define": {
     "AUTH_ISSUER": "\"http://localhost:8787\"",
     "MCP_RESOURCE": "\"http://localhost:8788/mcp\"",
+    "ALLOW_HTTP": "true",
   },
 
   "env": {
@@ -35,6 +36,7 @@
       "define": {
         "AUTH_ISSUER": "\"https://auth.example.com\"",
         "MCP_RESOURCE": "\"https://mcp.example.com/mcp\"",
+        "ALLOW_HTTP": "false",
       },
     },
   },

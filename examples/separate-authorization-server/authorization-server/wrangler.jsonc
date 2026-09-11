@@ -17,6 +17,7 @@
     "AUTH_ISSUER": "\"http://localhost:8787\"",
     "MCP_RESOURCE": "\"http://localhost:8788/mcp\"",
     "REPORTS_RESOURCE": "\"https://reports.localhost/api\"",
+    "ALLOW_HTTP": "true",
   },
 
   "env": {
@@ -28,6 +29,7 @@
         "AUTH_ISSUER": "\"https://auth.example.com\"",
         "MCP_RESOURCE": "\"https://mcp.example.com/mcp\"",
         "REPORTS_RESOURCE": "\"https://reports.example.com/api\"",
+        "ALLOW_HTTP": "false",
       },
       "kv_namespaces": [{ "binding": "OAUTH_KV", "id": "<replace-with-your-kv-id>" }],
     },
