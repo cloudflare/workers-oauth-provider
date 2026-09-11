@@ -1900,6 +1900,20 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   }
 
   /**
+   * The audience a stored access token is treated as bound to.
+   *
+   * A token issued before resource binding has no stored audience. It keeps
+   * working at the server-selected migration resource (the sole resource, or
+   * `legacyGrantResource` in a multi-resource deployment) until it expires;
+   * refresh binds its grant and returns a bound replacement. The client never
+   * chooses this destination. Without a migration resource the token is
+   * treated as unbound and rejected.
+   */
+  private resolveStoredTokenAudience(audience: string | string[] | undefined): string | string[] | undefined {
+    return audience === undefined ? this.getLegacyGrantResource() : audience;
+  }
+
+  /**
    * Validates that a handler is either an ExportedHandler or a class extending WorkerEntrypoint
    * @param handler - The handler to validate
    * @param name - The name of the handler property for error messages
@@ -2248,7 +2262,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       throw new TypeError('resource must name one registered protected resource');
     }
     const summary = await this.unwrapToken<T>(token, env);
-    if (!summary || !isExactResource(summary.audience, configuredResource)) return null;
+    if (!summary || !isExactResource(this.resolveStoredTokenAudience(summary.audience), configuredResource))
+      return null;
     return {
       props: summary.grant.props,
       audience: configuredResource,
@@ -4393,7 +4408,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Internal token data was found in KV, so we check for expiration and set the context props
     if (tokenData) {
-      if (!isExactResource(tokenData.audience, configuredResource)) {
+      const tokenAudience = this.resolveStoredTokenAudience(tokenData.audience);
+      if (!isExactResource(tokenAudience, configuredResource)) {
         return this.createErrorResponse('invalid_token', {
           description: 'Access token is not bound to the configured resource',
           statusCode: 401,
@@ -4418,10 +4434,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       // Validate audience according to RFC 7519 Section 4.1.3
       // "If the principal processing the claim does not identify itself with a value in the
       // 'aud' claim when this claim is present, then the JWT MUST be rejected."
-      if (tokenData.audience) {
+      if (tokenAudience) {
         const requestUrl = new URL(request.url);
         const resourceServer = `${requestUrl.protocol}//${requestUrl.host}${requestUrl.pathname}${requestUrl.search}`;
-        const audiences = Array.isArray(tokenData.audience) ? tokenData.audience : [tokenData.audience];
+        const audiences = Array.isArray(tokenAudience) ? tokenAudience : [tokenAudience];
 
         // Check if any audience matches (RFC 3986: case-insensitive hostname comparison)
         const matches = audiences.some((aud) => audienceMatches(resourceServer, aud));
@@ -4728,7 +4744,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     requestedResource: string | string[] | undefined,
     subjectResource: string | string[] | undefined
   ): string {
-    const subjectAudience = this.findConfiguredResource(subjectResource);
+    const subjectAudience = this.findConfiguredResource(this.resolveStoredTokenAudience(subjectResource));
     if (!subjectAudience) {
       throw new OAuthError('invalid_target', {
         description: 'Subject token is not bound to a configured resource',

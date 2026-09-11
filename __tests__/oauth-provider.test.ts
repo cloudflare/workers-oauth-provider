@@ -6883,7 +6883,7 @@ describe('OAuthProvider', () => {
       }
     );
 
-    it('keeps an old unbound access token unusable while refresh binds the grant and replacement token', async () => {
+    it('keeps an old unbound access token working at the sole resource while refresh binds the grant', async () => {
       const provider = createProvider({ allowTokenExchangeGrant: true });
       const client = await registerClient(provider);
       const tokens = await issueTokens(provider, client);
@@ -6896,12 +6896,17 @@ describe('OAuthProvider', () => {
       delete oldToken.audience;
       await mockEnv.OAUTH_KV.put(oldTokenKey, JSON.stringify(oldToken));
 
+      // The old token has no stored audience. It is treated as bound to the
+      // sole resource, so exchange and API access keep working until it expires.
       for (const aud of [undefined, configuredResource]) {
         await expect(
           mockEnv.OAUTH_PROVIDER!.exchangeToken({ subjectToken: tokens.access_token, aud })
-        ).rejects.toMatchObject({ code: 'invalid_target' });
+        ).resolves.toMatchObject({ resource: configuredResource });
         expect(((await mockEnv.OAUTH_KV.get(key, { type: 'json' })) as Grant).resource).toBeUndefined();
       }
+      await expect(
+        mockEnv.OAUTH_PROVIDER!.exchangeToken({ subjectToken: tokens.access_token, aud: 'https://other.example.com' })
+      ).rejects.toMatchObject({ code: 'invalid_target' });
 
       const refreshed = await refresh(provider, client, tokens.refresh_token);
       expect(refreshed.status).toBe(200);
@@ -6915,11 +6920,8 @@ describe('OAuthProvider', () => {
         createMockRequest('https://example.com/api/test', 'GET', {
           Authorization: `Bearer ${accessToken}`,
         });
-      expect((await provider.fetch(apiRequest(tokens.access_token), mockEnv, mockCtx)).status).toBe(401);
+      expect((await provider.fetch(apiRequest(tokens.access_token), mockEnv, mockCtx)).status).toBe(200);
       expect((await provider.fetch(apiRequest(refreshedTokens.access_token), mockEnv, mockCtx)).status).toBe(200);
-      await expect(mockEnv.OAUTH_PROVIDER!.exchangeToken({ subjectToken: tokens.access_token })).rejects.toMatchObject({
-        code: 'invalid_target',
-      });
       await expect(
         mockEnv.OAUTH_PROVIDER!.exchangeToken({ subjectToken: refreshedTokens.access_token })
       ).resolves.toMatchObject({ resource: configuredResource });
@@ -13513,6 +13515,24 @@ describe('functional authorization-server and resource-server composition', () =
     await expect(env.OAUTH_KV.get(grantKey, { type: 'json' })).resolves.toMatchObject({
       resource: calendarResource,
     });
+  });
+
+  it('keeps an old unbound access token working only at the server-selected legacy resource', async () => {
+    const { authorizationServer } = createRoles({ legacyGrantResource: calendarResource });
+    const client = await registerClient(authorizationServer);
+    const tokens = await issueTokens(authorizationServer, client, calendarResource);
+    const tokenKey = (await env.OAUTH_KV.list({ prefix: 'token:' })).keys[0].name;
+    const oldToken = (await env.OAUTH_KV.get(tokenKey, { type: 'json' })) as Token;
+    delete oldToken.audience;
+    await env.OAUTH_KV.put(tokenKey, JSON.stringify(oldToken));
+
+    await expect(authorizationServer.validateToken(tokens.access_token, calendarResource, env)).resolves.toMatchObject({
+      audience: calendarResource,
+    });
+    await expect(authorizationServer.validateToken(tokens.access_token, driveResource, env)).resolves.toBeNull();
+
+    const { authorizationServer: withoutMigrationTarget } = createRoles();
+    await expect(withoutMigrationTarget.validateToken(tokens.access_token, calendarResource, env)).resolves.toBeNull();
   });
 
   it('can register remote audiences without hosting their handlers', async () => {

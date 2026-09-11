@@ -555,7 +555,7 @@ For a multi-resource `OAuthAuthorizationServer`, `defaultResource` and `legacyGr
 
 Both values must name a registered resource. If a multi-resource server omits `legacyGrantResource`, an old unbound grant cannot be migrated safely and must be reauthorized. A stored grant already bound to a registered resource keeps that resource; a grant bound to an unregistered value fails closed.
 
-Previously issued access tokens with no audience are rejected by 1.0's protected-resource check, but an eligible refresh grant can acquire the server-selected migration resource on refresh. Multiple resources can share the same authorization server, provider implementation, and KV namespace; separate storage is an optional deployment boundary, not a resource-binding requirement.
+Previously issued access tokens with no audience keep working until they expire. They are treated as bound to the server-selected migration resource (the sole resource, or `legacyGrantResource`), and refresh binds the grant and returns a bound replacement token. A multi-resource server without `legacyGrantResource` has no safe destination, so it rejects such tokens and their refresh grants must be reauthorized. Multiple resources can share the same authorization server, provider implementation, and KV namespace; separate storage is an optional deployment boundary, not a resource-binding requirement.
 
 The 1.0 API removes `resourceMatchOriginOnly`. Canonical matching with scheme/host case tolerance replaces it.
 
