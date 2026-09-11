@@ -93,6 +93,40 @@ async function signCustomJwt(
 }
 
 describe('JWT access tokens', () => {
+  it('accepts an http issuer, JWKS URI, and audience on loopback hosts for local development', async () => {
+    const localIssuer = 'http://localhost:8787';
+    const localResource = 'http://localhost:8788/mcp';
+    const key = await createKey('RS256', 'local-current');
+    const accessTokens = createJwtAccessTokens<{}, TestProps>({
+      issuer: localIssuer,
+      jwksUri: `${localIssuer}/.well-known/jwks.json`,
+      keys: () => ({
+        current: { kid: 'local-current', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
+      }),
+    });
+    const props: TestProps = { userId: 'user-123', tenantId: 'tenant-1', upstreamAccessToken: 'secret' };
+    const issued = await accessTokens.issue(issueInput(props, { audience: localResource }));
+    expect(decodePart(issued.token, 1)).toMatchObject({ iss: localIssuer, aud: localResource });
+
+    const validate = createJwtAccessTokenValidator({
+      issuer: localIssuer,
+      audience: localResource,
+      keys: () => [key.publicJwk],
+      mapClaimsToProps: ({ userId }) => ({ userId }),
+    });
+    await expect(
+      validate({ token: issued.token, request: new Request(localResource), env: {} })
+    ).resolves.toMatchObject({ audience: localResource, props: { userId: 'user-123' } });
+
+    expect(() =>
+      createJwtAccessTokens<{}, TestProps>({
+        issuer: 'http://auth.example.com',
+        jwksUri: 'http://auth.example.com/.well-known/jwks.json',
+        keys: () => ({ current: { kid: 'x', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk } }),
+      })
+    ).toThrow('issuer must be an absolute HTTPS URL');
+  });
+
   it.each(['RS256', 'ES256'] as const)('issues and verifies an RFC 9068 %s access token', async (alg) => {
     const key = await createKey(alg, `${alg}-current`);
     const props: TestProps = {
