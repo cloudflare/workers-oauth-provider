@@ -32,9 +32,24 @@ async function handleAuthorize(request: Request, oauth: OAuthHelpers<McpProps>):
     return new Response('Method not allowed', { status: 405, headers: { Allow: 'GET, POST' } });
   }
 
+  // PLACEHOLDER AUTHENTICATION, part one. This endpoint believes whatever username the
+  // form sends, so it refuses to run anywhere but on a loopback host: deploying the example
+  // unchanged cannot mint grants for arbitrary users. Replace the placeholder before
+  // deploying; see "Before production" in the README.
+  if (!isLoopbackHost(url.hostname)) {
+    return new Response('The placeholder login only runs on localhost. Replace it before deploying.', {
+      status: 501,
+    });
+  }
+
   let authRequest: AuthRequest;
+  let clientName: string;
   try {
     authRequest = await oauth.parseAuthRequest(request);
+    // Only the display name is needed from the client record. For a CIMD client this can
+    // fetch the metadata document again, so it stays inside the same failure handling.
+    const client = await oauth.lookupClient(authRequest.clientId);
+    clientName = client?.clientName ?? authRequest.clientId;
   } catch (error) {
     return renderAuthorizationFailure(error);
   }
@@ -42,8 +57,6 @@ async function handleAuthorize(request: Request, oauth: OAuthHelpers<McpProps>):
   // The consent screen and the grant must describe the same thing, so both are built
   // from the filtered list rather than from what the client asked for.
   const scope = grantableScopes(authRequest.scope);
-  const client = await oauth.lookupClient(authRequest.clientId);
-  const clientName = client?.clientName ?? authRequest.clientId;
 
   if (request.method === 'GET') {
     return renderLoginPage(url, clientName, scope, authRequest.resource ?? '');
@@ -56,8 +69,8 @@ async function handleAuthorize(request: Request, oauth: OAuthHelpers<McpProps>):
     return redirectToClient(authRequest, { error: 'access_denied', error_description: 'The user denied the request' });
   }
 
-  // PLACEHOLDER AUTHENTICATION. Production code must establish who the user is before
-  // this point. See "Before production" in the README.
+  // PLACEHOLDER AUTHENTICATION, part two. Production code must establish who the user is
+  // before this point; the loopback guard above is all that stops this from running there.
   const userId = String(form.get('username') ?? '').trim() || 'demo';
 
   const { redirectTo } = await oauth.completeAuthorization({
@@ -66,8 +79,8 @@ async function handleAuthorize(request: Request, oauth: OAuthHelpers<McpProps>):
     metadata: { clientName },
     scope,
     // Props are encrypted and stored on the grant, then handed back to the protected
-    // handler as `ctx.props`. The granted scope is copied in because this configuration
-    // exposes no other view of what the token carries.
+    // handler as `ctx.props`. The granted scope is copied in here, and the
+    // `tokenExchangeCallback` in `index.ts` keeps it equal to each token's effective scope.
     props: { userId, clientId: authRequest.clientId, scopes: scope } satisfies McpProps,
   });
 
@@ -113,4 +126,10 @@ function redirectToClient(authRequest: AuthRequest, params: Record<string, strin
   if (authRequest.state) redirect.searchParams.set('state', authRequest.state);
   if (authRequest.issuer) redirect.searchParams.set('iss', authRequest.issuer);
   return Response.redirect(redirect.toString(), 302);
+}
+
+/** `localhost`, `127.0.0.0/8`, or `::1`: the hosts `wrangler dev` serves. */
+function isLoopbackHost(hostname: string): boolean {
+  const host = hostname.replace(/^\[|\]$/g, '');
+  return host === 'localhost' || host === '::1' || /^127(\.\d{1,3}){3}$/.test(host);
 }

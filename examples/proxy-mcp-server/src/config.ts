@@ -15,9 +15,11 @@ export const MCP_READ_SCOPE = 'mcp:read';
 /**
  * What the MCP handler sees as `ctx.props`.
  *
- * `ctx.props` is exactly what the application stored on the grant, so the granted scope
- * has to be copied in by hand: the provider validates a token's scope but does not show
- * it to the protected handler.
+ * `ctx.props` is exactly what the application stored, so scope has to be carried in by
+ * hand: the consent handler copies the granted scope in, and the `tokenExchangeCallback`
+ * in `index.ts` replaces it with each token's effective scope, which a client may narrow
+ * at the token endpoint. The provider validates a token's scope but does not show it to
+ * the protected handler.
  */
 export interface McpProps {
   userId: string;

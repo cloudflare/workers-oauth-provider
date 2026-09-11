@@ -128,7 +128,9 @@ the clearest way to see what the token carried.
    custom domain, and `env.production.define.MCP_RESOURCE` must be `https://<your-host>/mcp`
    and match that route exactly: the resource string is compared strictly, with a lowercase
    scheme and host, no default port, and a significant trailing slash.
-3. `npm run deploy` (`wrangler deploy --env production`).
+3. Replace the placeholder login first: `/authorize` answers `501` on any host other than
+   loopback until it is. See "Before production".
+4. `npm run deploy` (`wrangler deploy --env production`).
 
 The issuer is derived from the request origin, so it becomes `https://<your-host>` on its
 own. Nothing else changes between local and production.
@@ -136,7 +138,9 @@ own. Nothing else changes between local and production.
 ## Before production
 
 - **Replace the login placeholder.** `src/login-page.ts` accepts any username and
-  `src/authorize.ts` believes it. Put a real session behind it: a signed cookie, an
+  `src/authorize.ts` believes it, which is why `handleAuthorize()` refuses to run anywhere
+  but on a loopback host (it answers `501` elsewhere). Remove that guard together with the
+  placeholder. Put a real session behind it: a signed cookie, an
   upstream IdP such as GitHub or Google, or Cloudflare Access in front of `/authorize`.
   Once there is a session, the consent form also needs a CSRF token. See
   [docs/advanced-configuration.md](../../docs/advanced-configuration.md) and the
@@ -145,12 +149,13 @@ own. Nothing else changes between local and production.
   advertised, which is the floor rather than a policy: the provider publishes
   `scopesSupported` but never enforces it, so an unfiltered request would mint a token
   carrying anything a client asked for. Decide per user and per client what to grant.
-- **Know what scope the handler can see.** `ctx.props` is the data stored on the _grant_,
-  and this configuration exposes no effective token scope, so `src/mcp.ts` cannot tell that
-  a client narrowed its token at the token endpoint. Treat the check there as a grant-level
-  gate; a resource that needs per-token scope wants the split topology in
-  [../separate-authorization-server](../separate-authorization-server), where the validator
-  returns the token's own scope.
+- **Keep `props.scopes` equal to the token's scope.** `ctx.props` is the data the
+  application stored, and this configuration exposes no effective token scope to
+  `src/mcp.ts`, so `src/index.ts` sets a `tokenExchangeCallback` that copies each token's
+  effective scope into `accessTokenProps`. Without it a token narrowed at the token endpoint
+  would still carry the grant's full scope into the handler. The split topology in
+  [../separate-authorization-server](../separate-authorization-server) needs no copy,
+  because its validator returns the token's own scope.
 - **Set token lifetimes.** `accessTokenTTL`, `refreshTokenTTL`, and `clientRegistrationTTL`
   default to 1 hour, 30 days, and 90 days. Every MCP request is authorized on its own, so a
   short access token TTL is cheap.

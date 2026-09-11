@@ -35,6 +35,14 @@ export default new OAuthProvider<Env>({
 
   scopesSupported: SCOPES_SUPPORTED,
 
+  // `ctx.props` is what the application stored, so on its own it would carry the grant's
+  // full scope into the handler even for a token the client narrowed at the token
+  // endpoint. This callback runs on every token issuance with that token's effective
+  // scope, and the props it returns are the ones `McpApiHandler` sees for it.
+  tokenExchangeCallback: ({ props, requestedScope }) => ({
+    accessTokenProps: { ...props, scopes: requestedScope },
+  }),
+
   resourceMetadata: {
     resource: MCP_RESOURCE,
     // `authorization_servers` is omitted on purpose: the authorization server is this

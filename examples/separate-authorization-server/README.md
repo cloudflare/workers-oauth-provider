@@ -140,19 +140,23 @@ scope: the clearest way to see what the token carried.
    all non-inheritable, so the `env.production` block in each config repeats them. The two
    Workers must agree on `MCP_RESOURCE` exactly: it is compared strictly, with a lowercase
    scheme and host, no default port, and a significant trailing slash.
-3. Deploy the authorization server first (`npm run deploy:auth`), then the MCP server
+3. Replace the placeholder login first: `/authorize` answers `501` on any host other than
+   loopback until it is. See "Before production".
+4. Deploy the authorization server first (`npm run deploy:auth`), then the MCP server
    (`npm run deploy:mcp`).
 
    `wrangler deploy --env production` suffixes the Worker name, so the bound service in
    `mcp-server/wrangler.jsonc` carries the same suffix
    (`example-authorization-server-production`) and keeps `entrypoint: "McpTokenValidator"`.
 
-4. Attach the custom domains (`auth.example.com`, `mcp.example.com`) to their Workers.
+5. Attach the custom domains (`auth.example.com`, `mcp.example.com`) to their Workers.
 
 ## Before production
 
 - **Replace the login placeholder.** `authorization-server/src/login-page.ts` accepts any
-  username and `authorize.ts` believes it. Put a real session behind it: a signed cookie,
+  username and `authorize.ts` believes it, which is why `handleAuthorize()` refuses to run
+  anywhere but on a loopback host (it answers `501` elsewhere). Remove that guard together
+  with the placeholder. Put a real session behind it: a signed cookie,
   an upstream IdP such as GitHub or Google, or Cloudflare Access in front of `/authorize`,
   and add a CSRF token to the consent form. See
   [docs/advanced-configuration.md](../../docs/advanced-configuration.md) and the

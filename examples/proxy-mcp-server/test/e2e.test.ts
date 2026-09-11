@@ -282,15 +282,14 @@ describe('the protected MCP server', () => {
     expect(response.headers.get('WWW-Authenticate')).toBe('Bearer error="insufficient_scope", scope="mcp:read"');
   });
 
-  it('still accepts a token narrowed at the token endpoint, because props carry the grant scope', async () => {
+  it('rejects a token narrowed below mcp:read at the token endpoint', async () => {
     const client = await registerPublicClient();
     const redirect = await driveLoginPage(client.client_id, { resource: MCP_RESOURCE, scope: 'mcp:read mcp:write' });
 
-    // A client may ask the token endpoint for less than the grant allows. The provider
-    // honours that in the token, but `ctx.props` is the data stored on the *grant*, and
-    // the combined configuration exposes no effective token scope, so this handler
-    // cannot see the narrowing. Pinned here because it is a library gap, not a choice:
-    // the split example reads `ValidatedAccessToken.scope` and gets this right.
+    // A client may ask the token endpoint for less than the grant allows. `ctx.props` is
+    // the data the application stored, so the example's `tokenExchangeCallback` rewrites
+    // `scopes` to each token's effective scope. Without it the handler would still see
+    // the grant's full scope and accept this token.
     const tokens = (await (
       await exchangeCode(client.client_id, redirect.searchParams.get('code') as string, {
         resource: MCP_RESOURCE,
@@ -298,7 +297,7 @@ describe('the protected MCP server', () => {
       })
     ).json()) as TokenResponse;
     expect(tokens.scope).toBe('mcp:write');
-    expect(await mcpStatus(tokens.access_token)).toBe(200);
+    expect(await mcpStatus(tokens.access_token)).toBe(403);
   });
 });
 
