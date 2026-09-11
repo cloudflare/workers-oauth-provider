@@ -182,30 +182,35 @@ class WorkersKvStorage implements OAuthStorage {
   }
 
   private async deleteClientWithGrants(clientId: string): Promise<void> {
-    // Grants are keyed by user, so revoking a client's grants scans every grant.
-    let cursor: string | undefined;
-    do {
-      const page = await this.list(GRANT_PREFIX, { cursor });
-      for (const { name } of page.keys) {
-        const grant = await this.kv.get<Grant>(name, { type: 'json' });
-        if (grant?.clientId === clientId) await this.revokeGrant({ userId: grant.userId, grantId: grant.id });
-      }
-      cursor = page.cursor;
-    } while (cursor !== undefined);
+    // Remove the client record first so an interrupted sweep cannot leave a usable
+    // client whose grants and tokens were only partly revoked.
+    await this.kv.delete(`${CLIENT_PREFIX}${clientId}`);
+
+    // Grants are keyed by user, so revoking a client's grants scans every grant. Keys are
+    // collected before anything is deleted: deleting while paginating could skip records.
+    for (const name of await this.listAllKeys(GRANT_PREFIX)) {
+      const grant = await this.kv.get<Grant>(name, { type: 'json' });
+      if (grant?.clientId === clientId) await this.revokeGrant({ userId: grant.userId, grantId: grant.id });
+    }
 
     // Token exchange can issue a token to this client below a source grant owned
     // by another client, so exchanged tokens are swept separately.
-    cursor = undefined;
+    for (const name of await this.listAllKeys(TOKEN_PREFIX)) {
+      const token = await this.kv.get<Token>(name, { type: 'json' });
+      if (token?.grant?.clientId === clientId) await this.kv.delete(name);
+    }
+  }
+
+  /** Every key under a prefix, read to completion before the caller mutates anything. */
+  private async listAllKeys(prefix: string): Promise<string[]> {
+    const names: string[] = [];
+    let cursor: string | undefined;
     do {
-      const page = await this.list(TOKEN_PREFIX, { cursor });
-      for (const { name } of page.keys) {
-        const token = await this.kv.get<Token>(name, { type: 'json' });
-        if (token?.grant?.clientId === clientId) await this.kv.delete(name);
-      }
+      const page = await this.list(prefix, { cursor });
+      names.push(...page.keys.map(({ name }) => name));
       cursor = page.cursor;
     } while (cursor !== undefined);
-
-    await this.kv.delete(`${CLIENT_PREFIX}${clientId}`);
+    return names;
   }
 
   private async reserveReplay(key: string, expiresAt: number): Promise<'reserved' | 'exists'> {
