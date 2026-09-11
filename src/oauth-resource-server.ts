@@ -1,4 +1,4 @@
-import { validateResourceUri } from './oauth-resource';
+import { hasAcceptedCanonicalScheme, validateResourceUri } from './oauth-resource';
 
 const PROTECTED_RESOURCE_WELL_KNOWN_PREFIX = '/.well-known/oauth-protected-resource';
 const NO_CACHE_HEADERS = { 'Cache-Control': 'no-store', Pragma: 'no-cache' } as const;
@@ -172,9 +172,11 @@ function validateOptions<Env, Props>(options: OAuthResourceServerOptions<Env, Pr
   }
 
   const resource = options.resourceMetadata?.resource;
-  const resourceUrl = parseCanonicalHttpsUrl(resource);
+  const resourceUrl = parseCanonicalUrl(resource);
   if (!resourceUrl) {
-    throw new TypeError('resourceMetadata.resource must be a canonical absolute HTTPS URI without a fragment');
+    throw new TypeError(
+      'resourceMetadata.resource must be a canonical absolute HTTPS URI without a fragment (http is accepted only on a loopback host)'
+    );
   }
 
   const authorizationServers = options.resourceMetadata.authorization_servers;
@@ -182,9 +184,11 @@ function validateOptions<Env, Props>(options: OAuthResourceServerOptions<Env, Pr
     throw new TypeError('resourceMetadata.authorization_servers must contain at least one issuer');
   }
   for (const issuer of authorizationServers) {
-    const issuerUrl = parseCanonicalHttpsUrl(issuer);
+    const issuerUrl = parseCanonicalUrl(issuer);
     if (!issuerUrl || issuerUrl.search || issuerUrl.hash) {
-      throw new TypeError('resourceMetadata.authorization_servers must contain canonical HTTPS issuer URLs');
+      throw new TypeError(
+        'resourceMetadata.authorization_servers must contain canonical HTTPS issuer URLs (http is accepted only on a loopback host)'
+      );
     }
   }
 
@@ -215,7 +219,7 @@ function validateOptions<Env, Props>(options: OAuthResourceServerOptions<Env, Pr
   };
 }
 
-function parseCanonicalHttpsUrl(value: unknown): URL | null {
+function parseCanonicalUrl(value: unknown): URL | null {
   if (typeof value !== 'string' || !validateResourceUri(value)) {
     return null;
   }
@@ -228,7 +232,7 @@ function parseCanonicalHttpsUrl(value: unknown): URL | null {
   }
 
   if (
-    parsed.protocol !== 'https:' ||
+    !hasAcceptedCanonicalScheme(parsed) ||
     parsed.username ||
     parsed.password ||
     parsed.protocol !== parsed.protocol.toLowerCase() ||

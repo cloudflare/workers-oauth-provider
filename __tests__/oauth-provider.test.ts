@@ -484,7 +484,64 @@ describe('OAuthProvider', () => {
             tokenEndpoint: '/oauth/token',
             resourceMetadata: { resource: 'HTTPS://RESOURCE.EXAMPLE.COM:8443/Mcp?Tenant=A' },
           })
-      ).toThrow('resourceMetadata.resource must use a lowercase HTTPS scheme and lowercase host');
+      ).toThrow('resourceMetadata.resource must use a lowercase scheme and lowercase host');
+    });
+
+    it('accepts http resource and issuer identifiers on loopback hosts for local development', async () => {
+      const resource = 'http://localhost:8787/mcp';
+      const authorizationServers = ['http://127.0.0.1:8787', 'http://[::1]:8787'];
+      const provider = new OAuthProvider({
+        apiRoute: ['/mcp'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        resourceMetadata: { resource, authorization_servers: authorizationServers },
+      });
+      const metadata = await provider.fetch(
+        createMockRequest('http://localhost:8787/.well-known/oauth-protected-resource/mcp'),
+        mockEnv,
+        mockCtx
+      );
+
+      expect(metadata.status).toBe(200);
+      await expect(metadata.json()).resolves.toMatchObject({ resource, authorization_servers: authorizationServers });
+    });
+
+    it.each([
+      'http://localhost.example.com/mcp',
+      'http://127.0.0.1.example.com/mcp',
+      'http://mcp.example.com/mcp',
+      'http://[::2]/mcp',
+    ])('rejects the http resource identifier %s because its host is not loopback', (resource) => {
+      expect(
+        () =>
+          new OAuthProvider({
+            apiRoute: ['/mcp'],
+            apiHandler: TestApiHandler,
+            defaultHandler: testDefaultHandler,
+            authorizeEndpoint: '/authorize',
+            tokenEndpoint: '/oauth/token',
+            resourceMetadata: { resource },
+          })
+      ).toThrow('resourceMetadata.resource is required and must be an absolute HTTPS URI');
+    });
+
+    it('rejects an http authorization server issuer on a non-loopback host', () => {
+      expect(
+        () =>
+          new OAuthProvider({
+            apiRoute: ['/mcp'],
+            apiHandler: TestApiHandler,
+            defaultHandler: testDefaultHandler,
+            authorizeEndpoint: '/authorize',
+            tokenEndpoint: '/oauth/token',
+            resourceMetadata: {
+              resource: 'http://localhost:8787/mcp',
+              authorization_servers: ['http://auth.example.com'],
+            },
+          })
+      ).toThrow('resourceMetadata.authorization_servers must contain valid HTTPS issuer URLs');
     });
 
     it('should preserve case in the configured path and query', async () => {
@@ -13124,6 +13181,48 @@ describe('functional authorization-server and resource-server composition', () =
       ).toThrow('authorizationServer.issuer');
     }
   );
+
+  it('accepts an http issuer, endpoints, and registered resource on loopback hosts for local development', async () => {
+    const localIssuer = 'http://localhost:8787';
+    const localResource = 'http://localhost:8788/mcp';
+    const authorizationServer = new OAuthAuthorizationServer<TestEnv>({
+      issuer: localIssuer,
+      authorizeEndpoint: '/authorize',
+      tokenEndpoint: 'http://localhost:8787/oauth/token',
+    });
+    authorizationServer.registerResource(localResource);
+
+    const response = await authorizationServer.fetch(
+      createMockRequest('http://localhost:8787/.well-known/oauth-authorization-server'),
+      env,
+      ctx
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      issuer: localIssuer,
+      token_endpoint: 'http://localhost:8787/oauth/token',
+      protected_resources: [localResource],
+    });
+
+    expect(
+      () =>
+        new OAuthAuthorizationServer<TestEnv>({
+          issuer: 'http://auth.example.com',
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: '/oauth/token',
+        })
+    ).toThrow('authorizationServer.issuer must be a canonical absolute HTTPS URL');
+
+    expect(
+      () =>
+        new OAuthAuthorizationServer<TestEnv>({
+          issuer,
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: 'http://auth.example.com/oauth/token',
+        })
+    ).toThrow('tokenEndpoint must be an absolute HTTPS URL');
+  });
 
   it('requires secure fragment-free endpoints in the role-based API', () => {
     expect(

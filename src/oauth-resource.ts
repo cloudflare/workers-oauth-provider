@@ -1,3 +1,23 @@
+/**
+ * Loopback hosts where a plain `http` scheme is accepted for local development.
+ * Matches RFC 8252 §7.3 loopback handling: 127.0.0.0/8, ::1, and `localhost`.
+ */
+export function isLoopbackHostname(hostname: string): boolean {
+  const host = hostname.toLowerCase();
+  if (host === 'localhost' || host === '::1' || host === '[::1]') return true;
+  const ipv4 = /^127\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  return ipv4 !== null && ipv4.slice(1).every((octet) => Number(octet) <= 255);
+}
+
+/**
+ * Whether a canonical resource, issuer, or endpoint URL uses an accepted
+ * scheme: `https`, or `http` only on a loopback host so `wrangler dev` on
+ * http://localhost keeps working. Production identifiers must use `https`.
+ */
+export function hasAcceptedCanonicalScheme(url: URL): boolean {
+  return url.protocol === 'https:' || (url.protocol === 'http:' && isLoopbackHostname(url.hostname));
+}
+
 /** Validate an RFC 3986-safe HTTP(S) resource identifier for RFC 8707. */
 export function validateResourceUri(uri: string): boolean {
   if (!uri || typeof uri !== 'string') return false;

@@ -44,7 +44,7 @@ import {
   validateIdJagClaims,
   validateIdJagHeader,
 } from './ema/validators';
-import { validateResourceUri } from './oauth-resource';
+import { hasAcceptedCanonicalScheme, isLoopbackHostname, validateResourceUri } from './oauth-resource';
 
 export { AuthorizationError } from './oauth-capabilities';
 export type { AuthorizationErrorCode, AuthorizationErrorOptions } from './oauth-capabilities';
@@ -1792,8 +1792,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       } catch (e) {
         throw new TypeError(`${name} must be either an absolute path starting with / or a valid URL`);
       }
-      if (this.explicitIssuer && (parsed.protocol !== 'https:' || parsed.username || parsed.password || parsed.hash)) {
-        throw new TypeError(`${name} must be an absolute HTTPS URL without userinfo or a fragment`);
+      if (
+        this.explicitIssuer &&
+        (!hasAcceptedCanonicalScheme(parsed) || parsed.username || parsed.password || parsed.hash)
+      ) {
+        throw new TypeError(
+          `${name} must be an absolute HTTPS URL without userinfo or a fragment (http is accepted only on a loopback host)`
+        );
       }
     }
   }
@@ -1808,7 +1813,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
     if (
       !validateResourceUri(issuer) ||
-      parsed.protocol !== 'https:' ||
+      !hasAcceptedCanonicalScheme(parsed) ||
       parsed.username ||
       parsed.password ||
       parsed.search ||
@@ -1816,7 +1821,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       foldResourceSchemeAndHost(issuer) !== issuer ||
       (parsed.href !== issuer && parsed.origin !== issuer)
     ) {
-      throw new TypeError('authorizationServer.issuer must be a canonical absolute HTTPS URL');
+      throw new TypeError(
+        'authorizationServer.issuer must be a canonical absolute HTTPS URL (http is accepted only on a loopback host)'
+      );
     }
   }
 
@@ -1929,11 +1936,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
   /** Validate configured RFC 9728 protected resource metadata. */
   private validateResourceMetadataOptions(options: OAuthProtectedResourceMetadata): void {
-    if (!options || !validateResourceUri(options.resource) || new URL(options.resource).protocol !== 'https:') {
-      throw new TypeError('resourceMetadata.resource is required and must be an absolute HTTPS URI without a fragment');
+    if (!options || !validateResourceUri(options.resource) || !hasAcceptedCanonicalScheme(new URL(options.resource))) {
+      throw new TypeError(
+        'resourceMetadata.resource is required and must be an absolute HTTPS URI without a fragment (http is accepted only on a loopback host)'
+      );
     }
     if (foldResourceSchemeAndHost(options.resource) !== options.resource) {
-      throw new TypeError('resourceMetadata.resource must use a lowercase HTTPS scheme and lowercase host');
+      throw new TypeError('resourceMetadata.resource must use a lowercase scheme and lowercase host');
     }
     const parsedResource = new URL(options.resource);
     if (
@@ -1959,7 +1968,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         }
         if (
           !validateResourceUri(issuer) ||
-          parsed.protocol !== 'https:' ||
+          !hasAcceptedCanonicalScheme(parsed) ||
           parsed.username ||
           parsed.password ||
           foldResourceSchemeAndHost(issuer) !== issuer ||
@@ -1967,7 +1976,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
           issuer.includes('?') ||
           issuer.includes('#')
         ) {
-          throw new TypeError('resourceMetadata.authorization_servers must contain valid HTTPS issuer URLs');
+          throw new TypeError(
+            'resourceMetadata.authorization_servers must contain valid HTTPS issuer URLs (http is accepted only on a loopback host)'
+          );
         }
       }
     }
@@ -5466,20 +5477,7 @@ async function generateTokenId(token: string): Promise<string> {
  */
 function isLoopbackUri(uri: string): boolean {
   try {
-    const url = new URL(uri);
-    const host = url.hostname;
-    // Check for IPv4 loopback (127.0.0.0/8)
-    if (host.match(/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/)) {
-      return true;
-    }
-    // Check for IPv6 loopback (::1 or [::1])
-    if (host === '::1' || host === '[::1]') {
-      return true;
-    }
-    if (host.toLowerCase() === 'localhost') {
-      return true;
-    }
-    return false;
+    return isLoopbackHostname(new URL(uri).hostname);
   } catch {
     return false;
   }

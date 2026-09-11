@@ -363,4 +363,57 @@ describe('createOAuthResourceServer', () => {
       })
     ).toThrow('resourceMetadata.authorization_servers must contain canonical HTTPS issuer URLs');
   });
+
+  it('accepts http resource and issuer identifiers on loopback hosts for local development', async () => {
+    const localResource = 'http://localhost:8788/mcp';
+    const server = createTestServer({
+      resourceMetadata: { resource: localResource, authorization_servers: ['http://localhost:8787'] },
+      validateToken: async () => ({
+        props: { userId: 'user-123', scopes: ['mcp:read'] },
+        audience: localResource,
+        expiresAt: Date.now() / 1000 + 300,
+      }),
+    });
+
+    const metadata = await server.fetch(
+      new Request('http://localhost:8788/.well-known/oauth-protected-resource/mcp'),
+      env,
+      new MockExecutionContext()
+    );
+    expect(metadata.status).toBe(200);
+    await expect(metadata.json()).resolves.toMatchObject({
+      resource: localResource,
+      authorization_servers: ['http://localhost:8787'],
+    });
+
+    const challenge = await server.fetch(new Request('http://localhost:8788/mcp'), env, new MockExecutionContext());
+    expect(challenge.status).toBe(401);
+    expect(challenge.headers.get('WWW-Authenticate')).toContain(
+      'resource_metadata="http://localhost:8788/.well-known/oauth-protected-resource/mcp"'
+    );
+
+    const authorized = await server.fetch(
+      new Request('http://localhost:8788/mcp', { headers: { Authorization: 'Bearer token' } }),
+      env,
+      new MockExecutionContext()
+    );
+    expect(authorized.status).toBe(200);
+  });
+
+  it('rejects http identifiers on non-loopback hosts', () => {
+    expect(() =>
+      createTestServer({
+        resourceMetadata: {
+          resource: 'http://mcp.example.com/mcp',
+          authorization_servers: ['https://auth.example.com'],
+        },
+      })
+    ).toThrow('resourceMetadata.resource must be a canonical absolute HTTPS URI');
+
+    expect(() =>
+      createTestServer({
+        resourceMetadata: { resource: RESOURCE, authorization_servers: ['http://auth.example.com'] },
+      })
+    ).toThrow('resourceMetadata.authorization_servers must contain canonical HTTPS issuer URLs');
+  });
 });
