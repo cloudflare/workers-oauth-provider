@@ -166,6 +166,14 @@ export interface JwtClaimsToPropsInput<Env> extends VerifiedJwtAccessToken {
   env: Env;
 }
 
+/** The verification key a token names, passed to a validator's `keys` resolver. */
+export interface JwtAccessTokenKeyHint {
+  /** `kid` from the token header, absent when the header carries none. */
+  readonly kid?: string;
+  /** Algorithm from the token header, already restricted to the allowed list. */
+  readonly alg: JwtAccessTokenAlgorithm;
+}
+
 /** Configuration for {@link createJwtAccessTokenValidator}. */
 export interface JwtAccessTokenValidatorOptions<Env = Cloudflare.Env, Props = unknown> {
   /** Exact authorization-server issuer expected in `iss`. */
@@ -174,8 +182,12 @@ export interface JwtAccessTokenValidatorOptions<Env = Cloudflare.Env, Props = un
   audience: string;
   /** Allowed algorithms. Defaults to `['RS256']`. Never derived from the token. */
   algorithms?: JwtAccessTokenAlgorithm[];
-  /** Resolve trusted public keys. Token-controlled key URLs are never followed. */
-  keys(env: Env): JwtAccessTokenPublicKey[] | Promise<JwtAccessTokenPublicKey[]>;
+  /**
+   * Resolve trusted public keys. Token-controlled key URLs are never followed. The
+   * hint carries the `kid` and `alg` the token names, so a cached key set can be
+   * refreshed once when the authorization server has rotated to a key it lacks.
+   */
+  keys(env: Env, hint: JwtAccessTokenKeyHint): JwtAccessTokenPublicKey[] | Promise<JwtAccessTokenPublicKey[]>;
   /** Map already verified claims to the typed context exposed as `ctx.props`. */
   mapClaimsToProps(input: JwtClaimsToPropsInput<Env>): Props | null | Promise<Props | null>;
   /** Permitted clock skew in seconds. Defaults to 30 seconds. */
@@ -348,7 +360,16 @@ export function createJwtAccessTokenValidator<Env = Cloudflare.Env, Props = unkn
     const parsed = parseCompactJwt(token, maxTokenBytes);
     if (!parsed) return null;
     if (!preflightParsedJwt(parsed, issuer, [audience], algorithms, false, clockSkewSeconds)) return null;
-    const publicKeys = validatePublicKeys(await options.keys(env), algorithms);
+    const alg = parsed.header.alg;
+    if (typeof alg !== 'string' || !algorithms.includes(alg as JwtAccessTokenAlgorithm)) return null;
+    const hint: JwtAccessTokenKeyHint = {
+      ...(typeof parsed.header.kid === 'string' ? { kid: parsed.header.kid } : {}),
+      alg: alg as JwtAccessTokenAlgorithm,
+    };
+    const publicKeys = validatePublicKeys(await options.keys(env, hint), algorithms);
+    // RFC 9068 §4: a resource server accepts a token whose `aud` contains its own
+    // identifier, so an interoperable array audience is honoured here even though the
+    // package's own issuer only mints a single string.
     const verified = await verifyParsedJwt(parsed, {
       issuer,
       allowedAudiences: [audience],
@@ -587,8 +608,16 @@ function validatePublicJwk(
     throw new TypeError("JWT public JWK key_ops must include 'verify'");
   }
   if (key.alg === 'RS256' && key.kty !== 'RSA') throw new TypeError('RS256 JWT public JWK must use kty RSA');
-  if (key.alg === 'RS256' && (!isNonEmptyString(key.n) || rsaModulusBits(key.n) < 2048 || !isNonEmptyString(key.e))) {
-    throw new TypeError('RS256 JWT public JWK must contain an RSA modulus of at least 2048 bits and an exponent');
+  if (
+    key.alg === 'RS256' &&
+    (!isNonEmptyString(key.n) ||
+      rsaModulusBits(key.n) < 2048 ||
+      !isNonEmptyString(key.e) ||
+      !isUsableRsaExponent(key.e))
+  ) {
+    throw new TypeError(
+      'RS256 JWT public JWK must contain an RSA modulus of at least 2048 bits and an odd public exponent of at least 3'
+    );
   }
   if (key.alg === 'ES256' && (key.kty !== 'EC' || key.crv !== 'P-256')) {
     throw new TypeError('ES256 JWT public JWK must use kty EC and crv P-256');
@@ -809,6 +838,22 @@ function validatePrivateKeyAlgorithm(key: CryptoKey, algorithm: JwtAccessTokenAl
   if (algorithm === 'ES256' && (details.name !== 'ECDSA' || details.namedCurve !== 'P-256')) {
     throw new TypeError('ES256 privateKey must be an ECDSA P-256 key');
   }
+}
+
+/**
+ * An RSA public exponent of 1 (or any even value) makes PKCS#1 v1.5 verification
+ * trivially forgeable, and WebCrypto imports such keys without complaint.
+ */
+function isUsableRsaExponent(encodedExponent: string): boolean {
+  let exponent: Uint8Array;
+  try {
+    exponent = decodeBytes(encodedExponent);
+  } catch {
+    return false;
+  }
+  let value = 0n;
+  for (const byte of exponent) value = (value << 8n) | BigInt(byte);
+  return value >= 3n && (value & 1n) === 1n;
 }
 
 function rsaModulusBits(encodedModulus: string): number {

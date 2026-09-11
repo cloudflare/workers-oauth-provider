@@ -70,6 +70,7 @@ export {
   type JwtAccessTokenIssueInput,
   type JwtAccessTokenKeySet,
   type JwtAccessTokenPublicClaimsInput,
+  type JwtAccessTokenKeyHint,
   type JwtAccessTokenPublicKey,
   type JwtAccessTokenSigningKey,
   type JwtAccessTokenValidation,
@@ -829,7 +830,7 @@ export interface ProtectResourceHandleOptions<Env = Cloudflare.Env, Props = unkn
  * Obtained from `OAuthAuthorizationServer.resource()`, so a misspelled identifier fails
  * at module initialization instead of on a request.
  */
-export interface OAuthResourceHandle<Env = Cloudflare.Env> {
+export interface OAuthResourceHandle<Env = Cloudflare.Env, Props = unknown> {
   /** Canonical spelling of the declared resource identifier. */
   readonly resource: string;
   /**
@@ -839,7 +840,7 @@ export interface OAuthResourceHandle<Env = Cloudflare.Env> {
    */
   validateToken<T = any>(token: string, env: Env): Promise<ValidatedAccessToken<T> | null>;
   /** Host this resource in the same Worker and return its independently routable fetch surface. */
-  protect<Props = unknown>(options: ProtectResourceHandleOptions<Env, Props>): OAuthProtectedResource<Env>;
+  protect<P = Props>(options: ProtectResourceHandleOptions<Env, P>): OAuthProtectedResource<Env>;
 }
 
 /** Audience-checked token context suitable for a private Service Binding. */
@@ -1773,14 +1774,14 @@ export class OAuthAuthorizationServer<Env = Cloudflare.Env, Props = unknown> {
    * A handle for one resource declared in `resources`. Throws at module initialization
    * when the identifier was not declared.
    */
-  resource(resource: string): OAuthResourceHandle<Env> {
+  resource(resource: string): OAuthResourceHandle<Env, Props> {
     const canonical = this.#impl.requireDeclaredResource(resource);
     return {
       resource: canonical,
       validateToken: <T = any>(token: string, env: Env) =>
         this.#impl.validateAccessToken<T>(token, canonical, env as Env & ProviderEnv),
-      protect: <Props = unknown>(options: ProtectResourceHandleOptions<Env, Props>) =>
-        this.protectResource<Props>({
+      protect: <P = Props>(options: ProtectResourceHandleOptions<Env, P>) =>
+        this.protectResource<P>({
           resourceMetadata: { ...(options.resourceMetadata ?? {}), resource: canonical },
           handler: options.handler,
           resolveExternalToken: options.resolveExternalToken,
@@ -1789,7 +1790,7 @@ export class OAuthAuthorizationServer<Env = Cloudflare.Env, Props = unknown> {
   }
 
   /** Host one declared resource in this Worker and return its independently routable RS surface. */
-  protectResource<Props = unknown>(options: ProtectResourceOptions<Env, Props>): OAuthProtectedResource<Env> {
+  protectResource<P = Props>(options: ProtectResourceOptions<Env, P>): OAuthProtectedResource<Env> {
     const resource = this.#impl.registerResourceServer({
       resourceMetadata: options.resourceMetadata,
       handler: options.handler,
@@ -2517,6 +2518,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
           Response.json(jwks, {
             headers: {
               'Cache-Control': 'public, max-age=300',
+              // The response is cacheable and its CORS headers depend on Origin, so a
+              // shared cache must key the no-Origin variant separately too.
+              Vary: 'Origin',
             },
           })
         ),
@@ -4458,19 +4462,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       resource: configuredResource,
     });
 
-    // Fresh clock read so the JTI KV TTL reflects the assertion's remaining
-    // lifetime at the moment of write, not at pipeline start (JWKS fetch
-    // already burned several ms; mapper hasn't run yet).
-    const markNow = Math.floor(Date.now() / 1000);
-    const replay = await jtiStore.markUsed({
-      issuer: claims.value.claims.iss,
-      jti: claims.value.claims.jti,
-      exp: claims.value.claims.exp,
-      now: markNow,
-      env,
-    });
-    if (!replay.ok) return replay;
-
     let mapperOutput: unknown;
     try {
       mapperOutput = await enterpriseOptions.mapClaims({
@@ -4501,21 +4492,39 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     });
     if (!ttl.ok) return ttl;
 
-    return ok(
-      await this.issueEmaAccessToken({
-        format: accessTokenFormat,
-        clientId: clientInfo.clientId,
-        userId: mapped.value.userId,
-        mapperScope: mapped.value.scope,
-        mapperProps: mapped.value.props,
-        mapperMetadata: mapped.value.metadata,
-        assertionScopes: claims.value.assertionScopes,
-        resource: configuredResource,
-        accessTokenTTLSeconds: ttl.value,
-        env,
-        now: issueNow,
-      })
-    );
+    // Build (and for JWTs, sign) the access token before anything is written, so a
+    // signing or key-resolution failure leaves the one-use assertion retryable, as it
+    // does for an authorization code. The mapper therefore runs before the replay check;
+    // the assertion's signature has already been verified at that point.
+    const prepared = await this.prepareEmaAccessToken({
+      format: accessTokenFormat,
+      clientId: clientInfo.clientId,
+      userId: mapped.value.userId,
+      mapperScope: mapped.value.scope,
+      mapperProps: mapped.value.props,
+      mapperMetadata: mapped.value.metadata,
+      assertionScopes: claims.value.assertionScopes,
+      resource: configuredResource,
+      accessTokenTTLSeconds: ttl.value,
+      env,
+      now: issueNow,
+    });
+
+    // The replay marker is the write that consumes the assertion. Fresh clock read so
+    // its KV TTL reflects the assertion's remaining lifetime at the moment of write.
+    const markNow = Math.floor(Date.now() / 1000);
+    const replay = await jtiStore.markUsed({
+      issuer: claims.value.claims.iss,
+      jti: claims.value.claims.jti,
+      exp: claims.value.claims.exp,
+      now: markNow,
+      env,
+    });
+    if (!replay.ok) return replay;
+
+    await this.saveGrantWithTTL(env, prepared.grantKey, prepared.grant, issueNow);
+    await this.persistAccessToken(env, prepared.minted);
+    return ok(prepared.response);
   }
 
   /**
@@ -4562,7 +4571,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * grant: encrypt the props, persist the grant under `grant:userId:grantId`,
    * and create an access token bound to the resource as audience.
    */
-  private async issueEmaAccessToken(args: {
+  /** Builds the grant record and access token for an enterprise-managed grant without writing either. */
+  private async prepareEmaAccessToken(args: {
     format: AccessTokenFormat;
     clientId: string;
     userId: string;
@@ -4574,7 +4584,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     accessTokenTTLSeconds: number;
     env: Env & ProviderEnv;
     now: number;
-  }): Promise<TokenResponse> {
+  }): Promise<{ grantKey: string; grant: Grant; minted: MintedAccessToken; response: TokenResponse }> {
     // Defense-in-depth downscope: the mapper's output is filtered through the
     // assertion's scope claim (when present) so that a mapper returning an
     // out-of-band `admin` scope cannot escalate beyond what the IdP authorized.
@@ -4598,9 +4608,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       expiresAt: args.now + args.accessTokenTTLSeconds,
       resource: args.resource,
     };
-    await this.saveGrantWithTTL(args.env, `grant:${args.userId}:${grantId}`, grant, args.now);
-
-    const accessToken = await this.createAccessToken({
+    const minted = await this.mintAccessToken({
       format: args.format,
       userId: args.userId,
       grantId,
@@ -4614,11 +4622,16 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     });
 
     return {
-      access_token: accessToken,
-      token_type: 'bearer',
-      expires_in: args.accessTokenTTLSeconds,
-      scope: tokenScopes.join(' '),
-      resource: args.resource,
+      grantKey: `grant:${args.userId}:${grantId}`,
+      grant,
+      minted,
+      response: {
+        access_token: minted.accessToken,
+        token_type: 'bearer',
+        expires_in: args.accessTokenTTLSeconds,
+        scope: tokenScopes.join(' '),
+        resource: args.resource,
+      },
     };
   }
 
