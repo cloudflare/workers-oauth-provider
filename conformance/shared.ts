@@ -5,6 +5,8 @@ export const READ_SCOPE = 'mcp:read';
 export const WRITE_SCOPE = 'mcp:write';
 export const OFFLINE_ACCESS_SCOPE = 'offline_access';
 export const INSUFFICIENT_SCOPE_TOKEN = 'valid-upstream-token-with-too-little-scope';
+export const FOREIGN_AUDIENCE_TOKEN = 'valid-upstream-token-for-another-resource';
+export const FOREIGN_RESOURCE = 'https://other.example.com/mcp';
 export const DENIED_SCOPE = 'conformance:deny';
 
 export type TokenEndpointAuthMethod = 'none' | 'client_secret_basic' | 'client_secret_post';
