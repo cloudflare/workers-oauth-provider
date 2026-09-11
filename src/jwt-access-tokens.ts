@@ -109,11 +109,6 @@ export interface JwtAccessTokensOptions<Env = Cloudflare.Env, Props = unknown> {
   ): JwtJsonValue | undefined | Promise<JwtJsonValue | undefined>;
   /** Maximum compact-token size accepted and emitted. Defaults to 16 KiB. */
   maxTokenBytes?: number;
-  /**
-   * Accept plain `http` for `issuer`, `jwksUri`, and token audiences. OAuth 2.1 requires
-   * `https`, so set this only in a local development configuration. Defaults to false.
-   */
-  allowHttp?: boolean;
 }
 
 /** Verified JWT context before a resource-specific props mapper runs. */
@@ -187,8 +182,6 @@ export interface JwtAccessTokenValidatorOptions<Env = Cloudflare.Env, Props = un
   clockSkewSeconds?: number;
   /** Maximum accepted compact-token size. Defaults to 16 KiB. */
   maxTokenBytes?: number;
-  /** Accept plain `http` for `issuer` and `audience` in local development. Defaults to false. */
-  allowHttp?: boolean;
 }
 
 /** Structural input accepted by both combined and standalone resource-server validators. */
@@ -216,9 +209,8 @@ export interface JwtAccessTokenValidation<Props> {
 export function createJwtAccessTokens<Env = Cloudflare.Env, Props = unknown>(
   options: JwtAccessTokensOptions<Env, Props>
 ): JwtAccessTokens<Env, Props> {
-  const allowHttp = options?.allowHttp === true;
-  const issuer = validateIssuer(options?.issuer, allowHttp);
-  const jwksUri = validateAbsoluteHttpsUrl(options?.jwksUri, 'jwksUri', allowHttp);
+  const issuer = validateIssuer(options?.issuer);
+  const jwksUri = validateAbsoluteHttpsUrl(options?.jwksUri, 'jwksUri');
   const maxTokenBytes = validateMaxTokenBytes(options?.maxTokenBytes);
   if (typeof options?.keys !== 'function') throw new TypeError('keys must be a function');
   if (options.publicClaims !== undefined && typeof options.publicClaims !== 'function') {
@@ -251,7 +243,7 @@ export function createJwtAccessTokens<Env = Cloudflare.Env, Props = unknown>(
     maxTokenBytes,
 
     async issue(input): Promise<JwtIssuedAccessToken> {
-      const snapshot = snapshotIssueInput(input, allowHttp);
+      const snapshot = snapshotIssueInput(input);
       const keySet = validateKeySet(await options.keys(snapshot.env));
       const projectedClaims = options.publicClaims ? await options.publicClaims(snapshot) : undefined;
       const publicClaims =
@@ -302,7 +294,7 @@ export function createJwtAccessTokens<Env = Cloudflare.Env, Props = unknown>(
       if (!Array.isArray(allowedAudiences) || allowedAudiences.length === 0) {
         throw new TypeError('allowedAudiences must contain at least one canonical resource URI');
       }
-      const audiences = [...new Set(allowedAudiences.map((value) => validateCanonicalResource(value, allowHttp)))];
+      const audiences = [...new Set(allowedAudiences.map((value) => validateCanonicalResource(value)))];
       const parsed = parseCompactJwt(token, maxTokenBytes);
       if (!parsed || !isAcceptedJwtType(parsed.header.typ)) return null;
       if (parsed.claims.iss !== issuer) return null;
@@ -324,7 +316,7 @@ export function createJwtAccessTokens<Env = Cloudflare.Env, Props = unknown>(
   internalStateVerifiers.set(accessTokens, async (token, env) => {
     const parsed = parseCompactJwt(token, maxTokenBytes);
     if (!parsed || !isAcceptedJwtType(parsed.header.typ) || parsed.claims.iss !== issuer) return null;
-    const audience = readCanonicalSingleAudience(parsed.claims.aud, allowHttp);
+    const audience = readCanonicalSingleAudience(parsed.claims.aud);
     if (!audience) return null;
     return verifyAgainstAudiences(parsed, [audience], env as Env);
   });
@@ -344,9 +336,8 @@ export function createJwtAccessTokens<Env = Cloudflare.Env, Props = unknown>(
 export function createJwtAccessTokenValidator<Env = Cloudflare.Env, Props = unknown>(
   options: JwtAccessTokenValidatorOptions<Env, Props>
 ): (input: JwtAccessTokenValidationInput<Env>) => Promise<JwtAccessTokenValidation<Props> | null> {
-  const allowHttp = options?.allowHttp === true;
-  const issuer = validateIssuer(options?.issuer, allowHttp);
-  const audience = validateCanonicalResource(options?.audience, allowHttp);
+  const issuer = validateIssuer(options?.issuer);
+  const audience = validateCanonicalResource(options?.audience);
   const algorithms = validateAlgorithms(options?.algorithms ?? ['RS256']);
   const clockSkewSeconds = validateClockSkew(options?.clockSkewSeconds);
   const maxTokenBytes = validateMaxTokenBytes(options?.maxTokenBytes);
@@ -624,13 +615,12 @@ function containsPrivateJwkMaterial(key: JwtAccessTokenPublicKey): boolean {
 }
 
 function snapshotIssueInput<Env, Props>(
-  input: JwtAccessTokenIssueInput<Env, Props>,
-  allowHttp: boolean
+  input: JwtAccessTokenIssueInput<Env, Props>
 ): JwtAccessTokenIssueInput<Env, Props> {
   if (!isNonEmptyString(input.userId)) throw new TypeError('JWT access token userId is required');
   if (!isNonEmptyString(input.grantId)) throw new TypeError('JWT access token grantId is required');
   if (!isNonEmptyString(input.clientId)) throw new TypeError('JWT access token clientId is required');
-  validateCanonicalResource(input.audience, allowHttp);
+  validateCanonicalResource(input.audience);
   if (!Array.isArray(input.scope) || input.scope.some((scope) => !isValidOAuthScopeToken(scope))) {
     throw new TypeError('JWT access token scope must contain valid OAuth scope tokens');
   }
@@ -650,34 +640,34 @@ function snapshotIssueInput<Env, Props>(
   });
 }
 
-function validateIssuer(value: unknown, allowHttp: boolean): string {
-  const issuer = validateAbsoluteHttpsUrl(value, 'issuer', allowHttp);
+function validateIssuer(value: unknown): string {
+  const issuer = validateAbsoluteHttpsUrl(value, 'issuer');
   const parsed = new URL(issuer);
   if (parsed.search || parsed.hash) throw new TypeError('issuer must not contain a query or fragment');
   return issuer;
 }
 
-function validateCanonicalResource(value: unknown, allowHttp: boolean): string {
-  if (typeof value !== 'string' || !isCanonicalHttpsUrl(value, allowHttp)) {
+function validateCanonicalResource(value: unknown): string {
+  if (typeof value !== 'string' || !isCanonicalHttpsUrl(value)) {
     throw new TypeError(
-      'audience must be a canonical absolute HTTPS resource URI (set allowHttp: true to accept http in development)'
+      'audience must be a canonical absolute HTTPS resource URI (http is accepted only on a loopback host)'
     );
   }
   return value;
 }
 
-function readCanonicalSingleAudience(value: unknown, allowHttp: boolean): string | null {
+function readCanonicalSingleAudience(value: unknown): string | null {
   if (typeof value !== 'string') return null;
   try {
-    return validateCanonicalResource(value, allowHttp);
+    return validateCanonicalResource(value);
   } catch {
     return null;
   }
 }
 
-function validateAbsoluteHttpsUrl(value: unknown, name: string, allowHttp: boolean): string {
-  if (typeof value !== 'string' || !isCanonicalHttpsUrl(value, allowHttp)) {
-    throw new TypeError(`${name} must be an absolute HTTPS URL (set allowHttp: true to accept http in development)`);
+function validateAbsoluteHttpsUrl(value: unknown, name: string): string {
+  if (typeof value !== 'string' || !isCanonicalHttpsUrl(value)) {
+    throw new TypeError(`${name} must be an absolute HTTPS URL (http is accepted only on a loopback host)`);
   }
   const parsed = new URL(value);
   if (parsed.hash) {
@@ -686,11 +676,11 @@ function validateAbsoluteHttpsUrl(value: unknown, name: string, allowHttp: boole
   return value;
 }
 
-function isCanonicalHttpsUrl(value: string, allowHttp: boolean): boolean {
+function isCanonicalHttpsUrl(value: string): boolean {
   if (!validateResourceUri(value)) return false;
   const parsed = new URL(value);
   return (
-    hasAcceptedCanonicalScheme(parsed, allowHttp) &&
+    hasAcceptedCanonicalScheme(parsed) &&
     !parsed.username &&
     !parsed.password &&
     parsed.protocol === parsed.protocol.toLowerCase() &&
