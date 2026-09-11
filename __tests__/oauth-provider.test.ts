@@ -3,7 +3,9 @@ import {
   AuthorizationError,
   CimdFetchError,
   ExternalTokenError,
+  createJwtAccessTokenValidator,
   createJwtAccessTokens,
+  createOAuthResourceServer,
   OAuthError,
   OAuthAuthorizationServer,
   OAuthProvider as BaseOAuthProvider,
@@ -15288,6 +15290,111 @@ describe('functional authorization-server and resource-server composition', () =
       expect(response.status).toBe(expectedStatus);
     }
   });
+
+  it('types ctx.props of a hosted handler from the class Props parameter', () => {
+    const typed = new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>({
+      issuer,
+      resources: [calendarResource, driveResource],
+      authorizeEndpoint: '/authorize',
+      tokenEndpoint: '/oauth/token',
+    });
+    const hosted = typed.protectResource({
+      resourceMetadata: { resource: calendarResource },
+      handler: {
+        fetch(_request, _env, executionContext) {
+          const userId: string = executionContext.props.userId;
+          return Response.json({ userId });
+        },
+      },
+    });
+    const viaHandle = typed.resource(driveResource).protect({
+      handler: {
+        fetch(_request, _env, executionContext) {
+          const userId: string = executionContext.props.userId;
+          return Response.json({ userId });
+        },
+      },
+    });
+    expect(typeof hosted.fetch).toBe('function');
+    expect(typeof viaHandle.fetch).toBe('function');
+  });
+
+  it('validates provider-minted JWTs offline in a separate resource Worker and falls back for opaque tokens', async () => {
+    const jwtAccessTokens = await createTestJwtAccessTokens();
+    let format: 'jwt' | 'opaque' = 'jwt';
+    const authorizationServer = new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>({
+      issuer,
+      resources: [calendarResource, driveResource],
+      authorizeEndpoint: '/authorize',
+      tokenEndpoint: '/oauth/token',
+      clientRegistrationEndpoint: '/oauth/register',
+      scopesSupported: ['calendar:read', 'drive:read'],
+      accessTokens: jwtAccessTokens,
+      accessTokenFormat: () => format,
+    });
+    const client = await registerClient(authorizationServer);
+    const calendarJwt = await issueTokens(authorizationServer, client, calendarResource);
+    const driveJwt = await issueTokens(authorizationServer, client, driveResource);
+    format = 'opaque';
+    const opaque = await issueTokens(authorizationServer, client, calendarResource);
+    expect(calendarJwt.access_token.split('.')).toHaveLength(3);
+    expect(opaque.access_token.split(':')).toHaveLength(3);
+
+    const jwksResponse = await authorizationServer.fetch(
+      createMockRequest(`${issuer}/.well-known/jwks.json`),
+      env,
+      ctx
+    );
+    expect(jwksResponse.status).toBe(200);
+    const jwks = await jwksResponse.json<{ keys: JwtAccessTokenPublicKey[] }>();
+
+    type CalendarProps = { userId: string; scopes: string[] };
+    const validateJwt = createJwtAccessTokenValidator<TestEnv, CalendarProps>({
+      issuer,
+      audience: calendarResource,
+      keys: () => jwks.keys,
+      mapClaimsToProps: ({ userId, scope }) => ({ userId, scopes: scope }),
+    });
+    // The README's migration pattern: offline validation first, then the resource-pinned
+    // authorization-server binding for tokens issued before JWTs were switched on.
+    const validateDuringMigration = async (input: Parameters<typeof validateJwt>[0]) => {
+      const jwt = await validateJwt(input);
+      if (jwt) return jwt;
+      const validated = await authorizationServer
+        .resource(calendarResource)
+        .validateToken<FunctionalAuthProps>(input.token, env);
+      if (!validated) return null;
+      return {
+        props: { userId: validated.props.userId, scopes: validated.scope },
+        audience: validated.audience,
+        expiresAt: validated.expiresAt,
+      };
+    };
+    const resourceWorker = createOAuthResourceServer<TestEnv, CalendarProps>({
+      resourceMetadata: {
+        resource: calendarResource,
+        authorization_servers: [issuer],
+        scopes_supported: ['calendar:read'],
+      },
+      validateToken: validateDuringMigration,
+      handler: {
+        fetch: (_request, _env, executionContext) => Response.json((executionContext as MockExecutionContext).props),
+      },
+    });
+    const statusFor = async (token: string) =>
+      (
+        await resourceWorker.fetch(
+          createMockRequest(calendarResource, 'GET', { Authorization: `Bearer ${token}` }),
+          env,
+          ctx
+        )
+      ).status;
+
+    expect(await statusFor(calendarJwt.access_token)).toBe(200);
+    expect(await statusFor(driveJwt.access_token)).toBe(401);
+    expect(await statusFor(opaque.access_token)).toBe(200);
+    expect(await statusFor('not-a-token')).toBe(401);
+  });
 });
 
 describe('request URL audience check on the combined provider', () => {
@@ -15453,5 +15560,170 @@ describe('request URL audience check on the combined provider', () => {
     );
     expect(response.status).toBe(401);
     expect(response.headers.get('WWW-Authenticate')).toContain('error="invalid_token"');
+  });
+});
+
+describe('enterprise-managed authorization with JWT access tokens', () => {
+  const issuer = 'https://auth.example.com';
+  const calendarResource = 'https://calendar.example.com/mcp';
+  const idpIssuer = 'https://idp.example.com';
+  let env: TestEnv;
+  let ctx: MockExecutionContext;
+
+  beforeEach(() => {
+    env = createMockEnv();
+    ctx = new MockExecutionContext();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function base64Url(bytes: Uint8Array): string {
+    let binary = '';
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+  }
+
+  function encodeJson(value: Record<string, unknown>): string {
+    return base64Url(new TextEncoder().encode(JSON.stringify(value)));
+  }
+
+  async function generateRsaKey(kid: string) {
+    const pair = (await crypto.subtle.generateKey(
+      { name: 'RSASSA-PKCS1-v1_5', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' },
+      true,
+      ['sign', 'verify']
+    )) as CryptoKeyPair;
+    const publicJwk = {
+      ...((await crypto.subtle.exportKey('jwk', pair.publicKey)) as JsonWebKey),
+      kid,
+      alg: 'RS256' as const,
+      use: 'sig',
+      key_ops: ['verify'],
+    } satisfies JwtAccessTokenPublicKey;
+    return { privateKey: pair.privateKey, publicJwk };
+  }
+
+  async function signAssertion(privateKey: CryptoKey, claims: Record<string, unknown>, kid: string) {
+    const header = encodeJson({ alg: 'RS256', typ: 'oauth-id-jag+jwt', kid });
+    const payload = encodeJson(claims);
+    const signature = await crypto.subtle.sign(
+      { name: 'RSASSA-PKCS1-v1_5' },
+      privateKey,
+      new TextEncoder().encode(`${header}.${payload}`)
+    );
+    return `${header}.${payload}.${base64Url(new Uint8Array(signature))}`;
+  }
+
+  it('keeps the one-use assertion retryable when JWT signing fails', async () => {
+    const idpKey = await generateRsaKey('idp-key');
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: RequestInfo | URL) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url === `${idpIssuer}/jwks.json`) return Response.json({ keys: [idpKey.publicJwk] });
+      return new Response('not found', { status: 404 });
+    });
+
+    const signingKey = await generateRsaKey('signing-key');
+    let keyLookups = 0;
+    const accessTokens = createJwtAccessTokens<TestEnv, { userId: string }>({
+      issuer,
+      jwksUri: `${issuer}/.well-known/jwks.json`,
+      keys: () => {
+        keyLookups += 1;
+        if (keyLookups === 1) throw new Error('key store unavailable');
+        return {
+          current: {
+            kid: 'signing-key',
+            alg: 'RS256',
+            privateKey: signingKey.privateKey,
+            publicJwk: signingKey.publicJwk,
+          },
+        };
+      },
+    });
+    const authorizationServer = new OAuthAuthorizationServer<TestEnv, { userId: string }>({
+      issuer,
+      resources: [calendarResource],
+      authorizeEndpoint: '/authorize',
+      tokenEndpoint: '/oauth/token',
+      clientRegistrationEndpoint: '/oauth/register',
+      scopesSupported: ['calendar:read'],
+      accessTokens,
+      enterpriseManagedAuthorization: {
+        trustedIssuers: async () => ({ issuer: idpIssuer, jwksUri: `${idpIssuer}/jwks.json`, algorithms: ['RS256'] }),
+        mapClaims: async ({ claims, requestedScope }) => ({
+          userId: `enterprise-${claims.sub}`,
+          scope: requestedScope,
+          metadata: {},
+          props: { userId: `enterprise-${claims.sub}` },
+        }),
+      },
+    });
+    const registration = await authorizationServer.fetch(
+      createMockRequest(
+        `${issuer}/oauth/register`,
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify({
+          redirect_uris: ['https://client.example.com/callback'],
+          token_endpoint_auth_method: 'client_secret_post',
+        })
+      ),
+      env,
+      ctx
+    );
+    expect(registration.status).toBe(201);
+    const client = await registration.json<any>();
+
+    const now = Math.floor(Date.now() / 1000);
+    const assertion = await signAssertion(
+      idpKey.privateKey,
+      {
+        iss: idpIssuer,
+        sub: 'employee-1',
+        aud: issuer,
+        resource: calendarResource,
+        client_id: client.client_id,
+        jti: crypto.randomUUID(),
+        iat: now,
+        exp: now + 300,
+        scope: 'calendar:read',
+      },
+      'idp-key'
+    );
+    const exchange = () =>
+      authorizationServer.fetch(
+        createMockRequest(
+          `${issuer}/oauth/token`,
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          new URLSearchParams({
+            grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+            assertion,
+            client_id: client.client_id,
+            client_secret: client.client_secret,
+          }).toString()
+        ),
+        env,
+        ctx
+      );
+
+    // The signing key is unavailable on the first attempt: nothing may be consumed.
+    await expect(exchange()).rejects.toThrow('key store unavailable');
+    expect((await env.OAUTH_KV.list({ prefix: 'enterprise-jti:' })).keys).toHaveLength(0);
+    expect((await env.OAUTH_KV.list({ prefix: 'grant:' })).keys).toHaveLength(0);
+    expect((await env.OAUTH_KV.list({ prefix: 'token:' })).keys).toHaveLength(0);
+
+    // The same assertion is retryable, and only then is it consumed.
+    const retried = await exchange();
+    expect(retried.status).toBe(200);
+    const tokens = await retried.json<any>();
+    expect(tokens.access_token.split('.')).toHaveLength(3);
+    expect((await env.OAUTH_KV.list({ prefix: 'enterprise-jti:' })).keys).toHaveLength(1);
+
+    const replayed = await exchange();
+    expect(replayed.status).toBe(400);
+    await expect(replayed.json()).resolves.toMatchObject({ error: 'invalid_grant' });
   });
 });
