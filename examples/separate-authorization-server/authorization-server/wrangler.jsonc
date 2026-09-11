@@ -1,0 +1,35 @@
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "example-authorization-server",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-29",
+  // nodejs_compat: shared code from the MCP SDK's dependency tree.
+  // global_fetch_strictly_public: required by clientIdMetadataDocumentEnabled, which
+  // fetches client metadata documents from the public internet.
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "dev": { "port": 8787 },
+  "kv_namespaces": [{ "binding": "OAUTH_KV", "id": "<replace-with-your-kv-id>" }],
+
+  // The issuer and every resource identifier have to exist before the first request, so
+  // they are inlined at build time. These values serve `npm run dev:auth`, `npm test`,
+  // and `npm run conformance`, which all run the two Workers on localhost.
+  "define": {
+    "AUTH_ISSUER": "\"https://localhost:8787\"",
+    "MCP_RESOURCE": "\"https://localhost:8788/mcp\"",
+    "REPORTS_RESOURCE": "\"https://reports.localhost/api\"",
+  },
+
+  "env": {
+    "production": {
+      "routes": [{ "pattern": "auth.example.com", "custom_domain": true }],
+      // `define`, `kv_namespaces`, and `routes` are all non-inheritable: an environment
+      // has to repeat everything it needs.
+      "define": {
+        "AUTH_ISSUER": "\"https://auth.example.com\"",
+        "MCP_RESOURCE": "\"https://mcp.example.com/mcp\"",
+        "REPORTS_RESOURCE": "\"https://reports.example.com/api\"",
+      },
+      "kv_namespaces": [{ "binding": "OAUTH_KV", "id": "<replace-with-your-kv-id>" }],
+    },
+  },
+}

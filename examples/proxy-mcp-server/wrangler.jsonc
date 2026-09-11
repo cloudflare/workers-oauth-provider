@@ -1,0 +1,27 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "example-proxy-mcp-server",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-29",
+  // nodejs_compat: the MCP TypeScript SDK pulls in Node built-ins.
+  // global_fetch_strictly_public: required by clientIdMetadataDocumentEnabled, which
+  // fetches client metadata documents from the public internet.
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "dev": { "port": 8787 },
+  "kv_namespaces": [{ "binding": "OAUTH_KV", "id": "<replace-with-your-kv-id>" }],
+
+  // The canonical resource identifier has to exist before the first request, so it is
+  // inlined at build time. These values serve `npm run dev`, `npm test`, and
+  // `npm run conformance`, which all run the Worker on localhost:8787.
+  "define": { "MCP_RESOURCE": "\"https://localhost:8787/mcp\"" },
+
+  "env": {
+    "production": {
+      "routes": [{ "pattern": "mcp.example.com", "custom_domain": true }],
+      // `define`, `kv_namespaces`, and `routes` are all non-inheritable: an environment
+      // has to repeat everything it needs.
+      "define": { "MCP_RESOURCE": "\"https://mcp.example.com/mcp\"" },
+      "kv_namespaces": [{ "binding": "OAUTH_KV", "id": "<replace-with-your-kv-id>" }],
+    },
+  },
+}

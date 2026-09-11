@@ -1,0 +1,25 @@
+{
+  "name": "example-separate-authorization-server",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev:auth": "wrangler dev --config authorization-server/wrangler.jsonc --local-protocol https --inspector-port 9229",
+    "dev:mcp": "wrangler dev --config mcp-server/wrangler.jsonc --local-protocol https --inspector-port 9230",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "conformance": "node scripts/conformance.mjs",
+    "deploy:auth": "wrangler deploy --config authorization-server/wrangler.jsonc --env production",
+    "deploy:mcp": "wrangler deploy --config mcp-server/wrangler.jsonc --env production"
+  },
+  "dependencies": {
+    "@cloudflare/workers-oauth-provider": "file:../..",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260730.1",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.8",
+    "wrangler": "^4.115.0"
+  }
+}
