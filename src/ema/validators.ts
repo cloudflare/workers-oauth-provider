@@ -10,7 +10,8 @@
  */
 
 import type { ClientInfo } from '../oauth-provider';
-import { isValidOAuthScopeToken, resourceMatches, validateResourceUri } from '../oauth-provider';
+import { isValidOAuthScopeToken } from '../oauth-provider';
+import { resourceMatches, validateResourceUri } from '../oauth-resource';
 import { EMA_DEFAULT_JWT_ALGORITHM, EMA_SUPPORTED_JWT_ALGORITHMS, type EmaSupportedAlg } from './constants';
 import { err, ok, type EmaValidationError, type Result } from './result';
 import type {
@@ -163,7 +164,6 @@ interface ValidateClaimsInput {
   expectedAudience: string;
   clientId: string;
   configuredResource: string;
-  matchOriginOnly: boolean;
   now: number;
   clockSkewSeconds: number;
   maxAssertionLifetimeSeconds: number;
@@ -186,7 +186,7 @@ interface ValidateClaimsInput {
  *   - `scope` (if present) conforms to RFC 6749 §3.3 grammar
  */
 export function validateIdJagClaims(input: ValidateClaimsInput): Result<ValidatedIdJag, EmaValidationError> {
-  const { rawClaims, trustedIssuer, expectedAudience, clientId, configuredResource, matchOriginOnly } = input;
+  const { rawClaims, trustedIssuer, expectedAudience, clientId, configuredResource } = input;
   const { now, clockSkewSeconds, maxAssertionLifetimeSeconds } = input;
 
   const iss = readRequiredString(rawClaims, 'iss');
@@ -241,7 +241,7 @@ export function validateIdJagClaims(input: ValidateClaimsInput): Result<Validate
     return err({ reason: 'resource_invalid', resource: resource.value });
   }
 
-  if (!resourceMatches(resource.value, configuredResource, matchOriginOnly)) {
+  if (!resourceMatches(resource.value, configuredResource)) {
     return err({ reason: 'resource_mismatch', expected: configuredResource, got: resource.value });
   }
 

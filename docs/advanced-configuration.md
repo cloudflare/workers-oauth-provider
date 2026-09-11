@@ -67,7 +67,7 @@ Plain errors continue to surface as 500 responses.
 
 ## OAuth 2.0 Token Exchange
 
-Set `allowTokenExchangeGrant: true` to enable RFC 8693. Clients can exchange an existing access token for a token with narrower scopes, a permitted resource, or a shorter lifetime.
+Set `allowTokenExchangeGrant: true` to enable RFC 8693. Clients can exchange an existing access token for a token with narrower scopes or a shorter lifetime. Token exchange cannot change the subject grant's registered canonical resource audience.
 
 Application code can also call:
 
@@ -75,12 +75,24 @@ Application code can also call:
 await env.OAUTH_PROVIDER.exchangeToken({
   subjectToken,
   scope: ['documents:read'],
-  aud: 'https://api.example.com/documents',
+  aud: 'https://mcp.example.com/mcp', // Must match the subject grant's resource
   expiresIn: 900,
 });
 ```
 
-The new token cannot exceed the subject token's scope ceiling, permitted resources, or remaining lifetime.
+The new token cannot exceed the subject token's scope ceiling or remaining lifetime. Its subject audience and any `aud` request value must resolve to the same registered resource. Subject-token failures return `invalid_request`, as RFC 8693 §2.2.2 requires.
+
+A client must register `urn:ietf:params:oauth:grant-type:token-exchange` in its `grant_types` to use the grant at the token endpoint. A token is exchanged by the client its grant was issued to. Exchanging a token that another client obtained is rejected with `invalid_request` unless `tokenExchangeCallback` allows that specific exchange. The callback sees both parties, so the decision can be per client pair:
+
+```ts
+tokenExchangeCallback: (options) => {
+  if (options.grantType === 'urn:ietf:params:oauth:grant-type:token-exchange') {
+    // options.clientId is the exchanging client; options.subjectClientId issued the grant.
+    const trusted = options.subjectClientId === options.clientId || DELEGATES.has(options.clientId);
+    return { allowCrossClientExchange: trusted };
+  }
+},
+```
 
 ## Enterprise-managed authorization
 
@@ -298,8 +310,7 @@ new OAuthProvider({
 
 The callback can:
 
-- Return `{ props, audience }` to authenticate. If `resourceMetadata.resource` is configured, the audience is required and must exactly match it.
-- Return `{ props }` when no explicit resource is configured. The provider applies its origin-bound default resource policy.
+- Return `{ props, audience }` to authenticate. The audience is required, must be a single string, and must identify the configured canonical `resourceMetadata.resource`; scheme and host comparisons are ASCII case-insensitive and an empty path equals `/`, while port, path, query, and trailing slash are strict. An array is rejected.
 - Return `null` for a generic `401 invalid_token` response.
 - Throw the exported `ExternalTokenError` for an intentional structured response.
 
