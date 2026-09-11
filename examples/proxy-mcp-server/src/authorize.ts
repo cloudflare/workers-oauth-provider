@@ -42,16 +42,24 @@ async function handleAuthorize(request: Request, oauth: OAuthHelpers<McpProps>):
     });
   }
 
+  // Nothing about the request is trusted until parseAuthRequest() has validated it, so a
+  // failure here renders locally.
   let authRequest: AuthRequest;
-  let clientName: string;
   try {
     authRequest = await oauth.parseAuthRequest(request);
-    // Only the display name is needed from the client record. For a CIMD client this can
-    // fetch the metadata document again, so it stays inside the same failure handling.
+  } catch (error) {
+    return renderAuthorizationFailure(error);
+  }
+
+  // Only the display name is needed from the client record. For a CIMD client this can
+  // fetch the metadata document again; the redirect URI is validated by now, so a failure
+  // goes back to the client as an OAuth error.
+  let clientName: string;
+  try {
     const client = await oauth.lookupClient(authRequest.clientId);
     clientName = client?.clientName ?? authRequest.clientId;
   } catch (error) {
-    return renderAuthorizationFailure(error);
+    return renderAuthorizationFailure(error, authRequest);
   }
 
   // The consent screen and the grant must describe the same thing, so both are built
@@ -94,7 +102,7 @@ async function handleAuthorize(request: Request, oauth: OAuthHelpers<McpProps>):
     });
     return Response.redirect(redirectTo, 302);
   } catch (error) {
-    return renderAuthorizationFailure(error);
+    return renderAuthorizationFailure(error, authRequest);
   }
 }
 
@@ -112,10 +120,18 @@ function grantableScopes(requested: string[]): string[] {
 /**
  * `parseAuthRequest()` rejects a bad request in two ways, and a failure to fetch a client
  * ID metadata document is a third. Without a validated `redirectUri` the error has to be
- * rendered locally, because redirecting an unvalidated URI is an open redirect.
+ * rendered locally, because redirecting an unvalidated URI is an open redirect. Once the
+ * request has been validated, a later metadata fetch failure goes back to the client as an
+ * OAuth error with `state` and `iss` (RFC 6749 §4.1.2.1), so the client stops waiting.
  */
-function renderAuthorizationFailure(error: unknown): Response {
+function renderAuthorizationFailure(error: unknown, authRequest?: AuthRequest): Response {
   if (error instanceof CimdFetchError) {
+    if (authRequest) {
+      return redirectToClient(authRequest, {
+        error: 'temporarily_unavailable',
+        error_description: 'The client ID metadata document could not be fetched',
+      });
+    }
     return new Response('The client ID metadata document could not be fetched', { status: 400 });
   }
   if (!(error instanceof AuthorizationError)) throw error;
