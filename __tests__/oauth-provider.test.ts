@@ -12680,6 +12680,28 @@ describe('OAuthProvider', () => {
       return tokenResponse.json<any>();
     }
 
+    it('deletes every grant and token when the key listing is paginated', async () => {
+      await authorizeAndGetTokens('user-1');
+      await authorizeAndGetTokens('user-2');
+      await authorizeAndGetTokens('user-3');
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys.length).toBe(3);
+
+      // Force one key per page so a sweep that deletes while paginating would skip records.
+      const originalList = mockEnv.OAUTH_KV.list.bind(mockEnv.OAUTH_KV);
+      const list = vi
+        .spyOn(mockEnv.OAUTH_KV, 'list')
+        .mockImplementation((options: Parameters<typeof originalList>[0]) => originalList({ ...options, limit: 1 }));
+      try {
+        await mockEnv.OAUTH_PROVIDER!.deleteClient(clientId);
+      } finally {
+        list.mockRestore();
+      }
+
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys.length).toBe(0);
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'token:' })).keys.length).toBe(0);
+      expect(await mockEnv.OAUTH_KV.get(`client:${clientId}`, { type: 'json' })).toBeNull();
+    });
+
     it('should delete all grants and tokens when a client is deleted', async () => {
       // Create grants for two different users
       const tokens1 = await authorizeAndGetTokens('user-1');
@@ -13469,6 +13491,60 @@ describe('functional authorization-server and resource-server composition', () =
       ctx
     );
   }
+
+  it('keeps the authorization code retryable when JWT signing fails', async () => {
+    const keyPair = (await crypto.subtle.generateKey(
+      { name: 'RSASSA-PKCS1-v1_5', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' },
+      true,
+      ['sign', 'verify']
+    )) as CryptoKeyPair;
+    const publicJwk = {
+      ...((await crypto.subtle.exportKey('jwk', keyPair.publicKey)) as JsonWebKey),
+      kid: 'flaky-key',
+      alg: 'RS256' as const,
+      use: 'sig',
+      key_ops: ['verify'],
+    } satisfies JwtAccessTokenPublicKey;
+    let keyLookups = 0;
+    const accessTokens = createJwtAccessTokens<TestEnv, FunctionalAuthProps>({
+      issuer,
+      jwksUri: `${issuer}/.well-known/jwks.json`,
+      keys: () => {
+        keyLookups += 1;
+        if (keyLookups === 1) throw new Error('key store unavailable');
+        return { current: { kid: publicJwk.kid, alg: 'RS256', privateKey: keyPair.privateKey, publicJwk } };
+      },
+    });
+    const authorizationServer = new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>({
+      issuer,
+      resources: [calendarResource],
+      authorizeEndpoint: '/authorize',
+      tokenEndpoint: '/oauth/token',
+      clientRegistrationEndpoint: '/oauth/register',
+      scopesSupported: ['calendar:read'],
+      accessTokens,
+    });
+    authorizationServer.protectResource({
+      resourceMetadata: { resource: calendarResource, scopes_supported: ['calendar:read'] },
+      handler: resourceHandler('calendar'),
+    });
+    const client = await registerClient(authorizationServer);
+    const code = await authorize(authorizationServer, client, [calendarResource]);
+
+    // The first exchange fails while signing, before the code is consumed.
+    await expect(exchangeCode(authorizationServer, client, code)).rejects.toThrow('key store unavailable');
+    const grants = await env.OAUTH_KV.list({ prefix: 'grant:' });
+    const grant = (await env.OAUTH_KV.get(grants.keys[0].name, { type: 'json' })) as Grant;
+    expect(grant.authCodeWrappedKey).toBeDefined();
+    expect((await env.OAUTH_KV.list({ prefix: 'token:' })).keys).toHaveLength(0);
+
+    // The same code succeeds once the key store is back.
+    const retry = await exchangeCode(authorizationServer, client, code);
+    expect(retry.status).toBe(200);
+    const tokens = await retry.json<any>();
+    expect(tokens.access_token.split('.')).toHaveLength(3);
+    expect(keyLookups).toBe(2);
+  });
 
   it('publishes one AS and independent metadata for two routed MCP resources', async () => {
     const { authorizationServer, calendar, drive } = createRoles();
