@@ -12943,6 +12943,7 @@ describe('functional authorization-server and resource-server composition', () =
   function createRoles(policy: { defaultResource?: string; legacyGrantResource?: string } = {}) {
     const authorizationServer = new OAuthAuthorizationServer<TestEnv>({
       issuer,
+      resources: [calendarResource, driveResource],
       authorizeEndpoint: '/authorize',
       tokenEndpoint: '/oauth/token',
       clientRegistrationEndpoint: '/oauth/register',
@@ -13146,9 +13147,10 @@ describe('functional authorization-server and resource-server composition', () =
     const pathIssuer = 'https://auth.example.com/tenant///';
     const authorizationServer = new OAuthAuthorizationServer<TestEnv>({
       issuer: pathIssuer,
+      resources: [calendarResource],
       authorizeEndpoint: '/tenant/authorize',
       tokenEndpoint: '/tenant/oauth/token',
-    }).registerResource(calendarResource);
+    });
 
     const response = await authorizationServer.fetch(
       createMockRequest('https://auth.example.com/.well-known/oauth-authorization-server/tenant'),
@@ -13176,6 +13178,7 @@ describe('functional authorization-server and resource-server composition', () =
         () =>
           new OAuthAuthorizationServer<TestEnv>({
             issuer: unsafeIssuer,
+            resources: [calendarResource],
             authorizeEndpoint: '/authorize',
             tokenEndpoint: '/oauth/token',
           })
@@ -13188,11 +13191,11 @@ describe('functional authorization-server and resource-server composition', () =
     const localResource = 'http://localhost:8788/mcp';
     const authorizationServer = new OAuthAuthorizationServer<TestEnv>({
       issuer: localIssuer,
+      resources: [localResource],
       authorizeEndpoint: '/authorize',
       tokenEndpoint: 'http://localhost:8787/oauth/token',
       allowHttp: true,
     });
-    authorizationServer.registerResource(localResource);
 
     const response = await authorizationServer.fetch(
       createMockRequest('http://localhost:8787/.well-known/oauth-authorization-server'),
@@ -13211,6 +13214,7 @@ describe('functional authorization-server and resource-server composition', () =
       () =>
         new OAuthAuthorizationServer<TestEnv>({
           issuer: 'http://localhost:8787',
+          resources: [calendarResource],
           authorizeEndpoint: '/authorize',
           tokenEndpoint: '/oauth/token',
         })
@@ -13220,6 +13224,7 @@ describe('functional authorization-server and resource-server composition', () =
       () =>
         new OAuthAuthorizationServer<TestEnv>({
           issuer,
+          resources: [calendarResource],
           authorizeEndpoint: '/authorize',
           tokenEndpoint: 'http://auth.example.com/oauth/token',
         })
@@ -13231,6 +13236,7 @@ describe('functional authorization-server and resource-server composition', () =
       () =>
         new OAuthAuthorizationServer<TestEnv>({
           issuer,
+          resources: [calendarResource],
           authorizeEndpoint: '/authorize',
           tokenEndpoint: 'http://auth.example.com/oauth/token',
         })
@@ -13240,6 +13246,7 @@ describe('functional authorization-server and resource-server composition', () =
       () =>
         new OAuthAuthorizationServer<TestEnv>({
           issuer,
+          resources: [calendarResource],
           authorizeEndpoint: '/authorize#consent',
           tokenEndpoint: '/oauth/token',
         })
@@ -13249,6 +13256,7 @@ describe('functional authorization-server and resource-server composition', () =
       () =>
         new OAuthAuthorizationServer<TestEnv>({
           issuer,
+          resources: [calendarResource],
           authorizeEndpoint: '/authorize',
           tokenEndpoint: 'https://user:password@auth.example.com/oauth/token',
         })
@@ -13260,6 +13268,7 @@ describe('functional authorization-server and resource-server composition', () =
       () =>
         new OAuthAuthorizationServer<TestEnv>({
           issuer,
+          resources: [calendarResource],
           authorizeEndpoint: '/authorize',
           tokenEndpoint: '/oauth',
           clientRegistrationEndpoint: '/oauth',
@@ -13270,6 +13279,7 @@ describe('functional authorization-server and resource-server composition', () =
       () =>
         new OAuthAuthorizationServer<TestEnv>({
           issuer,
+          resources: [calendarResource],
           authorizeEndpoint: '/authorize',
           tokenEndpoint: '/.well-known/oauth-authorization-server',
         })
@@ -13279,6 +13289,7 @@ describe('functional authorization-server and resource-server composition', () =
       () =>
         new OAuthAuthorizationServer<TestEnv>({
           issuer,
+          resources: [calendarResource],
           authorizeEndpoint: '/authorize',
           tokenEndpoint: '/oauth/token',
           clientRegistrationEndpoint: '/.well-known/oauth-authorization-server',
@@ -13289,10 +13300,11 @@ describe('functional authorization-server and resource-server composition', () =
   it('retains static authorization queries and distinguishes same-path AS endpoints', async () => {
     const authorizationServer = new OAuthAuthorizationServer<TestEnv>({
       issuer,
+      resources: [calendarResource],
       authorizeEndpoint: '/authorize?tenant=calendar',
       tokenEndpoint: `${issuer}/oauth?operation=token`,
       clientRegistrationEndpoint: `${issuer}/oauth?operation=register`,
-    }).registerResource(calendarResource);
+    });
     const oauth = authorizationServer.getOAuthApi(env);
     const client = await oauth.createClient({
       redirectUris: ['https://client.example.com/callback'],
@@ -13356,6 +13368,7 @@ describe('functional authorization-server and resource-server composition', () =
     };
     const authorizationServer = new OAuthAuthorizationServer<TestEnv>({
       issuer,
+      resources: [calendarResource],
       authorizeEndpoint: '/authorize',
       tokenEndpoint: '/oauth/token',
     });
@@ -13391,9 +13404,10 @@ describe('functional authorization-server and resource-server composition', () =
     const tokenEndpoint = 'https://tokens.example.com/oauth/token';
     const authorizationServer = new OAuthAuthorizationServer<TestEnv>({
       issuer,
+      resources: [calendarResource],
       authorizeEndpoint: '/authorize',
       tokenEndpoint,
-    }).registerResource(calendarResource);
+    });
 
     const metadata = await authorizationServer.fetch(
       createMockRequest(`${issuer}/.well-known/oauth-authorization-server`),
@@ -13421,10 +13435,10 @@ describe('functional authorization-server and resource-server composition', () =
     const client = await registerClient(authorizationServer);
     const calendarTokens = await issueTokens(authorizationServer, client, calendarResource);
     await expect(
-      authorizationServer.validateToken(calendarTokens.access_token, calendarResource, env)
+      authorizationServer.resource(calendarResource).validateToken(calendarTokens.access_token, env)
     ).resolves.toMatchObject({ audience: calendarResource, clientId: client.client_id });
     await expect(
-      authorizationServer.validateToken(calendarTokens.access_token, driveResource, env)
+      authorizationServer.resource(driveResource).validateToken(calendarTokens.access_token, env)
     ).resolves.toBeNull();
 
     const calendarResponse = await calendar.fetch(
@@ -13526,23 +13540,111 @@ describe('functional authorization-server and resource-server composition', () =
     delete oldToken.audience;
     await env.OAUTH_KV.put(tokenKey, JSON.stringify(oldToken));
 
-    await expect(authorizationServer.validateToken(tokens.access_token, calendarResource, env)).resolves.toMatchObject({
+    await expect(
+      authorizationServer.resource(calendarResource).validateToken(tokens.access_token, env)
+    ).resolves.toMatchObject({
       audience: calendarResource,
     });
-    await expect(authorizationServer.validateToken(tokens.access_token, driveResource, env)).resolves.toBeNull();
+    await expect(
+      authorizationServer.resource(driveResource).validateToken(tokens.access_token, env)
+    ).resolves.toBeNull();
 
     const { authorizationServer: withoutMigrationTarget } = createRoles();
-    await expect(withoutMigrationTarget.validateToken(tokens.access_token, calendarResource, env)).resolves.toBeNull();
+    await expect(
+      withoutMigrationTarget.resource(calendarResource).validateToken(tokens.access_token, env)
+    ).resolves.toBeNull();
   });
 
-  it('can register remote audiences without hosting their handlers', async () => {
+  it('validates the resource registry and policy options at construction', () => {
+    const base = { issuer, authorizeEndpoint: '/authorize', tokenEndpoint: '/oauth/token' };
+    expect(() => new OAuthAuthorizationServer<TestEnv>({ ...base, resources: [] })).toThrow(
+      'resources must list at least one canonical protected resource identifier'
+    );
+    expect(
+      () => new OAuthAuthorizationServer<TestEnv>({ ...base, resources: [calendarResource, calendarResource] })
+    ).toThrow('resources must be unique');
+    expect(
+      () =>
+        new OAuthAuthorizationServer<TestEnv>({
+          ...base,
+          resources: [calendarResource, driveResource],
+          defaultResource: 'https://calendar.example.com/typo',
+        })
+    ).toThrow('defaultResource must name one of the configured protected resources');
+    expect(
+      () =>
+        new OAuthAuthorizationServer<TestEnv>({
+          ...base,
+          resources: [calendarResource, driveResource],
+          legacyGrantResource: 'https://drive.example.com/typo',
+        })
+    ).toThrow('legacyGrantResource must name one of the configured protected resources');
+
+    const authorizationServer = new OAuthAuthorizationServer<TestEnv>({ ...base, resources: [calendarResource] });
+    expect(() => authorizationServer.resource(driveResource)).toThrow(`${driveResource} is not declared in resources`);
+    expect(() =>
+      authorizationServer.protectResource({
+        resourceMetadata: { resource: driveResource },
+        handler: resourceHandler('drive'),
+      })
+    ).toThrow(`${driveResource} is not declared in resources`);
+    authorizationServer.protectResource({
+      resourceMetadata: { resource: calendarResource },
+      handler: resourceHandler('calendar'),
+    });
+    expect(() =>
+      authorizationServer.protectResource({
+        resourceMetadata: { resource: calendarResource },
+        handler: resourceHandler('calendar'),
+      })
+    ).toThrow(`A protected resource is already hosted for ${calendarResource}`);
+  });
+
+  it('hosts and validates a declared resource through its handle', async () => {
     const authorizationServer = new OAuthAuthorizationServer<TestEnv>({
       issuer,
+      resources: [calendarResource, driveResource],
       authorizeEndpoint: '/authorize',
       tokenEndpoint: '/oauth/token',
-    })
-      .registerResource(calendarResource)
-      .registerResource(driveResource);
+      clientRegistrationEndpoint: '/oauth/register',
+      scopesSupported: ['calendar:read', 'drive:read'],
+    });
+    const calendar = authorizationServer.resource(calendarResource);
+    expect(calendar.resource).toBe(calendarResource);
+    const surface = calendar.protect({
+      resourceMetadata: { scopes_supported: ['calendar:read'], resource_name: 'Calendar MCP' },
+      handler: resourceHandler('calendar'),
+    });
+
+    const metadata = await surface.fetch(
+      createMockRequest('https://calendar.example.com/.well-known/oauth-protected-resource/mcp'),
+      env,
+      ctx
+    );
+    await expect(metadata.json()).resolves.toMatchObject({
+      resource: calendarResource,
+      authorization_servers: [issuer],
+      scopes_supported: ['calendar:read'],
+      resource_name: 'Calendar MCP',
+    });
+
+    const client = await registerClient(authorizationServer);
+    const tokens = await issueTokens(authorizationServer, client, calendarResource);
+    await expect(calendar.validateToken(tokens.access_token, env)).resolves.toMatchObject({
+      audience: calendarResource,
+    });
+    await expect(
+      authorizationServer.resource(driveResource).validateToken(tokens.access_token, env)
+    ).resolves.toBeNull();
+  });
+
+  it('declares remote audiences without hosting their handlers', async () => {
+    const authorizationServer = new OAuthAuthorizationServer<TestEnv>({
+      issuer,
+      resources: [calendarResource, driveResource],
+      authorizeEndpoint: '/authorize',
+      tokenEndpoint: '/oauth/token',
+    });
     const response = await authorizationServer.fetch(
       createMockRequest(`${issuer}/.well-known/oauth-authorization-server`),
       env,

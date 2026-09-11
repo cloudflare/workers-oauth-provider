@@ -589,6 +589,9 @@ interface OAuthAuthorizationServerConfiguration {
   /** Canonical RFC 8414 issuer. Its origin gates authorization-server routes. */
   issuer: string;
 
+  /** Every canonical protected resource this authorization server issues tokens for. */
+  resources: readonly string[];
+
   /** Authorization endpoint advertised by the AS. A path is resolved against `issuer`. */
   authorizeEndpoint: string;
 
@@ -649,6 +652,15 @@ export type OAuthAuthorizationServerOptions<Env = Cloudflare.Env> = Omit<
   /** Canonical RFC 8414 issuer. */
   issuer: string;
 
+  /**
+   * Canonical identifiers of every protected resource this authorization server issues
+   * tokens for, whether hosted in this Worker through `protectResource()` or by another
+   * Worker or service. At least one is required. The registry is fixed at construction,
+   * so `defaultResource`, `legacyGrantResource`, and `resource()` are checked before the
+   * first request.
+   */
+  resources: readonly string[];
+
   /** Resource selected for a new authorization request that omits `resource`. */
   defaultResource?: string;
 
@@ -668,6 +680,31 @@ export interface ProtectResourceOptions<Env = Cloudflare.Env, Props = unknown> {
 /** A protected-resource fetch surface created by an authorization server. */
 export interface OAuthProtectedResource<Env = Cloudflare.Env> {
   fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response>;
+}
+
+/** Options for {@link OAuthResourceHandle.protect}; the resource comes from the handle. */
+export interface ProtectResourceHandleOptions<Env = Cloudflare.Env, Props = unknown> {
+  resourceMetadata?: Omit<OAuthProtectedResourceMetadata, 'resource'>;
+  handler: ProtectResourceOptions<Env, Props>['handler'];
+  resolveExternalToken?: ProtectResourceOptions<Env, Props>['resolveExternalToken'];
+}
+
+/**
+ * One protected resource declared in `OAuthAuthorizationServerOptions.resources`.
+ * Obtained from `OAuthAuthorizationServer.resource()`, so a misspelled identifier fails
+ * at module initialization instead of on a request.
+ */
+export interface OAuthResourceHandle<Env = Cloudflare.Env> {
+  /** Canonical spelling of the declared resource identifier. */
+  readonly resource: string;
+  /**
+   * Validate an opaque access token for this resource only. A separate Worker can call
+   * this over a private Service Binding; the audience is fixed here, so the caller
+   * cannot ask about another resource's tokens.
+   */
+  validateToken<T = any>(token: string, env: Env): Promise<ValidatedAccessToken<T> | null>;
+  /** Host this resource in the same Worker and return its independently routable fetch surface. */
+  protect<Props = unknown>(options: ProtectResourceHandleOptions<Env, Props>): OAuthProtectedResource<Env>;
 }
 
 /** Audience-checked token context suitable for a private Service Binding. */
@@ -1524,6 +1561,7 @@ export class OAuthAuthorizationServer<Env = Cloudflare.Env> {
   constructor(options: OAuthAuthorizationServerOptions<Env>) {
     const {
       issuer,
+      resources,
       defaultResource,
       legacyGrantResource,
       authorizeEndpoint,
@@ -1538,6 +1576,7 @@ export class OAuthAuthorizationServer<Env = Cloudflare.Env> {
       },
       authorizationServer: {
         issuer,
+        resources,
         authorizeEndpoint,
         tokenEndpoint,
         clientRegistrationEndpoint,
@@ -1547,7 +1586,26 @@ export class OAuthAuthorizationServer<Env = Cloudflare.Env> {
     });
   }
 
-  /** Register one audience and return its independently routable RS surface. */
+  /**
+   * A handle for one resource declared in `resources`. Throws at module initialization
+   * when the identifier was not declared.
+   */
+  resource(resource: string): OAuthResourceHandle<Env> {
+    const canonical = this.#impl.requireDeclaredResource(resource);
+    return {
+      resource: canonical,
+      validateToken: <T = any>(token: string, env: Env) =>
+        this.#impl.validateAccessToken<T>(token, canonical, env as Env & ProviderEnv),
+      protect: <Props = unknown>(options: ProtectResourceHandleOptions<Env, Props>) =>
+        this.protectResource<Props>({
+          resourceMetadata: { ...(options.resourceMetadata ?? {}), resource: canonical },
+          handler: options.handler,
+          resolveExternalToken: options.resolveExternalToken,
+        }),
+    };
+  }
+
+  /** Host one declared resource in this Worker and return its independently routable RS surface. */
   protectResource<Props = unknown>(options: ProtectResourceOptions<Env, Props>): OAuthProtectedResource<Env> {
     const resource = this.#impl.registerResourceServer({
       resourceMetadata: options.resourceMetadata,
@@ -1559,12 +1617,6 @@ export class OAuthAuthorizationServer<Env = Cloudflare.Env> {
     };
   }
 
-  /** Register an audience hosted by another Worker or service. */
-  registerResource(resource: string): this {
-    this.#impl.registerResourceIdentifier(resource);
-    return this;
-  }
-
   /** Serve protocol-owned authorization-server endpoints, excluding the application authorization UI. */
   fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     return this.#impl.fetchAuthorizationServer(request, env as Env & ProviderEnv, ctx);
@@ -1573,15 +1625,6 @@ export class OAuthAuthorizationServer<Env = Cloudflare.Env> {
   /** Obtain helpers for scheduled jobs or custom code outside a fetch dispatch. */
   getOAuthApi(env: Env): OAuthHelpers {
     return this.#impl.createOAuthHelpers(env as Env & ProviderEnv);
-  }
-
-  /**
-   * Validate an opaque token for one fixed registered audience. A separate
-   * Worker can expose a resource-specific wrapper around this method over a
-   * private Service Binding.
-   */
-  validateToken<T = any>(token: string, resource: string, env: Env): Promise<ValidatedAccessToken<T> | null> {
-    return this.#impl.validateAccessToken<T>(token, resource, env as Env & ProviderEnv);
   }
 
   purgeExpiredData(env: Env, options?: PurgeOptions): Promise<PurgeResult> {
@@ -1675,7 +1718,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         tokenEndpoint: authorizationServer.tokenEndpoint,
         clientRegistrationEndpoint: authorizationServer.clientRegistrationEndpoint,
       };
-      configuredResourceServers = [];
+      const declared = authorizationServer.resources;
+      if (!Array.isArray(declared) || declared.length === 0 || declared.some((value) => typeof value !== 'string')) {
+        throw new TypeError('resources must list at least one canonical protected resource identifier');
+      }
+      configuredResourceServers = declared.map((resource) => ({ resourceMetadata: { resource } }));
     } else {
       this.explicitIssuer = undefined;
       normalizedOptions = options;
@@ -1713,6 +1760,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         resolveExternalToken,
       };
     });
+    for (const [index, server] of this.resourceServers.entries()) {
+      const duplicate = this.resourceServers
+        .slice(0, index)
+        .some((other) => isExactResource(other.resourceMetadata.resource, server.resourceMetadata.resource));
+      if (duplicate) {
+        throw new TypeError(`resources must be unique; duplicate ${server.resourceMetadata.resource}`);
+      }
+    }
 
     if (!roleBased) {
       const legacyOptions = options as OAuthProviderOptions<Env>;
@@ -1754,6 +1809,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const authorizationServer = roleBased ? options.authorizationServer : undefined;
     this.configuredDefaultAuthorizationResource = authorizationServer?.defaultResource ?? soleResource;
     this.configuredLegacyGrantResource = authorizationServer?.legacyGrantResource ?? soleResource;
+    if (roleBased) {
+      // The registry is complete, so a misspelled policy value fails here rather than
+      // on the first authorization or refresh request.
+      this.getDefaultAuthorizationResource();
+      this.getLegacyGrantResource();
+    }
 
     // Cloudflare KV rejects token writes whose expiration is less than 60 seconds in the
     // future, so an access token TTL below that would make every token issuance fail with
@@ -2728,11 +2789,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @returns Response with OAuth server metadata
    */
   private async handleMetadataDiscovery(requestUrl: URL): Promise<Response> {
-    if (this.resourceServers.length === 0) {
-      throw new TypeError(
-        'The authorization server has no protected resources; call registerResource() or protectResource() first'
-      );
-    }
     // For endpoints specified as paths, use the request URL's origin
     const tokenEndpoint = this.getFullEndpointUrl(this.options.tokenEndpoint, requestUrl);
     const authorizeEndpoint = this.getFullEndpointUrl(this.options.authorizeEndpoint, requestUrl);
@@ -2754,7 +2810,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       token_endpoint: tokenEndpoint,
       // RFC 9728 §4. The provider's resource registry is finite and enumerable.
       // Each individual grant/token still receives exactly one of these audiences.
-      protected_resources: this.resourceServers.map((server) => server.resourceMetadata.resource),
+      // RFC 8414 §3.2: claims with zero elements are omitted from the response.
+      ...(this.resourceServers.length > 0
+        ? { protected_resources: this.resourceServers.map((server) => server.resourceMetadata.resource) }
+        : {}),
       // not implemented: jwks_uri
       registration_endpoint: registrationEndpoint,
       scopes_supported: this.options.scopesSupported,
@@ -4560,54 +4619,47 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     return new OAuthHelpersImpl<Env>(env, this);
   }
 
-  /** Add an AS audience without hosting that resource in this Worker. */
-  registerResourceIdentifier(resource: string): void {
-    this.validateResourceMetadataOptions({ resource });
-    if (this.findConfiguredResource(resource)) {
-      throw new TypeError(`A protected resource is already registered for ${resource}`);
+  /** Resolve a declared resource to its canonical spelling, or throw at module initialization. */
+  requireDeclaredResource(resource: string): string {
+    const canonical = typeof resource === 'string' ? this.findConfiguredResource(resource) : undefined;
+    if (!canonical) {
+      throw new TypeError(`${String(resource)} is not declared in resources`);
     }
-    this.resourceServers.push({ resourceMetadata: { resource } });
+    return canonical;
   }
 
-  /** Register a protected-resource role during module initialization. */
+  /** Host a declared resource in this Worker during module initialization. */
   registerResourceServer(configuration: InternalProtectedResourceConfiguration<Env>): string {
-    const resourceMetadata = this.snapshotResourceMetadata(configuration.resourceMetadata);
-    this.validateResourceMetadataOptions(resourceMetadata);
-    const resource = resourceMetadata.resource;
-    if (this.findConfiguredResource(resource)) {
-      throw new TypeError(`A protected resource is already registered for ${resource}`);
+    const canonical = this.requireDeclaredResource(configuration.resourceMetadata?.resource as string);
+    const resourceServer = this.resourceServers.find((server) => server.resourceMetadata.resource === canonical)!;
+    if (resourceServer.apiHandler) {
+      throw new TypeError(`A protected resource is already hosted for ${canonical}`);
     }
+    const resourceMetadata = this.snapshotResourceMetadata({ ...configuration.resourceMetadata, resource: canonical });
+    this.validateResourceMetadataOptions(resourceMetadata);
     if (
       this.explicitIssuer &&
       resourceMetadata.authorization_servers &&
       !resourceMetadata.authorization_servers.some((issuer) => resourceMatches(issuer, this.explicitIssuer!, false))
     ) {
-      throw new TypeError(`resourceMetadata.authorization_servers for ${resource} must include ${this.explicitIssuer}`);
+      throw new TypeError(
+        `resourceMetadata.authorization_servers for ${canonical} must include ${this.explicitIssuer}`
+      );
     }
 
-    const resourceServer: NormalizedResourceServer<Env> = {
-      resourceMetadata,
-      apiHandler: this.validateHandler(configuration.handler, 'handler'),
-      resolveExternalToken: configuration.resolveExternalToken,
-    };
-    const newRoutes = [
-      {
-        route: resource,
-        handler: resourceServer.apiHandler!,
-        resourceServer,
-      },
-    ];
-
-    this.resourceServers.push(resourceServer);
-    this.typedApiHandlers.push(...newRoutes);
+    const previous: NormalizedResourceServer<Env> = { ...resourceServer };
+    resourceServer.resourceMetadata = resourceMetadata;
+    resourceServer.apiHandler = this.validateHandler(configuration.handler, 'handler');
+    resourceServer.resolveExternalToken = configuration.resolveExternalToken;
+    this.typedApiHandlers.push({ route: canonical, handler: resourceServer.apiHandler, resourceServer });
     try {
       this.validateResourceRouteIsolation();
     } catch (error) {
-      this.resourceServers.pop();
-      this.typedApiHandlers.splice(this.typedApiHandlers.length - newRoutes.length, newRoutes.length);
+      this.typedApiHandlers.pop();
+      Object.assign(resourceServer, previous);
       throw error;
     }
-    return resource;
+    return canonical;
   }
 
   /**
