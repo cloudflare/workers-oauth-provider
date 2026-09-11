@@ -131,6 +131,10 @@ export class MockExecutionContext implements ExecutionContext {
   passThroughOnException(): void {
     // No-op for tests
   }
+
+  abort(): void {
+    // No-op for tests
+  }
 }
 
 // Test environment type

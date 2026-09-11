@@ -1,4 +1,5 @@
 import { describe, it, expect, expectTypeOf, beforeEach, vi, afterEach } from 'vitest';
+import { workersKvStorage } from '../src/storage/kv';
 import {
   AuthorizationError,
   CimdFetchError,
@@ -15725,5 +15726,50 @@ describe('enterprise-managed authorization with JWT access tokens', () => {
     const replayed = await exchange();
     expect(replayed.status).toBe(400);
     await expect(replayed.json()).resolves.toMatchObject({ error: 'invalid_grant' });
+  });
+});
+
+describe('storage provider resolution', () => {
+  it('opens storage per operation rather than caching the first store for an environment', async () => {
+    const env = createMockEnv();
+    const ctx = new MockExecutionContext();
+    const kv = workersKvStorage<TestEnv>({
+      binding: (requestEnv) => requestEnv.OAUTH_KV as unknown as KVNamespace,
+    });
+    let opens = 0;
+    const provider = new OAuthProvider<TestEnv>({
+      apiRoute: '/api/',
+      apiHandler: TestApiHandler,
+      defaultHandler: testDefaultHandler,
+      authorizeEndpoint: '/authorize',
+      tokenEndpoint: '/oauth/token',
+      clientRegistrationEndpoint: '/oauth/register',
+      resourceMetadata: { resource: 'https://example.com' },
+      storage: {
+        id: 'counting',
+        minimumTtlSeconds: kv.minimumTtlSeconds,
+        open(requestEnv) {
+          opens += 1;
+          return kv.open(requestEnv);
+        },
+      },
+    });
+    const register = () =>
+      provider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify({ redirect_uris: ['https://client.example.com/callback'] })
+        ),
+        env,
+        ctx
+      );
+    expect((await register()).status).toBe(201);
+    const afterFirst = opens;
+    expect(afterFirst).toBeGreaterThan(0);
+    expect((await register()).status).toBe(201);
+    // The same environment object is reused across requests in a Worker isolate.
+    expect(opens).toBeGreaterThan(afterFirst);
   });
 });

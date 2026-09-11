@@ -38,11 +38,15 @@ workers-oauth-provider/
 │   ├── oauth-capabilities.ts  # Pure server/client metadata capability policy
 │   ├── oauth-client-metadata.ts # Typed DCR parsing and CIMD resolution pipeline
 │   ├── jwt-access-tokens.ts   # RFC 9068 signing, JWKS, and pinned offline validation
-│   └── ema/                   # Enterprise-Managed Authorization pipeline
+│   ├── ema/                   # Enterprise-Managed Authorization pipeline
+│   └── storage/               # Storage contract and adapters
+│       ├── kv/                # Default Workers KV adapter (existing key layout)
+│       └── durable-object/    # Per-user Durable Object SQLite adapter
 ├── __tests__/
 │   ├── oauth-provider.test.ts # Comprehensive provider integration suite
 │   ├── oauth-capabilities.test.ts # Pure capability policy tests
 │   ├── jwt-access-tokens.test.ts # RFC 9068 signing and validation tests
+│   ├── storage/               # KV adapter tests; durable-object/ runs in workerd via vitest-pool-workers
 │   ├── setup.ts               # Vitest setup and mocking
 │   └── mocks/
 │       └── cloudflare-workers.ts
@@ -54,7 +58,8 @@ workers-oauth-provider/
 │   └── worker/                # Real Wrangler Worker with local KV
 ├── dist/                      # Build output (tsdown)
 ├── docs/
-│   └── advanced-configuration.md
+│   ├── advanced-configuration.md
+│   └── storage-providers.md   # Storage contract, capabilities, and adapter design
 ├── .github/workflows/
 │   ├── ci.yml                 # PR validation
 │   ├── release.yml            # Changesets-based npm publishing
@@ -65,7 +70,7 @@ workers-oauth-provider/
 └── README.md                  # Usage documentation
 ```
 
-**Audit-oriented architecture:** Request orchestration and storage-backed OAuth behavior remain in `src/oauth-provider.ts`. Typed OAuth client metadata parsing plus CIMD fetching and resolution live in `src/oauth-client-metadata.ts`; pure authorization-server/client capability policy lives in `src/oauth-capabilities.ts`. RFC 9068 access-token signing, JWKS publication, and pinned offline validation live in `src/jwt-access-tokens.ts`. The experimental Enterprise-Managed Authorization validation pipeline is isolated in `src/ema/` so its JWT and trust-boundary code can be reviewed independently.
+**Audit-oriented architecture:** Request orchestration and storage-backed OAuth behavior remain in `src/oauth-provider.ts`. Typed OAuth client metadata parsing plus CIMD fetching and resolution live in `src/oauth-client-metadata.ts`; pure authorization-server/client capability policy lives in `src/oauth-capabilities.ts`. RFC 9068 access-token signing, JWKS publication, and pinned offline validation live in `src/jwt-access-tokens.ts`. All persistence goes through the storage contract in `src/storage/`; the provider never touches a binding directly, and production source contains no KV, SQL, or Durable Object calls outside `src/storage/`. The experimental Enterprise-Managed Authorization validation pipeline is isolated in `src/ema/` so its JWT and trust-boundary code can be reviewed independently.
 
 ## Setup
 
@@ -78,15 +83,17 @@ Node 24+ required.
 
 ## Commands
 
-| Command                    | What it does                              |
-| -------------------------- | ----------------------------------------- |
-| `npm run build`            | Builds single-file ESM bundle with tsdown |
-| `npm run check`            | Runs typecheck + tests                    |
-| `npm run typecheck`        | TypeScript type checking (no emit)        |
-| `npm run test`             | Runs vitest test suite                    |
-| `npm run test:conformance` | Runs MCP auth conformance tests           |
-| `npm run test:watch`       | Runs vitest in watch mode                 |
-| `npm run prettier`         | Formats all files with Prettier           |
+| Command                    | What it does                                              |
+| -------------------------- | --------------------------------------------------------- |
+| `npm run build`            | Builds the ESM bundle and storage entrypoints with tsdown |
+| `npm run check`            | Runs typecheck + tests                                    |
+| `npm run typecheck`        | TypeScript type checking (no emit)                        |
+| `npm run test`             | Runs the unit suite, then the Durable Object suite        |
+| `npm run test:unit`        | Runs the Node vitest suite only                           |
+| `npm run test:workers`     | Runs the Durable Object adapter tests in workerd          |
+| `npm run test:conformance` | Runs MCP auth conformance tests                           |
+| `npm run test:watch`       | Runs vitest in watch mode                                 |
+| `npm run prettier`         | Formats all files with Prettier                           |
 
 ## Code standards
 
