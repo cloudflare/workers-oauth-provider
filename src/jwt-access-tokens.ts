@@ -1,4 +1,4 @@
-import { validateResourceUri } from './oauth-resource';
+import { hasAcceptedCanonicalScheme, validateResourceUri } from './oauth-resource';
 import { isValidOAuthScopeToken } from './oauth-capabilities';
 
 /** Collision-resistant private claim carrying the provider's grant identifier. */
@@ -93,7 +93,7 @@ export interface JwtIssuedAccessToken {
 export interface JwtAccessTokensOptions<Env = Cloudflare.Env, Props = unknown> {
   /** Exact RFC 8414 authorization-server issuer. */
   issuer: string;
-  /** Absolute HTTPS JWKS URL served by the authorization-server fetch surface. */
+  /** Absolute HTTPS JWKS URL served by the authorization-server fetch surface (http only on a loopback host). */
   jwksUri: string;
   /** Resolve the active signing key plus any staged or retiring public keys from application code. */
   keys(env: Env): JwtAccessTokenKeySet | Promise<JwtAccessTokenKeySet>;
@@ -649,7 +649,9 @@ function validateIssuer(value: unknown): string {
 
 function validateCanonicalResource(value: unknown): string {
   if (typeof value !== 'string' || !isCanonicalHttpsUrl(value)) {
-    throw new TypeError('audience must be a canonical absolute HTTPS resource URI');
+    throw new TypeError(
+      'audience must be a canonical absolute HTTPS resource URI (http is accepted only on a loopback host)'
+    );
   }
   return value;
 }
@@ -665,7 +667,7 @@ function readCanonicalSingleAudience(value: unknown): string | null {
 
 function validateAbsoluteHttpsUrl(value: unknown, name: string): string {
   if (typeof value !== 'string' || !isCanonicalHttpsUrl(value)) {
-    throw new TypeError(`${name} must be an absolute HTTPS URL`);
+    throw new TypeError(`${name} must be an absolute HTTPS URL (http is accepted only on a loopback host)`);
   }
   const parsed = new URL(value);
   if (parsed.hash) {
@@ -678,7 +680,7 @@ function isCanonicalHttpsUrl(value: string): boolean {
   if (!validateResourceUri(value)) return false;
   const parsed = new URL(value);
   return (
-    parsed.protocol === 'https:' &&
+    hasAcceptedCanonicalScheme(parsed) &&
     !parsed.username &&
     !parsed.password &&
     parsed.protocol === parsed.protocol.toLowerCase() &&
