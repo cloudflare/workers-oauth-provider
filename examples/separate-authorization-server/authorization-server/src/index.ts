@@ -1,4 +1,4 @@
-import { OAuthAuthorizationServer } from '@cloudflare/workers-oauth-provider';
+import { OAuthAuthorizationServer, type ValidatedAccessToken } from '@cloudflare/workers-oauth-provider';
 import { WorkerEntrypoint } from 'cloudflare:workers';
 import { SCOPES_SUPPORTED, type GrantProps } from '../../shared/config';
 import { handleAuthorize } from './authorize';
@@ -64,8 +64,10 @@ const mcp = authorizationServer.resource(MCP_RESOURCE);
  * `entrypoint: "McpTokenValidator"`.
  */
 export class McpTokenValidator extends WorkerEntrypoint<Env> {
-  validateToken(token: string) {
-    return mcp.validateToken(token, this.env);
+  // An explicit return type keeps the RPC stub type (`Service<McpTokenValidator>`) simple:
+  // TypeScript cannot map a generic method across the Service Binding boundary.
+  validateToken(token: string): Promise<ValidatedAccessToken<GrantProps> | null> {
+    return mcp.validateToken<GrantProps>(token, this.env);
   }
 }
 
