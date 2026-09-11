@@ -14340,6 +14340,27 @@ describe('functional authorization-server and resource-server composition', () =
     );
     expect(exchanged.status).toBe(200);
   });
+  it('rejects hosted resources on one path whose queries nest, and keeps disjoint tenants apart', () => {
+    const host = (resources: string[]) => {
+      const authorizationServer = new OAuthAuthorizationServer<TestEnv>({
+        issuer,
+        resources,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+      });
+      for (const resource of resources) {
+        authorizationServer.protectResource({ resourceMetadata: { resource }, handler: resourceHandler('tenant') });
+      }
+    };
+    // A request for the more specific resource also carries the less specific one's query.
+    expect(() =>
+      host(['https://tenant.example.com/mcp?tenant=a', 'https://tenant.example.com/mcp?tenant=a&region=eu'])
+    ).toThrow('API routes for different resources must not overlap');
+    expect(() =>
+      host(['https://tenant.example.com/mcp?tenant=a', 'https://tenant.example.com/mcp?tenant=b'])
+    ).not.toThrow();
+  });
+
   it('requires an external token resolver to return a single string audience', async () => {
     const cases: Array<[unknown, number]> = [
       [calendarResource, 200],
@@ -14500,6 +14521,20 @@ describe('request URL audience check on the combined provider', () => {
       'is not covered by resourceMetadata.resource'
     );
     expect(() => new OAuthProvider<TestEnv>({ ...options, apiRoute: '/mcp/' })).not.toThrow();
+  });
+
+  it('rejects a resource inside the protected-resource metadata namespace at construction', () => {
+    expect(
+      () =>
+        new OAuthProvider<TestEnv>({
+          apiRoute: '/.well-known/oauth-protected-resource/service',
+          apiHandler: TestApiHandler,
+          defaultHandler,
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: '/oauth/token',
+          resourceMetadata: { resource: 'https://example.com/.well-known/oauth-protected-resource/service' },
+        })
+    ).toThrow('must not be inside the /.well-known/oauth-protected-resource namespace');
   });
 
   it('rejects an access token whose stored record has expired', async () => {

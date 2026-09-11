@@ -182,6 +182,13 @@ function validateOptions<Env, Props>(options: OAuthResourceServerOptions<Env, Pr
       'resourceMetadata.resource must be a canonical absolute HTTPS URI without a fragment (http is accepted only on a loopback host)'
     );
   }
+  // The metadata namespace is dispatched to discovery before the protected handler, so a
+  // resource inside it could never receive a request.
+  if (isProtectedResourceMetadataPath(resourceUrl)) {
+    throw new TypeError(
+      `resourceMetadata.resource must not be inside the ${PROTECTED_RESOURCE_WELL_KNOWN_PREFIX} namespace`
+    );
+  }
 
   const authorizationServers = options.resourceMetadata.authorization_servers;
   if (!Array.isArray(authorizationServers) || authorizationServers.length === 0) {

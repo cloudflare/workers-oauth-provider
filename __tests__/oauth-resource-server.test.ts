@@ -517,6 +517,17 @@ describe('createOAuthResourceServer', () => {
     expect(response.status).toBe(401);
   });
 
+  it('rejects a resource inside the protected-resource metadata namespace at construction', () => {
+    expect(() =>
+      createTestServer({
+        resourceMetadata: {
+          resource: 'https://mcp.example.com/.well-known/oauth-protected-resource/service',
+          authorization_servers: ['https://auth.example.com'],
+        },
+      })
+    ).toThrow('must not be inside the /.well-known/oauth-protected-resource namespace');
+  });
+
   it('rejects http identifiers on non-loopback hosts', () => {
     expect(() =>
       createTestServer({

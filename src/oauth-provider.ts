@@ -1967,9 +1967,17 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         const aUrl = new URL(a.route);
         const bUrl = new URL(b.route);
         if (aUrl.origin !== bUrl.origin) continue;
-        // Two resources on one path that differ by query are dispatched by exact query
-        // match, so they do not overlap. A query-less route would match any query.
-        if (aUrl.search && bUrl.search && aUrl.search !== bUrl.search) continue;
+        // Two resources on one path with disjoint queries are told apart by the query a
+        // request carries. A query-less route would match any query, and a query that is a
+        // subset of the other's would match that resource's requests too.
+        if (
+          aUrl.search &&
+          bUrl.search &&
+          !requestCarriesResourceQuery(aUrl, bUrl) &&
+          !requestCarriesResourceQuery(bUrl, aUrl)
+        ) {
+          continue;
+        }
         if (pathsOverlapOnBoundary(aUrl.pathname, bUrl.pathname)) {
           throw new TypeError(`API routes for different resources must not overlap: ${a.route} and ${b.route}`);
         }
@@ -2106,6 +2114,16 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     ) {
       throw new TypeError(
         'resourceMetadata.resource must use canonical URL serialization without userinfo, a default port, or dot segments'
+      );
+    }
+    // The metadata namespace is dispatched to discovery before any protected route, so a
+    // resource inside it could never receive a request.
+    if (
+      parsedResource.pathname === PROTECTED_RESOURCE_WELL_KNOWN_PREFIX ||
+      parsedResource.pathname.startsWith(`${PROTECTED_RESOURCE_WELL_KNOWN_PREFIX}/`)
+    ) {
+      throw new TypeError(
+        `resourceMetadata.resource must not be inside the ${PROTECTED_RESOURCE_WELL_KNOWN_PREFIX} namespace`
       );
     }
 
