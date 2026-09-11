@@ -1,5 +1,23 @@
 # @cloudflare/workers-oauth-provider
 
+## 1.0.0
+
+### Major Changes
+
+- [#289](https://github.com/cloudflare/workers-oauth-provider/pull/289) [`a6c2e4a`](https://github.com/cloudflare/workers-oauth-provider/commit/a6c2e4a29d0fdae53caf47c7974c70b428c4145e) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Split the authorization server and resource server roles, and bind every token to one canonical resource.
+  - `OAuthAuthorizationServer` declares its `resources` at construction. `resource(uri)` returns a handle whose `validateToken(token, env)` is pinned to that resource, suitable for a private Service Binding, and whose `protect()` hosts it in the same Worker; `protectResource()` does the same for a declared resource. Metadata advertises the registry as RFC 9728 `protected_resources`.
+  - `createOAuthResourceServer()` runs a separately deployed protected-resource Worker: RFC 9728 metadata, Bearer challenges, an application token-validation callback, and audience and expiry checks.
+  - Every new grant and access token is bound to exactly one registered resource. A multi-resource server requires `resource` unless `defaultResource` is set; code exchange and refresh inherit the grant's resource and reject retargeting; a new grant replaces only same-resource grants.
+  - Stored 0.x state keeps working. A sole resource, or `legacyGrantResource`, is the migration target for grants and tokens without one; an array audience resolves to the registered resource it contains; a grant that cannot be bound fails refresh with `invalid_grant`, which conformant clients answer with a new authorization.
+  - Breaking: `resourceMetadata.resource` is required and canonical (`http` only on loopback hosts). Construction rejects routes the resource does not cover, absolute routes on another origin or with a conflicting query, hosted resources whose queries nest, and resources inside the metadata namespace. Removed: `resourceMatchOriginOnly`, `registerResource()`, the three-argument `validateToken()`, the `originOnly` parameter of `resourceMatches()`, and `EmaValidationInput.matchOriginOnly`. `ResolveExternalTokenResult.audience` is required and a single string; `ExchangeTokenOptions.aud`, `AuthRequest.resource`, and `TokenExchangeCallbackOptions.resource` are single strings.
+  - Protocol: `redirect_uri` on a code exchange must equal the authorization request's (OAuth 2.1 §4.1.3); registered `grant_types` are enforced with `unauthorized_client`; token exchange is bound to the grant's client unless `tokenExchangeCallback` returns `allowCrossClientExchange: true`, and subject-token failures return `invalid_request`; an empty resource path equals `/`; a repeated identical `resource` is accepted; challenges carry `resource_metadata` on the resource and its path descendants; discovery answers HEAD and OPTIONS, every 405 carries `Allow`, and a query-bearing resource accepts extra request parameters.
+
+### Patch Changes
+
+- [#303](https://github.com/cloudflare/workers-oauth-provider/pull/303) [`742e222`](https://github.com/cloudflare/workers-oauth-provider/commit/742e222c55f5adbd8975c964f2248ea8a1670770) Thanks [@kanywst](https://github.com/kanywst)! - Fix uncaught 500 when an ID-JAG assertion has under 60 seconds left. The EMA replay marker
+  took its KV TTL straight from the assertion's remaining lifetime, so KV rejected the write
+  and the request crashed instead of exchanging. The marker's TTL is now floored at 60s.
+
 ## 0.10.3
 
 ### Patch Changes
