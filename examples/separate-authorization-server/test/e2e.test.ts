@@ -10,8 +10,8 @@ import { createTestHarness } from 'wrangler';
  * to pick a Worker, and only the named form preserves the `https` scheme that both
  * identifiers depend on.
  */
-const AUTH_ISSUER = 'https://localhost:8787';
-const MCP_RESOURCE = 'https://localhost:8788/mcp';
+const AUTH_ISSUER = 'http://localhost:8787';
+const MCP_RESOURCE = 'http://localhost:8788/mcp';
 const REPORTS_RESOURCE = 'https://reports.localhost/api';
 const REDIRECT_URI = 'https://client.example.com/callback';
 const CODE_VERIFIER = 'e2e-code-verifier-that-is-at-least-43-characters-long';
@@ -55,7 +55,7 @@ describe('discovery', () => {
   });
 
   it('publishes protected resource metadata at the canonical well-known URL', async () => {
-    const response = await mcpServer.fetch('https://localhost:8788/.well-known/oauth-protected-resource/mcp');
+    const response = await mcpServer.fetch('http://localhost:8788/.well-known/oauth-protected-resource/mcp');
     expect(response.status).toBe(200);
 
     const metadata = (await response.json()) as Json;
@@ -68,7 +68,7 @@ describe('discovery', () => {
     // A resource with a path publishes only the path-suffix form. The bare well-known
     // path belongs to a resource whose path is `/`, so aliasing it there would identify
     // a different resource.
-    const root = await mcpServer.fetch('https://localhost:8788/.well-known/oauth-protected-resource');
+    const root = await mcpServer.fetch('http://localhost:8788/.well-known/oauth-protected-resource');
     expect(root.status).toBe(404);
   });
 });
@@ -80,7 +80,7 @@ describe('bearer challenges', () => {
 
     const challenge = response.headers.get('WWW-Authenticate') ?? '';
     expect(challenge).toMatch(/^Bearer\b/);
-    expect(challenge).toContain('resource_metadata="https://localhost:8788/.well-known/oauth-protected-resource/mcp"');
+    expect(challenge).toContain('resource_metadata="http://localhost:8788/.well-known/oauth-protected-resource/mcp"');
     // RFC 6750 section 3.1: no error code when the request carried no credentials,
     // otherwise a client cannot tell "you never authenticated" from "your token is bad".
     expect(challenge).not.toContain('error=');
@@ -153,7 +153,7 @@ describe('authorization code flow', () => {
 
   it('binds a grant to defaultResource when the client omits resource', async () => {
     const client = await registerPublicClient();
-    // No `resource` parameter, which is what the conformance suite and older clients
+    // No `resource` parameter, which is what older clients
     // send. With two registered audiences, `defaultResource` is what keeps them working.
     const redirect = await driveLoginPage(client.client_id, { scope: 'mcp:read' });
     const tokens = await exchange(client.client_id, redirect);
@@ -292,7 +292,7 @@ describe('the protected MCP server', () => {
 
   it('grants no scope to a client that requests none, which this resource then refuses', async () => {
     const client = await registerPublicClient();
-    // The conformance suite sends exactly this: no `scope` and no `resource`.
+    // Older clients send exactly this: no `scope` and no `resource`.
     const redirect = await driveLoginPage(client.client_id, {});
     const tokens = await exchange(client.client_id, redirect);
 

@@ -16,8 +16,8 @@
 
   // Must match the authorization server's values byte for byte.
   "define": {
-    "AUTH_ISSUER": "\"https://localhost:8787\"",
-    "MCP_RESOURCE": "\"https://localhost:8788/mcp\"",
+    "AUTH_ISSUER": "\"http://localhost:8787\"",
+    "MCP_RESOURCE": "\"http://localhost:8788/mcp\"",
   },
 
   "env": {

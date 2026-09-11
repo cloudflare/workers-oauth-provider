@@ -9,7 +9,7 @@ import { createTestHarness } from 'wrangler';
  * named form preserves the `https` scheme, and the combined provider derives its issuer
  * and its audience comparison from the request URL.
  */
-const ORIGIN = 'https://localhost:8787';
+const ORIGIN = 'http://localhost:8787';
 const MCP_RESOURCE = `${ORIGIN}/mcp`;
 const REDIRECT_URI = 'https://client.example.com/callback';
 const CODE_VERIFIER = 'e2e-code-verifier-that-is-at-least-43-characters-long';
@@ -147,7 +147,7 @@ describe('authorization code flow', () => {
 
   it('binds a grant to the sole registered resource when the client omits resource', async () => {
     const client = await registerPublicClient();
-    // No `resource` parameter, which is what the conformance suite and older clients
+    // No `resource` parameter, which is what older clients
     // send. A provider that hosts exactly one audience selects it for them.
     const redirect = await driveLoginPage(client.client_id, { scope: 'mcp:read' });
     const tokens = await exchange(client.client_id, redirect);

@@ -36,7 +36,7 @@ const authorizationServer = new OAuthAuthorizationServer<Env, GrantProps>({
   tokenEndpoint: '/oauth/token',
 
   // MCP 2026 prefers Client ID Metadata Documents. Dynamic client registration stays on
-  // as the compatibility path that existing MCP clients and the conformance CLI use.
+  // as the compatibility path that existing MCP clients use.
   clientRegistrationEndpoint: '/oauth/register',
   clientIdMetadataDocumentEnabled: true,
 

@@ -7,7 +7,7 @@ over a private Service Binding that is pinned to its own resource identifier. Th
 topology to copy when the team that owns identity is not the team that owns the MCP server.
 
 ```
-                      https://localhost:8787 (authorization server)
+                      http://localhost:8787 (authorization server)
   ┌──────────────┐    ┌─────────────────────────────────────────────┐
   │  MCP client  │    │  OAuthAuthorizationServer                   │
   │  discovery ──┼───►│  /.well-known/oauth-authorization-server    │
@@ -17,9 +17,9 @@ topology to copy when the team that owns identity is not the team that owns the 
   │              │    └─────────────────────────────────────────────┘
   │              │       │ OAUTH_KV                 ▲ AUTHORIZATION_SERVER (Service
   │              │       ▼ (clients, grants,        │ Binding, entrypoint McpTokenValidator,
-  │              │          tokens)                 │ pinned to https://localhost:8788/mcp)
+  │              │          tokens)                 │ pinned to http://localhost:8788/mcp)
   │              │    ┌─────────────────────────────────────────────┐
-  │  MCP calls ──┼───►│  https://localhost:8788 (MCP resource)      │
+  │  MCP calls ──┼───►│  http://localhost:8788 (MCP resource)      │
   │              │    │  /.well-known/oauth-protected-resource/mcp  │
   └──────────────┘    │  /mcp ──► McpServer (whoami, add)           │
                       │  no KV, no client or token storage          │
@@ -43,18 +43,15 @@ server adds `authorize.ts` and `login-page.ts` (the placeholder login), the MCP 
 Two terminals, because these are two Workers. Start the authorization server first:
 
 ```sh
-npm run dev:auth    # https://localhost:8787
-npm run dev:mcp     # https://localhost:8788
-curl -k https://localhost:8787/.well-known/oauth-authorization-server
-curl -k https://localhost:8788/.well-known/oauth-protected-resource/mcp
-curl -ki https://localhost:8788/mcp    # 401 with WWW-Authenticate: Bearer ... resource_metadata="..."
+npm run dev:auth    # http://localhost:8787
+npm run dev:mcp     # http://localhost:8788
+curl http://localhost:8787/.well-known/oauth-authorization-server
+curl http://localhost:8788/.well-known/oauth-protected-resource/mcp
+curl -i http://localhost:8788/mcp    # 401 with WWW-Authenticate: Bearer ... resource_metadata="..."
 ```
 
-`--local-protocol https` is not optional. The issuer (`https://localhost:8787`) and the
-resource (`https://localhost:8788/mcp`) must be absolute HTTPS URLs on this branch, and the
-library compares them against the request URL, so a plain-HTTP dev server never matches
-itself. The certificate is self-signed, so pass `-k` to curl and set
-`NODE_TLS_REJECT_UNAUTHORIZED=0` for a Node client.
+Plain `http` works here because the library accepts it only on loopback hosts (`localhost`,
+`127.0.0.0/8`, `::1`). Every other host, including production, must use `https`.
 
 Both dev scripts pass `--inspector-port` because two `wrangler dev` sessions otherwise
 fight over the same debugger port and the second exits with `Address already in use`, so
@@ -64,7 +61,7 @@ The issuer and both resource identifiers are build-time constants, inlined by wr
 `define` map, because each OAuth object is constructed once at module scope, before any
 request exists, and its constructor validates them. `define` is not inherited by a named
 environment, so each environment repeats it: the top level names the localhost URLs above
-and serves `npm run dev:auth`, `npm test` and `npm run conformance`, while `env.production`
+and serves `npm run dev:auth`, `npm run dev:mcp` and `npm test`, while `env.production`
 names the deployed domains. The alternative is to build both objects lazily inside
 `fetch()` from `env` vars and memoize them. Either way these are protocol values rather
 than mere ports, so moving a Worker means editing the `define` map as well as `--port`, and
@@ -95,42 +92,16 @@ minted for the _other_ registered audience being rejected at the MCP Worker. It 
 same build as the dev scripts, so it shares their canonical URLs, and addresses each Worker
 with `harness.getWorker(name).fetch()`.
 
-## Run the MCP conformance suite
-
-```sh
-npm run conformance    # stop the dev servers first: this needs ports 8787, 8788 and 3000
-```
-
-`scripts/conformance.mjs` starts both dev servers, registers a public client by DCR, runs
-the official `@modelcontextprotocol/conformance` `authorization` scenarios against
-`https://localhost:8787`, then plays the part of the browser: it reads the authorization
-URL from the CLI's output, submits the login form, and follows the redirect into the CLI's
-callback server. It exits non-zero if any check is not `SUCCESS` (the CLI itself exits 0
-even when a check fails) and writes raw results to `conformance-results/`. Expected:
-
-```
-SUCCESS  authorization-code-grant
-SUCCESS  authorization-server-metadata
-SUCCESS  authorization-server-metadata-cimd
-```
-
-The suite's authorization request omits both `resource` and `scope` and has no flag for
-either: `defaultResource` is what keeps the grant scenario green on a server with two
-audiences, and the token it obtains carries no scope, so `/mcp` would refuse it with
-`403 insufficient_scope`. There are no resource-server scenarios today, so the binding is
-covered only by `npm test`.
-
 ## Try it with an MCP client
 
-Point any MCP client that speaks OAuth at `https://localhost:8788/mcp`. It reads the
-protected resource metadata, discovers `https://localhost:8787`, registers itself, and
-opens the login page. Most clients reject a self-signed certificate; a Node client can be
-started with `NODE_TLS_REJECT_UNAUTHORIZED=0`, anything else wants a deployed hostname.
+Point any MCP client that speaks OAuth at `http://localhost:8788/mcp`. It reads the
+protected resource metadata, discovers `http://localhost:8787`, registers itself, and
+opens the login page.
 
 By hand, with both dev servers running:
 
 ```sh
-CLIENT=$(curl -sk -X POST https://localhost:8787/oauth/register -H 'content-type: application/json' \
+CLIENT=$(curl -s -X POST http://localhost:8787/oauth/register -H 'content-type: application/json' \
   -d '{"client_name":"curl","redirect_uris":["http://127.0.0.1:3000/callback"],
        "grant_types":["authorization_code"],"response_types":["code"],
        "token_endpoint_auth_method":"none"}' | jq -r .client_id)
@@ -141,17 +112,17 @@ CHALLENGE=$(printf %s "$VERIFIER" | openssl dgst -binary -sha256 | base64 | tr '
 
 # Approve. A browser would GET this first and render the form; the POST is the submission.
 # `scope` must include mcp:read or the MCP server answers 403.
-CODE=$(curl -sk -i -X POST "https://localhost:8787/authorize?response_type=code&client_id=$CLIENT\
+CODE=$(curl -s -i -X POST "http://localhost:8787/authorize?response_type=code&client_id=$CLIENT\
 &redirect_uri=http%3A%2F%2F127.0.0.1%3A3000%2Fcallback&scope=mcp%3Aread+mcp%3Awrite&state=demo\
 &resource=https%3A%2F%2Flocalhost%3A8788%2Fmcp&code_challenge=$CHALLENGE&code_challenge_method=S256" \
   -d 'username=demo&action=approve' | sed -n 's/^[Ll]ocation:.*[?&]code=\([^&]*\).*/\1/p')
 
 # `resource` must repeat here: it is what binds the token to the MCP resource.
-TOKEN=$(curl -sk -X POST https://localhost:8787/oauth/token -d grant_type=authorization_code \
+TOKEN=$(curl -s -X POST http://localhost:8787/oauth/token -d grant_type=authorization_code \
   -d "code=$CODE" -d "client_id=$CLIENT" -d 'redirect_uri=http://127.0.0.1:3000/callback' \
-  -d "code_verifier=$VERIFIER" -d 'resource=https://localhost:8788/mcp' | jq -r .access_token)
+  -d "code_verifier=$VERIFIER" -d 'resource=http://localhost:8788/mcp' | jq -r .access_token)
 
-curl -sk https://localhost:8788/mcp -H "authorization: Bearer $TOKEN" \
+curl -s http://localhost:8788/mcp -H "authorization: Bearer $TOKEN" \
   -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"whoami","arguments":{}}}'
 ```

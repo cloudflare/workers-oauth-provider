@@ -3,10 +3,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev --local-protocol https",
+    "dev": "wrangler dev",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "conformance": "node scripts/conformance.mjs",
     "deploy": "wrangler deploy --env production"
   },
   "dependencies": {

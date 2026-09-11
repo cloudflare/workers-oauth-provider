@@ -11,9 +11,9 @@
   "kv_namespaces": [{ "binding": "OAUTH_KV", "id": "<replace-with-your-kv-id>" }],
 
   // The canonical resource identifier has to exist before the first request, so it is
-  // inlined at build time. These values serve `npm run dev`, `npm test`, and
-  // `npm run conformance`, which all run the Worker on localhost:8787.
-  "define": { "MCP_RESOURCE": "\"https://localhost:8787/mcp\"" },
+  // inlined at build time. These values serve `npm run dev` and `npm test`, which
+  // both run the Worker on localhost:8787.
+  "define": { "MCP_RESOURCE": "\"http://localhost:8787/mcp\"" },
 
   "env": {
     "production": {
