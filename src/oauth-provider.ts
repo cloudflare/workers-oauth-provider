@@ -47,6 +47,7 @@ import {
 import {
   assertJwtAccessTokensComponent,
   verifyJwtForProviderState,
+  warmJwtSigningKey,
   type JwtAccessTokens,
   type VerifiedJwtAccessToken,
 } from './jwt-access-tokens';
@@ -67,7 +68,6 @@ export {
   createJwtAccessTokenValidator,
   type JwtAccessTokenAlgorithm,
   type JwtAccessTokenClaims,
-  type JwtAccessTokenIssueInput,
   type JwtAccessTokenKeySet,
   type JwtAccessTokenPublicClaimsInput,
   type JwtAccessTokenKeyHint,
@@ -4392,7 +4392,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * Sequence:
    *   parse → validate header → trust issuer → fetch JWKS → select key →
    *   verify signature → validate claims → parse scope → select token format →
-   *   record jti → run mapper → validate mapper result → compute TTL → mint token.
+   *   prove signing key → record jti → run mapper → validate mapper result →
+   *   compute TTL → build token → write grant and token.
+   *
+   * The `jti` write consumes the assertion, and everything that can fail for a reason
+   * unrelated to this assertion is settled before it: the rollout policy, and resolving
+   * and proving the signing key. A key-store outage therefore leaves the assertion
+   * retryable, while a replay is rejected before the deployer's `mapClaims` runs at all.
    */
   private async runEmaPipeline(args: {
     body: any;
@@ -4455,12 +4461,29 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const requestedScope = parseEmaScopeParam(body.scope, claims.value.assertionScopes);
     if (!requestedScope.ok) return requestedScope;
 
-    // A rollout-policy failure must not consume the one-use assertion JTI.
+    // Neither a rollout-policy failure nor an unusable signing key may consume the
+    // one-use assertion JTI, so both are settled before it is marked used.
     const accessTokenFormat = await this.selectAccessTokenFormat({
       env,
       clientId: clientInfo.clientId,
       resource: configuredResource,
     });
+    if (accessTokenFormat === 'jwt' && this.jwtAccessTokens) {
+      await warmJwtSigningKey(this.jwtAccessTokens, env);
+    }
+
+    // Consume the assertion before any application code runs. Single use has to mean the
+    // deployer's mapClaims sees one presentation of an assertion, not one per replay.
+    // Fresh clock read so the marker's TTL reflects the assertion's remaining lifetime.
+    const markNow = Math.floor(Date.now() / 1000);
+    const replay = await jtiStore.markUsed({
+      issuer: claims.value.claims.iss,
+      jti: claims.value.claims.jti,
+      exp: claims.value.claims.exp,
+      now: markNow,
+      env,
+    });
+    if (!replay.ok) return replay;
 
     let mapperOutput: unknown;
     try {
@@ -4509,18 +4532,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       env,
       now: issueNow,
     });
-
-    // The replay marker is the write that consumes the assertion. Fresh clock read so
-    // its KV TTL reflects the assertion's remaining lifetime at the moment of write.
-    const markNow = Math.floor(Date.now() / 1000);
-    const replay = await jtiStore.markUsed({
-      issuer: claims.value.claims.iss,
-      jti: claims.value.claims.jti,
-      exp: claims.value.claims.exp,
-      now: markNow,
-      env,
-    });
-    if (!replay.ok) return replay;
 
     await this.saveGrantWithTTL(env, prepared.grantKey, prepared.grant, issueNow);
     await this.persistAccessToken(env, prepared.minted);
@@ -4667,13 +4678,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       // Revocation is a lifecycle operation on issuer-owned state. It must keep
       // working even if the token's audience was removed from the live registry.
       const { tokenData } = await this.resolveInternalAccessToken(token, env, 'stored-token');
-      if (
-        tokenData &&
-        (await this.revokeAccessIfOwned(tokenData.id, tokenData.userId, tokenData.grantId, clientInfo, env))
-      ) {
-        return new Response('', { status: 200 });
+      if (tokenData) {
+        await this.revokeAccessIfOwned(tokenData.id, tokenData.userId, tokenData.grantId, clientInfo, env);
       }
-      // RFC 7009 deliberately does not reveal whether the submitted token was valid.
+      // RFC 7009 deliberately does not reveal whether the submitted token was valid, and a
+      // JWT access token has no refresh-token reading to fall back to.
       return new Response('', { status: 200 });
     }
 
@@ -5496,11 +5505,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   }
 
   /**
-   * Build the access token and its state record without touching KV. A JWT signing or
-   * key-resolution failure therefore leaves every one-shot credential (authorization
-   * code, refresh token rotation) untouched and retryable.
+   * Build the access token and its state record without touching KV, so the caller can
+   * sign before it consumes a one-shot credential. The authorization-code and
+   * enterprise-assertion paths use it for exactly that: a JWT signing or key-resolution
+   * failure leaves the code or assertion untouched and retryable. Refresh rotation writes
+   * its grant first and stays retryable through the previous-refresh-token window instead.
    */
-  async mintAccessToken(params: CreateAccessTokenOptions<Env>): Promise<MintedAccessToken> {
+  private async mintAccessToken(params: CreateAccessTokenOptions<Env>): Promise<MintedAccessToken> {
     const {
       format,
       userId,
@@ -5585,7 +5596,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   }
 
   /** Write a minted access token's state record to KV. */
-  async persistAccessToken(env: Env & ProviderEnv, minted: MintedAccessToken): Promise<void> {
+  private async persistAccessToken(env: Env & ProviderEnv, minted: MintedAccessToken): Promise<void> {
     try {
       await env.OAUTH_KV.put(minted.key, JSON.stringify(minted.record), { expirationTtl: minted.expiresIn });
     } catch (error) {

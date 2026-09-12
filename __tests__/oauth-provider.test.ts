@@ -16302,6 +16302,14 @@ describe('enterprise-managed authorization with JWT access tokens', () => {
       return new Response('not found', { status: 404 });
     });
 
+    const mapClaims = vi.fn(
+      async ({ claims, requestedScope }: { claims: { sub: string }; requestedScope: string[] }) => ({
+        userId: `enterprise-${claims.sub}`,
+        scope: requestedScope,
+        metadata: {},
+        props: { userId: `enterprise-${claims.sub}` },
+      })
+    );
     const signingKey = await generateRsaKey('signing-key');
     let keyLookups = 0;
     const accessTokens = createJwtAccessTokens<TestEnv, { userId: string }>({
@@ -16330,12 +16338,7 @@ describe('enterprise-managed authorization with JWT access tokens', () => {
       accessTokens,
       enterpriseManagedAuthorization: {
         trustedIssuers: async () => ({ issuer: idpIssuer, jwksUri: `${idpIssuer}/jwks.json`, algorithms: ['RS256'] }),
-        mapClaims: async ({ claims, requestedScope }) => ({
-          userId: `enterprise-${claims.sub}`,
-          scope: requestedScope,
-          metadata: {},
-          props: { userId: `enterprise-${claims.sub}` },
-        }),
+        mapClaims,
       },
     });
     const registration = await authorizationServer.fetch(
@@ -16387,11 +16390,13 @@ describe('enterprise-managed authorization with JWT access tokens', () => {
         ctx
       );
 
-    // The signing key is unavailable on the first attempt: nothing may be consumed.
+    // The signing key is unavailable on the first attempt: nothing may be consumed, and
+    // the failure is settled before the deployer's mapper is asked to do any work.
     await expect(exchange()).rejects.toThrow('key store unavailable');
     expect((await env.OAUTH_KV.list({ prefix: 'enterprise-jti:' })).keys).toHaveLength(0);
     expect((await env.OAUTH_KV.list({ prefix: 'grant:' })).keys).toHaveLength(0);
     expect((await env.OAUTH_KV.list({ prefix: 'token:' })).keys).toHaveLength(0);
+    expect(mapClaims).not.toHaveBeenCalled();
 
     // The same assertion is retryable, and only then is it consumed.
     const retried = await exchange();
@@ -16400,8 +16405,13 @@ describe('enterprise-managed authorization with JWT access tokens', () => {
     expect(tokens.access_token.split('.')).toHaveLength(3);
     expect((await env.OAUTH_KV.list({ prefix: 'enterprise-jti:' })).keys).toHaveLength(1);
 
+    expect(mapClaims).toHaveBeenCalledTimes(1);
+
+    // Single use means the mapper sees one presentation of an assertion, not one per
+    // replay: the jti marker is written before any application code runs.
     const replayed = await exchange();
     expect(replayed.status).toBe(400);
     await expect(replayed.json()).resolves.toMatchObject({ error: 'invalid_grant' });
+    expect(mapClaims).toHaveBeenCalledTimes(1);
   });
 });

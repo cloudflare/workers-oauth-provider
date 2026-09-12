@@ -141,9 +141,9 @@ describe('JWT access tokens', () => {
         keys: () => [{ ...key.publicJwk, e }],
         mapClaimsToProps: ({ userId }) => ({ userId }),
       });
-      await expect(validate({ token: issued.token, request: new Request(RESOURCE), env: {} })).rejects.toThrow(
-        'odd public exponent of at least 3'
-      );
+      // A resource server is handed someone else's JWKS: an unusable key is skipped, and a
+      // token left with no key to verify against is invalid_token rather than an outage.
+      await expect(validate({ token: issued.token, request: new Request(RESOURCE), env: {} })).resolves.toBeNull();
       const publisher = createJwtAccessTokens<{}, TestProps>({
         issuer: ISSUER,
         jwksUri: JWKS_URI,
@@ -158,6 +158,179 @@ describe('JWT access tokens', () => {
       });
       await expect(publisher.getJwks({})).rejects.toThrow('odd public exponent of at least 3');
     }
+  });
+
+  it('skips a foreign or unusable key rather than failing every request', async () => {
+    const key = await createKey('RS256', 'signing');
+    const accessTokens = createJwtAccessTokens<{}, TestProps>({
+      issuer: ISSUER,
+      jwksUri: JWKS_URI,
+      keys: () => ({
+        current: { kid: 'signing', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
+      }),
+    });
+    const issued = await accessTokens.issue(
+      issueInput({ userId: 'user-123', tenantId: 'tenant-1', upstreamAccessToken: 'secret' })
+    );
+
+    // RFC 7517 §4.4 makes `alg` optional, and an authorization server may publish keys for
+    // other purposes alongside its access-token key. Neither may take the resource down.
+    const { alg: _alg, ...algLess } = key.publicJwk;
+    const foreignKeys = [
+      algLess as JwtAccessTokenPublicKey,
+      { ...key.publicJwk, kid: 'encryption', use: 'enc' } as JwtAccessTokenPublicKey,
+      key.publicJwk,
+    ];
+    const validate = createJwtAccessTokenValidator<{}, { userId: string }>({
+      issuer: ISSUER,
+      audience: RESOURCE,
+      keys: () => foreignKeys,
+      mapClaimsToProps: ({ userId }) => ({ userId }),
+    });
+    await expect(validate({ token: issued.token, request: new Request(RESOURCE), env: {} })).resolves.toMatchObject({
+      props: { userId: 'user-123' },
+    });
+
+    // A resolver that has no key for this token answers invalid_token, not a 503.
+    const empty = createJwtAccessTokenValidator<{}, { userId: string }>({
+      issuer: ISSUER,
+      audience: RESOURCE,
+      keys: () => [],
+      mapClaimsToProps: ({ userId }) => ({ userId }),
+    });
+    await expect(empty({ token: issued.token, request: new Request(RESOURCE), env: {} })).resolves.toBeNull();
+  });
+
+  it('publishes only JWK members and keeps a __proto__ public claim inert', async () => {
+    const key = await createKey('RS256', 'published');
+    const accessTokens = createJwtAccessTokens<{}, TestProps>({
+      issuer: ISSUER,
+      jwksUri: JWKS_URI,
+      keys: () => ({
+        current: {
+          kid: 'published',
+          alg: 'RS256',
+          privateKey: key.privateKey,
+          // An application key record carries its own bookkeeping beside the JWK.
+          publicJwk: { ...key.publicJwk, kmsKeyId: 'arn:secret', retireAfter: 1 } as JwtAccessTokenPublicKey,
+        },
+      }),
+    });
+    const jwks = await accessTokens.getJwks({});
+    expect(Object.keys(jwks.keys[0]).sort()).toEqual(['alg', 'e', 'kid', 'kty', 'n', 'use']);
+
+    // The application owns publicClaims, so a __proto__ member is a loud error rather than
+    // a silent drop: no resource server can copy such a claim onto an object safely.
+    const withProto = createJwtAccessTokens<{}, TestProps>({
+      issuer: ISSUER,
+      jwksUri: JWKS_URI,
+      keys: () => ({
+        current: { kid: 'published', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
+      }),
+      publicClaims: () => JSON.parse('{"attrs":{"__proto__":{"isAdmin":true}}}'),
+    });
+    await expect(
+      withProto.issue(issueInput({ userId: 'user-123', tenantId: 'tenant-1', upstreamAccessToken: 'secret' }))
+    ).rejects.toThrow('__proto__');
+  });
+
+  it('drops a __proto__ member from a public claim minted elsewhere', async () => {
+    const key = await createKey('RS256', 'foreign');
+    const accessTokens = createJwtAccessTokens<{}, TestProps>({
+      issuer: ISSUER,
+      jwksUri: JWKS_URI,
+      keys: () => ({
+        current: { kid: 'foreign', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
+      }),
+    });
+    const issued = await accessTokens.issue(
+      issueInput({ userId: 'user-123', tenantId: 'tenant-1', upstreamAccessToken: 'secret' })
+    );
+    const header = decodePart(issued.token, 0);
+    const claims = decodePart(issued.token, 1);
+    const polluted = await signCustomJwt(
+      header,
+      { ...claims, [JWT_ACCESS_TOKEN_PUBLIC_CLAIMS]: JSON.parse('{"__proto__":{"isAdmin":true}}') },
+      key.privateKey
+    );
+    const validate = createJwtAccessTokenValidator<{}, { admin: boolean }>({
+      issuer: ISSUER,
+      audience: RESOURCE,
+      keys: () => [key.publicJwk],
+      mapClaimsToProps: ({ publicClaims }) => {
+        // The obvious thing a resource server writes, and it must stay safe.
+        const copied = Object.assign({}, publicClaims as object) as { isAdmin?: boolean };
+        return { admin: copied.isAdmin === true };
+      },
+    });
+    await expect(validate({ token: polluted, request: new Request(RESOURCE), env: {} })).resolves.toMatchObject({
+      props: { admin: false },
+    });
+  });
+
+  it('rejects a foreign issuer, a disallowed algorithm, and each missing required claim', async () => {
+    // Every one of these is a rejection the offline validator is solely responsible for:
+    // unlike verify()/recognizes(), it has no separate issuer or typ pre-check.
+    const key = await createKey('RS256', 'required-claims');
+    const es256 = await createKey('ES256', 'es-key');
+    const accessTokens = createJwtAccessTokens<{}, TestProps>({
+      issuer: ISSUER,
+      jwksUri: JWKS_URI,
+      keys: () => ({
+        current: { kid: 'required-claims', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
+      }),
+    });
+    const issued = await accessTokens.issue(
+      issueInput({ userId: 'user-123', tenantId: 'tenant-1', upstreamAccessToken: 'secret' })
+    );
+    const header = decodePart(issued.token, 0);
+    const claims = decodePart(issued.token, 1);
+    const mapClaimsToProps = vi.fn(({ userId }: { userId: string }) => ({ userId }));
+    const keys = vi.fn(() => [key.publicJwk, es256.publicJwk]);
+    const validate = createJwtAccessTokenValidator<{}, { userId: string }>({
+      issuer: ISSUER,
+      audience: RESOURCE,
+      algorithms: ['RS256'],
+      keys,
+      mapClaimsToProps,
+    });
+    const run = (token: string) => validate({ token, request: new Request(RESOURCE), env: {} });
+
+    // Control: the untampered token is accepted, so each rejection below is the claim.
+    await expect(run(issued.token)).resolves.toMatchObject({ props: { userId: 'user-123' } });
+
+    const omit = (name: string) => {
+      const { [name]: _removed, ...rest } = claims;
+      return rest;
+    };
+    const variants: Array<[string, Record<string, unknown>, Record<string, unknown>]> = [
+      ['foreign issuer', header, { ...claims, iss: 'https://attacker.example.com' }],
+      ['foreign audience', header, { ...claims, aud: 'https://other.example.com/mcp' }],
+      ['generic typ', { ...header, typ: 'JWT' }, claims],
+      ['no kid', { alg: 'RS256', typ: 'at+jwt' }, claims],
+      ['no sub', header, omit('sub')],
+      ['no client_id', header, omit('client_id')],
+      ['no jti', header, omit('jti')],
+      ['no grant id', header, omit(JWT_ACCESS_TOKEN_GRANT_ID_CLAIM)],
+    ];
+    for (const [label, variantHeader, variantClaims] of variants) {
+      mapClaimsToProps.mockClear();
+      const token = await signCustomJwt(variantHeader, variantClaims, key.privateKey);
+      await expect(run(token), label).resolves.toBeNull();
+      expect(mapClaimsToProps, label).not.toHaveBeenCalled();
+    }
+
+    // An algorithm outside the allowlist is refused even though its key is in the set,
+    // and it is refused before the resolver is consulted.
+    keys.mockClear();
+    const esToken = await signEs256Jwt({ alg: 'ES256', typ: 'at+jwt', kid: 'es-key' }, claims, es256.privateKey);
+    await expect(run(esToken)).resolves.toBeNull();
+    expect(keys).not.toHaveBeenCalled();
+
+    // `alg: none` with a structurally valid third segment, so parsing is not what rejects it.
+    const unsigned = `${encodePart({ alg: 'none', typ: 'at+jwt', kid: 'required-claims' })}.${encodePart(claims)}.AAAA`;
+    await expect(run(unsigned)).resolves.toBeNull();
+    expect(keys).not.toHaveBeenCalled();
   });
 
   it('accepts an http issuer, JWKS URI, and audience on loopback hosts for local development', async () => {
@@ -704,16 +877,13 @@ describe('JWT access tokens', () => {
       }),
       publicClaims: () => JSON.parse('{"__proto__":{"polluted":true},"safe":"value"}') as never,
     });
-    const specialKeyToken = await specialKeyClaims.issue(
-      issueInput({ userId: 'user-123', tenantId: 'tenant-a', upstreamAccessToken: 'secret' })
-    );
-    const specialValue = decodePart(specialKeyToken.token, 1)[JWT_ACCESS_TOKEN_PUBLIC_CLAIMS] as Record<
-      string,
-      unknown
-    >;
-    expect(Object.prototype.hasOwnProperty.call(specialValue, '__proto__')).toBe(true);
-    expect(specialValue.safe).toBe('value');
-    expect(specialValue.__proto__).toEqual({ polluted: true });
+    // A null-prototype clone keeps such a key inert here, but the claim is consumed by
+    // resource servers this issuer does not control, and the ordinary way to read it
+    // (Object.assign or a spread onto a plain object) reassigns that object's prototype.
+    // The hazard cannot be exported, so issuance refuses it.
+    await expect(
+      specialKeyClaims.issue(issueInput({ userId: 'user-123', tenantId: 'tenant-a', upstreamAccessToken: 'secret' }))
+    ).rejects.toThrow('__proto__');
 
     const validate = createJwtAccessTokenValidator<{}, {}>({
       issuer: ISSUER,
@@ -758,3 +928,17 @@ describe('JWT access tokens', () => {
     expect(mapper).not.toHaveBeenCalled();
   });
 });
+
+async function signEs256Jwt(
+  header: Record<string, unknown>,
+  claims: Record<string, unknown>,
+  privateKey: CryptoKey
+): Promise<string> {
+  const signingInput = `${encodePart(header)}.${encodePart(claims)}`;
+  const signature = await crypto.subtle.sign(
+    { name: 'ECDSA', hash: 'SHA-256' },
+    privateKey,
+    new TextEncoder().encode(signingInput)
+  );
+  return `${signingInput}.${encodeBinary(new Uint8Array(signature))}`;
+}
