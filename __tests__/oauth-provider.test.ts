@@ -14535,9 +14535,7 @@ describe('functional authorization-server and resource-server composition', () =
     const client = await registerClient(authorizationServer);
     const code = await authorize(authorizationServer, client, [calendarResource]);
 
-    await expect(exchangeCode(authorizationServer, client, code)).rejects.toThrow(
-      "accessTokenFormat must return either 'opaque' or 'jwt'"
-    );
+    await expectFormatPolicyError(await exchangeCode(authorizationServer, client, code));
     expect((await env.OAUTH_KV.list({ prefix: 'token:' })).keys).toHaveLength(0);
     const grantKey = (await env.OAUTH_KV.list({ prefix: 'grant:' })).keys[0].name;
     await expect(env.OAUTH_KV.get(grantKey, { type: 'json' })).resolves.toMatchObject({
@@ -14553,9 +14551,7 @@ describe('functional authorization-server and resource-server composition', () =
 
     const grantBeforeFailedRefresh = (await env.OAUTH_KV.get(grantKey, { type: 'json' })) as Grant;
     selectedFormat = 'automatic';
-    await expect(refresh(authorizationServer, client, retryTokens.refresh_token)).rejects.toThrow(
-      "accessTokenFormat must return either 'opaque' or 'jwt'"
-    );
+    await expectFormatPolicyError(await refresh(authorizationServer, client, retryTokens.refresh_token));
     const grantAfterFailedRefresh = (await env.OAUTH_KV.get(grantKey, { type: 'json' })) as Grant;
     expect(grantAfterFailedRefresh.refreshTokenId).toBe(grantBeforeFailedRefresh.refreshTokenId);
     expect(grantAfterFailedRefresh.previousRefreshTokenId).toBe(grantBeforeFailedRefresh.previousRefreshTokenId);
@@ -14648,9 +14644,7 @@ describe('functional authorization-server and resource-server composition', () =
       };
 
       const retryableAssertion = await createAssertion();
-      await expect(exchangeAssertion(retryableAssertion)).rejects.toThrow(
-        "accessTokenFormat must return either 'opaque' or 'jwt'"
-      );
+      await expectFormatPolicyError(await exchangeAssertion(retryableAssertion));
       expect((await env.OAUTH_KV.list({ prefix: 'enterprise-jti:' })).keys).toHaveLength(0);
       expect((await env.OAUTH_KV.list({ prefix: 'grant:' })).keys).toHaveLength(0);
       expect((await env.OAUTH_KV.list({ prefix: 'token:' })).keys).toHaveLength(0);
@@ -15737,3 +15731,12 @@ describe('enterprise-managed authorization with JWT access tokens', () => {
     expect(mapClaims).toHaveBeenCalledTimes(1);
   });
 });
+
+/** A misconfigured accessTokenFormat policy is a server_error in the OAuth envelope. */
+async function expectFormatPolicyError(response: Response): Promise<void> {
+  expect(response.status).toBe(500);
+  await expect(response.json()).resolves.toMatchObject({
+    error: 'server_error',
+    error_description: "accessTokenFormat must return either 'opaque' or 'jwt'",
+  });
+}
