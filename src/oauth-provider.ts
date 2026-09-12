@@ -5488,7 +5488,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const policyContext = Object.freeze({ ...context });
     const format = await this.accessTokenFormatPolicy(policyContext);
     if (format !== 'opaque' && format !== 'jwt') {
-      throw new TypeError("accessTokenFormat must return either 'opaque' or 'jwt'");
+      throw new OAuthError('server_error', {
+        description: "accessTokenFormat must return either 'opaque' or 'jwt'",
+        statusCode: 500,
+      });
     }
     return format;
   }
@@ -6669,6 +6672,15 @@ class OAuthHelpersImpl<Env = Cloudflare.Env, Props = any> implements OAuthHelper
 
     // Callers can pass a reconstructed AuthRequest rather than one returned by
     // parseAuthRequest(), so re-apply registry selection before any mutation.
+    // RFC 6749 §3.3 scope tokens are space-delimited on the wire, so a value carrying a
+    // space, a quote or a backslash cannot round-trip. Reject it here, where the
+    // application supplied it, rather than when a token is later signed.
+    if (options.scope !== undefined) {
+      if (!Array.isArray(options.scope) || options.scope.some((scope) => !isValidOAuthScopeToken(scope))) {
+        throw new TypeError('completeAuthorization scope must contain valid OAuth scope tokens');
+      }
+    }
+
     const effectiveResource = this.provider.resolveAuthorizationRequestResource(options.request.resource);
 
     // Re-apply PKCE policy after client, redirect, response-type, and resource
