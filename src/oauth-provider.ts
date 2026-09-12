@@ -1634,6 +1634,13 @@ interface CreateAccessTokenOptions<Env = Cloudflare.Env> {
   scope: string[];
 
   /**
+   * Scope of the underlying authorization grant, denormalized onto the token record and
+   * surfaced as `TokenSummary.grant.scope` and `TokenExchangeCallbackOptions.scope`.
+   * Defaults to `scope`, which is only correct when this token carries the whole grant.
+   */
+  grantScope?: string[];
+
+  /**
    * Encrypted props for the token
    */
   encryptedProps: string;
@@ -4024,6 +4031,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       grantId,
       clientId: grantData.clientId,
       scope: tokenScopes,
+      // A refresh may narrow the token below the grant; the record denormalizes the grant.
+      grantScope: grantData.scope,
       encryptedProps: encryptedAccessTokenProps,
       encryptionKey: accessTokenEncryptionKey,
       expiresIn: accessTokenTTL,
@@ -5501,6 +5510,23 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @param params - Options for creating the access token
    * @returns The access token string
    */
+  /**
+   * Implicit flow issuance. The grant is written only once the token exists, so a signing
+   * or key-resolution failure leaves no grant behind, as on the authorization-code and
+   * enterprise-assertion paths. There is no one-shot credential here, but a failed attempt
+   * would otherwise leave a TTL-less grant the user sees as a live consent.
+   */
+  async createImplicitAccessToken(
+    params: CreateAccessTokenOptions<Env>,
+    grantKey: string,
+    grant: Grant
+  ): Promise<string> {
+    const minted = await this.mintAccessToken(params);
+    await params.env.OAUTH_KV.put(grantKey, JSON.stringify(grant), grantPutOptions(grant));
+    await this.persistAccessToken(params.env, minted);
+    return minted.accessToken;
+  }
+
   async createAccessToken(params: CreateAccessTokenOptions<Env>): Promise<string> {
     const minted = await this.mintAccessToken(params);
     await this.persistAccessToken(params.env, minted);
@@ -5590,7 +5616,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       wrappedEncryptionKey: accessTokenWrappedKey,
       grant: {
         clientId: clientId,
-        scope: scope,
+        scope: params.grantScope ?? scope,
         encryptedProps: encryptedProps,
       },
     };
@@ -6726,8 +6752,9 @@ class OAuthHelpersImpl<Env = Cloudflare.Env, Props = any> implements OAuthHelper
       // Resource selection was validated before any grant or token mutation.
       const audience = effectiveResource;
 
-      // Select the writer before storing the implicit grant. A policy failure
-      // leaves no grant or token state behind.
+      // Select the writer before storing the implicit grant, and build the token before
+      // it too, so neither a policy failure nor a signing or key-resolution failure
+      // leaves a grant behind. Matches the authorization-code and assertion paths.
       const accessTokenFormat = await this.provider.selectAccessTokenFormat({
         env: this.env,
         clientId: options.request.clientId,
@@ -6749,20 +6776,22 @@ class OAuthHelpersImpl<Env = Cloudflare.Env, Props = any> implements OAuthHelper
 
       // Store the grant with a key that includes the user ID
       const grantKey = `grant:${options.userId}:${grantId}`;
-      await this.env.OAUTH_KV.put(grantKey, JSON.stringify(grant), grantPutOptions(grant));
-
-      const accessToken = await this.provider.createAccessToken({
-        format: accessTokenFormat,
-        userId: options.userId,
-        grantId,
-        clientId: options.request.clientId,
-        scope: options.scope,
-        encryptedProps: encryptedData,
-        encryptionKey,
-        expiresIn: accessTokenTTL,
-        audience,
-        env: this.env,
-      });
+      const accessToken = await this.provider.createImplicitAccessToken(
+        {
+          format: accessTokenFormat,
+          userId: options.userId,
+          grantId,
+          clientId: options.request.clientId,
+          scope: options.scope,
+          encryptedProps: encryptedData,
+          encryptionKey,
+          expiresIn: accessTokenTTL,
+          audience,
+          env: this.env,
+        },
+        grantKey,
+        grant
+      );
 
       // Build the redirect URL for implicit flow (token in fragment, not query params)
       const redirectUrl = new URL(options.request.redirectUri);

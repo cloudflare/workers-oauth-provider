@@ -15963,6 +15963,71 @@ describe('functional authorization-server and resource-server composition', () =
     }
   });
 
+  it('keeps the grant scope on a token record narrowed by refresh', async () => {
+    const twoScopeServer = new OAuthAuthorizationServer<TestEnv>({
+      issuer,
+      resources: [calendarResource],
+      authorizeEndpoint: '/authorize',
+      tokenEndpoint: '/oauth/token',
+      clientRegistrationEndpoint: '/oauth/register',
+      scopesSupported: ['calendar:read', 'calendar:write'],
+    });
+    const client = await registerClient(twoScopeServer);
+
+    const url = new URL(`${issuer}/authorize`);
+    url.searchParams.set('response_type', 'code');
+    url.searchParams.set('client_id', client.client_id);
+    url.searchParams.set('redirect_uri', 'https://client.example.com/callback');
+    url.searchParams.set('scope', 'calendar:read calendar:write');
+    url.searchParams.set('resource', calendarResource);
+    const oauth = twoScopeServer.getOAuthApi(env);
+    const authRequest = await oauth.parseAuthRequest(createMockRequest(url.href));
+    const { redirectTo } = await oauth.completeAuthorization({
+      request: authRequest,
+      userId: 'test-user-123',
+      metadata: {},
+      scope: authRequest.scope,
+      props: { userId: 'test-user-123' },
+    });
+    const code = new URL(redirectTo).searchParams.get('code')!;
+    const exchanged = await exchangeCode(twoScopeServer, client, code, calendarResource);
+    expect(exchanged.status).toBe(200);
+    const tokens = await exchanged.json<any>();
+
+    const grantKey = (await env.OAUTH_KV.list({ prefix: 'grant:' })).keys[0].name;
+    expect(((await env.OAUTH_KV.get(grantKey, { type: 'json' })) as Grant).scope).toEqual([
+      'calendar:read',
+      'calendar:write',
+    ]);
+
+    // Refresh asking for strictly less than the grant allows.
+    const narrowed = await twoScopeServer.fetch(
+      createMockRequest(
+        `${issuer}/oauth/token`,
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        new URLSearchParams({
+          grant_type: 'refresh_token',
+          refresh_token: tokens.refresh_token,
+          client_id: client.client_id,
+          client_secret: client.client_secret,
+          scope: 'calendar:read',
+        }).toString()
+      ),
+      env,
+      ctx
+    );
+    expect(narrowed.status).toBe(200);
+    await expect(narrowed.json()).resolves.toMatchObject({ scope: 'calendar:read' });
+
+    // The token is narrowed, but the record denormalizes the grant, so grant.scope is
+    // still what the user consented to. tokenExchangeCallback contrasts the two.
+    const tokenKeys = (await env.OAUTH_KV.list({ prefix: 'token:' })).keys;
+    const record = (await env.OAUTH_KV.get(tokenKeys[tokenKeys.length - 1].name, { type: 'json' })) as Token;
+    expect(record.scope).toEqual(['calendar:read']);
+    expect(record.grant.scope).toEqual(['calendar:read', 'calendar:write']);
+  });
+
   it('types ctx.props of a hosted handler from the class Props parameter', () => {
     const typed = new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>({
       issuer,
