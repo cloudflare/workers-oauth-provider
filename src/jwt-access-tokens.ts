@@ -13,9 +13,18 @@ export const JWT_ACCESS_TOKEN_PUBLIC_CLAIMS = 'https://workers.cloudflare.com/oa
 const DEFAULT_MAX_TOKEN_BYTES = 16 * 1024;
 const MAX_CONFIGURED_TOKEN_BYTES = 128 * 1024;
 const MAX_KEY_ID_LENGTH = 128;
+/** Permitted clock skew, shared by the issuer's own verifier and the offline validator. */
+const DEFAULT_CLOCK_SKEW_SECONDS = 30;
+const SUPPORTED_ALGORITHMS: readonly JwtAccessTokenAlgorithm[] = ['RS256', 'ES256'];
 const MAX_PUBLIC_CLAIM_DEPTH = 64;
 const MAX_PUBLIC_CLAIM_NODES = 10_000;
 const verifiedSigningKeyPairs = new WeakMap<CryptoKey, Map<string, Promise<void>>>();
+
+/** A signature the caller already produced, used in place of a probe signature. */
+interface SigningKeyPairProof {
+  readonly signature: Uint8Array;
+  readonly data: Uint8Array;
+}
 const JWT_TYPE = 'at+jwt';
 const ACCEPTED_JWT_TYPES = new Set([JWT_TYPE, 'application/at+jwt']);
 const FORBIDDEN_JOSE_HEADERS = ['jku', 'jwk', 'x5u', 'x5c', 'b64'] as const;
@@ -80,9 +89,6 @@ export interface JwtAccessTokenPublicClaimsInput<Env, Props> {
   readonly env: Env;
 }
 
-/** Input used internally by the authorization server to mint one JWT access token. */
-export interface JwtAccessTokenIssueInput<Env, Props> extends JwtAccessTokenPublicClaimsInput<Env, Props> {}
-
 /** Signed token plus its validated claims, returned to the provider's storage layer. */
 export interface JwtIssuedAccessToken {
   token: string;
@@ -130,7 +136,7 @@ export interface JwtAccessTokens<Env = Cloudflare.Env, Props = unknown> {
   readonly jwksUri: string;
   readonly maxTokenBytes: number;
   /** Mint one signed access token from provider-validated grant state. */
-  issue: (input: JwtAccessTokenIssueInput<Env, Props>) => Promise<JwtIssuedAccessToken>;
+  issue: (input: JwtAccessTokenPublicClaimsInput<Env, Props>) => Promise<JwtIssuedAccessToken>;
   /** Verify against an explicit finite set of audiences owned by the caller. */
   verify: (token: string, allowedAudiences: readonly string[], env: Env) => Promise<VerifiedJwtAccessToken | null>;
   /** Cheaply identify a structurally valid token that claims this component's issuer and type. */
@@ -139,8 +145,22 @@ export interface JwtAccessTokens<Env = Cloudflare.Env, Props = unknown> {
   getJwks: (env: Env) => Promise<{ keys: JwtAccessTokenPublicKey[] }>;
 }
 
-type InternalStateVerifier = (token: string, env: unknown) => Promise<VerifiedJwtAccessToken | null>;
-const internalStateVerifiers = new WeakMap<object, InternalStateVerifier>();
+interface InternalHooks {
+  /** Verify against the token's own audience for a provider-owned state cross-check. */
+  readonly verify: (token: string, env: unknown) => Promise<VerifiedJwtAccessToken | null>;
+  /**
+   * Resolve and prove the signing key without issuing anything, so a caller can find out
+   * that it cannot sign before it consumes a one-shot credential.
+   */
+  readonly warm: (env: unknown) => Promise<void>;
+}
+/**
+ * Brands the objects this factory returns. A WeakMap rather than a property so that a
+ * spread copy of the component is not branded, which is what makes the factory-only
+ * invariant detectable rather than merely documented.
+ */
+const internalStateVerifiers = new WeakMap<object, InternalHooks>();
+const NOT_FROM_FACTORY = 'accessTokens must be created by createJwtAccessTokens';
 
 /** @internal Verify only for an immediate provider-owned state-record cross-check. */
 export function verifyJwtForProviderState<Env>(
@@ -148,15 +168,22 @@ export function verifyJwtForProviderState<Env>(
   token: string,
   env: Env
 ): Promise<VerifiedJwtAccessToken | null> {
-  const verify = internalStateVerifiers.get(accessTokens);
-  if (!verify) throw new TypeError('JWT access-token component was not created by createJwtAccessTokens');
-  return verify(token, env);
+  const hooks = internalStateVerifiers.get(accessTokens);
+  if (!hooks) throw new TypeError(NOT_FROM_FACTORY);
+  return hooks.verify(token, env);
+}
+
+/** @internal Prove the signing key is usable before a one-shot credential is consumed. */
+export function warmJwtSigningKey<Env>(accessTokens: JwtAccessTokens<Env, any>, env: Env): Promise<void> {
+  const hooks = internalStateVerifiers.get(accessTokens);
+  if (!hooks) throw new TypeError(NOT_FROM_FACTORY);
+  return hooks.warm(env);
 }
 
 /** @internal Enforce the factory-only invariant at provider construction time. */
 export function assertJwtAccessTokensComponent(value: JwtAccessTokens<any, any>): void {
   if (!internalStateVerifiers.has(value)) {
-    throw new TypeError('accessTokens must be created by createJwtAccessTokens');
+    throw new TypeError(NOT_FROM_FACTORY);
   }
 }
 
@@ -168,8 +195,8 @@ export interface JwtClaimsToPropsInput<Env> extends VerifiedJwtAccessToken {
 
 /** The verification key a token names, passed to a validator's `keys` resolver. */
 export interface JwtAccessTokenKeyHint {
-  /** `kid` from the token header, absent when the header carries none. */
-  readonly kid?: string;
+  /** `kid` from the token header. Always present: a token without one is rejected first. */
+  readonly kid: string;
   /** Algorithm from the token header, already restricted to the allowed list. */
   readonly alg: JwtAccessTokenAlgorithm;
 }
@@ -183,9 +210,15 @@ export interface JwtAccessTokenValidatorOptions<Env = Cloudflare.Env, Props = un
   /** Allowed algorithms. Defaults to `['RS256']`. Never derived from the token. */
   algorithms?: JwtAccessTokenAlgorithm[];
   /**
-   * Resolve trusted public keys. Token-controlled key URLs are never followed. The
-   * hint carries the `kid` and `alg` the token names, so a cached key set can be
-   * refreshed once when the authorization server has rotated to a key it lacks.
+   * Resolve trusted public keys. Token-controlled key URLs are never followed.
+   *
+   * The hint carries the `kid` and `alg` the token names, so a cached key set can be
+   * refreshed when the authorization server has rotated to a key it lacks. That hint is
+   * read from the JOSE header before any signature has been checked, so it is
+   * unauthenticated attacker-chosen input: a resolver that fetches per unknown `kid` must
+   * bound that work, for example by refreshing at most once per interval and remembering
+   * which `kid` values it has already failed to find. Returning an empty array, or a set
+   * without the named key, is answered as `invalid_token`.
    */
   keys(env: Env, hint: JwtAccessTokenKeyHint): JwtAccessTokenPublicKey[] | Promise<JwtAccessTokenPublicKey[]>;
   /** Map already verified claims to the typed context exposed as `ctx.props`. */
@@ -234,7 +267,17 @@ export function createJwtAccessTokens<Env = Cloudflare.Env, Props = unknown>(
     audiences: readonly string[],
     env: Env
   ): Promise<VerifiedJwtAccessToken | null> => {
-    if (!preflightParsedJwt(parsed, issuer, audiences, ['RS256', 'ES256'], true, 30)) return null;
+    // Cheap reject before resolving keys, so a junk token never reaches the caller's
+    // `keys()` resolver. It cannot yet narrow to the key set's algorithms, and it carries
+    // no authority: verifyParsedJwt repeats every check below against the loaded key set.
+    const preflight: PreflightOptions = {
+      issuer,
+      allowedAudiences: audiences,
+      allowedAlgorithms: SUPPORTED_ALGORITHMS,
+      requireSingleAudience: true,
+      clockSkewSeconds: DEFAULT_CLOCK_SKEW_SECONDS,
+    };
+    if (!preflightParsedJwt(parsed, preflight)) return null;
     const keySet = validateKeySet(await options.keys(env));
     return verifyParsedJwt(parsed, {
       issuer,
@@ -245,7 +288,7 @@ export function createJwtAccessTokens<Env = Cloudflare.Env, Props = unknown>(
       publicKeys: keySet.publicKeys,
       allowedAudiences: audiences,
       requireSingleAudience: true,
-      clockSkewSeconds: 30,
+      clockSkewSeconds: DEFAULT_CLOCK_SKEW_SECONDS,
     });
   };
 
@@ -285,17 +328,13 @@ export function createJwtAccessTokens<Env = Cloudflare.Env, Props = unknown>(
       if (projectedTokenBytes > maxTokenBytes) {
         throw new TypeError(`JWT access token exceeds the configured ${maxTokenBytes}-byte limit`);
       }
-      const signature = await crypto.subtle.sign(
-        getSigningAlgorithm(keySet.current.alg),
-        keySet.current.privateKey,
-        signingInput
+      const signature = new Uint8Array(
+        await crypto.subtle.sign(getSigningAlgorithm(keySet.current.alg), keySet.current.privateKey, signingInput)
       );
-      if (
-        !(await verifySignature(keySet.current.publicJwk, keySet.current.alg, new Uint8Array(signature), signingInput))
-      ) {
-        throw new TypeError('current JWT signing key privateKey does not match publicJwk');
-      }
-      const token = `${signingInputText}.${encodeBytes(new Uint8Array(signature))}`;
+      // Prove the pair with the signature just produced. Memoized per key pair, so only the
+      // first token issued under a key costs the extra verification.
+      await assertSigningKeyPair(keySet.current, { signature, data: signingInput });
+      const token = `${signingInputText}.${encodeBytes(signature)}`;
       if (new TextEncoder().encode(token).byteLength > maxTokenBytes) {
         throw new TypeError(`JWT access token exceeds the configured ${maxTokenBytes}-byte limit`);
       }
@@ -325,14 +364,21 @@ export function createJwtAccessTokens<Env = Cloudflare.Env, Props = unknown>(
     },
   };
 
-  internalStateVerifiers.set(accessTokens, async (token, env) => {
-    const parsed = parseCompactJwt(token, maxTokenBytes);
-    if (!parsed || !isAcceptedJwtType(parsed.header.typ) || parsed.claims.iss !== issuer) return null;
-    const audience = readCanonicalSingleAudience(parsed.claims.aud);
-    if (!audience) return null;
-    return verifyAgainstAudiences(parsed, [audience], env as Env);
+  internalStateVerifiers.set(accessTokens, {
+    verify: async (token, env) => {
+      const parsed = parseCompactJwt(token, maxTokenBytes);
+      if (!parsed || !isAcceptedJwtType(parsed.header.typ) || parsed.claims.iss !== issuer) return null;
+      const audience = readCanonicalSingleAudience(parsed.claims.aud);
+      if (!audience) return null;
+      return verifyAgainstAudiences(parsed, [audience], env as Env);
+    },
+    warm: async (env) => {
+      await assertSigningKeyPair(validateKeySet(await options.keys(env as Env)).current);
+    },
   });
-  return accessTokens;
+  // Frozen so the branded object the provider re-reads on every request cannot have its
+  // methods swapped after construction validated it.
+  return Object.freeze(accessTokens);
 }
 
 /**
@@ -359,17 +405,26 @@ export function createJwtAccessTokenValidator<Env = Cloudflare.Env, Props = unkn
   return async ({ token, request, env }) => {
     const parsed = parseCompactJwt(token, maxTokenBytes);
     if (!parsed) return null;
-    if (!preflightParsedJwt(parsed, issuer, [audience], algorithms, false, clockSkewSeconds)) return null;
-    const alg = parsed.header.alg;
-    if (typeof alg !== 'string' || !algorithms.includes(alg as JwtAccessTokenAlgorithm)) return null;
-    const hint: JwtAccessTokenKeyHint = {
-      ...(typeof parsed.header.kid === 'string' ? { kid: parsed.header.kid } : {}),
-      alg: alg as JwtAccessTokenAlgorithm,
+    const preflight: PreflightOptions = {
+      issuer,
+      allowedAudiences: [audience],
+      allowedAlgorithms: algorithms,
+      // RFC 9068 §4: a resource server accepts a token whose `aud` contains its own
+      // identifier, so an interoperable array audience is honoured here even though the
+      // package's own issuer only mints a single string.
+      requireSingleAudience: false,
+      clockSkewSeconds,
     };
-    const publicKeys = validatePublicKeys(await options.keys(env, hint), algorithms);
-    // RFC 9068 §4: a resource server accepts a token whose `aud` contains its own
-    // identifier, so an interoperable array audience is honoured here even though the
-    // package's own issuer only mints a single string.
+    if (!preflightParsedJwt(parsed, preflight)) return null;
+    // preflightParsedJwt has already restricted `alg` to `algorithms` and required a `kid`.
+    const hint: JwtAccessTokenKeyHint = {
+      kid: parsed.header.kid as string,
+      alg: parsed.header.alg as JwtAccessTokenAlgorithm,
+    };
+    const publicKeys = usablePublicKeys(await options.keys(env, hint), algorithms);
+    // No key for this token is an unverifiable token, not a broken validator: returning
+    // null makes it a 401 invalid_token (RFC 9068 §4) instead of a 503.
+    if (publicKeys.length === 0) return null;
     const verified = await verifyParsedJwt(parsed, {
       issuer,
       allowedAudiences: [audience],
@@ -392,13 +447,17 @@ interface ParsedJwt {
   signature: Uint8Array;
 }
 
-interface VerifyParsedOptions {
+interface PreflightOptions {
   issuer: string;
   allowedAudiences: readonly string[];
-  allowedAlgorithms: JwtAccessTokenAlgorithm[];
-  publicKeys: JwtAccessTokenPublicKey[];
+  allowedAlgorithms: readonly JwtAccessTokenAlgorithm[];
+  /** Reject an array `aud`. The issuer's own profile is always single-audience. */
   requireSingleAudience: boolean;
   clockSkewSeconds: number;
+}
+
+interface VerifyParsedOptions extends PreflightOptions {
+  publicKeys: JwtAccessTokenPublicKey[];
 }
 
 async function verifyParsedJwt(
@@ -406,18 +465,7 @@ async function verifyParsedJwt(
   options: VerifyParsedOptions
 ): Promise<VerifiedJwtAccessToken | null> {
   const { header, claims } = parsed;
-  if (
-    !preflightParsedJwt(
-      parsed,
-      options.issuer,
-      options.allowedAudiences,
-      options.allowedAlgorithms,
-      options.requireSingleAudience,
-      options.clockSkewSeconds
-    )
-  ) {
-    return null;
-  }
+  if (!preflightParsedJwt(parsed, options)) return null;
 
   const alg = header.alg as JwtAccessTokenAlgorithm;
   const kid = header.kid;
@@ -429,29 +477,20 @@ async function verifyParsedJwt(
   try {
     verified = await verifySignature(matchingKeys[0], alg, parsed.signature, parsed.signingInput);
   } catch (error) {
-    throw new TypeError(`Unable to use configured JWT verification key: ${errorMessage(error)}`);
+    throw withCause(new TypeError(`Unable to use configured JWT verification key: ${errorMessage(error)}`), error);
   }
   if (!verified) return null;
 
   // Repeat every semantic check after cryptographic verification. This keeps
   // untrusted preflight checks strictly an optimization rather than an authority.
-  if (
-    !preflightParsedJwt(
-      parsed,
-      options.issuer,
-      options.allowedAudiences,
-      options.allowedAlgorithms,
-      options.requireSingleAudience,
-      options.clockSkewSeconds
-    )
-  ) {
-    return null;
-  }
+  if (!preflightParsedJwt(parsed, options)) return null;
   const audience = selectAudience(claims.aud, options.allowedAudiences, options.requireSingleAudience);
   const scope = parseScopeClaim(claims.scope);
   const grantId = claims[JWT_ACCESS_TOKEN_GRANT_ID_CLAIM] as string;
   if (!audience || !scope || typeof claims.exp !== 'number') return null;
-  const publicClaims = claims[JWT_ACCESS_TOKEN_PUBLIC_CLAIMS];
+  // Symmetric with the null-prototype clone the issuer builds: a `__proto__` member that
+  // rode along inside the public claim must reach mapClaimsToProps as ordinary data.
+  const publicClaims = detachPrototypes(claims[JWT_ACCESS_TOKEN_PUBLIC_CLAIMS]);
 
   return {
     claims: claims as unknown as JwtAccessTokenClaims,
@@ -466,14 +505,8 @@ async function verifyParsedJwt(
   };
 }
 
-function preflightParsedJwt(
-  parsed: ParsedJwt,
-  issuer: string,
-  allowedAudiences: readonly string[],
-  allowedAlgorithms: readonly JwtAccessTokenAlgorithm[],
-  requireSingleAudience: boolean,
-  clockSkewSeconds: number
-): boolean {
+function preflightParsedJwt(parsed: ParsedJwt, options: PreflightOptions): boolean {
+  const { issuer, allowedAudiences, allowedAlgorithms, requireSingleAudience, clockSkewSeconds } = options;
   const { header, claims } = parsed;
   if (!isAcceptedJwtType(header.typ)) return false;
   if (FORBIDDEN_JOSE_HEADERS.some((name) => name in header) || 'crit' in header) return false;
@@ -575,16 +608,33 @@ function validateKeySet(value: JwtAccessTokenKeySet): ValidatedKeySet {
   };
 }
 
-function validatePublicKeys(
+/**
+ * Narrow a resolver's key set to the keys this validator can actually verify with.
+ *
+ * A resource server is handed someone else's JWKS, and RFC 7517 §4.4 makes `alg` optional
+ * while RFC 9068 §4 expects an authorization server to publish keys for other purposes in
+ * the same document. So an entry this package cannot classify is skipped rather than
+ * treated as a configuration error: one foreign key must not take the resource server
+ * down for tokens whose own key is sitting beside it. Returning no usable key at all is a
+ * property of the token, not an outage, and the caller turns it into `invalid_token`.
+ */
+function usablePublicKeys(
   value: JwtAccessTokenPublicKey[],
   algorithms: JwtAccessTokenAlgorithm[]
 ): JwtAccessTokenPublicKey[] {
-  if (!Array.isArray(value) || value.length === 0) throw new TypeError('keys must return at least one public JWK');
-  const keys = value.map((key) => validatePublicJwk(key));
-  assertUniqueKeyIds(keys);
-  if (!keys.some((key) => algorithms.includes(key.alg as JwtAccessTokenAlgorithm))) {
-    throw new TypeError('keys did not return a public JWK for an allowed algorithm');
+  if (!Array.isArray(value)) throw new TypeError('keys must return an array of public JWKs');
+  const keys: JwtAccessTokenPublicKey[] = [];
+  for (const key of value) {
+    let validated: JwtAccessTokenPublicKey;
+    try {
+      validated = validatePublicJwk(key);
+    } catch {
+      continue;
+    }
+    if (algorithms.includes(validated.alg as JwtAccessTokenAlgorithm)) keys.push(validated);
   }
+  // A duplicate `kid` is ambiguous rather than foreign, and verifyParsedJwt already
+  // refuses to guess between two keys carrying one `kid`.
   return keys;
 }
 
@@ -594,8 +644,12 @@ function validatePublicJwk(
   expectedKeyId?: string
 ): JwtAccessTokenPublicKey {
   if (!value || typeof value !== 'object') throw new TypeError('JWT public key must be a JWK object');
+  // Reject private material on the caller's own object: cloneJwk() copies an allowlist and
+  // would quietly drop the very members this refuses to publish.
+  if (containsPrivateJwkMaterial(value)) {
+    throw new TypeError('JWT public JWK must not contain private key material');
+  }
   const key = cloneJwk(value);
-  if (containsPrivateJwkMaterial(key)) throw new TypeError('JWT public JWK must not contain private key material');
   if (!isNonEmptyString(key.kid) || key.kid.length > MAX_KEY_ID_LENGTH) {
     throw new TypeError(`JWT public JWK kid must contain 1-${MAX_KEY_ID_LENGTH} characters`);
   }
@@ -622,8 +676,8 @@ function validatePublicJwk(
   if (key.alg === 'ES256' && (key.kty !== 'EC' || key.crv !== 'P-256')) {
     throw new TypeError('ES256 JWT public JWK must use kty EC and crv P-256');
   }
-  if (key.alg === 'ES256' && (!isNonEmptyString(key.x) || !isNonEmptyString(key.y))) {
-    throw new TypeError('ES256 JWT public JWK must contain x and y coordinates');
+  if (key.alg === 'ES256' && (!isP256Coordinate(key.x) || !isP256Coordinate(key.y))) {
+    throw new TypeError('ES256 JWT public JWK must contain 32-byte base64url x and y coordinates');
   }
   // RFC 7517 advises against publishing both `use` and `key_ops`. `use: sig`
   // is the broadly interoperable constraint for an authorization-server JWKS.
@@ -639,13 +693,51 @@ function assertUniqueKeyIds(keys: JwtAccessTokenPublicKey[]): void {
   }
 }
 
+/**
+ * Rebuild plain objects with a null prototype and drop any `__proto__` member.
+ *
+ * The issuer refuses to mint such a member, so this only matters for a token minted by
+ * another build, but the consequence is not local: `mapClaimsToProps` receiving a claim
+ * with a `__proto__` key would reassign the prototype of any ordinary object it copies the
+ * claim onto, and a copy is the obvious thing to write.
+ */
+function detachPrototypes(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(detachPrototypes);
+  if (!value || typeof value !== 'object') return value;
+  const detached = Object.create(null) as Record<string, unknown>;
+  for (const [key, member] of Object.entries(value)) {
+    if (key === '__proto__') continue;
+    detached[key] = detachPrototypes(member);
+  }
+  return detached;
+}
+
+/** A P-256 affine coordinate is exactly 32 base64url-encoded bytes (RFC 7518 §6.2.1.2). */
+function isP256Coordinate(value: unknown): boolean {
+  if (!isNonEmptyString(value)) return false;
+  try {
+    return decodeBytes(value).length === 32;
+  } catch {
+    return false;
+  }
+}
+
 function containsPrivateJwkMaterial(key: JwtAccessTokenPublicKey): boolean {
-  return ['d', 'p', 'q', 'dp', 'dq', 'qi', 'oth', 'k'].some((name) => name in key);
+  // Presence alone is not enough to judge: workerd's exportKey() materializes the optional
+  // members of the JsonWebKey dictionary as own properties holding undefined, so a public
+  // key legitimately has a `d` key that carries nothing. Only a real value is material.
+  return ['d', 'p', 'q', 'dp', 'dq', 'qi', 'oth', 'k'].some(
+    (name) => (key as unknown as Record<string, unknown>)[name] !== undefined
+  );
+}
+
+function isPublishedJwkMember(name: string): name is (typeof PUBLISHED_JWK_MEMBERS)[number] {
+  return (PUBLISHED_JWK_MEMBERS as readonly string[]).includes(name);
 }
 
 function snapshotIssueInput<Env, Props>(
-  input: JwtAccessTokenIssueInput<Env, Props>
-): JwtAccessTokenIssueInput<Env, Props> {
+  input: JwtAccessTokenPublicClaimsInput<Env, Props>
+): JwtAccessTokenPublicClaimsInput<Env, Props> {
   if (!isNonEmptyString(input.userId)) throw new TypeError('JWT access token userId is required');
   if (!isNonEmptyString(input.grantId)) throw new TypeError('JWT access token grantId is required');
   if (!isNonEmptyString(input.clientId)) throw new TypeError('JWT access token clientId is required');
@@ -671,8 +763,7 @@ function snapshotIssueInput<Env, Props>(
 
 function validateIssuer(value: unknown): string {
   const issuer = validateAbsoluteHttpsUrl(value, 'issuer');
-  const parsed = new URL(issuer);
-  if (parsed.search || parsed.hash) throw new TypeError('issuer must not contain a query or fragment');
+  if (new URL(issuer).search) throw new TypeError('issuer must not contain a query');
   return issuer;
 }
 
@@ -698,10 +789,7 @@ function validateAbsoluteHttpsUrl(value: unknown, name: string): string {
   if (typeof value !== 'string' || !isCanonicalHttpsUrl(value)) {
     throw new TypeError(`${name} must be an absolute HTTPS URL (http is accepted only on a loopback host)`);
   }
-  const parsed = new URL(value);
-  if (parsed.hash) {
-    throw new TypeError(`${name} must be an absolute HTTPS URL without userinfo or a fragment`);
-  }
+  // isCanonicalHttpsUrl already rejects userinfo and any '#', so nothing further to check.
   return value;
 }
 
@@ -726,7 +814,7 @@ function validateAlgorithms(value: JwtAccessTokenAlgorithm[]): JwtAccessTokenAlg
 }
 
 function validateClockSkew(value: number | undefined): number {
-  const skew = value ?? 30;
+  const skew = value ?? DEFAULT_CLOCK_SKEW_SECONDS;
   if (!Number.isInteger(skew) || skew < 0 || skew > 300) {
     throw new TypeError('clockSkewSeconds must be an integer between 0 and 300');
   }
@@ -742,7 +830,7 @@ function validateMaxTokenBytes(value: number | undefined): number {
 }
 
 function isSupportedAlgorithm(value: unknown): value is JwtAccessTokenAlgorithm {
-  return value === 'RS256' || value === 'ES256';
+  return SUPPORTED_ALGORITHMS.includes(value as JwtAccessTokenAlgorithm);
 }
 
 function isAcceptedJwtType(value: unknown): boolean {
@@ -778,7 +866,7 @@ async function verifySignature(
   return crypto.subtle.verify(getSigningAlgorithm(algorithm), publicKey, signature, signingInput);
 }
 
-async function assertSigningKeyPair(key: JwtAccessTokenSigningKey): Promise<void> {
+async function assertSigningKeyPair(key: JwtAccessTokenSigningKey, proof?: SigningKeyPairProof): Promise<void> {
   const fingerprint = JSON.stringify(key.publicJwk);
   let validations = verifiedSigningKeyPairs.get(key.privateKey);
   if (!validations) {
@@ -787,7 +875,7 @@ async function assertSigningKeyPair(key: JwtAccessTokenSigningKey): Promise<void
   }
   let validation = validations.get(fingerprint);
   if (!validation) {
-    validation = proveSigningKeyPair(key);
+    validation = proveSigningKeyPair(key, proof);
     validations.set(fingerprint, validation);
   }
   try {
@@ -798,15 +886,20 @@ async function assertSigningKeyPair(key: JwtAccessTokenSigningKey): Promise<void
   }
 }
 
-async function proveSigningKeyPair(key: JwtAccessTokenSigningKey): Promise<void> {
-  const probe = new TextEncoder().encode('workers-oauth-provider jwt key-pair check');
-  let signature: ArrayBuffer;
-  try {
-    signature = await crypto.subtle.sign(getSigningAlgorithm(key.alg), key.privateKey, probe);
-  } catch (error) {
-    throw new TypeError(`Unable to use current JWT signing key: ${errorMessage(error)}`);
+async function proveSigningKeyPair(key: JwtAccessTokenSigningKey, proof?: SigningKeyPairProof): Promise<void> {
+  let signature: Uint8Array;
+  let data: Uint8Array;
+  if (proof) {
+    ({ signature, data } = proof);
+  } else {
+    data = new TextEncoder().encode('workers-oauth-provider jwt key-pair check');
+    try {
+      signature = new Uint8Array(await crypto.subtle.sign(getSigningAlgorithm(key.alg), key.privateKey, data));
+    } catch (error) {
+      throw withCause(new TypeError(`Unable to use current JWT signing key: ${errorMessage(error)}`), error);
+    }
   }
-  if (!(await verifySignature(key.publicJwk, key.alg, new Uint8Array(signature), probe))) {
+  if (!(await verifySignature(key.publicJwk, key.alg, signature, data))) {
     throw new TypeError('current JWT signing key privateKey does not match publicJwk');
   }
 }
@@ -940,6 +1033,10 @@ function cloneJsonValueAt(value: unknown, source: string, state: JsonCloneState,
     // instead of invoking Object.prototype's legacy setter during the clone.
     const result = Object.create(null) as Record<string, JwtJsonValue>;
     for (const key of Object.keys(value)) {
+      // Nothing downstream can hold such a member safely: a resource server that copies
+      // the claim onto an ordinary object with Object.assign or a spread would reassign
+      // that object's prototype. Refuse to mint it rather than export the hazard.
+      if (key === '__proto__') throw new TypeError(`${source} must not contain a __proto__ member`);
       consumeCloneTextBudget(state, key, source);
       result[key] = cloneJsonValueAt((value as Record<string, unknown>)[key], source, state, depth + 1);
     }
@@ -988,8 +1085,30 @@ function decodeBytes(value: string): Uint8Array {
   return bytes;
 }
 
+/**
+ * Members that belong in a published JWK. An allowlist rather than a denylist, because the
+ * caller's key record is an application object: anything it carries beside the key (an
+ * internal id, a rotation timestamp) would otherwise be served on the public JWKS.
+ */
+const PUBLISHED_JWK_MEMBERS = ['kty', 'kid', 'alg', 'use', 'n', 'e', 'crv', 'x', 'y'] as const;
+
 function cloneJwk(value: JwtAccessTokenPublicKey): JwtAccessTokenPublicKey {
-  return JSON.parse(JSON.stringify(value)) as JwtAccessTokenPublicKey;
+  const source = JSON.parse(JSON.stringify(value)) as Record<string, unknown>;
+  const published: Partial<Record<(typeof PUBLISHED_JWK_MEMBERS)[number], unknown>> = {};
+  for (const [name, member] of Object.entries(source)) {
+    if (isPublishedJwkMember(name) && member !== undefined) published[name] = member;
+  }
+  return published as unknown as JwtAccessTokenPublicKey;
+}
+
+/**
+ * Keep the underlying WebCrypto failure reachable for diagnostics. Assigned rather than
+ * passed to the constructor because the package targets a language level without the
+ * ES2022 `cause` option.
+ */
+function withCause(error: TypeError, cause: unknown): TypeError {
+  Object.defineProperty(error, 'cause', { value: cause, enumerable: false, configurable: true, writable: true });
+  return error;
 }
 
 function errorMessage(error: unknown): string {
