@@ -63,6 +63,7 @@ export { AuthorizationError } from './oauth-capabilities';
 export type { AuthorizationErrorCode, AuthorizationErrorOptions } from './oauth-capabilities';
 export { JWT_ACCESS_TOKEN_GRANT_ID_CLAIM, JWT_ACCESS_TOKEN_PUBLIC_CLAIMS } from './jwt-access-tokens';
 export {
+  createJwksKeyResolver,
   createJwtAccessTokens,
   createJwtAccessTokenValidator,
   type IssuedJwtAccessToken,
@@ -74,6 +75,8 @@ export {
   type JwtAlgorithm,
   type JwtClaimsToPropsInput,
   type JwtJsonValue,
+  type JwksFetcher,
+  type JwksKeyResolverOptions,
   type JwtKeyHint,
   type JwtKeySet,
   type JwtPublicKey,

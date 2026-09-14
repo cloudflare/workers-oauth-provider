@@ -16,15 +16,15 @@ const MAX_KEY_ID_LENGTH = 128;
 /** Permitted clock skew, shared by the issuer's own verifier and the offline validator. */
 const DEFAULT_CLOCK_SKEW_SECONDS = 30;
 const SUPPORTED_ALGORITHMS: readonly JwtAlgorithm[] = ['RS256', 'ES256'];
+const DEFAULT_JWKS_CACHE_TTL_SECONDS = 5 * 60;
+/** One forced refresh per window, because `kid` is unauthenticated attacker-chosen input. */
+const JWKS_REFRESH_COOLDOWN_SECONDS = 30;
+const JWKS_FETCH_TIMEOUT_MS = 10_000;
+const MAX_JWKS_BYTES = 64 * 1024;
 const MAX_PUBLIC_CLAIM_DEPTH = 64;
 const MAX_PUBLIC_CLAIM_NODES = 10_000;
 const verifiedSigningKeyPairs = new WeakMap<CryptoKey, Map<string, Promise<void>>>();
 
-/** A signature the caller already produced, used in place of a probe signature. */
-interface SigningKeyPairProof {
-  readonly signature: Uint8Array;
-  readonly data: Uint8Array;
-}
 const JWT_TYPE = 'at+jwt';
 const ACCEPTED_JWT_TYPES = new Set([JWT_TYPE, 'application/at+jwt']);
 const FORBIDDEN_JOSE_HEADERS = ['jku', 'jwk', 'x5u', 'x5c', 'b64'] as const;
@@ -300,9 +300,10 @@ export function createJwtAccessTokens<Env = Cloudflare.Env, Props = unknown>(
       const signature = new Uint8Array(
         await crypto.subtle.sign(getSigningAlgorithm(keySet.signingKey.alg), keySet.signingKey.privateKey, signingInput)
       );
-      // Prove the pair with the signature just produced. Memoized per key pair, so only the
-      // first token issued under a key costs the extra verification.
-      await assertSigningKeyPair(keySet.signingKey, { signature, data: signingInput });
+      // Memoised per key pair, so only the first token issued under a key pays for this.
+      // A privateKey paired with the wrong publicJwk is a routine rotation slip, and
+      // without the proof its only symptom is a 401 at every resource server.
+      await assertSigningKeyPair(keySet.signingKey);
       const token = `${signingInputText}.${encodeBytes(signature)}`;
       if (new TextEncoder().encode(token).byteLength > MAX_TOKEN_BYTES) {
         throw new TypeError(`JWT access token exceeds the ${MAX_TOKEN_BYTES}-byte limit`);
@@ -403,6 +404,153 @@ export function createJwtAccessTokenValidator<Env = Cloudflare.Env, Props = unkn
   };
 }
 
+/** Configuration for {@link createJwksKeyResolver}. */
+export interface JwksKeyResolverOptions<Env = Cloudflare.Env> {
+  /**
+   * The authorization server's exact `jwks_uri`. This is the only URL ever fetched: a
+   * key URL named by a token is never followed.
+   */
+  jwksUri: string;
+  /**
+   * Where to send the request. Return a Service Binding to the authorization Worker to
+   * keep the fetch on Cloudflare's network and off the public internet. Defaults to
+   * global `fetch`.
+   */
+  fetcher?: (env: Env) => JwksFetcher | undefined;
+  /**
+   * How long a fetched key set is reused, in seconds. A shorter `max-age` on the
+   * response wins. Defaults to 300 seconds, which is what this package's own
+   * authorization server publishes.
+   */
+  cacheTtlSeconds?: number;
+}
+
+/** Anything that can perform the JWKS request: a Service Binding, or global `fetch`. */
+export interface JwksFetcher {
+  fetch(request: Request): Promise<Response>;
+}
+
+/**
+ * Resolve an authorization server's public keys for `createJwtAccessTokenValidator`,
+ * with the caching every resource server needs and the refresh limit it is easy to
+ * forget.
+ *
+ * A token names the `kid` it wants, and that name is attacker-chosen and unauthenticated
+ * at the point this runs. So an unknown `kid` refreshes the key set at most once per
+ * cooldown window; without that bound, a stream of invented `kid` values turns every
+ * resource server into an amplifier pointed at the authorization server's JWKS endpoint.
+ * Serving a stale set meanwhile is safe, because verification still has to succeed
+ * against whatever keys come back.
+ */
+export function createJwksKeyResolver<Env = Cloudflare.Env>(
+  options: JwksKeyResolverOptions<Env>
+): (env: Env, hint: JwtKeyHint) => Promise<JwtPublicKey[]> {
+  const jwksUri = validateAbsoluteHttpsUrl(options?.jwksUri, 'jwksUri');
+  const maxCacheTtlSeconds = validateCacheTtl(options?.cacheTtlSeconds);
+  if (options?.fetcher !== undefined && typeof options.fetcher !== 'function') {
+    throw new TypeError('fetcher must be a function');
+  }
+
+  let cached: { keys: JwtPublicKey[]; expiresAt: number; nextForcedRefreshAt: number } | undefined;
+  let inFlight: Promise<JwtPublicKey[]> | undefined;
+
+  const load = async (env: Env, now: number): Promise<JwtPublicKey[]> => {
+    inFlight ??= (async () => {
+      try {
+        const fetched = await fetchJwks(jwksUri, options.fetcher?.(env));
+        cached = {
+          keys: fetched.keys,
+          expiresAt: now + Math.min(maxCacheTtlSeconds, fetched.maxAgeSeconds ?? maxCacheTtlSeconds),
+          nextForcedRefreshAt: now + JWKS_REFRESH_COOLDOWN_SECONDS,
+        };
+        return cached.keys;
+      } finally {
+        inFlight = undefined;
+      }
+    })();
+    return inFlight;
+  };
+
+  return async (env, hint) => {
+    const now = Math.floor(Date.now() / 1000);
+    if (!cached || cached.expiresAt <= now) return load(env, now);
+    if (cached.keys.some((key) => key.kid === hint.kid)) return cached.keys;
+    // An unknown `kid` is the authorization server having rotated, or an attacker
+    // guessing. One refresh per cooldown serves both without serving as an amplifier.
+    if (cached.nextForcedRefreshAt > now) return cached.keys;
+    return load(env, now);
+  };
+}
+
+interface FetchedJwks {
+  keys: JwtPublicKey[];
+  /** `max-age` from the response, when it declared one. */
+  maxAgeSeconds?: number;
+}
+
+async function fetchJwks(jwksUri: string, fetcher: JwksFetcher | undefined): Promise<FetchedJwks> {
+  const abort = new AbortController();
+  const timeout = setTimeout(() => abort.abort(), JWKS_FETCH_TIMEOUT_MS);
+  try {
+    const request = new Request(jwksUri, {
+      headers: { Accept: 'application/jwk-set+json, application/json' },
+      signal: abort.signal,
+    });
+    const response = await (fetcher ? fetcher.fetch(request) : fetch(request));
+    if (!response.ok) throw new TypeError(`JWKS request failed with status ${response.status}`);
+    const declaredLength = Number(response.headers.get('content-length') ?? Number.NaN);
+    if (Number.isFinite(declaredLength) && declaredLength > MAX_JWKS_BYTES) {
+      throw new TypeError('JWKS response exceeds the size limit');
+    }
+    const body = await readBodyWithLimit(response, MAX_JWKS_BYTES);
+    const document: unknown = JSON.parse(body);
+    if (!document || typeof document !== 'object' || !Array.isArray((document as { keys?: unknown }).keys)) {
+      throw new TypeError('JWKS response has no keys array');
+    }
+    const maxAge = /(?:^|,)\s*max-age=(\d+)/i.exec(response.headers.get('Cache-Control') ?? '');
+    return {
+      keys: (document as { keys: JwtPublicKey[] }).keys,
+      ...(maxAge ? { maxAgeSeconds: Number(maxAge[1]) } : {}),
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/** Bound memory before parsing a response this Worker does not control the size of. */
+async function readBodyWithLimit(response: Response, maxBytes: number): Promise<string> {
+  if (!response.body) throw new TypeError('JWKS response has no body');
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) throw new TypeError('JWKS response exceeds the size limit');
+      chunks.push(value);
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(merged);
+}
+
+function validateCacheTtl(value: number | undefined): number {
+  const ttl = value ?? DEFAULT_JWKS_CACHE_TTL_SECONDS;
+  if (!Number.isInteger(ttl) || ttl < 1 || ttl > 86_400) {
+    throw new TypeError('cacheTtlSeconds must be an integer between 1 and 86400');
+  }
+  return ttl;
+}
+
 interface ParsedJwt {
   header: Record<string, unknown>;
   claims: Record<string, unknown>;
@@ -428,8 +576,6 @@ async function verifyParsedJwt(
   options: VerifyParsedOptions
 ): Promise<VerifiedJwtAccessToken | null> {
   const { header, claims } = parsed;
-  if (!checkUnverifiedJwt(parsed, options)) return null;
-
   const alg = header.alg as JwtAlgorithm;
   const kid = header.kid;
   if (typeof kid !== 'string') return null;
@@ -444,8 +590,10 @@ async function verifyParsedJwt(
   }
   if (!verified) return null;
 
-  // Repeat every semantic check after cryptographic verification. This keeps
-  // untrusted preflight checks strictly an optimization rather than an authority.
+  // Every semantic check runs here, after cryptographic verification, so a caller's
+  // cheap pre-parse check is strictly an optimization and never an authority. Key
+  // selection above cannot admit an algorithm outside the allowlist: it requires an
+  // exact match against a `kid`/`alg` pair that `validatePublicJwk` already narrowed.
   if (!checkUnverifiedJwt(parsed, options)) return null;
   const audience = selectAudience(claims.aud, options.allowedAudiences, options.requireSingleAudience);
   const scope = parseScopeClaim(claims.scope);
@@ -609,6 +757,10 @@ function validatePublicJwk(
   if (containsPrivateJwkMaterial(value)) {
     throw new TypeError('JWT public JWK must not contain private key material');
   }
+  const declaredKeyOps = (value as { key_ops?: unknown }).key_ops;
+  if (declaredKeyOps !== undefined && (!Array.isArray(declaredKeyOps) || !declaredKeyOps.includes('verify'))) {
+    throw new TypeError("JWT public JWK key_ops must include 'verify'");
+  }
   const key = cloneJwk(value);
   if (!isNonEmptyString(key.kid) || key.kid.length > MAX_KEY_ID_LENGTH) {
     throw new TypeError(`JWT public JWK kid must contain 1-${MAX_KEY_ID_LENGTH} characters`);
@@ -618,9 +770,6 @@ function validatePublicJwk(
     throw new TypeError('JWT public JWK alg must match signing key');
   if (expectedKeyId && key.kid !== expectedKeyId) throw new TypeError('JWT public JWK kid must match signing key');
   if (key.use !== undefined && key.use !== 'sig') throw new TypeError("JWT public JWK use must be 'sig'");
-  if (key.key_ops !== undefined && (!Array.isArray(key.key_ops) || !key.key_ops.includes('verify'))) {
-    throw new TypeError("JWT public JWK key_ops must include 'verify'");
-  }
   if (key.alg === 'RS256' && key.kty !== 'RSA') throw new TypeError('RS256 JWT public JWK must use kty RSA');
   if (
     key.alg === 'RS256' &&
@@ -639,10 +788,10 @@ function validatePublicJwk(
   if (key.alg === 'ES256' && (!isP256Coordinate(key.x) || !isP256Coordinate(key.y))) {
     throw new TypeError('ES256 JWT public JWK must contain 32-byte base64url x and y coordinates');
   }
-  // RFC 7517 advises against publishing both `use` and `key_ops`. `use: sig`
-  // is the broadly interoperable constraint for an authorization-server JWKS.
-  const { key_ops: _keyOperations, ...publicJwk } = key;
-  return { ...publicJwk, use: 'sig' } as JwtPublicKey;
+  // RFC 7517 advises against publishing both `use` and `key_ops`. `use: sig` is the
+  // broadly interoperable constraint for an authorization-server JWKS, and `key_ops`
+  // never survives the published-member allowlist above.
+  return { ...key, use: 'sig' } as JwtPublicKey;
 }
 
 function assertUniqueKeyIds(keys: JwtPublicKey[]): void {
@@ -689,10 +838,6 @@ function containsPrivateJwkMaterial(key: JwtPublicKey): boolean {
   return ['d', 'p', 'q', 'dp', 'dq', 'qi', 'oth', 'k'].some(
     (name) => (key as unknown as Record<string, unknown>)[name] !== undefined
   );
-}
-
-function isPublishedJwkMember(name: string): name is (typeof PUBLISHED_JWK_MEMBERS)[number] {
-  return (PUBLISHED_JWK_MEMBERS as readonly string[]).includes(name);
 }
 
 function snapshotIssueInput<Env, Props>(
@@ -801,7 +946,7 @@ async function verifySignature(
   return crypto.subtle.verify(getSigningAlgorithm(algorithm), publicKey, signature, signingInput);
 }
 
-async function assertSigningKeyPair(key: JwtSigningKey, proof?: SigningKeyPairProof): Promise<void> {
+async function assertSigningKeyPair(key: JwtSigningKey): Promise<void> {
   const cacheKey = JSON.stringify(key.publicJwk);
   let verifications = verifiedSigningKeyPairs.get(key.privateKey);
   if (!verifications) {
@@ -810,7 +955,7 @@ async function assertSigningKeyPair(key: JwtSigningKey, proof?: SigningKeyPairPr
   }
   let verification = verifications.get(cacheKey);
   if (!verification) {
-    verification = proveSigningKeyPair(key, proof);
+    verification = proveSigningKeyPair(key);
     verifications.set(cacheKey, verification);
   }
   try {
@@ -821,18 +966,13 @@ async function assertSigningKeyPair(key: JwtSigningKey, proof?: SigningKeyPairPr
   }
 }
 
-async function proveSigningKeyPair(key: JwtSigningKey, proof?: SigningKeyPairProof): Promise<void> {
+async function proveSigningKeyPair(key: JwtSigningKey): Promise<void> {
+  const data = new TextEncoder().encode('workers-oauth-provider jwt key-pair check');
   let signature: Uint8Array;
-  let data: Uint8Array;
-  if (proof) {
-    ({ signature, data } = proof);
-  } else {
-    data = new TextEncoder().encode('workers-oauth-provider jwt key-pair check');
-    try {
-      signature = new Uint8Array(await crypto.subtle.sign(getSigningAlgorithm(key.alg), key.privateKey, data));
-    } catch (error) {
-      throw withCause(new TypeError(`Unable to use the JWT signing key: ${errorMessage(error)}`), error);
-    }
+  try {
+    signature = new Uint8Array(await crypto.subtle.sign(getSigningAlgorithm(key.alg), key.privateKey, data));
+  } catch (error) {
+    throw withCause(new TypeError(`Unable to use the JWT signing key: ${errorMessage(error)}`), error);
   }
   if (!(await verifySignature(key.publicJwk, key.alg, signature, data))) {
     throw new TypeError('JWT signing key privateKey does not match publicJwk');
@@ -1028,10 +1168,10 @@ function decodeBytes(value: string): Uint8Array {
 const PUBLISHED_JWK_MEMBERS = ['kty', 'kid', 'alg', 'use', 'n', 'e', 'crv', 'x', 'y'] as const;
 
 function cloneJwk(value: JwtPublicKey): JwtPublicKey {
-  const source = JSON.parse(JSON.stringify(value)) as Record<string, unknown>;
   const published: Partial<Record<(typeof PUBLISHED_JWK_MEMBERS)[number], unknown>> = {};
-  for (const [name, member] of Object.entries(source)) {
-    if (isPublishedJwkMember(name) && member !== undefined) published[name] = member;
+  for (const name of PUBLISHED_JWK_MEMBERS) {
+    const member = (value as unknown as Record<string, unknown>)[name];
+    if (member !== undefined) published[name] = member;
   }
   return published as unknown as JwtPublicKey;
 }
