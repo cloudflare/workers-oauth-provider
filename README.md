@@ -148,7 +148,7 @@ export default new OAuthProvider<Env>({
 
 `apiRoute` and `apiHandler` protect one or more route prefixes with a single handler. Use `apiHandlers` when different prefixes need different handlers.
 
-Before calling a protected handler, the provider reads the bearer token, rejects missing, invalid, or expired credentials, checks its audience, and exposes the authenticated application data through `ctx.props`. The handler does not need to parse or validate the token, but it must still enforce ownership, tenancy, and any application permissions deliberately stored in `props`. Effective OAuth token scope is not added to `ctx.props`; see [Scope behavior](#scope-behavior).
+Before calling a protected handler, the provider reads the bearer token, rejects missing, invalid, or expired credentials, checks its audience, and exposes the authenticated application data through `ctx.props`. The handler does not need to parse or validate the token, but it must still enforce ownership, tenancy, and any application permissions deliberately stored in `props`.
 
 Requests outside the protected route prefixes go to `defaultHandler`. In the example above, that handler owns `/authorize`.
 
@@ -324,7 +324,9 @@ Bind the Calendar Worker to `CalendarTokenValidator`; expose a separate Drive en
 
 ### Signed JWT access tokens
 
-Access tokens remain opaque by default. An `OAuthAuthorizationServer` can install signed [RFC 9068](https://www.rfc-editor.org/rfc/rfc9068.html) JWT access-token support with `createJwtAccessTokens()`. With no issuance policy, new access tokens become JWTs. Authorization codes and refresh tokens remain opaque.
+Access tokens are opaque unless you ask for JWTs. `createJwtAccessTokens()` gives an `OAuthAuthorizationServer` signed [RFC 9068](https://www.rfc-editor.org/rfc/rfc9068.html) access-token support in two separately controlled halves: passing it as `jwtAccessTokens` installs the reader, the signer and the JWKS endpoint, and `accessTokenFormat` decides what each new access token is written as. Until you set `accessTokenFormat`, issuance stays opaque, so the reader is always deployed before the writer. Authorization codes and refresh tokens remain opaque throughout.
+
+Tokens carry `typ: at+jwt`, the provider grant ID in `https://workers.cloudflare.com/oauth-provider/claims/grant-id`, and any `publicClaims` value in `https://workers.cloudflare.com/oauth-provider/claims/public`. Both claim URIs are exported as `JWT_ACCESS_TOKEN_GRANT_ID_CLAIM` and `JWT_ACCESS_TOKEN_PUBLIC_CLAIMS` for a consumer that reads the token without this package.
 
 OAuth clients must continue treating the access-token string as opaque; JWT validation is a resource-server concern.
 
@@ -363,7 +365,9 @@ const authorizationServer = new OAuthAuthorizationServer<Env, AuthProps>({
   resources: [CALENDAR_RESOURCE],
   authorizeEndpoint: '/authorize',
   tokenEndpoint: '/oauth/token',
-  jwtAccessTokens: jwtAccessTokens,
+  jwtAccessTokens,
+  // Issue JWTs. Omit this while the resource servers that read them are still shipping.
+  accessTokenFormat: () => 'jwt',
 });
 
 const calendar = authorizationServer.protectResource({
@@ -390,10 +394,9 @@ A separate resource Worker that needs only public data can validate the JWT loca
 
 ```ts
 import {
+  createJwksKeyResolver,
   createJwtAccessTokenValidator,
   createOAuthResourceServer,
-  type JwtKeyHint,
-  type JwtPublicKey,
   type ValidatedAccessToken,
 } from '@cloudflare/workers-oauth-provider';
 
@@ -421,39 +424,20 @@ interface CalendarProps {
   scopes: string[];
 }
 
-let cachedJwks: { keys: JwtPublicKey[]; expiresAt: number } | undefined;
-
-async function loadTrustedAccessTokenKeys(env: CalendarEnv, hint: JwtKeyHint): Promise<JwtPublicKey[]> {
-  // A cached key set is reused until it expires, unless the token names a `kid` it
-  // does not hold: that is what a freshly rotated signing key looks like, so refresh
-  // once instead of rejecting the token.
-  if (cachedJwks && cachedJwks.expiresAt > Date.now()) {
-    if (!hint.kid || cachedJwks.keys.some((key) => key.kid === hint.kid)) return cachedJwks.keys;
-  }
-
-  // Fetch only the configured URI over the AS Service Binding. Never follow a
-  // key URL supplied by a token.
-  const response = await env.AUTHORIZATION_SERVER_JWKS.fetch(
-    new Request(JWKS_URI, { headers: { Accept: 'application/json' } })
-  );
-  if (!response.ok) throw new Error(`JWKS request failed: ${response.status}`);
-
-  const document: unknown = await response.json();
-  if (!document || typeof document !== 'object' || !('keys' in document) || !Array.isArray(document.keys)) {
-    throw new Error('JWKS response has no keys array');
-  }
-  const keys = document.keys as JwtPublicKey[];
-  const maxAge = /(?:^|,)\s*max-age=(\d+)/i.exec(response.headers.get('Cache-Control') ?? '');
-  cachedJwks = {
-    keys,
-    expiresAt: Date.now() + (maxAge ? Number(maxAge[1]) * 1000 : 0),
-  };
-  return keys;
-}
+// Fetches only this URL, caches the result, and refreshes for an unknown `kid` at most
+// once per cooldown window. A token names the `kid` it wants, and that name is
+// unauthenticated attacker-chosen input, so a refresh per miss would turn this Worker
+// into an amplifier pointed at the authorization server.
+const loadTrustedAccessTokenKeys = createJwksKeyResolver<CalendarEnv>({
+  jwksUri: JWKS_URI,
+  fetcher: (env) => env.AUTHORIZATION_SERVER_JWKS,
+});
 
 const validateCalendarJwt = createJwtAccessTokenValidator<CalendarEnv, CalendarProps>({
   issuer: AUTH_ISSUER,
   audience: CALENDAR_RESOURCE,
+  // Required, never defaulted: an authorization server signing ES256 against a validator
+  // that assumed RS256 rejects every token as `invalid_token`.
   algorithms: ['RS256'],
   keys: loadTrustedAccessTokenKeys,
   mapClaimsToProps({ userId, scope, publicClaims }) {
@@ -513,14 +497,14 @@ Do not fall through to a permissive external-token resolver. The fallback above 
 
 Rotate keys in this order:
 
-1. Add the next public JWK to `verificationKeys` while the old key remains `current`.
+1. Add the next public JWK to `verificationKeys` while the old key stays `signingKey`.
 2. Wait at least the JWKS cache lifetime after publication—currently five minutes from the authorization server's `Cache-Control` header—before signing with the new key.
-3. Promote the new private key to `current`, remove its now-duplicate public JWK from `verificationKeys`, and add the old current key's public JWK there.
+3. Promote the new private key to `signingKey`, remove its now-duplicate public JWK from `verificationKeys`, and add the retiring key's public JWK there.
 4. Keep the old public JWK until the last token signed with it has passed the maximum effective access-token lifetime, plus JWKS cache time and clock skew; then remove it.
 
-Resource Workers should fetch only the configured `jwks_uri`, never cache longer than its response allows, and select exactly one key by `kid` and pinned algorithm. `maxTokenBytes` is a paired setting: a validator drops any token larger than its own limit before looking at it, so raise it on every offline validator before raising it on the issuer.
+Resource Workers should fetch only the configured `jwks_uri`, never cache longer than its response allows, and select exactly one key by `kid` and pinned algorithm. `createJwksKeyResolver()` does all three.
 
-Roll this out reader before writer. `accessTokens` installs the JWT reader, signer, and JWKS; `accessTokenFormat` controls only the representation of each newly issued access token:
+Roll this out reader before writer. `jwtAccessTokens` installs the JWT reader, signer, and JWKS; `accessTokenFormat` controls only the representation of each newly issued access token:
 
 ```ts
 const authorizationServer = new OAuthAuthorizationServer<Env, AuthProps>({
@@ -528,17 +512,17 @@ const authorizationServer = new OAuthAuthorizationServer<Env, AuthProps>({
   resources: [CALENDAR_RESOURCE],
   authorizeEndpoint: '/authorize',
   tokenEndpoint: '/oauth/token',
-  jwtAccessTokens: jwtAccessTokens,
+  jwtAccessTokens,
   accessTokenFormat: ({ env }) => (env.JWT_ISSUANCE_ENABLED ? 'jwt' : 'opaque'),
 });
 ```
 
-The policy runs for every access-token issuance. Its immutable context contains `env`, the authenticated `clientId`, and the canonical `resource`, so application code can use a deployment flag or a deterministic client/resource cohort. Keep it local and highly available: throwing, rejecting, or returning anything except `opaque` or `jwt` fails before one-use authorization state is consumed rather than silently downgrading security.
+`accessTokenFormat` runs for every access-token issuance. Its immutable input contains `env` and the canonical `resource`, so a deployment can flip the writer globally with one flag or stage it one resource at a time as each resource Worker's validator ships. The client is deliberately absent: a client never inspects an access token, so it cannot be what decides the token's representation. Keep `accessTokenFormat` local and highly available — throwing, rejecting, or returning anything except `opaque` or `jwt` fails the request before one-use authorization state is consumed, rather than silently downgrading security.
 
-1. Configure `accessTokens` while the callback returns `opaque`, then deploy the authorization server everywhere. It publishes `jwks_uri`, serves the future signing key, and accepts both compatible opaque tokens and JWTs while continuing to issue opaque access tokens.
+1. Configure `jwtAccessTokens` and leave `accessTokenFormat` unset, then deploy the authorization server everywhere. It publishes `jwks_uri`, serves the future signing key, and accepts both compatible opaque tokens and JWTs while continuing to issue opaque access tokens.
 2. Deploy JWT validation to every token consumer. A separate resource Worker must temporarily fall back to its resource-pinned Service Binding validator for old opaque tokens.
-3. Verify the deployment and wait at least the JWKS cache lifetime before changing the callback to return `jwt`. New authorization-code, refresh, implicit, token-exchange, and enterprise-managed access tokens now become JWTs. Existing access tokens are not converted or invalidated, and authorization codes and refresh tokens remain opaque.
-4. Confirm every issuer instance and rollout cohort now returns `jwt`, then keep the opaque fallback for the maximum effective access-token lifetime measured from the last possible opaque issuance, including any TTL overrides. To roll back after removing that fallback, first restore the resource-pinned opaque fallback to every JWT-only consumer, then return `opaque`; retain `accessTokens`, its JWKS, and every required verification key until all previously issued JWTs have expired plus cache time and clock skew.
+3. Verify the deployment and wait at least the JWKS cache lifetime before adding an `accessTokenFormat` that returns `jwt`. New authorization-code, refresh, implicit, token-exchange, and enterprise-managed access tokens now become JWTs. Existing access tokens are not converted or invalidated, and authorization codes and refresh tokens remain opaque.
+4. Confirm every issuer instance and every resource now returns `jwt`, then keep the opaque fallback for the maximum effective access-token lifetime measured from the last possible opaque issuance, including any TTL overrides. To roll back after removing that fallback, first restore the resource-pinned opaque fallback to every JWT-only consumer, then return `opaque`; retain `jwtAccessTokens`, its JWKS, and every required verification key until all previously issued JWTs have expired plus cache time and clock skew.
 
 State-backed provider surfaces continue accepting compatible access tokens issued in the old opaque format until those tokens expire. A JWT-only offline validator does not understand an old opaque token, which is why the temporary fallback is required. Never roll back to a package version or configuration that cannot read still-live JWT access tokens. This token-format rollout does not bypass the resource migration policy: a pre-resource opaque access token is treated as bound to the server-selected migration resource until it expires, and its refresh grant migrates according to `legacyGrantResource`.
 
@@ -865,9 +849,11 @@ The functional role API adds these surfaces without removing `OAuthProvider`:
 | Surface                                                  | Purpose                                                                                     |
 | -------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
 | `new OAuthAuthorizationServer({ issuer, resources, … })` | Create the AS role with a canonical RFC 8414 issuer and its fixed resource registry         |
-| `createJwtAccessTokens({ … })`                           | Install JWT signing, reading, and JWKS while retaining stateful token props                 |
-| `accessTokenFormat(context)`                             | Select opaque or JWT format for each newly issued access token                              |
+| `createJwtAccessTokens({ … })`                           | Build the JWT signer, reader, and JWKS, keeping the stateful token record                   |
+| `jwtAccessTokens`                                        | Install that component on the authorization server; issuance stays opaque until asked       |
+| `accessTokenFormat`                                      | Return `opaque` or `jwt` per issuance; unset means opaque                                   |
 | `createJwtAccessTokenValidator({ … })`                   | Validate pinned JWT claims offline for one fixed resource                                   |
+| `createJwksKeyResolver({ … })`                           | Fetch and cache an authorization server's JWKS for that validator, with a refresh limit     |
 | `protectResource({ resourceMetadata, handler })`         | Host one declared resource in this Worker, returning its fetch surface                      |
 | `resource(uri)`                                          | Obtain a handle for one declared resource, with `validateToken(token, env)` and `protect()` |
 | `defaultResource`                                        | Select a deliberate default for new authorization requests that omit it                     |
