@@ -7,8 +7,8 @@ import {
   getOAuthApi,
   type OAuthHelpers,
   type OAuthProviderOptions,
-  type JwtAccessTokenAlgorithm,
-  type JwtAccessTokenPublicKey,
+  type JwtAlgorithm,
+  type JwtPublicKey,
 } from '../../src/oauth-provider';
 import {
   CLIENT_REDIRECT_URI,
@@ -117,7 +117,7 @@ function requireProvider(): OAuthProvider<ConformanceWorkerEnv> {
 
 export default class McpOAuthConformanceWorker extends WorkerEntrypoint<ConformanceWorkerEnv> {
   /** Exercise signing and verification in real workerd WebCrypto, not Node's test implementation. */
-  async roundTripJwt(algorithm: JwtAccessTokenAlgorithm): Promise<{
+  async roundTripJwt(algorithm: JwtAlgorithm): Promise<{
     header: Record<string, unknown>;
     verified: boolean;
   }> {
@@ -139,14 +139,14 @@ export default class McpOAuthConformanceWorker extends WorkerEntrypoint<Conforma
       alg: algorithm,
       use: 'sig',
       key_ops: ['verify'],
-    } satisfies JwtAccessTokenPublicKey;
+    } satisfies JwtPublicKey;
     const issuer = 'https://auth.workerd.test';
     const audience = 'https://resource.workerd.test/mcp';
     const accessTokens = createJwtAccessTokens<ConformanceWorkerEnv, { secret: string }>({
       issuer,
       jwksUri: `${issuer}/.well-known/jwks.json`,
       keys: () => ({
-        current: { kid: publicJwk.kid, alg: algorithm, privateKey: keyPair.privateKey, publicJwk },
+        signingKey: { kid: publicJwk.kid, alg: algorithm, privateKey: keyPair.privateKey, publicJwk },
       }),
     });
     const now = Math.floor(Date.now() / 1000);

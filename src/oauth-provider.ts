@@ -46,7 +46,7 @@ import {
 } from './ema/validators';
 import {
   jwtInternals,
-  type JwtAccessTokenPublicKey,
+  type JwtPublicKey,
   type JwtAccessTokens,
   type VerifiedJwtAccessToken,
 } from './jwt-access-tokens';
@@ -65,19 +65,19 @@ export { JWT_ACCESS_TOKEN_GRANT_ID_CLAIM, JWT_ACCESS_TOKEN_PUBLIC_CLAIMS } from 
 export {
   createJwtAccessTokens,
   createJwtAccessTokenValidator,
-  type JwtAccessTokenAlgorithm,
+  type IssuedJwtAccessToken,
   type JwtAccessTokenClaims,
-  type JwtAccessTokenKeySet,
-  type JwtAccessTokenPublicClaimsInput,
-  type JwtAccessTokenKeyHint,
-  type JwtAccessTokenPublicKey,
-  type JwtAccessTokenSigningKey,
-  type JwtAccessTokenValidatorOptions,
+  type JwtAccessTokenIssueInput,
   type JwtAccessTokens,
   type JwtAccessTokensOptions,
+  type JwtAccessTokenValidatorOptions,
+  type JwtAlgorithm,
   type JwtClaimsToPropsInput,
-  type JwtIssuedAccessToken,
   type JwtJsonValue,
+  type JwtKeyHint,
+  type JwtKeySet,
+  type JwtPublicKey,
+  type JwtSigningKey,
   type VerifiedJwtAccessToken,
 } from './jwt-access-tokens';
 export * from './oauth-resource-server';
@@ -651,10 +651,10 @@ interface OAuthAuthorizationServerConfiguration<Env = Cloudflare.Env> {
   clientRegistrationEndpoint?: string;
 
   /** Optional RFC 9068 JWT access-token issuer created by `createJwtAccessTokens()`. */
-  accessTokens?: InternalJwtAccessTokens<Env>;
+  jwtAccessTokens?: InternalJwtAccessTokens<Env>;
 
   /** Functional policy selecting the format of each newly issued access token. */
-  accessTokenFormat?: AccessTokenFormatPolicy<Env>;
+  accessTokenFormat?: (input: AccessTokenFormatInput<Env>) => AccessTokenFormat | Promise<AccessTokenFormat>;
 
   /**
    * Resource selected when a new authorization request omits `resource`.
@@ -679,11 +679,6 @@ export interface AccessTokenFormatInput<Env = Cloudflare.Env> {
   readonly env: Env;
   readonly resource: string;
 }
-
-/** Functional policy for selecting the representation of each new access token. */
-export type AccessTokenFormatPolicy<Env = Cloudflare.Env> = (
-  input: AccessTokenFormatInput<Env>
-) => AccessTokenFormat | Promise<AccessTokenFormat>;
 
 /** Internal input used when `protectResource()` registers one hosted role. */
 interface InternalProtectedResourceConfiguration<Env = Cloudflare.Env> {
@@ -750,23 +745,22 @@ export type OAuthAuthorizationServerOptions<Env = Cloudflare.Env, Props = any> =
    * `jwks_uri`. When configured, the authorization server accepts both its
    * valid JWT access tokens and compatible legacy opaque access tokens.
    *
-   * New access tokens default to JWT. Use `accessTokenFormat` to stage the JWT
-   * reader and JWKS before enabling JWT issuance. Authorization codes and
-   * refresh tokens remain opaque.
+   * This installs the reader, the signer and the JWKS; it does not change what is
+   * issued. Set `accessTokenFormat` to start writing JWTs once every consumer can
+   * validate them. Authorization codes and refresh tokens remain opaque.
    */
-  accessTokens?: JwtAccessTokens<Env, Props>;
+  jwtAccessTokens?: JwtAccessTokens<Env, Props>;
 
   /**
    * Selects the representation of each newly issued access token. This controls
    * issuance only: it does not restrict accepted token formats, rewrite existing
    * tokens, or change refresh-token format.
    *
-   * Requires `accessTokens` and defaults to JWT. Return `opaque` during a
-   * reader-before-writer deployment, then return `jwt` after every consumer can
-   * validate JWTs. A thrown error or invalid result fails issuance; the provider
-   * never silently downgrades to opaque.
+   * Requires `jwtAccessTokens`. Without it, access tokens stay opaque. A thrown
+   * error or invalid result fails issuance; the provider never silently
+   * downgrades to opaque.
    */
-  accessTokenFormat?: AccessTokenFormatPolicy<Env>;
+  accessTokenFormat?: (input: AccessTokenFormatInput<Env>) => AccessTokenFormat | Promise<AccessTokenFormat>;
 
   /** Typed props refresh/exchange hook for this authorization server. */
   tokenExchangeCallback?: (
@@ -1563,11 +1557,11 @@ export interface GrantSummary {
 /**
  * Options for creating an access token
  */
-/** An access token built by `mintAccessToken()` but not yet written to KV. */
-interface MintedAccessToken {
+/** An access token built by `prepareAccessToken()` but not yet written to KV. */
+interface PreparedAccessToken {
   accessToken: string;
-  key: string;
-  record: Token;
+  tokenKey: string;
+  tokenData: Token;
   expiresIn: number;
 }
 
@@ -1635,7 +1629,7 @@ interface CreateAccessTokenOptions<Env = Cloudflare.Env> {
   env: Env & ProviderEnv;
 }
 
-interface InternalAccessTokenResolution {
+interface AccessTokenResolution {
   /** Stored record after all representation-specific checks have passed. */
   tokenData: Token | null;
 
@@ -1643,10 +1637,10 @@ interface InternalAccessTokenResolution {
    * Whether this credential identifies itself as one of this issuer's JWTs.
    * Invalid issuer-owned JWTs fail closed instead of reaching an external resolver.
    */
-  rejectExternalFallback: boolean;
+  isOwnJwt: boolean;
 }
 
-type InternalJwtAudiencePolicy = 'registered-resource' | 'stored-token';
+type JwtAudienceSource = 'registered-resource' | 'token-audience';
 
 type InternalOAuthProviderOptions<Env> = Omit<OAuthProviderOptions<Env>, 'resourceMetadata'> & {
   resourceMetadata?: OAuthProtectedResourceMetadata;
@@ -1723,7 +1717,7 @@ export class OAuthAuthorizationServer<Env = Cloudflare.Env, Props = any> {
       authorizeEndpoint,
       tokenEndpoint,
       clientRegistrationEndpoint,
-      accessTokens,
+      jwtAccessTokens,
       accessTokenFormat,
       ...commonOptions
     } = options;
@@ -1738,7 +1732,7 @@ export class OAuthAuthorizationServer<Env = Cloudflare.Env, Props = any> {
         authorizeEndpoint,
         tokenEndpoint,
         clientRegistrationEndpoint,
-        accessTokens,
+        jwtAccessTokens,
         accessTokenFormat,
         defaultResource,
         legacyGrantResource,
@@ -1824,7 +1818,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   private readonly jwtAccessTokens: InternalJwtAccessTokens<Env> | undefined;
 
   /** Optional reader-first rollout policy for newly issued access tokens. */
-  private readonly accessTokenFormatPolicy: AccessTokenFormatPolicy<Env> | undefined;
+  private readonly accessTokenFormatPolicy:
+    | ((input: AccessTokenFormatInput<Env>) => AccessTokenFormat | Promise<AccessTokenFormat>)
+    | undefined;
 
   /** Every protected-resource role hosted by this provider. */
   private readonly resourceServers: NormalizedResourceServer<Env>[];
@@ -1880,16 +1876,16 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       const { authorizationServer, ...commonOptions } = options;
       this.validateAuthorizationServerIssuer(authorizationServer.issuer);
       this.explicitIssuer = authorizationServer.issuer;
-      this.jwtAccessTokens = authorizationServer.accessTokens;
+      this.jwtAccessTokens = authorizationServer.jwtAccessTokens;
       this.accessTokenFormatPolicy = authorizationServer.accessTokenFormat;
       if (this.accessTokenFormatPolicy !== undefined && typeof this.accessTokenFormatPolicy !== 'function') {
         throw new TypeError('accessTokenFormat must be a function');
       }
       if (this.accessTokenFormatPolicy && !this.jwtAccessTokens) {
-        throw new TypeError('accessTokenFormat requires accessTokens');
+        throw new TypeError('accessTokenFormat requires jwtAccessTokens');
       }
       if (this.jwtAccessTokens && this.jwtAccessTokens.issuer !== authorizationServer.issuer) {
-        throw new TypeError('accessTokens issuer must exactly match authorizationServer.issuer');
+        throw new TypeError('jwtAccessTokens issuer must exactly match authorizationServer.issuer');
       }
       if (this.jwtAccessTokens) jwtInternals(this.jwtAccessTokens);
       normalizedOptions = {
@@ -1931,7 +1927,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       this.validateEndpoint(this.options.clientRegistrationEndpoint, 'clientRegistrationEndpoint');
     }
     if (this.jwtAccessTokens) {
-      this.validateEndpoint(this.jwtAccessTokens.jwksUri, 'accessTokens.jwksUri');
+      this.validateEndpoint(this.jwtAccessTokens.jwksUri, 'jwtAccessTokens.jwksUri');
     }
     if (roleBased) {
       this.validateAuthorizationServerRouteIsolation();
@@ -2123,7 +2119,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       for (const [endpoint, name] of collisions) {
         const endpointUrl = new URL(this.getFullEndpointUrl(endpoint, issuerUrl));
         if (jwksUrl.origin === endpointUrl.origin && jwksUrl.pathname === endpointUrl.pathname) {
-          throw new TypeError(`accessTokens.jwksUri must not collide with ${name}`);
+          throw new TypeError(`jwtAccessTokens.jwksUri must not collide with ${name}`);
         }
       }
     }
@@ -2476,7 +2472,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
           request
         );
       }
-      let jwks: { keys: JwtAccessTokenPublicKey[] };
+      let jwks: { keys: JwtPublicKey[] };
       try {
         jwks = await this.jwtAccessTokens.getJwks(env);
       } catch (error) {
@@ -2595,35 +2591,35 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   private async resolveInternalAccessToken(
     token: string,
     env: Env & ProviderEnv,
-    jwtAudiencePolicy: InternalJwtAudiencePolicy = 'registered-resource'
-  ): Promise<InternalAccessTokenResolution> {
-    if (this.jwtAccessTokens && jwtInternals(this.jwtAccessTokens).recognizes(token)) {
+    audienceSource: JwtAudienceSource = 'registered-resource'
+  ): Promise<AccessTokenResolution> {
+    if (this.jwtAccessTokens && jwtInternals(this.jwtAccessTokens).isOwnJwt(token)) {
       const registeredResources = this.resourceServers.map((server) => server.resourceMetadata.resource);
       const verified =
-        jwtAudiencePolicy === 'stored-token'
+        audienceSource === 'token-audience'
           ? await jwtInternals(this.jwtAccessTokens).verify(token, env)
           : registeredResources.length > 0
             ? await this.jwtAccessTokens.verify(token, registeredResources, env)
             : null;
-      if (!verified) return { tokenData: null, rejectExternalFallback: true };
+      if (!verified) return { tokenData: null, isOwnJwt: true };
 
       const id = await generateTokenId(token);
       const tokenData: Token | null = await env.OAUTH_KV.get(`token:${verified.userId}:${verified.grantId}:${id}`, {
         type: 'json',
       });
       if (!tokenData || !this.jwtClaimsMatchStoredToken(id, verified, tokenData)) {
-        return { tokenData: null, rejectExternalFallback: true };
+        return { tokenData: null, isOwnJwt: true };
       }
-      return { tokenData, rejectExternalFallback: true };
+      return { tokenData, isOwnJwt: true };
     }
 
     const parts = token.split(':');
-    if (parts.length !== 3) return { tokenData: null, rejectExternalFallback: false };
+    if (parts.length !== 3) return { tokenData: null, isOwnJwt: false };
 
     const [userId, grantId] = parts;
     const id = await generateTokenId(token);
     const tokenData: Token | null = await env.OAUTH_KV.get(`token:${userId}:${grantId}:${id}`, { type: 'json' });
-    return { tokenData, rejectExternalFallback: false };
+    return { tokenData, isOwnJwt: false };
   }
 
   /** The signed JWT and encrypted state record must describe exactly the same token. */
@@ -3677,7 +3673,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Mint (and for JWTs, sign) the access token before the grant write consumes the
     // authorization code, so a signing or key-resolution failure leaves the code
     // retryable instead of forcing the user to authorize again.
-    const minted = await this.mintAccessToken({
+    const prepared = await this.prepareAccessToken({
       format: accessTokenFormat,
       userId,
       grantId,
@@ -3695,8 +3691,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     await this.saveGrantWithTTL(env, grantKey, grantData, now);
 
     // Store the access token record with potentially narrowed scopes
-    await this.persistAccessToken(env, minted);
-    const accessToken = minted.accessToken;
+    await this.persistAccessToken(env, prepared);
+    const accessToken = prepared.accessToken;
 
     // Build the response
     const tokenResponse: TokenResponse = {
@@ -4476,7 +4472,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     });
 
     await this.saveGrantWithTTL(env, prepared.grantKey, prepared.grant, issueNow);
-    await this.persistAccessToken(env, prepared.minted);
+    await this.persistAccessToken(env, prepared.prepared);
     return ok(prepared.response);
   }
 
@@ -4537,7 +4533,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     accessTokenTTLSeconds: number;
     env: Env & ProviderEnv;
     now: number;
-  }): Promise<{ grantKey: string; grant: Grant; minted: MintedAccessToken; response: TokenResponse }> {
+  }): Promise<{ grantKey: string; grant: Grant; prepared: PreparedAccessToken; response: TokenResponse }> {
     // Defense-in-depth downscope: the mapper's output is filtered through the
     // assertion's scope claim (when present) so that a mapper returning an
     // out-of-band `admin` scope cannot escalate beyond what the IdP authorized.
@@ -4561,7 +4557,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       expiresAt: args.now + args.accessTokenTTLSeconds,
       resource: args.resource,
     };
-    const minted = await this.mintAccessToken({
+    const prepared = await this.prepareAccessToken({
       format: args.format,
       userId: args.userId,
       grantId,
@@ -4577,9 +4573,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     return {
       grantKey: `grant:${args.userId}:${grantId}`,
       grant,
-      minted,
+      prepared,
       response: {
-        access_token: minted.accessToken,
+        access_token: prepared.accessToken,
         token_type: 'bearer',
         expires_in: args.accessTokenTTLSeconds,
         scope: tokenScopes.join(' '),
@@ -4616,10 +4612,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       return this.createErrorResponse('invalid_request', { description: 'Token parameter is required' });
     }
 
-    if (this.jwtAccessTokens && jwtInternals(this.jwtAccessTokens).recognizes(token)) {
+    if (this.jwtAccessTokens && jwtInternals(this.jwtAccessTokens).isOwnJwt(token)) {
       // Revocation is a lifecycle operation on issuer-owned state. It must keep
       // working even if the token's audience was removed from the live registry.
-      const { tokenData } = await this.resolveInternalAccessToken(token, env, 'stored-token');
+      const { tokenData } = await this.resolveInternalAccessToken(token, env, 'token-audience');
       if (tokenData) {
         await this.revokeAccessIfOwned(tokenData.id, tokenData.userId, tokenData.grantId, clientInfo, env);
       }
@@ -4936,11 +4932,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     const accessToken = bearerMatch[1];
-    const { tokenData, rejectExternalFallback } = await this.resolveInternalAccessToken(accessToken, env);
+    const { tokenData, isOwnJwt } = await this.resolveInternalAccessToken(accessToken, env);
 
     // An issuer-owned JWT always fails closed. Unknown credentials may still be
     // handled by the resource's explicit external token resolver.
-    if (!tokenData && (rejectExternalFallback || !externalTokenResolver)) {
+    if (!tokenData && (isOwnJwt || !externalTokenResolver)) {
       return this.createErrorResponse('invalid_token', {
         description: 'Invalid access token',
         statusCode: 401,
@@ -5372,7 +5368,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
   async selectAccessTokenFormat(input: AccessTokenFormatInput<Env>): Promise<AccessTokenFormat> {
     if (!this.jwtAccessTokens) return 'opaque';
-    // Installing `accessTokens` turns on the reader, the signer and the JWKS; it does not
+    // Installing `jwtAccessTokens` turns on the reader, the signer and the JWKS; it does not
     // start writing JWTs. A deployment that flipped issuance the moment the component was
     // configured would mint tokens its resource servers cannot yet verify, which is the
     // one ordering the rollout procedure exists to prevent.
@@ -5408,16 +5404,16 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     grantKey: string,
     grant: Grant
   ): Promise<string> {
-    const minted = await this.mintAccessToken(params);
+    const prepared = await this.prepareAccessToken(params);
     await params.env.OAUTH_KV.put(grantKey, JSON.stringify(grant));
-    await this.persistAccessToken(params.env, minted);
-    return minted.accessToken;
+    await this.persistAccessToken(params.env, prepared);
+    return prepared.accessToken;
   }
 
   async createAccessToken(params: CreateAccessTokenOptions<Env>): Promise<string> {
-    const minted = await this.mintAccessToken(params);
-    await this.persistAccessToken(params.env, minted);
-    return minted.accessToken;
+    const prepared = await this.prepareAccessToken(params);
+    await this.persistAccessToken(params.env, prepared);
+    return prepared.accessToken;
   }
 
   /**
@@ -5430,7 +5426,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * Refresh rotation writes its grant first and stays retryable through the
    * previous-refresh-token window instead.
    */
-  private async mintAccessToken(params: CreateAccessTokenOptions<Env>): Promise<MintedAccessToken> {
+  private async prepareAccessToken(params: CreateAccessTokenOptions<Env>): Promise<PreparedAccessToken> {
     const {
       format,
       userId,
@@ -5465,7 +5461,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     let jwtId: string | undefined;
     if (format === 'jwt') {
       const jwtAccessTokens = this.jwtAccessTokens;
-      if (!jwtAccessTokens) throw new TypeError('JWT access-token issuance requires accessTokens');
+      if (!jwtAccessTokens) throw new TypeError('JWT access-token issuance requires jwtAccessTokens');
       // The signed payload is client-readable. The JWT helper receives decrypted
       // props only so its explicit publicClaims mapper can select safe values;
       // the complete props remain encrypted in the state record below.
@@ -5527,13 +5523,20 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       },
     };
 
-    return { accessToken, key: `token:${userId}:${grantId}:${accessTokenId}`, record: accessTokenData, expiresIn };
+    return {
+      accessToken,
+      tokenKey: `token:${userId}:${grantId}:${accessTokenId}`,
+      tokenData: accessTokenData,
+      expiresIn,
+    };
   }
 
-  /** Write a minted access token's state record to KV. */
-  private async persistAccessToken(env: Env & ProviderEnv, minted: MintedAccessToken): Promise<void> {
+  /** Write a prepared access token's state record to KV. */
+  private async persistAccessToken(env: Env & ProviderEnv, prepared: PreparedAccessToken): Promise<void> {
     try {
-      await env.OAUTH_KV.put(minted.key, JSON.stringify(minted.record), { expirationTtl: minted.expiresIn });
+      await env.OAUTH_KV.put(prepared.tokenKey, JSON.stringify(prepared.tokenData), {
+        expirationTtl: prepared.expiresIn,
+      });
     } catch (error) {
       this.throwRetryableTokenStorageErrorIfKvRateLimited(error);
       throw error;
