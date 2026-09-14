@@ -4,6 +4,7 @@ import {
   JWT_ACCESS_TOKEN_PUBLIC_CLAIMS,
   createJwtAccessTokens,
   createJwtAccessTokenValidator,
+  jwtInternals,
   type JwtAccessTokenAlgorithm,
   type JwtAccessTokenPublicKey,
 } from '../src/jwt-access-tokens';
@@ -112,6 +113,7 @@ describe('JWT access tokens', () => {
     const validate = createJwtAccessTokenValidator<{}, { userId: string }>({
       issuer: ISSUER,
       audience: RESOURCE,
+      algorithms: ['RS256'],
       keys,
       mapClaimsToProps: ({ userId }) => ({ userId }),
     });
@@ -138,6 +140,7 @@ describe('JWT access tokens', () => {
       const validate = createJwtAccessTokenValidator<{}, { userId: string }>({
         issuer: ISSUER,
         audience: RESOURCE,
+        algorithms: ['RS256'],
         keys: () => [{ ...key.publicJwk, e }],
         mapClaimsToProps: ({ userId }) => ({ userId }),
       });
@@ -184,6 +187,7 @@ describe('JWT access tokens', () => {
     const validate = createJwtAccessTokenValidator<{}, { userId: string }>({
       issuer: ISSUER,
       audience: RESOURCE,
+      algorithms: ['RS256'],
       keys: () => foreignKeys,
       mapClaimsToProps: ({ userId }) => ({ userId }),
     });
@@ -195,6 +199,7 @@ describe('JWT access tokens', () => {
     const empty = createJwtAccessTokenValidator<{}, { userId: string }>({
       issuer: ISSUER,
       audience: RESOURCE,
+      algorithms: ['RS256'],
       keys: () => [],
       mapClaimsToProps: ({ userId }) => ({ userId }),
     });
@@ -256,6 +261,7 @@ describe('JWT access tokens', () => {
     const validate = createJwtAccessTokenValidator<{}, { admin: boolean }>({
       issuer: ISSUER,
       audience: RESOURCE,
+      algorithms: ['RS256'],
       keys: () => [key.publicJwk],
       mapClaimsToProps: ({ publicClaims }) => {
         // The obvious thing a resource server writes, and it must stay safe.
@@ -351,6 +357,7 @@ describe('JWT access tokens', () => {
     const validate = createJwtAccessTokenValidator({
       issuer: localIssuer,
       audience: localResource,
+      algorithms: ['RS256'],
       keys: () => [key.publicJwk],
       mapClaimsToProps: ({ userId }) => ({ userId }),
     });
@@ -399,7 +406,7 @@ describe('JWT access tokens', () => {
       grantId: 'grant-123',
       scope: ['calendar:read'],
     });
-    expect(accessTokens.recognizes(issued.token)).toBe(true);
+    expect(jwtInternals(accessTokens).recognizes(issued.token)).toBe(true);
   });
 
   it('includes only the explicitly projected client-readable claim', async () => {
@@ -483,6 +490,7 @@ describe('JWT access tokens', () => {
     const validate = createJwtAccessTokenValidator<{}, { userId: string; scopes: string[]; tenantId: string }>({
       issuer: ISSUER,
       audience: RESOURCE,
+      algorithms: ['RS256'],
       keys: () => [key.publicJwk],
       mapClaimsToProps: mapper,
     });
@@ -536,9 +544,9 @@ describe('JWT access tokens', () => {
     const validate = createJwtAccessTokenValidator<{}, { userId: string }>({
       issuer: ISSUER,
       audience: RESOURCE,
+      algorithms: ['RS256'],
       keys: () => [key.publicJwk],
       mapClaimsToProps,
-      clockSkewSeconds: 0,
     });
 
     const parts = issued.token.split('.');
@@ -549,6 +557,7 @@ describe('JWT access tokens', () => {
     const wrongAudience = createJwtAccessTokenValidator<{}, { userId: string }>({
       issuer: ISSUER,
       audience: 'https://drive.example.com/mcp',
+      algorithms: ['RS256'],
       keys: () => [key.publicJwk],
       mapClaimsToProps,
     });
@@ -583,7 +592,6 @@ describe('JWT access tokens', () => {
       algorithms: ['RS256'],
       keys,
       mapClaimsToProps: ({ userId }) => ({ userId }),
-      clockSkewSeconds: 0,
     });
 
     const interoperable = await signCustomJwt(
@@ -634,6 +642,7 @@ describe('JWT access tokens', () => {
     const validate = createJwtAccessTokenValidator<{}, {}>({
       issuer: ISSUER,
       audience: RESOURCE,
+      algorithms: ['RS256'],
       keys: () => [key.publicJwk],
       mapClaimsToProps: () => ({}),
     });
@@ -689,6 +698,7 @@ describe('JWT access tokens', () => {
     const validateWithPrepublishedCache = createJwtAccessTokenValidator<{}, {}>({
       issuer: ISSUER,
       audience: RESOURCE,
+      algorithms: ['RS256'],
       keys: () => jwksCachedAfterPrepublication,
       mapClaimsToProps: () => ({}),
     });
@@ -698,6 +708,7 @@ describe('JWT access tokens', () => {
     const validateWithStaleCache = createJwtAccessTokenValidator<{}, {}>({
       issuer: ISSUER,
       audience: RESOURCE,
+      algorithms: ['RS256'],
       keys: () => jwksCachedBeforePrepublication,
       mapClaimsToProps: () => ({}),
     });
@@ -760,9 +771,8 @@ describe('JWT access tokens', () => {
     const oversized = createJwtAccessTokens<{}, TestProps>({
       issuer: ISSUER,
       jwksUri: JWKS_URI,
-      maxTokenBytes: 1024,
       keys: () => ({ current: { kid: 'invalid', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk } }),
-      publicClaims: () => 'x'.repeat(2000),
+      publicClaims: () => 'x'.repeat(20_000),
     });
     const sign = vi.spyOn(crypto.subtle, 'sign');
     await expect(
@@ -888,6 +898,7 @@ describe('JWT access tokens', () => {
     const validate = createJwtAccessTokenValidator<{}, {}>({
       issuer: ISSUER,
       audience: RESOURCE,
+      algorithms: ['RS256'],
       keys: () => [key.publicJwk],
       mapClaimsToProps: () => undefined as never,
     });
@@ -917,6 +928,7 @@ describe('JWT access tokens', () => {
     const validate = createJwtAccessTokenValidator({
       issuer: ISSUER,
       audience: RESOURCE,
+      algorithms: ['RS256'],
       keys,
       mapClaimsToProps: mapper,
     });

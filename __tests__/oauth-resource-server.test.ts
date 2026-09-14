@@ -229,8 +229,7 @@ describe('createOAuthResourceServer', () => {
   });
 
   it.each([
-    // Outside the 30s allowance the package applies to a clock read on another Worker.
-    ['expired', 1_999_999_900],
+    ['expired', 1_999_999_999],
     ['invalid', Number.NaN],
   ])('rejects a token with an %s expiresAt value', async (_label, expiresAt) => {
     vi.spyOn(Date, 'now').mockReturnValue(2_000_000_000_000);
@@ -250,25 +249,6 @@ describe('createOAuthResourceServer', () => {
 
     expect(response.status).toBe(401);
     expect(response.headers.get('WWW-Authenticate')).toContain('error="invalid_token"');
-  });
-
-  it('honours the clock-skew allowance a validator applied to exp', async () => {
-    // `exp` is stamped by the authorization server's clock and read by this Worker's, so
-    // a validator configured to tolerate skew must not have that undone by the host.
-    vi.spyOn(Date, 'now').mockReturnValue(2_000_000_000_000);
-    const server = createTestServer({
-      validateToken: async () => ({
-        props: { userId: 'user-123', scopes: ['mcp:read'] },
-        audience: RESOURCE,
-        expiresAt: 2_000_000_000 - 10,
-      }),
-    });
-    const response = await server.fetch(
-      new Request(RESOURCE, { headers: { Authorization: 'Bearer within-skew' } }),
-      env,
-      new MockExecutionContext()
-    );
-    expect(response.status).toBe(200);
   });
 
   it('returns invalid_token when the validator rejects a token', async () => {
