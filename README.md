@@ -331,11 +331,7 @@ OAuth clients must continue treating the access-token string as opaque; JWT vali
 Signed does not mean encrypted. The JWT's issuer, subject (`userId`), audience, client ID, scope, timestamps, token ID, and provider grant ID are readable by the client. Application `props` are not copied into the JWT. Use `publicClaims` only to project non-secret JSON data that is safe for the client and anyone holding the access token to read:
 
 ```ts
-import {
-  createJwtAccessTokens,
-  OAuthAuthorizationServer,
-  type JwtAccessTokenKeySet,
-} from '@cloudflare/workers-oauth-provider';
+import { createJwtAccessTokens, OAuthAuthorizationServer, type JwtKeySet } from '@cloudflare/workers-oauth-provider';
 
 const AUTH_ISSUER = 'https://auth.example.com';
 const CALENDAR_RESOURCE = 'https://calendar.example.com/mcp';
@@ -353,7 +349,7 @@ interface AuthProps {
 
 // Resolve a non-extractable signing key and its public JWK from your
 // application-owned key store. See the rotation guidance below.
-declare function loadAccessTokenKeys(env: Env): Promise<JwtAccessTokenKeySet>;
+declare function loadAccessTokenKeys(env: Env): Promise<JwtKeySet>;
 
 const jwtAccessTokens = createJwtAccessTokens<Env, AuthProps>({
   issuer: AUTH_ISSUER,
@@ -367,7 +363,7 @@ const authorizationServer = new OAuthAuthorizationServer<Env, AuthProps>({
   resources: [CALENDAR_RESOURCE],
   authorizeEndpoint: '/authorize',
   tokenEndpoint: '/oauth/token',
-  accessTokens: jwtAccessTokens,
+  jwtAccessTokens: jwtAccessTokens,
 });
 
 const calendar = authorizationServer.protectResource({
@@ -396,8 +392,8 @@ A separate resource Worker that needs only public data can validate the JWT loca
 import {
   createJwtAccessTokenValidator,
   createOAuthResourceServer,
-  type JwtAccessTokenKeyHint,
-  type JwtAccessTokenPublicKey,
+  type JwtKeyHint,
+  type JwtPublicKey,
   type ValidatedAccessToken,
 } from '@cloudflare/workers-oauth-provider';
 
@@ -425,12 +421,9 @@ interface CalendarProps {
   scopes: string[];
 }
 
-let cachedJwks: { keys: JwtAccessTokenPublicKey[]; expiresAt: number } | undefined;
+let cachedJwks: { keys: JwtPublicKey[]; expiresAt: number } | undefined;
 
-async function loadTrustedAccessTokenKeys(
-  env: CalendarEnv,
-  hint: JwtAccessTokenKeyHint
-): Promise<JwtAccessTokenPublicKey[]> {
+async function loadTrustedAccessTokenKeys(env: CalendarEnv, hint: JwtKeyHint): Promise<JwtPublicKey[]> {
   // A cached key set is reused until it expires, unless the token names a `kid` it
   // does not hold: that is what a freshly rotated signing key looks like, so refresh
   // once instead of rejecting the token.
@@ -449,7 +442,7 @@ async function loadTrustedAccessTokenKeys(
   if (!document || typeof document !== 'object' || !('keys' in document) || !Array.isArray(document.keys)) {
     throw new Error('JWKS response has no keys array');
   }
-  const keys = document.keys as JwtAccessTokenPublicKey[];
+  const keys = document.keys as JwtPublicKey[];
   const maxAge = /(?:^|,)\s*max-age=(\d+)/i.exec(response.headers.get('Cache-Control') ?? '');
   cachedJwks = {
     keys,
@@ -535,7 +528,7 @@ const authorizationServer = new OAuthAuthorizationServer<Env, AuthProps>({
   resources: [CALENDAR_RESOURCE],
   authorizeEndpoint: '/authorize',
   tokenEndpoint: '/oauth/token',
-  accessTokens: jwtAccessTokens,
+  jwtAccessTokens: jwtAccessTokens,
   accessTokenFormat: ({ env }) => (env.JWT_ISSUANCE_ENABLED ? 'jwt' : 'opaque'),
 });
 ```

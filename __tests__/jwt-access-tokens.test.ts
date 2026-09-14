@@ -5,8 +5,8 @@ import {
   createJwtAccessTokens,
   createJwtAccessTokenValidator,
   jwtInternals,
-  type JwtAccessTokenAlgorithm,
-  type JwtAccessTokenPublicKey,
+  type JwtAlgorithm,
+  type JwtPublicKey,
 } from '../src/jwt-access-tokens';
 import { createOAuthResourceServer } from '../src/oauth-resource-server';
 
@@ -20,7 +20,7 @@ interface TestProps {
   upstreamAccessToken: string;
 }
 
-async function createKey(alg: JwtAccessTokenAlgorithm, kid: string) {
+async function createKey(alg: JwtAlgorithm, kid: string) {
   const keyPair = (await crypto.subtle.generateKey(
     alg === 'RS256'
       ? {
@@ -34,7 +34,7 @@ async function createKey(alg: JwtAccessTokenAlgorithm, kid: string) {
     ['sign', 'verify']
   )) as CryptoKeyPair;
   const exported = (await crypto.subtle.exportKey('jwk', keyPair.publicKey)) as JsonWebKey;
-  const publicJwk: JwtAccessTokenPublicKey = {
+  const publicJwk: JwtPublicKey = {
     ...exported,
     kid,
     alg,
@@ -100,7 +100,7 @@ describe('JWT access tokens', () => {
       issuer: ISSUER,
       jwksUri: JWKS_URI,
       keys: () => ({
-        current: { kid: 'rotated-key', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
+        signingKey: { kid: 'rotated-key', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
       }),
     });
     const issued = await accessTokens.issue(
@@ -129,7 +129,7 @@ describe('JWT access tokens', () => {
       issuer: ISSUER,
       jwksUri: JWKS_URI,
       keys: () => ({
-        current: { kid: 'weak-exponent', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
+        signingKey: { kid: 'weak-exponent', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
       }),
     });
     const issued = await accessTokens.issue(
@@ -151,7 +151,7 @@ describe('JWT access tokens', () => {
         issuer: ISSUER,
         jwksUri: JWKS_URI,
         keys: () => ({
-          current: {
+          signingKey: {
             kid: 'weak-exponent',
             alg: 'RS256',
             privateKey: key.privateKey,
@@ -169,7 +169,7 @@ describe('JWT access tokens', () => {
       issuer: ISSUER,
       jwksUri: JWKS_URI,
       keys: () => ({
-        current: { kid: 'signing', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
+        signingKey: { kid: 'signing', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
       }),
     });
     const issued = await accessTokens.issue(
@@ -180,8 +180,8 @@ describe('JWT access tokens', () => {
     // other purposes alongside its access-token key. Neither may take the resource down.
     const { alg: _alg, ...algLess } = key.publicJwk;
     const foreignKeys = [
-      algLess as JwtAccessTokenPublicKey,
-      { ...key.publicJwk, kid: 'encryption', use: 'enc' } as JwtAccessTokenPublicKey,
+      algLess as JwtPublicKey,
+      { ...key.publicJwk, kid: 'encryption', use: 'enc' } as JwtPublicKey,
       key.publicJwk,
     ];
     const validate = createJwtAccessTokenValidator<{}, { userId: string }>({
@@ -212,12 +212,12 @@ describe('JWT access tokens', () => {
       issuer: ISSUER,
       jwksUri: JWKS_URI,
       keys: () => ({
-        current: {
+        signingKey: {
           kid: 'published',
           alg: 'RS256',
           privateKey: key.privateKey,
           // An application key record carries its own bookkeeping beside the JWK.
-          publicJwk: { ...key.publicJwk, kmsKeyId: 'arn:secret', retireAfter: 1 } as JwtAccessTokenPublicKey,
+          publicJwk: { ...key.publicJwk, kmsKeyId: 'arn:secret', retireAfter: 1 } as JwtPublicKey,
         },
       }),
     });
@@ -230,7 +230,7 @@ describe('JWT access tokens', () => {
       issuer: ISSUER,
       jwksUri: JWKS_URI,
       keys: () => ({
-        current: { kid: 'published', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
+        signingKey: { kid: 'published', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
       }),
       publicClaims: () => JSON.parse('{"attrs":{"__proto__":{"isAdmin":true}}}'),
     });
@@ -245,7 +245,7 @@ describe('JWT access tokens', () => {
       issuer: ISSUER,
       jwksUri: JWKS_URI,
       keys: () => ({
-        current: { kid: 'foreign', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
+        signingKey: { kid: 'foreign', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
       }),
     });
     const issued = await accessTokens.issue(
@@ -276,14 +276,14 @@ describe('JWT access tokens', () => {
 
   it('rejects a foreign issuer, a disallowed algorithm, and each missing required claim', async () => {
     // Every one of these is a rejection the offline validator is solely responsible for:
-    // unlike verify()/recognizes(), it has no separate issuer or typ pre-check.
+    // unlike verify()/isOwnJwt(), it has no separate issuer or typ pre-check.
     const key = await createKey('RS256', 'required-claims');
     const es256 = await createKey('ES256', 'es-key');
     const accessTokens = createJwtAccessTokens<{}, TestProps>({
       issuer: ISSUER,
       jwksUri: JWKS_URI,
       keys: () => ({
-        current: { kid: 'required-claims', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
+        signingKey: { kid: 'required-claims', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
       }),
     });
     const issued = await accessTokens.issue(
@@ -347,7 +347,7 @@ describe('JWT access tokens', () => {
       issuer: localIssuer,
       jwksUri: `${localIssuer}/.well-known/jwks.json`,
       keys: () => ({
-        current: { kid: 'local-current', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
+        signingKey: { kid: 'local-current', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
       }),
     });
     const props: TestProps = { userId: 'user-123', tenantId: 'tenant-1', upstreamAccessToken: 'secret' };
@@ -369,7 +369,7 @@ describe('JWT access tokens', () => {
       createJwtAccessTokens<{}, TestProps>({
         issuer: 'http://auth.example.com',
         jwksUri: 'http://auth.example.com/.well-known/jwks.json',
-        keys: () => ({ current: { kid: 'x', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk } }),
+        keys: () => ({ signingKey: { kid: 'x', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk } }),
       })
     ).toThrow('issuer must be an absolute HTTPS URL');
   });
@@ -384,7 +384,9 @@ describe('JWT access tokens', () => {
     const accessTokens = createJwtAccessTokens<{}, TestProps>({
       issuer: ISSUER,
       jwksUri: JWKS_URI,
-      keys: () => ({ current: { kid: key.publicJwk.kid, alg, privateKey: key.privateKey, publicJwk: key.publicJwk } }),
+      keys: () => ({
+        signingKey: { kid: key.publicJwk.kid, alg, privateKey: key.privateKey, publicJwk: key.publicJwk },
+      }),
     });
 
     const issued = await accessTokens.issue(issueInput(props));
@@ -406,7 +408,7 @@ describe('JWT access tokens', () => {
       grantId: 'grant-123',
       scope: ['calendar:read'],
     });
-    expect(jwtInternals(accessTokens).recognizes(issued.token)).toBe(true);
+    expect(jwtInternals(accessTokens).isOwnJwt(issued.token)).toBe(true);
   });
 
   it('includes only the explicitly projected client-readable claim', async () => {
@@ -415,7 +417,7 @@ describe('JWT access tokens', () => {
       issuer: ISSUER,
       jwksUri: JWKS_URI,
       keys: () => ({
-        current: { kid: 'public-claims', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
+        signingKey: { kid: 'public-claims', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
       }),
       publicClaims: ({ props, audience }) => ({ tenantId: props.tenantId, audience }),
     });
@@ -435,7 +437,7 @@ describe('JWT access tokens', () => {
       issuer: ISSUER,
       jwksUri: JWKS_URI,
       keys: () => ({
-        current: {
+        signingKey: {
           kid: 'snapshot-input',
           alg: 'RS256',
           privateKey: key.privateKey,
@@ -475,7 +477,7 @@ describe('JWT access tokens', () => {
       issuer: ISSUER,
       jwksUri: JWKS_URI,
       keys: () => ({
-        current: { kid: 'validator', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
+        signingKey: { kid: 'validator', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
       }),
       publicClaims: ({ props }) => ({ tenantId: props.tenantId }),
     });
@@ -534,7 +536,7 @@ describe('JWT access tokens', () => {
       issuer: ISSUER,
       jwksUri: JWKS_URI,
       keys: () => ({
-        current: { kid: 'validation', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
+        signingKey: { kid: 'validation', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
       }),
     });
     const issued = await accessTokens.issue(
@@ -578,7 +580,9 @@ describe('JWT access tokens', () => {
     const accessTokens = createJwtAccessTokens<{}, TestProps>({
       issuer: ISSUER,
       jwksUri: JWKS_URI,
-      keys: () => ({ current: { kid: 'syntax', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk } }),
+      keys: () => ({
+        signingKey: { kid: 'syntax', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
+      }),
     });
     const issued = await accessTokens.issue(
       issueInput({ userId: 'user-123', tenantId: 'tenant-a', upstreamAccessToken: 'secret' })
@@ -634,7 +638,9 @@ describe('JWT access tokens', () => {
     const accessTokens = createJwtAccessTokens<{}, TestProps>({
       issuer: ISSUER,
       jwksUri: JWKS_URI,
-      keys: () => ({ current: { kid: 'headers', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk } }),
+      keys: () => ({
+        signingKey: { kid: 'headers', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
+      }),
     });
     const issued = await accessTokens.issue(
       issueInput({ userId: 'user-123', tenantId: 'tenant-a', upstreamAccessToken: 'secret' })
@@ -661,7 +667,7 @@ describe('JWT access tokens', () => {
       issuer: ISSUER,
       jwksUri: JWKS_URI,
       keys: () => ({
-        current: { kid: 'old', alg: 'RS256', privateKey: oldKey.privateKey, publicJwk: oldKey.publicJwk },
+        signingKey: { kid: 'old', alg: 'RS256', privateKey: oldKey.privateKey, publicJwk: oldKey.publicJwk },
       }),
     });
     const oldToken = await oldTokens.issue(
@@ -672,7 +678,7 @@ describe('JWT access tokens', () => {
       issuer: ISSUER,
       jwksUri: JWKS_URI,
       keys: () => ({
-        current: { kid: 'new', alg: 'RS256', privateKey: newKey.privateKey, publicJwk: newKey.publicJwk },
+        signingKey: { kid: 'new', alg: 'RS256', privateKey: newKey.privateKey, publicJwk: newKey.publicJwk },
         verificationKeys: [oldKey.publicJwk],
       }),
     });
@@ -687,7 +693,7 @@ describe('JWT access tokens', () => {
       issuer: ISSUER,
       jwksUri: JWKS_URI,
       keys: () => ({
-        current: { kid: 'old', alg: 'RS256', privateKey: oldKey.privateKey, publicJwk: oldKey.publicJwk },
+        signingKey: { kid: 'old', alg: 'RS256', privateKey: oldKey.privateKey, publicJwk: oldKey.publicJwk },
         verificationKeys: [newKey.publicJwk],
       }),
     });
@@ -719,12 +725,12 @@ describe('JWT access tokens', () => {
 
   it('rejects private material, duplicate kids, unsafe public claims, and oversized tokens', async () => {
     const key = await createKey('RS256', 'invalid');
-    const privateJwk = (await crypto.subtle.exportKey('jwk', key.privateKey)) as JwtAccessTokenPublicKey;
+    const privateJwk = (await crypto.subtle.exportKey('jwk', key.privateKey)) as JwtPublicKey;
     const privateMaterial = createJwtAccessTokens<{}, TestProps>({
       issuer: ISSUER,
       jwksUri: JWKS_URI,
       keys: () => ({
-        current: {
+        signingKey: {
           kid: 'invalid',
           alg: 'RS256',
           privateKey: key.privateKey,
@@ -738,7 +744,7 @@ describe('JWT access tokens', () => {
       issuer: ISSUER,
       jwksUri: JWKS_URI,
       keys: () => ({
-        current: { kid: 'invalid', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
+        signingKey: { kid: 'invalid', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
         verificationKeys: [key.publicJwk],
       }),
     });
@@ -749,7 +755,9 @@ describe('JWT access tokens', () => {
     const unsafeClaims = createJwtAccessTokens<{}, TestProps>({
       issuer: ISSUER,
       jwksUri: JWKS_URI,
-      keys: () => ({ current: { kid: 'invalid', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk } }),
+      keys: () => ({
+        signingKey: { kid: 'invalid', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
+      }),
       publicClaims: () => circular as never,
     });
     await expect(
@@ -761,7 +769,9 @@ describe('JWT access tokens', () => {
     const deepClaims = createJwtAccessTokens<{}, TestProps>({
       issuer: ISSUER,
       jwksUri: JWKS_URI,
-      keys: () => ({ current: { kid: 'invalid', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk } }),
+      keys: () => ({
+        signingKey: { kid: 'invalid', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
+      }),
       publicClaims: () => deeplyNested as never,
     });
     await expect(
@@ -771,7 +781,9 @@ describe('JWT access tokens', () => {
     const oversized = createJwtAccessTokens<{}, TestProps>({
       issuer: ISSUER,
       jwksUri: JWKS_URI,
-      keys: () => ({ current: { kid: 'invalid', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk } }),
+      keys: () => ({
+        signingKey: { kid: 'invalid', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
+      }),
       publicClaims: () => 'x'.repeat(20_000),
     });
     const sign = vi.spyOn(crypto.subtle, 'sign');
@@ -798,7 +810,7 @@ describe('JWT access tokens', () => {
       issuer: ISSUER,
       jwksUri: JWKS_URI,
       keys: () => ({
-        current: {
+        signingKey: {
           kid: 'unrelated',
           alg: 'RS256',
           privateKey: strong.privateKey,
@@ -825,11 +837,11 @@ describe('JWT access tokens', () => {
       ...((await crypto.subtle.exportKey('jwk', weakPair.publicKey)) as JsonWebKey),
       kid: 'weak',
       alg: 'RS256' as const,
-    } as JwtAccessTokenPublicKey;
+    } as JwtPublicKey;
     const weak = createJwtAccessTokens<{}, TestProps>({
       issuer: ISSUER,
       jwksUri: JWKS_URI,
-      keys: () => ({ current: { kid: 'weak', alg: 'RS256', privateKey: weakPair.privateKey, publicJwk: weakJwk } }),
+      keys: () => ({ signingKey: { kid: 'weak', alg: 'RS256', privateKey: weakPair.privateKey, publicJwk: weakJwk } }),
     });
     await expect(weak.getJwks({})).rejects.toThrow('at least 2048 bits');
 
@@ -847,12 +859,12 @@ describe('JWT access tokens', () => {
       ...((await crypto.subtle.exportKey('jwk', sha384Pair.publicKey)) as JsonWebKey),
       kid: 'sha384',
       alg: 'RS256' as const,
-    } as JwtAccessTokenPublicKey;
+    } as JwtPublicKey;
     const wrongHash = createJwtAccessTokens<{}, TestProps>({
       issuer: ISSUER,
       jwksUri: JWKS_URI,
       keys: () => ({
-        current: { kid: 'sha384', alg: 'RS256', privateKey: sha384Pair.privateKey, publicJwk: sha384Jwk },
+        signingKey: { kid: 'sha384', alg: 'RS256', privateKey: sha384Pair.privateKey, publicJwk: sha384Jwk },
       }),
     });
     await expect(wrongHash.getJwks({})).rejects.toThrow('PKCS#1 SHA-256');
@@ -866,7 +878,7 @@ describe('JWT access tokens', () => {
       issuer: ISSUER,
       jwksUri: JWKS_URI,
       keys: () => ({
-        current: { kid: 'snapshot', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
+        signingKey: { kid: 'snapshot', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
       }),
       publicClaims: () => projected,
     });
@@ -883,7 +895,7 @@ describe('JWT access tokens', () => {
       issuer: ISSUER,
       jwksUri: JWKS_URI,
       keys: () => ({
-        current: { kid: 'snapshot', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
+        signingKey: { kid: 'snapshot', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
       }),
       publicClaims: () => JSON.parse('{"__proto__":{"polluted":true},"safe":"value"}') as never,
     });

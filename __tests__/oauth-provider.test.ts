@@ -15,8 +15,8 @@ import {
   type ResolveExternalTokenResult,
   type Grant,
   type Token,
-  type JwtAccessTokenPublicKey,
-  type JwtAccessTokenPublicClaimsInput,
+  type JwtPublicKey,
+  type JwtAccessTokenIssueInput,
   type JwtJsonValue,
   type AccessTokenFormatInput,
 } from '../src/oauth-provider';
@@ -4346,7 +4346,7 @@ describe('OAuthProvider', () => {
     }
 
     // RFC 8693 §2.1 issues the exchanged token to the requesting client, and RFC 7009 §2.1
-    // lets only that client revoke it. This holds on the opaque path, with no `accessTokens`
+    // lets only that client revoke it. This holds on the opaque path, with no `jwtAccessTokens`
     // configured anywhere on this provider.
     it('gives RFC 7009 revocation ownership of an exchanged token to the exchanging client', async () => {
       const exchanged = await exchangeAsSecondClient();
@@ -14088,7 +14088,7 @@ describe('functional authorization-server and resource-server composition', () =
 
   async function createTestJwtAccessTokens(
     publicClaims: (
-      input: JwtAccessTokenPublicClaimsInput<TestEnv, FunctionalAuthProps>
+      input: JwtAccessTokenIssueInput<TestEnv, FunctionalAuthProps>
     ) => JwtJsonValue | undefined | Promise<JwtJsonValue | undefined> = ({ props }) => ({ userId: props.userId })
   ) {
     const keyPair = (await crypto.subtle.generateKey(
@@ -14107,12 +14107,12 @@ describe('functional authorization-server and resource-server composition', () =
       alg: 'RS256' as const,
       use: 'sig',
       key_ops: ['verify'],
-    } satisfies JwtAccessTokenPublicKey;
+    } satisfies JwtPublicKey;
     return createJwtAccessTokens<TestEnv, FunctionalAuthProps>({
       issuer,
       jwksUri: `${issuer}/.well-known/jwks.json`,
       keys: () => ({
-        current: {
+        signingKey: {
           kid: publicJwk.kid,
           alg: 'RS256',
           privateKey: keyPair.privateKey,
@@ -14268,15 +14268,15 @@ describe('functional authorization-server and resource-server composition', () =
       alg: 'RS256' as const,
       use: 'sig',
       key_ops: ['verify'],
-    } satisfies JwtAccessTokenPublicKey;
+    } satisfies JwtPublicKey;
     let keyLookups = 0;
-    const accessTokens = createJwtAccessTokens<TestEnv, FunctionalAuthProps>({
+    const jwtAccessTokens = createJwtAccessTokens<TestEnv, FunctionalAuthProps>({
       issuer,
       jwksUri: `${issuer}/.well-known/jwks.json`,
       keys: () => {
         keyLookups += 1;
         if (keyLookups === 1) throw new Error('key store unavailable');
-        return { current: { kid: publicJwk.kid, alg: 'RS256', privateKey: keyPair.privateKey, publicJwk } };
+        return { signingKey: { kid: publicJwk.kid, alg: 'RS256', privateKey: keyPair.privateKey, publicJwk } };
       },
     });
     const authorizationServer = new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>({
@@ -14286,7 +14286,7 @@ describe('functional authorization-server and resource-server composition', () =
       tokenEndpoint: '/oauth/token',
       clientRegistrationEndpoint: '/oauth/register',
       scopesSupported: ['calendar:read'],
-      accessTokens,
+      jwtAccessTokens,
       accessTokenFormat: () => 'jwt',
     });
     authorizationServer.protectResource({
@@ -14556,9 +14556,9 @@ describe('functional authorization-server and resource-server composition', () =
           resources: [calendarResource],
           authorizeEndpoint: '/authorize',
           tokenEndpoint: '/oauth/token',
-          accessTokens: collidingJwks,
+          jwtAccessTokens: collidingJwks,
         })
-    ).toThrow('accessTokens.jwksUri must not collide with tokenEndpoint');
+    ).toThrow('jwtAccessTokens.jwksUri must not collide with tokenEndpoint');
 
     const authorizationQueryCollision = createJwtAccessTokens<TestEnv>({
       issuer,
@@ -14574,9 +14574,9 @@ describe('functional authorization-server and resource-server composition', () =
           resources: [calendarResource],
           authorizeEndpoint: '/authorize',
           tokenEndpoint: '/oauth/token',
-          accessTokens: authorizationQueryCollision,
+          jwtAccessTokens: authorizationQueryCollision,
         })
-    ).toThrow('accessTokens.jwksUri must not collide with authorizeEndpoint');
+    ).toThrow('jwtAccessTokens.jwksUri must not collide with authorizeEndpoint');
 
     const wrongIssuerTokens = createJwtAccessTokens<TestEnv>({
       issuer: 'https://other-auth.example.com',
@@ -14592,9 +14592,9 @@ describe('functional authorization-server and resource-server composition', () =
           resources: [calendarResource],
           authorizeEndpoint: '/authorize',
           tokenEndpoint: '/oauth/token',
-          accessTokens: wrongIssuerTokens,
+          jwtAccessTokens: wrongIssuerTokens,
         })
-    ).toThrow('accessTokens issuer must exactly match');
+    ).toThrow('jwtAccessTokens issuer must exactly match');
   });
 
   it('requires a valid access-token format policy and JWT reader', () => {
@@ -14607,9 +14607,9 @@ describe('functional authorization-server and resource-server composition', () =
           tokenEndpoint: '/oauth/token',
           accessTokenFormat: () => 'opaque',
         })
-    ).toThrow('accessTokenFormat requires accessTokens');
+    ).toThrow('accessTokenFormat requires jwtAccessTokens');
 
-    const accessTokens = createJwtAccessTokens<TestEnv>({
+    const jwtAccessTokens = createJwtAccessTokens<TestEnv>({
       issuer,
       jwksUri: `${issuer}/.well-known/jwks.json`,
       keys: () => {
@@ -14623,7 +14623,7 @@ describe('functional authorization-server and resource-server composition', () =
           resources: [calendarResource],
           authorizeEndpoint: '/authorize',
           tokenEndpoint: '/oauth/token',
-          accessTokens,
+          jwtAccessTokens,
           accessTokenFormat: 'jwt' as unknown as () => 'jwt',
         })
     ).toThrow('accessTokenFormat must be a function');
@@ -15040,7 +15040,7 @@ describe('functional authorization-server and resource-server composition', () =
   });
 
   it('serves JWKS and preserves confidential ctx.props with state-backed JWT access tokens', async () => {
-    const accessTokens = await createTestJwtAccessTokens();
+    const jwtAccessTokens = await createTestJwtAccessTokens();
     expect(
       () =>
         new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>({
@@ -15048,9 +15048,9 @@ describe('functional authorization-server and resource-server composition', () =
           resources: [calendarResource],
           authorizeEndpoint: '/authorize',
           tokenEndpoint: '/oauth/token',
-          accessTokens: { ...accessTokens },
+          jwtAccessTokens: { ...jwtAccessTokens },
         })
-    ).toThrow('accessTokens must be created by createJwtAccessTokens');
+    ).toThrow('jwtAccessTokens must be created by createJwtAccessTokens');
     const externalResolver = vi.fn(async () => ({
       props: { acceptedByExternalResolver: true },
       audience: calendarResource,
@@ -15063,7 +15063,7 @@ describe('functional authorization-server and resource-server composition', () =
       tokenEndpoint: '/oauth/token',
       clientRegistrationEndpoint: '/oauth/register',
       scopesSupported: ['calendar:read'],
-      accessTokens,
+      jwtAccessTokens,
       accessTokenFormat: () => 'jwt',
     });
     const calendar = authorizationServer.protectResource({
@@ -15175,9 +15175,9 @@ describe('functional authorization-server and resource-server composition', () =
   });
 
   it('installs the JWT reader and JWKS without starting to issue JWTs', async () => {
-    // `accessTokens` alone is the reader half of the rollout: the JWKS is published and a
+    // `jwtAccessTokens` alone is the reader half of the rollout: the JWKS is published and a
     // JWT still validates, but issuance stays opaque until `accessTokenFormat` says otherwise.
-    const accessTokens = await createTestJwtAccessTokens();
+    const jwtAccessTokens = await createTestJwtAccessTokens();
     const readerOnly = new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>({
       issuer,
       resources: [calendarResource],
@@ -15185,7 +15185,7 @@ describe('functional authorization-server and resource-server composition', () =
       tokenEndpoint: '/oauth/token',
       clientRegistrationEndpoint: '/oauth/register',
       scopesSupported: ['calendar:read'],
-      accessTokens,
+      jwtAccessTokens,
     });
     readerOnly.protectResource({
       resourceMetadata: { resource: calendarResource, scopes_supported: ['calendar:read'] },
@@ -15217,13 +15217,13 @@ describe('functional authorization-server and resource-server composition', () =
       ...((await crypto.subtle.exportKey('jwk', keyPair.publicKey)) as JsonWebKey),
       kid: 'outage-key',
       alg: 'RS256' as const,
-    } satisfies JwtAccessTokenPublicKey;
-    const accessTokens = createJwtAccessTokens<TestEnv, FunctionalAuthProps>({
+    } satisfies JwtPublicKey;
+    const jwtAccessTokens = createJwtAccessTokens<TestEnv, FunctionalAuthProps>({
       issuer,
       jwksUri: `${issuer}/.well-known/jwks.json`,
       keys: () => {
         if (failKeys) throw new Error('secrets store unavailable');
-        return { current: { kid: publicJwk.kid, alg: 'RS256', privateKey: keyPair.privateKey, publicJwk } };
+        return { signingKey: { kid: publicJwk.kid, alg: 'RS256', privateKey: keyPair.privateKey, publicJwk } };
       },
     });
     const onError = vi.fn(() => undefined);
@@ -15232,7 +15232,7 @@ describe('functional authorization-server and resource-server composition', () =
       resources: [calendarResource],
       authorizeEndpoint: '/authorize',
       tokenEndpoint: '/oauth/token',
-      accessTokens,
+      jwtAccessTokens,
       onError,
     });
 
@@ -15258,10 +15258,10 @@ describe('functional authorization-server and resource-server composition', () =
     expect(opaqueTokens.access_token.split(':')).toHaveLength(3);
 
     env.JWT_ISSUANCE_ENABLED = false;
-    const publicClaims = vi.fn(({ props }: JwtAccessTokenPublicClaimsInput<TestEnv, FunctionalAuthProps>) => ({
+    const publicClaims = vi.fn(({ props }: JwtAccessTokenIssueInput<TestEnv, FunctionalAuthProps>) => ({
       userId: props.userId,
     }));
-    const accessTokens = await createTestJwtAccessTokens(publicClaims);
+    const jwtAccessTokens = await createTestJwtAccessTokens(publicClaims);
     let observedInput: AccessTokenFormatInput<TestEnv> | undefined;
     const accessTokenFormat = vi.fn(async (input: AccessTokenFormatInput<TestEnv>) => {
       observedInput = input;
@@ -15274,7 +15274,7 @@ describe('functional authorization-server and resource-server composition', () =
       tokenEndpoint: '/oauth/token',
       clientRegistrationEndpoint: '/oauth/register',
       scopesSupported: ['calendar:read'],
-      accessTokens,
+      jwtAccessTokens,
       accessTokenFormat,
     });
     const calendar = migrationServer.protectResource({
@@ -15357,7 +15357,7 @@ describe('functional authorization-server and resource-server composition', () =
   });
 
   it('fails closed without consuming authorization codes or refresh tokens', async () => {
-    const accessTokens = await createTestJwtAccessTokens();
+    const jwtAccessTokens = await createTestJwtAccessTokens();
     let selectedFormat = 'automatic';
     const authorizationServer = new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>({
       issuer,
@@ -15366,7 +15366,7 @@ describe('functional authorization-server and resource-server composition', () =
       tokenEndpoint: '/oauth/token',
       clientRegistrationEndpoint: '/oauth/register',
       scopesSupported: ['calendar:read'],
-      accessTokens,
+      jwtAccessTokens,
       accessTokenFormat: () => selectedFormat as 'opaque' | 'jwt',
     });
     authorizationServer.protectResource({
@@ -15416,7 +15416,7 @@ describe('functional authorization-server and resource-server composition', () =
     });
 
     try {
-      const accessTokens = await createTestJwtAccessTokens();
+      const jwtAccessTokens = await createTestJwtAccessTokens();
       let selectedFormat = 'automatic';
       const accessTokenFormat = vi.fn(() => selectedFormat as 'opaque' | 'jwt');
       const authorizationServer = new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>({
@@ -15426,7 +15426,7 @@ describe('functional authorization-server and resource-server composition', () =
         tokenEndpoint: '/oauth/token',
         clientRegistrationEndpoint: '/oauth/register',
         scopesSupported: ['calendar:read'],
-        accessTokens,
+        jwtAccessTokens,
         accessTokenFormat,
         enterpriseManagedAuthorization: {
           trustedIssuers: async () => ({
@@ -15520,7 +15520,7 @@ describe('functional authorization-server and resource-server composition', () =
   });
 
   it('revokes a stored JWT after its resource is removed from the live registry', async () => {
-    const accessTokens = await createTestJwtAccessTokens();
+    const jwtAccessTokens = await createTestJwtAccessTokens();
     const issuerOptions = {
       issuer,
       resources: [calendarResource],
@@ -15528,7 +15528,7 @@ describe('functional authorization-server and resource-server composition', () =
       tokenEndpoint: '/oauth/token',
       clientRegistrationEndpoint: '/oauth/register',
       scopesSupported: ['calendar:read'],
-      accessTokens,
+      jwtAccessTokens,
       accessTokenFormat: () => 'jwt' as const,
     };
     const issuingServer = new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>(issuerOptions);
@@ -15583,7 +15583,7 @@ describe('functional authorization-server and resource-server composition', () =
       authorizeEndpoint: '/authorize',
       tokenEndpoint: '/oauth/token',
       allowImplicitFlow: true,
-      accessTokens: implicitTokens,
+      jwtAccessTokens: implicitTokens,
       accessTokenFormat: implicitFormat,
     });
     const implicitCalendar = implicitServer.protectResource({
@@ -15642,7 +15642,7 @@ describe('functional authorization-server and resource-server composition', () =
       allowTokenExchangeGrant: true,
       // The exchanging client differs from the subject token's client below.
       tokenExchangeCallback: () => ({ allowCrossClientExchange: true }),
-      accessTokens: exchangeTokens,
+      jwtAccessTokens: exchangeTokens,
       accessTokenFormat: exchangeFormat,
     });
     const exchangeCalendar = exchangeServer.protectResource({
@@ -15786,7 +15786,7 @@ describe('functional authorization-server and resource-server composition', () =
       tokenEndpoint: '/oauth/token',
       clientRegistrationEndpoint: '/oauth/register',
       scopesSupported: ['calendar:read'],
-      accessTokens: exchangeTokens,
+      jwtAccessTokens: exchangeTokens,
       accessTokenFormat: () => 'jwt',
     });
     await exchangeDisabled.getOAuthApi(env).deleteClient(laterClient.client_id);
@@ -16229,7 +16229,7 @@ describe('functional authorization-server and resource-server composition', () =
       tokenEndpoint: '/oauth/token',
       clientRegistrationEndpoint: '/oauth/register',
       scopesSupported: ['calendar:read', 'drive:read'],
-      accessTokens: jwtAccessTokens,
+      jwtAccessTokens,
       accessTokenFormat: () => format,
     });
     const client = await registerClient(authorizationServer);
@@ -16246,7 +16246,7 @@ describe('functional authorization-server and resource-server composition', () =
       ctx
     );
     expect(jwksResponse.status).toBe(200);
-    const jwks = await jwksResponse.json<{ keys: JwtAccessTokenPublicKey[] }>();
+    const jwks = await jwksResponse.json<{ keys: JwtPublicKey[] }>();
 
     type CalendarProps = { userId: string; scopes: string[] };
     const validateJwt = createJwtAccessTokenValidator<TestEnv, CalendarProps>({
@@ -16502,7 +16502,7 @@ describe('enterprise-managed authorization with JWT access tokens', () => {
       alg: 'RS256' as const,
       use: 'sig',
       key_ops: ['verify'],
-    } satisfies JwtAccessTokenPublicKey;
+    } satisfies JwtPublicKey;
     return { privateKey: pair.privateKey, publicJwk };
   }
 
@@ -16535,14 +16535,14 @@ describe('enterprise-managed authorization with JWT access tokens', () => {
     );
     const signingKey = await generateRsaKey('signing-key');
     let keyLookups = 0;
-    const accessTokens = createJwtAccessTokens<TestEnv, { userId: string }>({
+    const jwtAccessTokens = createJwtAccessTokens<TestEnv, { userId: string }>({
       issuer,
       jwksUri: `${issuer}/.well-known/jwks.json`,
       keys: () => {
         keyLookups += 1;
         if (keyLookups === 1) throw new Error('key store unavailable');
         return {
-          current: {
+          signingKey: {
             kid: 'signing-key',
             alg: 'RS256',
             privateKey: signingKey.privateKey,
@@ -16558,7 +16558,7 @@ describe('enterprise-managed authorization with JWT access tokens', () => {
       tokenEndpoint: '/oauth/token',
       clientRegistrationEndpoint: '/oauth/register',
       scopesSupported: ['calendar:read'],
-      accessTokens,
+      jwtAccessTokens,
       accessTokenFormat: () => 'jwt',
       enterpriseManagedAuthorization: {
         trustedIssuers: async () => ({ issuer: idpIssuer, jwksUri: `${idpIssuer}/jwks.json`, algorithms: ['RS256'] }),
