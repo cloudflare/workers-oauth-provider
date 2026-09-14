@@ -18,7 +18,7 @@ import {
   type JwtAccessTokenPublicKey,
   type JwtAccessTokenPublicClaimsInput,
   type JwtJsonValue,
-  type AccessTokenFormatContext,
+  type AccessTokenFormatInput,
 } from '../src/oauth-provider';
 import type { ExecutionContext } from '@cloudflare/workers-types';
 // We're importing WorkerEntrypoint from our mock implementation
@@ -4289,6 +4289,90 @@ describe('OAuthProvider', () => {
       });
       const originalApiResponse = await oauthProvider.fetch(originalApiRequest, mockEnv, mockCtx);
       expect(originalApiResponse.status).toBe(200);
+    });
+
+    async function exchangeAsSecondClient(): Promise<any> {
+      const params = new URLSearchParams({
+        grant_type: 'urn:ietf:params:oauth:grant-type:token-exchange',
+        subject_token: accessToken,
+        subject_token_type: 'urn:ietf:params:oauth:token-type:access_token',
+      });
+      const response = await oauthProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+          },
+          params.toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+      expect(response.status).toBe(200);
+      return response.json<any>();
+    }
+
+    async function apiStatus(token: string): Promise<number> {
+      const response = await oauthProvider.fetch(
+        createMockRequest('https://example.com/api/test', 'GET', { Authorization: `Bearer ${token}` }),
+        mockEnv,
+        mockCtx
+      );
+      return response.status;
+    }
+
+    // The two clients register with different auth methods, so each authenticates its own way.
+    async function revokeAsClient(
+      token: string,
+      id: string,
+      secret: string,
+      auth: 'basic' | 'post'
+    ): Promise<Response> {
+      const body = new URLSearchParams({ token, token_type_hint: 'access_token' });
+      const headers: Record<string, string> = { 'Content-Type': 'application/x-www-form-urlencoded' };
+      if (auth === 'basic') {
+        headers.Authorization = `Basic ${btoa(`${id}:${secret}`)}`;
+      } else {
+        body.set('client_id', id);
+        body.set('client_secret', secret);
+      }
+      return oauthProvider.fetch(
+        createMockRequest('https://example.com/oauth/token', 'POST', headers, body.toString()),
+        mockEnv,
+        mockCtx
+      );
+    }
+
+    // RFC 8693 §2.1 issues the exchanged token to the requesting client, and RFC 7009 §2.1
+    // lets only that client revoke it. This holds on the opaque path, with no `accessTokens`
+    // configured anywhere on this provider.
+    it('gives RFC 7009 revocation ownership of an exchanged token to the exchanging client', async () => {
+      const exchanged = await exchangeAsSecondClient();
+      // Guards the test against silently drifting onto the JWT path.
+      expect(exchanged.access_token.split(':')).toHaveLength(3);
+      expect(await apiStatus(exchanged.access_token)).toBe(200);
+
+      // The source grant's client does not own it, and RFC 7009 answers 200 either way.
+      expect(
+        (await revokeAsClient(exchanged.access_token, originalClientId, originalClientSecret, 'post')).status
+      ).toBe(200);
+      expect(await apiStatus(exchanged.access_token)).toBe(200);
+
+      expect((await revokeAsClient(exchanged.access_token, clientId, clientSecret, 'basic')).status).toBe(200);
+      expect(await apiStatus(exchanged.access_token)).toBe(401);
+    });
+
+    it('sweeps exchanged tokens when their owning client is deleted, not the source grant client', async () => {
+      const exchanged = await exchangeAsSecondClient();
+      expect(exchanged.access_token.split(':')).toHaveLength(3);
+
+      await mockEnv.OAUTH_PROVIDER!.deleteClient(clientId);
+
+      expect(await apiStatus(exchanged.access_token)).toBe(401);
+      // The source grant and its own token are untouched.
+      expect(await apiStatus(accessToken)).toBe(200);
     });
 
     it('should exchange token with narrowed scopes', async () => {
@@ -13876,7 +13960,7 @@ describe('OAuthProvider', () => {
       expect(result.grantsPurged).toBe(0);
       // Token sweep should still run
       expect(result.tokensChecked).toBe(2); // 1 real token + 1 orphaned
-      expect(result.tokensPurged).toBe(2); // missing grant + token owned by the deleted client
+      expect(result.tokensPurged).toBe(1); // only orphaned one
     });
 
     it('should skip token sweep when purgeOrphanedTokens is false', async () => {
@@ -14203,6 +14287,7 @@ describe('functional authorization-server and resource-server composition', () =
       clientRegistrationEndpoint: '/oauth/register',
       scopesSupported: ['calendar:read'],
       accessTokens,
+      accessTokenFormat: () => 'jwt',
     });
     authorizationServer.protectResource({
       resourceMetadata: { resource: calendarResource, scopes_supported: ['calendar:read'] },
@@ -14211,8 +14296,11 @@ describe('functional authorization-server and resource-server composition', () =
     const client = await registerClient(authorizationServer);
     const code = await authorize(authorizationServer, client, [calendarResource]);
 
-    // The first exchange fails while signing, before the code is consumed.
-    await expect(exchangeCode(authorizationServer, client, code)).rejects.toThrow('key store unavailable');
+    // The first exchange fails while signing, before the code is consumed. The key-store
+    // fault reaches the client as an OAuth error, not as a bare throw out of the endpoint.
+    const failed = await exchangeCode(authorizationServer, client, code);
+    expect(failed.status).toBe(500);
+    expect((await failed.json<any>()).error).toBe('server_error');
     const grants = await env.OAUTH_KV.list({ prefix: 'grant:' });
     const grant = (await env.OAUTH_KV.get(grants.keys[0].name, { type: 'json' })) as Grant;
     expect(grant.authCodeWrappedKey).toBeDefined();
@@ -14976,6 +15064,7 @@ describe('functional authorization-server and resource-server composition', () =
       clientRegistrationEndpoint: '/oauth/register',
       scopesSupported: ['calendar:read'],
       accessTokens,
+      accessTokenFormat: () => 'jwt',
     });
     const calendar = authorizationServer.protectResource({
       resourceMetadata: { resource: calendarResource, scopes_supported: ['calendar:read'] },
@@ -15085,6 +15174,83 @@ describe('functional authorization-server and resource-server composition', () =
     ).resolves.toBeNull();
   });
 
+  it('installs the JWT reader and JWKS without starting to issue JWTs', async () => {
+    // `accessTokens` alone is the reader half of the rollout: the JWKS is published and a
+    // JWT still validates, but issuance stays opaque until `accessTokenFormat` says otherwise.
+    const accessTokens = await createTestJwtAccessTokens();
+    const readerOnly = new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>({
+      issuer,
+      resources: [calendarResource],
+      authorizeEndpoint: '/authorize',
+      tokenEndpoint: '/oauth/token',
+      clientRegistrationEndpoint: '/oauth/register',
+      scopesSupported: ['calendar:read'],
+      accessTokens,
+    });
+    readerOnly.protectResource({
+      resourceMetadata: { resource: calendarResource, scopes_supported: ['calendar:read'] },
+      handler: resourceHandler('calendar'),
+    });
+    const client = await registerClient(readerOnly);
+    const tokens = await issueTokens(readerOnly, client, calendarResource);
+    expect(tokens.access_token.split(':')).toHaveLength(3);
+
+    const jwks = await readerOnly.fetch(createMockRequest(`${issuer}/.well-known/jwks.json`), env, ctx);
+    expect(jwks.status).toBe(200);
+    await expect(jwks.json()).resolves.toMatchObject({ keys: [{ kid: 'integration-key' }] });
+    const metadata = await readerOnly.fetch(
+      createMockRequest(`${issuer}/.well-known/oauth-authorization-server`),
+      env,
+      ctx
+    );
+    await expect(metadata.json()).resolves.toMatchObject({ jwks_uri: `${issuer}/.well-known/jwks.json` });
+  });
+
+  it('reports a key-store outage on the JWKS route as a 503 through onError', async () => {
+    let failKeys = false;
+    const keyPair = (await crypto.subtle.generateKey(
+      { name: 'RSASSA-PKCS1-v1_5', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' },
+      true,
+      ['sign', 'verify']
+    )) as CryptoKeyPair;
+    const publicJwk = {
+      ...((await crypto.subtle.exportKey('jwk', keyPair.publicKey)) as JsonWebKey),
+      kid: 'outage-key',
+      alg: 'RS256' as const,
+    } satisfies JwtAccessTokenPublicKey;
+    const accessTokens = createJwtAccessTokens<TestEnv, FunctionalAuthProps>({
+      issuer,
+      jwksUri: `${issuer}/.well-known/jwks.json`,
+      keys: () => {
+        if (failKeys) throw new Error('secrets store unavailable');
+        return { current: { kid: publicJwk.kid, alg: 'RS256', privateKey: keyPair.privateKey, publicJwk } };
+      },
+    });
+    const onError = vi.fn(() => undefined);
+    const server = new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>({
+      issuer,
+      resources: [calendarResource],
+      authorizeEndpoint: '/authorize',
+      tokenEndpoint: '/oauth/token',
+      accessTokens,
+      onError,
+    });
+
+    expect((await server.fetch(createMockRequest(`${issuer}/.well-known/jwks.json`), env, ctx)).status).toBe(200);
+
+    failKeys = true;
+    const outage = await server.fetch(createMockRequest(`${issuer}/.well-known/jwks.json`), env, ctx);
+    expect(outage.status).toBe(503);
+    await expect(outage.json()).resolves.toMatchObject({ error: 'server_error' });
+    expect(onError).toHaveBeenCalledWith(
+      expect.objectContaining({
+        status: 503,
+        code: 'server_error',
+        internal: expect.objectContaining({ category: 'jwks', reason: 'key_resolution_failed' }),
+      })
+    );
+  });
+
   it('rolls access tokens from opaque to JWT without invalidating tokens or refresh grants', async () => {
     const opaqueRoles = createRoles();
     const client = await registerClient(opaqueRoles.authorizationServer);
@@ -15096,10 +15262,10 @@ describe('functional authorization-server and resource-server composition', () =
       userId: props.userId,
     }));
     const accessTokens = await createTestJwtAccessTokens(publicClaims);
-    let observedContext: AccessTokenFormatContext<TestEnv> | undefined;
-    const accessTokenFormat = vi.fn(async (context: AccessTokenFormatContext<TestEnv>) => {
-      observedContext = context;
-      return context.env.JWT_ISSUANCE_ENABLED ? ('jwt' as const) : ('opaque' as const);
+    let observedInput: AccessTokenFormatInput<TestEnv> | undefined;
+    const accessTokenFormat = vi.fn(async (input: AccessTokenFormatInput<TestEnv>) => {
+      observedInput = input;
+      return input.env.JWT_ISSUANCE_ENABLED ? ('jwt' as const) : ('opaque' as const);
     });
     const migrationServer = new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>({
       issuer,
@@ -15147,12 +15313,9 @@ describe('functional authorization-server and resource-server composition', () =
     expect(readerPhaseTokens.refresh_token.split(':')).toHaveLength(3);
     expect(accessTokenFormat).toHaveBeenCalledTimes(1);
     expect(publicClaims).not.toHaveBeenCalled();
-    expect(observedContext).toMatchObject({
-      env,
-      clientId: client.client_id,
-      resource: calendarResource,
-    });
-    expect(Object.isFrozen(observedContext)).toBe(true);
+    expect(observedInput).toMatchObject({ env, resource: calendarResource });
+    expect(observedInput).not.toHaveProperty('clientId');
+    expect(Object.isFrozen(observedInput)).toBe(true);
 
     // Writer flip: refresh mints a JWT, but neither previously issued opaque
     // access token is rewritten or rejected.
@@ -15366,6 +15529,7 @@ describe('functional authorization-server and resource-server composition', () =
       clientRegistrationEndpoint: '/oauth/register',
       scopesSupported: ['calendar:read'],
       accessTokens,
+      accessTokenFormat: () => 'jwt' as const,
     };
     const issuingServer = new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>(issuerOptions);
     issuingServer.protectResource({
@@ -15466,10 +15630,8 @@ describe('functional authorization-server and resource-server composition', () =
 
     env = createMockEnv();
     const exchangeTokens = await createTestJwtAccessTokens();
-    let jwtClientId: string | undefined;
-    const exchangeFormat = vi.fn(({ clientId }: AccessTokenFormatContext<TestEnv>) =>
-      clientId === jwtClientId ? ('jwt' as const) : ('opaque' as const)
-    );
+    let issueJwt = false;
+    const exchangeFormat = vi.fn(() => (issueJwt ? ('jwt' as const) : ('opaque' as const)));
     const exchangeServer = new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>({
       issuer,
       resources: [calendarResource],
@@ -15490,6 +15652,7 @@ describe('functional authorization-server and resource-server composition', () =
     const subjectClient = await registerClient(exchangeServer);
     const subject = await issueTokens(exchangeServer, subjectClient, calendarResource);
     expect(subject.access_token.split(':')).toHaveLength(3);
+    issueJwt = true;
     // The exchanging client must register the token-exchange grant type.
     const exchangeRegistration = await exchangeServer.fetch(
       createMockRequest(
@@ -15507,7 +15670,6 @@ describe('functional authorization-server and resource-server composition', () =
     );
     expect(exchangeRegistration.status).toBe(201);
     const exchangeClient = await exchangeRegistration.json<any>();
-    jwtClientId = exchangeClient.client_id;
     const exchangeSubject = async () => {
       const response = await exchangeServer.fetch(
         createMockRequest(
@@ -15625,6 +15787,7 @@ describe('functional authorization-server and resource-server composition', () =
       clientRegistrationEndpoint: '/oauth/register',
       scopesSupported: ['calendar:read'],
       accessTokens: exchangeTokens,
+      accessTokenFormat: () => 'jwt',
     });
     await exchangeDisabled.getOAuthApi(env).deleteClient(laterClient.client_id);
     expect(await tokenStatus(laterToken.access_token)).toBe(401);
@@ -16089,6 +16252,7 @@ describe('functional authorization-server and resource-server composition', () =
     const validateJwt = createJwtAccessTokenValidator<TestEnv, CalendarProps>({
       issuer,
       audience: calendarResource,
+      algorithms: ['RS256'],
       keys: () => jwks.keys,
       mapClaimsToProps: ({ userId, scope }) => ({ userId, scopes: scope }),
     });
@@ -16395,6 +16559,7 @@ describe('enterprise-managed authorization with JWT access tokens', () => {
       clientRegistrationEndpoint: '/oauth/register',
       scopesSupported: ['calendar:read'],
       accessTokens,
+      accessTokenFormat: () => 'jwt',
       enterpriseManagedAuthorization: {
         trustedIssuers: async () => ({ issuer: idpIssuer, jwksUri: `${idpIssuer}/jwks.json`, algorithms: ['RS256'] }),
         mapClaims,

@@ -45,9 +45,8 @@ import {
   validateIdJagHeader,
 } from './ema/validators';
 import {
-  assertJwtAccessTokensComponent,
-  verifyJwtForProviderState,
-  warmJwtSigningKey,
+  jwtInternals,
+  type JwtAccessTokenPublicKey,
   type JwtAccessTokens,
   type VerifiedJwtAccessToken,
 } from './jwt-access-tokens';
@@ -73,8 +72,6 @@ export {
   type JwtAccessTokenKeyHint,
   type JwtAccessTokenPublicKey,
   type JwtAccessTokenSigningKey,
-  type JwtAccessTokenValidation,
-  type JwtAccessTokenValidationInput,
   type JwtAccessTokenValidatorOptions,
   type JwtAccessTokens,
   type JwtAccessTokensOptions,
@@ -703,16 +700,15 @@ interface OAuthAuthorizationServerConfiguration<Env = Cloudflare.Env> {
 /** Access-token representations supported by the authorization server. */
 export type AccessTokenFormat = 'opaque' | 'jwt';
 
-/** Immutable context passed to an access-token format policy before issuance. */
-export interface AccessTokenFormatContext<Env = Cloudflare.Env> {
+/** Immutable input passed to an access-token format policy before issuance. */
+export interface AccessTokenFormatInput<Env = Cloudflare.Env> {
   readonly env: Env;
-  readonly clientId: string;
   readonly resource: string;
 }
 
 /** Functional policy for selecting the representation of each new access token. */
 export type AccessTokenFormatPolicy<Env = Cloudflare.Env> = (
-  context: AccessTokenFormatContext<Env>
+  input: AccessTokenFormatInput<Env>
 ) => AccessTokenFormat | Promise<AccessTokenFormat>;
 
 /** Internal input used when `protectResource()` registers one hosted role. */
@@ -744,7 +740,7 @@ type InternalOAuthAuthorizationServerOptions<Env = Cloudflare.Env> = Omit<
  * `getOAuthApi()` to parse and complete it; `fetch()` serves protocol-owned AS
  * endpoints such as metadata, token, revocation, and optional registration.
  */
-export type OAuthAuthorizationServerOptions<Env = Cloudflare.Env, Props = unknown> = Omit<
+export type OAuthAuthorizationServerOptions<Env = Cloudflare.Env, Props = any> = Omit<
   OAuthProviderOptions<Env>,
   | 'apiRoute'
   | 'apiHandler'
@@ -830,7 +826,7 @@ export interface ProtectResourceHandleOptions<Env = Cloudflare.Env, Props = unkn
  * Obtained from `OAuthAuthorizationServer.resource()`, so a misspelled identifier fails
  * at module initialization instead of on a request.
  */
-export interface OAuthResourceHandle<Env = Cloudflare.Env, Props = unknown> {
+export interface OAuthResourceHandle<Env = Cloudflare.Env, Props = any> {
   /** Canonical spelling of the declared resource identifier. */
   readonly resource: string;
   /**
@@ -956,7 +952,7 @@ export interface OAuthHelpers<Props = any> {
    *
    * Performs two sweep phases:
    * 1. Grant sweep: removes orphaned grants (client deleted) and expired grants (defense-in-depth for KV TTL)
-   * 2. Token sweep: removes orphaned tokens (grant or owning client deleted) as defense-in-depth
+   * 2. Token sweep: removes orphaned tokens (grant deleted) as defense-in-depth
    *
    * Safe to call repeatedly — deleted records disappear from KV, so subsequent invocations
    * naturally process fresh records without needing a persisted cursor.
@@ -1519,7 +1515,7 @@ export interface PurgeOptions {
   purgeExpiredGrants?: boolean;
 
   /**
-   * Whether to purge orphaned tokens whose grant or owning registered client no longer exists.
+   * Whether to purge orphaned tokens whose grant no longer exists.
    * Tokens already auto-expire via KV TTL (default 1 hour), so this is
    * defense-in-depth for partial revokeGrant() failures.
    * Defaults to true.
@@ -1641,6 +1637,13 @@ interface CreateAccessTokenOptions<Env = Cloudflare.Env> {
   grantScope?: string[];
 
   /**
+   * Clock read to stamp the record with. Callers that already clamped `expiresIn` against
+   * a grant's remaining lifetime pass the same read they clamped with, so the token cannot
+   * be recorded as outliving that grant. Defaults to a fresh read.
+   */
+  issuedAt?: number;
+
+  /**
    * Encrypted props for the token
    */
   encryptedProps: string;
@@ -1742,7 +1745,7 @@ export class OAuthProvider<Env = Cloudflare.Env> {
  * by dispatching requests to this object or to the handles returned by
  * `protectResource()`.
  */
-export class OAuthAuthorizationServer<Env = Cloudflare.Env, Props = unknown> {
+export class OAuthAuthorizationServer<Env = Cloudflare.Env, Props = any> {
   #impl: OAuthProviderImpl<Env>;
 
   constructor(options: OAuthAuthorizationServerOptions<Env, Props>) {
@@ -1928,7 +1931,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       if (this.jwtAccessTokens && this.jwtAccessTokens.issuer !== authorizationServer.issuer) {
         throw new TypeError('accessTokens issuer must exactly match authorizationServer.issuer');
       }
-      if (this.jwtAccessTokens) assertJwtAccessTokensComponent(this.jwtAccessTokens);
+      if (this.jwtAccessTokens) jwtInternals(this.jwtAccessTokens);
       normalizedOptions = {
         ...(commonOptions as Omit<InternalOAuthProviderOptions<Env>, 'authorizeEndpoint' | 'tokenEndpoint'>),
         authorizeEndpoint: authorizationServer.authorizeEndpoint,
@@ -2518,7 +2521,27 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
           request
         );
       }
-      const jwks = await this.jwtAccessTokens.getJwks(env);
+      let jwks: { keys: JwtAccessTokenPublicKey[] };
+      try {
+        jwks = await this.jwtAccessTokens.getJwks(env);
+      } catch (error) {
+        // The deployer's key store is the only thing that can fail here, and every
+        // resource server polls this endpoint, so the failure has to reach `onError`
+        // instead of escaping as an opaque unhandled rejection.
+        return this.addCorsHeaders(
+          this.createErrorResponse(
+            'server_error',
+            { description: 'JWKS is temporarily unavailable', statusCode: 503 },
+            {
+              category: 'jwks',
+              reason: 'key_resolution_failed',
+              detail: { message: error instanceof Error ? error.message : String(error) },
+            },
+            request
+          ),
+          request
+        );
+      }
       return this.addCorsHeaders(
         withoutBodyForHead(
           request,
@@ -2624,11 +2647,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     env: Env & ProviderEnv,
     jwtAudiencePolicy: InternalJwtAudiencePolicy = 'registered-resource'
   ): Promise<InternalAccessTokenResolution> {
-    if (this.jwtAccessTokens?.recognizes(token)) {
+    if (this.jwtAccessTokens && jwtInternals(this.jwtAccessTokens).recognizes(token)) {
       const registeredResources = this.resourceServers.map((server) => server.resourceMetadata.resource);
       const verified =
         jwtAudiencePolicy === 'stored-token'
-          ? await verifyJwtForProviderState(this.jwtAccessTokens, token, env)
+          ? await jwtInternals(this.jwtAccessTokens).verify(token, env)
           : registeredResources.length > 0
             ? await this.jwtAccessTokens.verify(token, registeredResources, env)
             : null;
@@ -3666,7 +3689,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // grant/token state. A policy outage must leave this code retryable.
     const accessTokenFormat = await this.selectAccessTokenFormat({
       env,
-      clientId: grantData.clientId,
       resource: audience,
     });
 
@@ -3988,7 +4010,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // legacy-resource backfill, so a failed decision leaves the grant retryable.
     const accessTokenFormat = await this.selectAccessTokenFormat({
       env,
-      clientId: grantData.clientId,
       resource: audience,
     });
 
@@ -4033,6 +4054,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       scope: tokenScopes,
       // A refresh may narrow the token below the grant; the record denormalizes the grant.
       grantScope: grantData.scope,
+      // The same read the TTL was clamped against, so `token.expiresAt <= grant.expiresAt`.
+      issuedAt: now,
       encryptedProps: encryptedAccessTokenProps,
       encryptionKey: accessTokenEncryptionKey,
       expiresIn: accessTokenTTL,
@@ -4225,7 +4248,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     const accessTokenFormat = await this.selectAccessTokenFormat({
       env,
-      clientId: clientInfo.clientId,
       resource: newAudience,
     });
 
@@ -4400,8 +4422,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    *
    * Sequence:
    *   parse → validate header → trust issuer → fetch JWKS → select key →
-   *   verify signature → validate claims → parse scope → select token format →
-   *   prove signing key → record jti → run mapper → validate mapper result →
+   *   verify signature → validate claims → select token format → prove signing key →
+   *   record jti → parse scope → run mapper → validate mapper result →
    *   compute TTL → build token → write grant and token.
    *
    * The `jti` write consumes the assertion, and everything that can fail for a reason
@@ -4467,18 +4489,16 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     });
     if (!claims.ok) return claims;
 
-    const requestedScope = parseEmaScopeParam(body.scope, claims.value.assertionScopes);
-    if (!requestedScope.ok) return requestedScope;
-
     // Neither a rollout-policy failure nor an unusable signing key may consume the
     // one-use assertion JTI, so both are settled before it is marked used.
     const accessTokenFormat = await this.selectAccessTokenFormat({
       env,
-      clientId: clientInfo.clientId,
       resource: configuredResource,
     });
     if (accessTokenFormat === 'jwt' && this.jwtAccessTokens) {
-      await warmJwtSigningKey(this.jwtAccessTokens, env);
+      // Resolve and prove the signing key before the one-use assertion is spent. `getJwks`
+      // is that resolution, minus the published document nobody reads here.
+      await this.jwtAccessTokens.getJwks(env);
     }
 
     // Consume the assertion before any application code runs. Single use has to mean the
@@ -4493,6 +4513,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       env,
     });
     if (!replay.ok) return replay;
+
+    const requestedScope = parseEmaScopeParam(body.scope, claims.value.assertionScopes);
+    if (!requestedScope.ok) return requestedScope;
 
     let mapperOutput: unknown;
     try {
@@ -4524,10 +4547,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     });
     if (!ttl.ok) return ttl;
 
-    // Build (and for JWTs, sign) the access token before anything is written, so a
-    // signing or key-resolution failure leaves the one-use assertion retryable, as it
-    // does for an authorization code. The mapper therefore runs before the replay check;
-    // the assertion's signature has already been verified at that point.
+    // Mint and sign before either write, so a failure here leaves no orphaned grant or
+    // token record; the signing key was already proven usable before the jti write above.
     const prepared = await this.prepareEmaAccessToken({
       format: accessTokenFormat,
       clientId: clientInfo.clientId,
@@ -4683,7 +4704,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       return this.createErrorResponse('invalid_request', { description: 'Token parameter is required' });
     }
 
-    if (this.jwtAccessTokens?.recognizes(token)) {
+    if (this.jwtAccessTokens && jwtInternals(this.jwtAccessTokens).recognizes(token)) {
       // Revocation is a lifecycle operation on issuer-owned state. It must keep
       // working even if the token's audience was removed from the live registry.
       const { tokenData } = await this.resolveInternalAccessToken(token, env, 'stored-token');
@@ -5487,15 +5508,19 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     };
   }
 
-  async selectAccessTokenFormat(context: AccessTokenFormatContext<Env>): Promise<AccessTokenFormat> {
+  async selectAccessTokenFormat(input: AccessTokenFormatInput<Env>): Promise<AccessTokenFormat> {
     if (!this.jwtAccessTokens) return 'opaque';
-    if (!this.accessTokenFormatPolicy) return 'jwt';
+    // Installing `accessTokens` turns on the reader, the signer and the JWKS; it does not
+    // start writing JWTs. A deployment that flipped issuance the moment the component was
+    // configured would mint tokens its resource servers cannot yet verify, which is the
+    // one ordering the rollout procedure exists to prevent.
+    if (!this.accessTokenFormatPolicy) return 'opaque';
 
     // Policies may be shared with application code. Give them an immutable
     // snapshot of only the canonical rollout inputs available before any
     // grant, authorization-code, replay-marker, or token mutation.
-    const policyContext = Object.freeze({ ...context });
-    const format = await this.accessTokenFormatPolicy(policyContext);
+    const policyInput = Object.freeze({ ...input });
+    const format = await this.accessTokenFormatPolicy(policyInput);
     if (format !== 'opaque' && format !== 'jwt') {
       throw new OAuthError('server_error', {
         description: "accessTokenFormat must return either 'opaque' or 'jwt'",
@@ -5535,10 +5560,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
   /**
    * Build the access token and its state record without touching KV, so the caller can
-   * sign before it consumes a one-shot credential. The authorization-code and
-   * enterprise-assertion paths use it for exactly that: a JWT signing or key-resolution
-   * failure leaves the code or assertion untouched and retryable. Refresh rotation writes
-   * its grant first and stays retryable through the previous-refresh-token window instead.
+   * order the signing against whatever it writes. The authorization-code path signs
+   * before the grant write that consumes the code, so a signing or key-resolution failure
+   * leaves the code retryable. The enterprise-assertion path must consume its assertion
+   * before the mapper runs, so it proves the signing key is resolvable up front and uses
+   * this helper only to keep a failed attempt from leaving a grant or token behind.
+   * Refresh rotation writes its grant first and stays retryable through the
+   * previous-refresh-token window instead.
    */
   private async mintAccessToken(params: CreateAccessTokenOptions<Env>): Promise<MintedAccessToken> {
     const {
@@ -5568,7 +5596,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       throw new TypeError("Access-token format must be either 'opaque' or 'jwt'");
     }
 
-    const now = Math.floor(Date.now() / 1000);
+    const now = params.issuedAt ?? Math.floor(Date.now() / 1000);
     const accessTokenExpiresAt = now + expiresIn;
 
     let accessToken: string;
@@ -5580,17 +5608,33 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       // props only so its explicit publicClaims mapper can select safe values;
       // the complete props remain encrypted in the state record below.
       const props = await decryptProps(encryptionKey, encryptedProps);
-      const issued = await jwtAccessTokens.issue({
-        props,
-        userId,
-        grantId,
-        clientId,
-        scope,
-        audience,
-        issuedAt: now,
-        expiresAt: accessTokenExpiresAt,
-        env,
-      });
+      let issued;
+      try {
+        issued = await jwtAccessTokens.issue({
+          props,
+          userId,
+          grantId,
+          clientId,
+          scope,
+          audience,
+          issuedAt: now,
+          expiresAt: accessTokenExpiresAt,
+          env,
+        });
+      } catch (error) {
+        // Unrepresentable grant state — a scope token that cannot round-trip through a
+        // space-delimited claim, an oversized public claim — is a configuration fault, and
+        // the deployer needs it shaped as an OAuth error with an `onError` line, not as a
+        // bare TypeError escaping the token endpoint.
+        if (error instanceof OAuthError) throw error;
+        throw withCause(
+          new OAuthError('server_error', {
+            description: 'Unable to issue a JWT access token',
+            statusCode: 500,
+          }),
+          error
+        );
+      }
       accessToken = issued.token;
       jwtId = issued.claims.jti;
     } else {
@@ -5858,6 +5902,16 @@ export interface OAuthErrorOptions {
  * }
  * ```
  */
+/**
+ * Keep the underlying failure reachable for diagnostics without putting it on the wire.
+ * Assigned rather than passed to the constructor because the package targets a language
+ * level without the ES2022 `cause` option.
+ */
+function withCause<E extends Error>(error: E, cause: unknown): E {
+  Object.defineProperty(error, 'cause', { value: cause, enumerable: false, configurable: true, writable: true });
+  return error;
+}
+
 export class OAuthError extends Error {
   /** OAuth 2.0 error code. */
   public readonly code: string;
@@ -6698,15 +6752,6 @@ class OAuthHelpersImpl<Env = Cloudflare.Env, Props = any> implements OAuthHelper
 
     // Callers can pass a reconstructed AuthRequest rather than one returned by
     // parseAuthRequest(), so re-apply registry selection before any mutation.
-    // RFC 6749 §3.3 scope tokens are space-delimited on the wire, so a value carrying a
-    // space, a quote or a backslash cannot round-trip. Reject it here, where the
-    // application supplied it, rather than when a token is later signed.
-    if (options.scope !== undefined) {
-      if (!Array.isArray(options.scope) || options.scope.some((scope) => !isValidOAuthScopeToken(scope))) {
-        throw new TypeError('completeAuthorization scope must contain valid OAuth scope tokens');
-      }
-    }
-
     const effectiveResource = this.provider.resolveAuthorizationRequestResource(options.request.resource);
 
     // Re-apply PKCE policy after client, redirect, response-type, and resource
@@ -6757,7 +6802,6 @@ class OAuthHelpersImpl<Env = Cloudflare.Env, Props = any> implements OAuthHelper
       // leaves a grant behind. Matches the authorization-code and assertion paths.
       const accessTokenFormat = await this.provider.selectAccessTokenFormat({
         env: this.env,
-        clientId: options.request.clientId,
         resource: audience,
       });
 
@@ -6787,6 +6831,8 @@ class OAuthHelpersImpl<Env = Cloudflare.Env, Props = any> implements OAuthHelper
           encryptionKey,
           expiresIn: accessTokenTTL,
           audience,
+          // The grant's own `createdAt`, so the pair written here agree on one clock.
+          issuedAt: now,
           env: this.env,
         },
         grantKey,
@@ -7294,11 +7340,10 @@ class OAuthHelpersImpl<Env = Cloudflare.Env, Props = any> implements OAuthHelper
       tokensPurged: 0,
       done: false,
     };
-    const knownGoodClients = new Set<string>();
-    const knownMissingClients = new Set<string>();
-
     // Phase 1: Grant sweep
     if (purgeOrphanedGrants || purgeExpiredGrants) {
+      const knownGoodClients = new Set<string>();
+      const knownMissingClients = new Set<string>();
       let grantCursor: string | undefined;
       let grantsDone = false;
 
@@ -7397,23 +7442,6 @@ class OAuthHelpersImpl<Env = Cloudflare.Env, Props = any> implements OAuthHelper
             } else {
               knownMissingGrants.add(grantKey);
               shouldPurge = true;
-            }
-          }
-
-          // Exchanged tokens may be owned by a different client than their
-          // backing source grant. Skip CIMD clients, which have no KV record.
-          const tokenClientId = tokenData.grant?.clientId;
-          if (!shouldPurge && tokenClientId && !this.provider.isClientMetadataUrl(tokenClientId)) {
-            if (knownMissingClients.has(tokenClientId)) {
-              shouldPurge = true;
-            } else if (!knownGoodClients.has(tokenClientId)) {
-              const client = await this.env.OAUTH_KV.get(`client:${tokenClientId}`, { type: 'json' });
-              if (client) {
-                knownGoodClients.add(tokenClientId);
-              } else {
-                knownMissingClients.add(tokenClientId);
-                shouldPurge = true;
-              }
             }
           }
 

@@ -10,8 +10,8 @@ export const JWT_ACCESS_TOKEN_GRANT_ID_CLAIM = 'https://workers.cloudflare.com/o
  */
 export const JWT_ACCESS_TOKEN_PUBLIC_CLAIMS = 'https://workers.cloudflare.com/oauth-provider/claims/public' as const;
 
-const DEFAULT_MAX_TOKEN_BYTES = 16 * 1024;
-const MAX_CONFIGURED_TOKEN_BYTES = 128 * 1024;
+/** Compact-token size ceiling, applied to every token this module emits and reads. */
+const MAX_TOKEN_BYTES = 16 * 1024;
 const MAX_KEY_ID_LENGTH = 128;
 /** Permitted clock skew, shared by the issuer's own verifier and the offline validator. */
 const DEFAULT_CLOCK_SKEW_SECONDS = 30;
@@ -113,8 +113,6 @@ export interface JwtAccessTokensOptions<Env = Cloudflare.Env, Props = unknown> {
   publicClaims?(
     input: JwtAccessTokenPublicClaimsInput<Env, Props>
   ): JwtJsonValue | undefined | Promise<JwtJsonValue | undefined>;
-  /** Maximum compact-token size accepted and emitted. Defaults to 16 KiB. */
-  maxTokenBytes?: number;
 }
 
 /** Verified JWT context before a resource-specific props mapper runs. */
@@ -134,57 +132,37 @@ export interface VerifiedJwtAccessToken {
 export interface JwtAccessTokens<Env = Cloudflare.Env, Props = unknown> {
   readonly issuer: string;
   readonly jwksUri: string;
-  readonly maxTokenBytes: number;
   /** Mint one signed access token from provider-validated grant state. */
   issue: (input: JwtAccessTokenPublicClaimsInput<Env, Props>) => Promise<JwtIssuedAccessToken>;
   /** Verify against an explicit finite set of audiences owned by the caller. */
   verify: (token: string, allowedAudiences: readonly string[], env: Env) => Promise<VerifiedJwtAccessToken | null>;
-  /** Cheaply identify a structurally valid token that claims this component's issuer and type. */
-  recognizes: (token: string) => boolean;
   /** Resolve the sanitized public key set published by the authorization server. */
   getJwks: (env: Env) => Promise<{ keys: JwtAccessTokenPublicKey[] }>;
 }
 
-interface InternalHooks {
+/** Capabilities the provider needs from a component and no npm consumer may reach. */
+interface JwtInternals<Env> {
   /** Verify against the token's own audience for a provider-owned state cross-check. */
-  readonly verify: (token: string, env: unknown) => Promise<VerifiedJwtAccessToken | null>;
-  /**
-   * Resolve and prove the signing key without issuing anything, so a caller can find out
-   * that it cannot sign before it consumes a one-shot credential.
-   */
-  readonly warm: (env: unknown) => Promise<void>;
+  readonly verify: (token: string, env: Env) => Promise<VerifiedJwtAccessToken | null>;
+  /** Cheaply identify a structurally valid token that claims this component's issuer and type. */
+  readonly recognizes: (token: string) => boolean;
 }
 /**
  * Brands the objects this factory returns. A WeakMap rather than a property so that a
  * spread copy of the component is not branded, which is what makes the factory-only
  * invariant detectable rather than merely documented.
  */
-const internalStateVerifiers = new WeakMap<object, InternalHooks>();
+const internals = new WeakMap<object, JwtInternals<any>>();
 const NOT_FROM_FACTORY = 'accessTokens must be created by createJwtAccessTokens';
 
-/** @internal Verify only for an immediate provider-owned state-record cross-check. */
-export function verifyJwtForProviderState<Env>(
-  accessTokens: JwtAccessTokens<Env, any>,
-  token: string,
-  env: Env
-): Promise<VerifiedJwtAccessToken | null> {
-  const hooks = internalStateVerifiers.get(accessTokens);
+/**
+ * @internal The provider's only door into a branded component. Called for its throw at
+ * construction time, and for the hooks on every request that carries a token.
+ */
+export function jwtInternals<Env>(accessTokens: JwtAccessTokens<Env, any>): JwtInternals<Env> {
+  const hooks = internals.get(accessTokens);
   if (!hooks) throw new TypeError(NOT_FROM_FACTORY);
-  return hooks.verify(token, env);
-}
-
-/** @internal Prove the signing key is usable before a one-shot credential is consumed. */
-export function warmJwtSigningKey<Env>(accessTokens: JwtAccessTokens<Env, any>, env: Env): Promise<void> {
-  const hooks = internalStateVerifiers.get(accessTokens);
-  if (!hooks) throw new TypeError(NOT_FROM_FACTORY);
-  return hooks.warm(env);
-}
-
-/** @internal Enforce the factory-only invariant at provider construction time. */
-export function assertJwtAccessTokensComponent(value: JwtAccessTokens<any, any>): void {
-  if (!internalStateVerifiers.has(value)) {
-    throw new TypeError(NOT_FROM_FACTORY);
-  }
+  return hooks;
 }
 
 /** Input passed to a stateless resource server's claim-to-props mapper. */
@@ -207,8 +185,13 @@ export interface JwtAccessTokenValidatorOptions<Env = Cloudflare.Env, Props = un
   issuer: string;
   /** One fixed canonical resource expected in `aud`. */
   audience: string;
-  /** Allowed algorithms. Defaults to `['RS256']`. Never derived from the token. */
-  algorithms?: JwtAccessTokenAlgorithm[];
+  /**
+   * Allowed algorithms. Never derived from the token, and never defaulted: an
+   * authorization server signing `ES256` against a validator that assumed `RS256`
+   * would reject every token as `invalid_token` with nothing to distinguish it
+   * from an expired one.
+   */
+  algorithms: JwtAccessTokenAlgorithm[];
   /**
    * Resolve trusted public keys. Token-controlled key URLs are never followed.
    *
@@ -223,21 +206,17 @@ export interface JwtAccessTokenValidatorOptions<Env = Cloudflare.Env, Props = un
   keys(env: Env, hint: JwtAccessTokenKeyHint): JwtAccessTokenPublicKey[] | Promise<JwtAccessTokenPublicKey[]>;
   /** Map already verified claims to the typed context exposed as `ctx.props`. */
   mapClaimsToProps(input: JwtClaimsToPropsInput<Env>): Props | null | Promise<Props | null>;
-  /** Permitted clock skew in seconds. Defaults to 30 seconds. */
-  clockSkewSeconds?: number;
-  /** Maximum accepted compact-token size. Defaults to 16 KiB. */
-  maxTokenBytes?: number;
 }
 
-/** Structural input accepted by both combined and standalone resource-server validators. */
-export interface JwtAccessTokenValidationInput<Env> {
+/** Input the resource-server host passes to a `validateToken` callback. */
+interface JwtAccessTokenValidationInput<Env> {
   token: string;
   request: Request;
   env: Env;
 }
 
-/** Structural result accepted by both resource-server validation surfaces. */
-export interface JwtAccessTokenValidation<Props> {
+/** What this validator returns. `expiresAt` is always populated, unlike the host's own type. */
+interface JwtAccessTokenValidation<Props> {
   props: Props;
   audience: string;
   expiresAt: number;
@@ -256,7 +235,6 @@ export function createJwtAccessTokens<Env = Cloudflare.Env, Props = unknown>(
 ): JwtAccessTokens<Env, Props> {
   const issuer = validateIssuer(options?.issuer);
   const jwksUri = validateAbsoluteHttpsUrl(options?.jwksUri, 'jwksUri');
-  const maxTokenBytes = validateMaxTokenBytes(options?.maxTokenBytes);
   if (typeof options?.keys !== 'function') throw new TypeError('keys must be a function');
   if (options.publicClaims !== undefined && typeof options.publicClaims !== 'function') {
     throw new TypeError('publicClaims must be a function');
@@ -295,7 +273,6 @@ export function createJwtAccessTokens<Env = Cloudflare.Env, Props = unknown>(
   const accessTokens: JwtAccessTokens<Env, Props> = {
     issuer,
     jwksUri,
-    maxTokenBytes,
 
     async issue(input): Promise<JwtIssuedAccessToken> {
       const snapshot = snapshotIssueInput(input);
@@ -304,7 +281,7 @@ export function createJwtAccessTokens<Env = Cloudflare.Env, Props = unknown>(
       const publicClaims =
         projectedClaims === undefined
           ? undefined
-          : cloneJsonValue(projectedClaims, 'publicClaims return value', maxTokenBytes);
+          : cloneJsonValue(projectedClaims, 'publicClaims return value', MAX_TOKEN_BYTES);
 
       const claims: JwtAccessTokenClaims = {
         iss: issuer,
@@ -323,11 +300,6 @@ export function createJwtAccessTokens<Env = Cloudflare.Env, Props = unknown>(
       const encodedClaims = encodeJson(claims);
       const signingInputText = `${encodedHeader}.${encodedClaims}`;
       const signingInput = new TextEncoder().encode(signingInputText);
-      const projectedTokenBytes =
-        signingInput.byteLength + 1 + encodedBase64UrlLength(expectedSignatureBytes(keySet.current));
-      if (projectedTokenBytes > maxTokenBytes) {
-        throw new TypeError(`JWT access token exceeds the configured ${maxTokenBytes}-byte limit`);
-      }
       const signature = new Uint8Array(
         await crypto.subtle.sign(getSigningAlgorithm(keySet.current.alg), keySet.current.privateKey, signingInput)
       );
@@ -335,8 +307,8 @@ export function createJwtAccessTokens<Env = Cloudflare.Env, Props = unknown>(
       // first token issued under a key costs the extra verification.
       await assertSigningKeyPair(keySet.current, { signature, data: signingInput });
       const token = `${signingInputText}.${encodeBytes(signature)}`;
-      if (new TextEncoder().encode(token).byteLength > maxTokenBytes) {
-        throw new TypeError(`JWT access token exceeds the configured ${maxTokenBytes}-byte limit`);
+      if (new TextEncoder().encode(token).byteLength > MAX_TOKEN_BYTES) {
+        throw new TypeError(`JWT access token exceeds the ${MAX_TOKEN_BYTES}-byte limit`);
       }
       return { token, claims };
     },
@@ -346,15 +318,10 @@ export function createJwtAccessTokens<Env = Cloudflare.Env, Props = unknown>(
         throw new TypeError('allowedAudiences must contain at least one canonical resource URI');
       }
       const audiences = [...new Set(allowedAudiences.map((value) => validateCanonicalResource(value)))];
-      const parsed = parseCompactJwt(token, maxTokenBytes);
+      const parsed = parseCompactJwt(token);
       if (!parsed || !isAcceptedJwtType(parsed.header.typ)) return null;
       if (parsed.claims.iss !== issuer) return null;
       return verifyAgainstAudiences(parsed, audiences, env);
-    },
-
-    recognizes(token): boolean {
-      const parsed = parseCompactJwt(token, maxTokenBytes);
-      return !!parsed && isAcceptedJwtType(parsed.header.typ) && parsed.claims.iss === issuer;
     },
 
     async getJwks(env): Promise<{ keys: JwtAccessTokenPublicKey[] }> {
@@ -364,16 +331,17 @@ export function createJwtAccessTokens<Env = Cloudflare.Env, Props = unknown>(
     },
   };
 
-  internalStateVerifiers.set(accessTokens, {
+  internals.set(accessTokens, {
     verify: async (token, env) => {
-      const parsed = parseCompactJwt(token, maxTokenBytes);
+      const parsed = parseCompactJwt(token);
       if (!parsed || !isAcceptedJwtType(parsed.header.typ) || parsed.claims.iss !== issuer) return null;
       const audience = readCanonicalSingleAudience(parsed.claims.aud);
       if (!audience) return null;
-      return verifyAgainstAudiences(parsed, [audience], env as Env);
+      return verifyAgainstAudiences(parsed, [audience], env);
     },
-    warm: async (env) => {
-      await assertSigningKeyPair(validateKeySet(await options.keys(env as Env)).current);
+    recognizes: (token) => {
+      const parsed = parseCompactJwt(token);
+      return !!parsed && isAcceptedJwtType(parsed.header.typ) && parsed.claims.iss === issuer;
     },
   });
   // Frozen so the branded object the provider re-reads on every request cannot have its
@@ -396,14 +364,12 @@ export function createJwtAccessTokenValidator<Env = Cloudflare.Env, Props = unkn
 ): (input: JwtAccessTokenValidationInput<Env>) => Promise<JwtAccessTokenValidation<Props> | null> {
   const issuer = validateIssuer(options?.issuer);
   const audience = validateCanonicalResource(options?.audience);
-  const algorithms = validateAlgorithms(options?.algorithms ?? ['RS256']);
-  const clockSkewSeconds = validateClockSkew(options?.clockSkewSeconds);
-  const maxTokenBytes = validateMaxTokenBytes(options?.maxTokenBytes);
+  const algorithms = validateAlgorithms(options?.algorithms);
   if (typeof options?.keys !== 'function') throw new TypeError('keys must be a function');
   if (typeof options?.mapClaimsToProps !== 'function') throw new TypeError('mapClaimsToProps must be a function');
 
   return async ({ token, request, env }) => {
-    const parsed = parseCompactJwt(token, maxTokenBytes);
+    const parsed = parseCompactJwt(token);
     if (!parsed) return null;
     const preflight: PreflightOptions = {
       issuer,
@@ -413,7 +379,7 @@ export function createJwtAccessTokenValidator<Env = Cloudflare.Env, Props = unkn
       // identifier, so an interoperable array audience is honoured here even though the
       // package's own issuer only mints a single string.
       requireSingleAudience: false,
-      clockSkewSeconds,
+      clockSkewSeconds: DEFAULT_CLOCK_SKEW_SECONDS,
     };
     if (!preflightParsedJwt(parsed, preflight)) return null;
     // preflightParsedJwt has already restricted `alg` to `algorithms` and required a `kid`.
@@ -431,7 +397,7 @@ export function createJwtAccessTokenValidator<Env = Cloudflare.Env, Props = unkn
       allowedAlgorithms: algorithms,
       publicKeys,
       requireSingleAudience: false,
-      clockSkewSeconds,
+      clockSkewSeconds: DEFAULT_CLOCK_SKEW_SECONDS,
     });
     if (!verified) return null;
     const props = await options.mapClaimsToProps({ ...verified, request, env });
@@ -551,8 +517,8 @@ function parseScopeClaim(value: unknown): string[] | null {
   return scopes;
 }
 
-function parseCompactJwt(token: string, maxTokenBytes: number): ParsedJwt | null {
-  if (typeof token !== 'string' || !token || new TextEncoder().encode(token).byteLength > maxTokenBytes) return null;
+function parseCompactJwt(token: string): ParsedJwt | null {
+  if (typeof token !== 'string' || !token || new TextEncoder().encode(token).byteLength > MAX_TOKEN_BYTES) return null;
   const segments = token.split('.');
   if (segments.length !== 3 || segments.some((segment) => !segment)) return null;
   try {
@@ -806,27 +772,11 @@ function isCanonicalHttpsUrl(value: string): boolean {
   );
 }
 
-function validateAlgorithms(value: JwtAccessTokenAlgorithm[]): JwtAccessTokenAlgorithm[] {
+function validateAlgorithms(value: unknown): JwtAccessTokenAlgorithm[] {
   if (!Array.isArray(value) || value.length === 0 || value.some((alg) => !isSupportedAlgorithm(alg))) {
     throw new TypeError('algorithms must contain RS256 and/or ES256');
   }
   return [...new Set(value)];
-}
-
-function validateClockSkew(value: number | undefined): number {
-  const skew = value ?? DEFAULT_CLOCK_SKEW_SECONDS;
-  if (!Number.isInteger(skew) || skew < 0 || skew > 300) {
-    throw new TypeError('clockSkewSeconds must be an integer between 0 and 300');
-  }
-  return skew;
-}
-
-function validateMaxTokenBytes(value: number | undefined): number {
-  const limit = value ?? DEFAULT_MAX_TOKEN_BYTES;
-  if (!Number.isInteger(limit) || limit < 1024 || limit > MAX_CONFIGURED_TOKEN_BYTES) {
-    throw new TypeError(`maxTokenBytes must be an integer between 1024 and ${MAX_CONFIGURED_TOKEN_BYTES}`);
-  }
-  return limit;
 }
 
 function isSupportedAlgorithm(value: unknown): value is JwtAccessTokenAlgorithm {
@@ -845,15 +795,6 @@ function getImportAlgorithm(algorithm: JwtAccessTokenAlgorithm): Parameters<Subt
 
 function getSigningAlgorithm(algorithm: JwtAccessTokenAlgorithm): Parameters<SubtleCrypto['sign']>[0] {
   return algorithm === 'RS256' ? { name: 'RSASSA-PKCS1-v1_5' } : { name: 'ECDSA', hash: 'SHA-256' };
-}
-
-function expectedSignatureBytes(key: JwtAccessTokenSigningKey): number {
-  if (key.alg === 'ES256') return 64;
-  return Math.ceil(((key.privateKey.algorithm as { modulusLength?: number }).modulusLength ?? 0) / 8);
-}
-
-function encodedBase64UrlLength(byteLength: number): number {
-  return Math.ceil((byteLength * 4) / 3);
 }
 
 async function verifySignature(
@@ -1049,7 +990,7 @@ function cloneJsonValueAt(value: unknown, source: string, state: JsonCloneState,
 function consumeCloneTextBudget(state: JsonCloneState, value: string, source: string): void {
   state.remainingTextBytes -= new TextEncoder().encode(value).byteLength;
   if (state.remainingTextBytes < 0) {
-    throw new TypeError(`${source} exceeds the configured JWT token-size budget`);
+    throw new TypeError(`${source} exceeds the JWT token-size budget`);
   }
 }
 

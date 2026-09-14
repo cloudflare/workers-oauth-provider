@@ -6,8 +6,6 @@ import {
 } from './oauth-resource';
 
 const PROTECTED_RESOURCE_WELL_KNOWN_PREFIX = '/.well-known/oauth-protected-resource';
-/** Matches the default the package's JWT validators apply to `exp`, `iat` and `nbf`. */
-const CLOCK_SKEW_SECONDS = 30;
 const NO_CACHE_HEADERS = { 'Cache-Control': 'no-store', Pragma: 'no-cache' } as const;
 
 /** RFC 9728 metadata published by a standalone OAuth resource server. */
@@ -312,10 +310,7 @@ function isValidTokenValidation<Props>(
 
   if (validation.expiresAt !== undefined) {
     if (typeof validation.expiresAt !== 'number' || !Number.isFinite(validation.expiresAt)) return false;
-    // `exp` is stamped by the authorization server's clock and read by this one, so the
-    // same allowance the package's own validators apply is honoured here. Without it this
-    // host silently overrode a configured `clockSkewSeconds` back to zero.
-    if (validation.expiresAt <= Date.now() / 1000 - CLOCK_SKEW_SECONDS) return false;
+    if (validation.expiresAt <= Date.now() / 1000) return false;
   }
 
   return true;
