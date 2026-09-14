@@ -137,6 +137,7 @@ export class MockExecutionContext implements ExecutionContext {
 export type TestEnv = {
   OAUTH_KV: MockKV;
   OAUTH_PROVIDER: OAuthHelpers | null;
+  JWT_ISSUANCE_ENABLED?: boolean;
 };
 
 // Simple API handler for testing
