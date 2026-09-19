@@ -418,9 +418,10 @@ export interface JwksKeyResolverOptions<Env = Cloudflare.Env> {
    */
   fetcher?: (env: Env) => JwksFetcher | undefined;
   /**
-   * How long a fetched key set is reused, in seconds. A shorter `max-age` on the
-   * response wins. Defaults to 300 seconds, which is what this package's own
-   * authorization server publishes.
+   * How long a fetched key set is reused, in seconds. The response's `Cache-Control`
+   * can only shorten this: a smaller `max-age` wins, and `no-store` or `no-cache`
+   * fetches on every validation. Defaults to 300 seconds, which is what this package's
+   * own authorization server publishes.
    */
   cacheTtlSeconds?: number;
 }
@@ -441,6 +442,12 @@ export interface JwksFetcher {
  * resource server into an amplifier pointed at the authorization server's JWKS endpoint.
  * Serving a stale set meanwhile is safe, because verification still has to succeed
  * against whatever keys come back.
+ *
+ * A key set is reused for `cacheTtlSeconds`, or for less when the response's
+ * `Cache-Control` says so: `max-age` caps the lifetime, and `no-store` or `no-cache`
+ * means every validation fetches again, with concurrent validations sharing one
+ * request. A key the authorization server removes therefore stops verifying no later
+ * than its own `Cache-Control` allows.
  */
 export function createJwksKeyResolver<Env = Cloudflare.Env>(
   options: JwksKeyResolverOptions<Env>
@@ -460,7 +467,7 @@ export function createJwksKeyResolver<Env = Cloudflare.Env>(
         const fetched = await fetchJwks(jwksUri, options.fetcher?.(env));
         cached = {
           keys: fetched.keys,
-          expiresAt: now + Math.min(maxCacheTtlSeconds, fetched.maxAgeSeconds ?? maxCacheTtlSeconds),
+          expiresAt: now + Math.min(maxCacheTtlSeconds, fetched.freshnessSeconds ?? maxCacheTtlSeconds),
           nextForcedRefreshAt: now + JWKS_REFRESH_COOLDOWN_SECONDS,
         };
         return cached.keys;
@@ -484,8 +491,8 @@ export function createJwksKeyResolver<Env = Cloudflare.Env>(
 
 interface FetchedJwks {
   keys: JwtPublicKey[];
-  /** `max-age` from the response, when it declared one. */
-  maxAgeSeconds?: number;
+  /** How long the response permits its own reuse, when its `Cache-Control` said. */
+  freshnessSeconds?: number;
 }
 
 async function fetchJwks(jwksUri: string, fetcher: JwksFetcher | undefined): Promise<FetchedJwks> {
@@ -507,14 +514,47 @@ async function fetchJwks(jwksUri: string, fetcher: JwksFetcher | undefined): Pro
     if (!document || typeof document !== 'object' || !Array.isArray((document as { keys?: unknown }).keys)) {
       throw new TypeError('JWKS response has no keys array');
     }
-    const maxAge = /(?:^|,)\s*max-age=(\d+)/i.exec(response.headers.get('Cache-Control') ?? '');
+    const freshnessSeconds = jwksFreshnessSeconds(response);
     return {
       keys: (document as { keys: JwtPublicKey[] }).keys,
-      ...(maxAge ? { maxAgeSeconds: Number(maxAge[1]) } : {}),
+      ...(freshnessSeconds !== undefined ? { freshnessSeconds } : {}),
     };
   } finally {
     clearTimeout(timeout);
   }
+}
+
+/**
+ * How long a JWKS response permits its own reuse, in seconds, from the `Cache-Control`
+ * directives that bind a private cache. `undefined` when the response says nothing
+ * about freshness, so the configured TTL applies.
+ *
+ * The most restrictive directive wins (RFC 9111 §4.2.1): `no-store` or `no-cache` is
+ * zero, a repeated `max-age` takes the smallest, and a `max-age` whose argument is not
+ * delta-seconds, as a token or quoted, counts as stale. A misconfigured origin can only
+ * make a resource server fetch more often, never serve a removed key for longer.
+ * `s-maxage` and `private` address shared caches and are ignored.
+ *
+ * Splitting on commas is enough here: a quoted argument containing a comma is not a
+ * shape any freshness directive takes, and a mis-split can only yield an unrecognised
+ * name or an invalid argument, both of which land on the restrictive side.
+ */
+function jwksFreshnessSeconds(response: Response): number | undefined {
+  const cacheControl = response.headers.get('Cache-Control');
+  if (cacheControl === null) return undefined;
+  let freshness: number | undefined;
+  for (const directive of cacheControl.split(',')) {
+    const separator = directive.indexOf('=');
+    const name = (separator === -1 ? directive : directive.slice(0, separator)).trim().toLowerCase();
+    if (name === 'no-store' || name === 'no-cache') return 0;
+    if (name !== 'max-age') continue;
+    const rawArgument = separator === -1 ? '' : directive.slice(separator + 1).trim();
+    const argument = rawArgument.replace(/^"(.*)"$/, '$1');
+    // RFC 9111 §1.2.2: a delta-seconds value beyond what can be represented is 2^31.
+    const seconds = /^\d+$/.test(argument) ? Math.min(Number(argument), 2 ** 31) : 0;
+    freshness = freshness === undefined ? seconds : Math.min(freshness, seconds);
+  }
+  return freshness;
 }
 
 /** Bound memory before parsing a response this Worker does not control the size of. */

@@ -502,7 +502,7 @@ Rotate keys in this order:
 3. Promote the new private key to `signingKey`, remove its now-duplicate public JWK from `verificationKeys`, and add the retiring key's public JWK there.
 4. Keep the old public JWK until the last token signed with it has passed the maximum effective access-token lifetime, plus JWKS cache time and clock skew; then remove it.
 
-Resource Workers should fetch only the configured `jwks_uri`, never cache longer than its response allows, and select exactly one key by `kid` and pinned algorithm. `createJwksKeyResolver()` does all three.
+Resource Workers should fetch only the configured `jwks_uri`, never cache longer than its response's `Cache-Control` allows, and select exactly one key by `kid` and pinned algorithm. `createJwksKeyResolver()` does all three: a smaller `max-age` shortens its cache, and `no-store` or `no-cache` makes it fetch for every validation.
 
 Roll this out reader before writer. `jwtAccessTokens` installs the JWT reader, signer, and JWKS; `accessTokenFormat` controls only the representation of each newly issued access token:
 

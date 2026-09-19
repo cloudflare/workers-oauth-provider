@@ -1051,6 +1051,74 @@ describe('createJwksKeyResolver', () => {
     }
   });
 
+  it('never reuses a key set longer than its Cache-Control allows', async () => {
+    const key = await createKey('RS256', 'key-1');
+    const now = Math.floor(Date.now() / 1000);
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now * 1000);
+    // Fetch count after two validations at one instant, then after a third two seconds later.
+    const fetchesFor = async (cacheControl: string): Promise<[number, number]> => {
+      const fetch = vi.fn(async () => jwksResponse([key.publicJwk], { 'Cache-Control': cacheControl }));
+      const resolve = createJwksKeyResolver<{}>({
+        jwksUri: JWKS_URI,
+        fetcher: () => ({ fetch }),
+        cacheTtlSeconds: 3600,
+      });
+      clock.mockReturnValue(now * 1000);
+      await resolve({}, { kid: 'key-1', alg: 'RS256' });
+      await resolve({}, { kid: 'key-1', alg: 'RS256' });
+      const atOnce = fetch.mock.calls.length;
+      clock.mockReturnValue((now + 2) * 1000);
+      await resolve({}, { kid: 'key-1', alg: 'RS256' });
+      return [atOnce, fetch.mock.calls.length];
+    };
+
+    try {
+      // A response that forbids reuse is fetched for every validation.
+      await expect(fetchesFor('no-store')).resolves.toEqual([2, 3]);
+      await expect(fetchesFor('no-cache')).resolves.toEqual([2, 3]);
+      await expect(fetchesFor('public, max-age=0')).resolves.toEqual([2, 3]);
+      // Directive names are case-insensitive, and the most restrictive one wins.
+      await expect(fetchesFor('NO-CACHE, max-age=300')).resolves.toEqual([2, 3]);
+      await expect(fetchesFor('max-age=3600, max-age=1')).resolves.toEqual([1, 2]);
+      // Invalid freshness is stale: a misconfigured server fetches more, never less.
+      await expect(fetchesFor('max-age=soon')).resolves.toEqual([2, 3]);
+      await expect(fetchesFor('max-age=-1')).resolves.toEqual([2, 3]);
+      await expect(fetchesFor('max-age')).resolves.toEqual([2, 3]);
+      // Delta-seconds may be a token or quoted, in any case.
+      await expect(fetchesFor('Public, Max-Age="1"')).resolves.toEqual([1, 2]);
+      // Shared-cache directives, and ones that only extend reuse, do not shorten it.
+      await expect(fetchesFor('private, s-maxage=0, max-age=1, stale-while-revalidate=30')).resolves.toEqual([1, 2]);
+      await expect(fetchesFor('private, s-maxage=0')).resolves.toEqual([1, 1]);
+      // No freshness directive at all leaves the configured TTL in charge.
+      await expect(fetchesFor('public')).resolves.toEqual([1, 1]);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it('shares one request between concurrent validations when the response forbids reuse', async () => {
+    const key = await createKey('RS256', 'key-1');
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const fetch = vi.fn(async () => {
+      await gate;
+      return jwksResponse([key.publicJwk], { 'Cache-Control': 'no-store' });
+    });
+    const resolve = createJwksKeyResolver<{}>({ jwksUri: JWKS_URI, fetcher: () => ({ fetch }) });
+
+    // Ten validations arrive while the first fetch is in flight: one request serves all of them.
+    const pending = Array.from({ length: 10 }, () => resolve({}, { kid: 'key-1', alg: 'RS256' }));
+    release();
+    for (const keys of await Promise.all(pending)) expect(keys).toMatchObject([{ kid: 'key-1' }]);
+    expect(fetch).toHaveBeenCalledTimes(1);
+
+    // The next validation after that fetches again, as `no-store` asks.
+    await resolve({}, { kid: 'key-1', alg: 'RS256' });
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
   it('rejects a failed, malformed, or oversized response and validates its own configuration', async () => {
     expect(() => createJwksKeyResolver<{}>({ jwksUri: 'http://auth.example.com/jwks.json' })).toThrow(
       'jwksUri must be an absolute HTTPS URL'
