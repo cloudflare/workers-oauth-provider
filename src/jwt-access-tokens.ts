@@ -225,10 +225,15 @@ interface JwtAccessTokenValidation<Props> {
 /**
  * Create an RFC 9068 access-token signer and reader for `OAuthAuthorizationServer`.
  *
- * New access tokens default to signed JWTs; `accessTokenFormat` can keep writing
- * opaque tokens during a reader-first rollout. The provider still keeps its
- * encrypted token-context record so built-in validation, confidential
- * `ctx.props`, token exchange, and immediate revocation retain their behavior.
+ * Passing the result as `jwtAccessTokens` installs the reader, the signer and the JWKS
+ * endpoint; issuance stays opaque until `accessTokenFormat` returns `'jwt'`, so the
+ * reader always ships before the writer. The provider still keeps its encrypted
+ * token-context record so built-in validation, confidential `ctx.props`, token
+ * exchange, and immediate revocation retain their behavior.
+ *
+ * `keys(env)` runs on every issuance and every same-Worker verification. Import the
+ * private key once per isolate and return the memoised set, rather than calling
+ * `crypto.subtle.importKey` inside it each time.
  */
 export function createJwtAccessTokens<Env = Cloudflare.Env, Props = unknown>(
   options: JwtAccessTokensOptions<Env, Props>
