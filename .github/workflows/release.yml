@@ -6,6 +6,12 @@ on:
     branches: [main]
     types: [completed]
 
+# `npm publish` moves `latest` unless told otherwise. Never let this publish interleave
+# with one from the v0 maintenance branch; the group is shared with v0's release.yml.
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
 jobs:
   release:
     permissions:
