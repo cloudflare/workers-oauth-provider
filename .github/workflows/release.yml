@@ -1,14 +1,19 @@
 name: Release
 
-# `workflow_run` always runs this file from the default branch, whatever branch's CI
-# completed. So releases for the `v0` maintenance branch are driven from `main`'s copy
-# of this file, and every step below must act on the branch whose CI run finished
-# rather than on the default branch it was loaded from.
+# The 0.x maintenance branch releases on push. main releases from a `workflow_run` after
+# CI, but that event always executes the default branch's copy of the workflow with the
+# default branch's `github.sha`, and changesets/action bases its Version Packages branch
+# and its tags on that sha. A v0 release therefore has to be triggered by a push to v0
+# itself, and it repeats CI's checks so that nothing untested is released.
 on:
-  workflow_run:
-    workflows: ['CI']
-    branches: [main, v0]
-    types: [completed]
+  push:
+    branches: [v0]
+
+# `npm publish` moves `latest` unless told otherwise. Never let a v0 publish interleave
+# with one from main; the group is shared with main's release.yml.
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
 
 jobs:
   release:
@@ -17,15 +22,14 @@ jobs:
       contents: write
       pull-requests: write
 
-    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.repository_owner == 'cloudflare' }}
-    timeout-minutes: 5
+    if: ${{ github.repository_owner == 'cloudflare' }}
+    timeout-minutes: 10
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
-          ref: ${{ github.event.workflow_run.head_branch }}
 
       - uses: actions/setup-node@v4
         with:
@@ -34,11 +38,12 @@ jobs:
 
       - run: npm ci
       - run: npm run build
+      - run: npm run check
+      - run: npx prettier --check .
 
       - id: changesets
         uses: changesets/action@v1
         with:
-          branch: ${{ github.event.workflow_run.head_branch }}
           version: ./.github/changeset-version.sh
           publish: ./.github/changeset-publish.sh
         env:
