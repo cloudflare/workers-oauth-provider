@@ -209,6 +209,10 @@ CI runs on every PR:
 
 All checks must pass before merge.
 
+### 0.x maintenance branch (`v0`)
+
+`main` carries the 1.0 line. Fixes that 0.x users need are cherry-picked to `v0` in a PR against that branch, with their changeset; the release workflow opens a Version Packages PR against `v0` and publishes from it. Once npm's `latest` is 1.x, `.github/changeset-publish.sh` publishes v0 releases under the `v0` dist-tag so they never displace `latest`. Only `main`'s `release.yml` is executed (`workflow_run` reads the default branch); keep `v0`'s copy identical.
+
 ### Bonk (AI code review)
 
 Mention `/bonk` or `@ask-bonk` in PR comments to get AI-powered code review and suggestions. Bonk can analyze code, suggest fixes, and even auto-commit improvements.

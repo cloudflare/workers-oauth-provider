@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, v0]
   pull_request:
-    branches: [main]
+    branches: [main, v0]
 
 jobs:
   # Main test job (named "test" to satisfy GitHub's expected status check)
