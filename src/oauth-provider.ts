@@ -6380,17 +6380,17 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
     let cursor: string | undefined;
     do {
       const page = await this.env.OAUTH_KV.list<unknown>({ prefix, limit: MAX_KV_LIST_LIMIT, cursor });
-      const unreadable: string[] = [];
+      const toRead: string[] = [];
       for (const key of page.keys) {
         if (isGrantKeyMetadata(key.metadata)) {
           if (matches(key.metadata)) found.push(key.name.slice(prefix.length));
         } else {
-          unreadable.push(key.name);
+          toRead.push(key.name);
         }
       }
-      for (let start = 0; start < unreadable.length; start += readConcurrency) {
+      for (let start = 0; start < toRead.length; start += readConcurrency) {
         const grants = await Promise.all(
-          unreadable
+          toRead
             .slice(start, start + readConcurrency)
             .map((name) => this.env.OAUTH_KV.get<Grant>(name, { type: 'json' }))
         );
