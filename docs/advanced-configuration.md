@@ -213,7 +213,7 @@ By default a grant's lifetime is fixed at the code exchange: it expires `refresh
 
 Returning `refreshTokenIdleTTL` from `tokenExchangeCallback` sets the lifetime for that one refresh and overrides the option, as in the example above. It sets rather than extends, so returning the upstream's remaining lifetime makes the grant track it exactly; return nothing when the upstream did not rotate and the option, or the fixed lifetime, applies.
 
-The slide happens only when a refresh succeeds. A callback that throws fails the refresh before anything is written, so a failed upstream refresh never renews the downstream grant. A grant that has already expired, including one that expires while a slow callback runs, is rejected with `invalid_grant` and is not revived. A retry with the immediately previous refresh token is a successful refresh and slides the expiry again.
+The slide is committed by the same grant write that rotates the refresh token. A callback that throws fails the refresh before that write, so a failed upstream refresh never renews the downstream grant. A grant that has already expired, including one that expires while a slow callback runs, is rejected with `invalid_grant` and is not revived. If the access-token write after the grant write fails, the grant is already rotated and extended, and the client's previous refresh token is still valid to retry with; that retry slides the expiry again.
 
 There is no built-in absolute maximum. A grant with `refreshTokenTTL: undefined` already lives indefinitely, and the callback is the place for lifetime policy: record the authorization time in `props` when the grant is created, and return a shrinking `refreshTokenIdleTTL`, or throw, once the grant is older than you allow.
 

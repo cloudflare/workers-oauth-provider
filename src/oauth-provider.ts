@@ -3676,9 +3676,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Sliding expiry. This runs after the re-check above, so a grant that expired while the
     // callback ran is not revived, and before the access-token clamp below, so the new access
-    // token may outlive the expiry being replaced. The grant write further down persists the
-    // new expiry as the record's KV expiration. A refresh that fails anywhere before that
-    // write, including in the callback, leaves the old expiry in place.
+    // token may outlive the expiry being replaced. The grant write further down commits the
+    // new expiry, as the record's KV expiration, together with the refresh-token rotation: a
+    // refresh that fails before that write leaves the old expiry, and one that fails after it
+    // leaves a rotated, extended grant that the client's still-valid previous token retries.
     if (refreshTokenIdleTTL !== undefined) {
       grantData.expiresAt = now + refreshTokenIdleTTL;
     }
