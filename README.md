@@ -594,6 +594,8 @@ Sensitive values are not stored in plaintext:
 
 See [storage-schema.md](https://github.com/cloudflare/workers-oauth-provider/blob/main/storage-schema.md) for the complete KV layout.
 
+By default `completeAuthorization()` revokes the user's earlier grants for the same client and resource. It finds them from KV key metadata that every grant written by 1.0 or later carries, so the cost is one `list()` per thousand grants the user has, not a read per grant. Grants written before 1.0 are read individually, `revokeExistingGrantsBatchSize` at a time (default 50), until a refresh rewrites them with metadata.
+
 KV TTLs remove expiring records automatically. `purgeExpiredData()` provides a manual sweep for orphaned or expired grants and tokens:
 
 ```ts

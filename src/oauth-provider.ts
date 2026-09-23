@@ -1091,10 +1091,12 @@ export interface CompleteAuthorizationOptions {
   revokeExistingGrants?: boolean;
 
   /**
-   * Maximum number of grants to fetch per page when revoking existing
-   * grants. Only used when revokeExistingGrants is not false.
-   * Must be a positive integer. Values above Cloudflare KV's 1000-key page
-   * limit are clamped to 1000. Defaults to 50.
+   * How many grants written by a version before 1.0 are read at once while
+   * revoking existing grants. Grants written by 1.0 or later carry their client,
+   * resource and redirect URI as KV key metadata and are matched from `list()`
+   * without being read, so this only bounds the fan-out for older grants. Only
+   * used when revokeExistingGrants is not false. Must be a positive integer;
+   * values above 1000 are clamped. Defaults to 50.
    */
   revokeExistingGrantsBatchSize?: number;
 }
@@ -4837,7 +4839,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const kvOptions =
       grantData.expiresAt !== undefined ? { expiration: Math.max(grantData.expiresAt, minExpiration) } : {};
     try {
-      await env.OAUTH_KV.put(grantKey, JSON.stringify(grantData), kvOptions);
+      await env.OAUTH_KV.put(grantKey, JSON.stringify(grantData), grantPutOptions(grantData, kvOptions));
     } catch (error) {
       this.throwRetryableTokenStorageErrorIfKvRateLimited(error);
       throw error;
@@ -5501,8 +5503,9 @@ const DEFAULT_PURGE_BATCH_SIZE = 50;
 const MAX_KV_LIST_LIMIT = 1000;
 
 /**
- * Default batch size for paginating existing grants when revoking them
- * during completeAuthorization. Conservative for each KV list page.
+ * How many grants written without key metadata `completeAuthorization()` reads at
+ * once while looking for grants to replace. Grants written with key metadata are
+ * matched from `list()` alone and never read.
  */
 const DEFAULT_REVOKE_EXISTING_GRANTS_BATCH_SIZE = 50;
 
@@ -5516,6 +5519,52 @@ function getRevokeExistingGrantsBatchSize(batchSize: number | undefined): number
   }
 
   return Math.min(batchSize, MAX_KV_LIST_LIMIT);
+}
+
+/**
+ * The fields a new authorization matches an existing grant on, mirrored into the
+ * grant key's KV metadata so `list()` returns them and `completeAuthorization()` does
+ * not have to read every grant record the user has. Nothing here is secret: the
+ * grant record already stores all three in the clear.
+ */
+interface GrantKeyMetadata {
+  clientId: string;
+  resource?: string | string[];
+  redirectUri?: string;
+}
+
+/** KV serialises key metadata as JSON and rejects a write carrying more than this. */
+const MAX_KV_METADATA_BYTES = 1024;
+
+/**
+ * Key metadata for a grant record, or `undefined` when it would not fit. A grant
+ * written without metadata is read individually when scanned, exactly like a grant
+ * written before metadata existed; that only happens when a `client_id` and two URLs
+ * together exceed a kilobyte.
+ */
+function grantKeyMetadata(grant: Grant): GrantKeyMetadata | undefined {
+  const metadata: GrantKeyMetadata = { clientId: grant.clientId };
+  if (grant.resource !== undefined) metadata.resource = grant.resource;
+  if (grant.redirectUri !== undefined) metadata.redirectUri = grant.redirectUri;
+  const bytes = new TextEncoder().encode(JSON.stringify(metadata)).byteLength;
+  return bytes <= MAX_KV_METADATA_BYTES ? metadata : undefined;
+}
+
+/** Every grant write goes through here so the key metadata cannot drift from the record. */
+function grantPutOptions(grant: Grant, expiry: KVNamespacePutOptions = {}): KVNamespacePutOptions {
+  const metadata = grantKeyMetadata(grant);
+  return metadata ? { ...expiry, metadata } : expiry;
+}
+
+/** Whether a listed key carries metadata this version can match a grant on. */
+function isGrantKeyMetadata(value: unknown): value is GrantKeyMetadata {
+  if (typeof value !== 'object' || value === null) return false;
+  const { clientId, resource, redirectUri } = value as Record<string, unknown>;
+  return (
+    typeof clientId === 'string' &&
+    (resource === undefined || typeof resource === 'string' || Array.isArray(resource)) &&
+    (redirectUri === undefined || typeof redirectUri === 'string')
+  );
 }
 
 /**
@@ -6141,21 +6190,15 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
       // without a stored redirectUri never match and are left alone — the bug being fixed
       // is over-revocation, so not revoking is the safe direction.
       const isCimdClient = this.provider.isClientMetadataUrl(clientId);
-      const batchSize = getRevokeExistingGrantsBatchSize(options.revokeExistingGrantsBatchSize);
-      let cursor: string | undefined;
-      do {
-        const page = await this.listUserGrants(options.userId, { cursor, limit: batchSize });
-        for (const grant of page.items) {
-          if (
-            grant.clientId === clientId &&
-            (!isCimdClient || grant.redirectUri === options.request.redirectUri) &&
-            this.provider.shouldReplaceGrantForResource(grant.resource, effectiveResource)
-          ) {
-            grantsToRevoke.push(grant.id);
-          }
-        }
-        cursor = page.cursor;
-      } while (cursor);
+      const readConcurrency = getRevokeExistingGrantsBatchSize(options.revokeExistingGrantsBatchSize);
+      grantsToRevoke = await this.findGrantIds(
+        options.userId,
+        (grant) =>
+          grant.clientId === clientId &&
+          (!isCimdClient || grant.redirectUri === options.request.redirectUri) &&
+          this.provider.shouldReplaceGrantForResource(grant.resource, effectiveResource),
+        readConcurrency
+      );
     }
 
     // Generate a unique grant ID
@@ -6201,7 +6244,7 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
 
       // Store the grant with a key that includes the user ID
       const grantKey = `grant:${options.userId}:${grantId}`;
-      await this.env.OAUTH_KV.put(grantKey, JSON.stringify(grant));
+      await this.env.OAUTH_KV.put(grantKey, JSON.stringify(grant), grantPutOptions(grant));
 
       // Store access token with denormalized grant information
       const accessTokenData: Token = {
@@ -6289,7 +6332,11 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
 
       // Set 10-minute TTL for the grant (will be extended when code is exchanged)
       const codeExpiresIn = 600; // 10 minutes
-      await this.env.OAUTH_KV.put(grantKey, JSON.stringify(grant), { expirationTtl: codeExpiresIn });
+      await this.env.OAUTH_KV.put(
+        grantKey,
+        JSON.stringify(grant),
+        grantPutOptions(grant, { expirationTtl: codeExpiresIn })
+      );
 
       // Build the redirect URL for authorization code flow
       const redirectUrl = new URL(options.request.redirectUri);
@@ -6310,6 +6357,50 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
 
       return { redirectTo: redirectUrl.toString() };
     }
+  }
+
+  /**
+   * IDs of the user's grants that satisfy `matches`, judged from KV key metadata
+   * wherever a grant carries it. Only grants written without metadata, by a version
+   * before 1.0 or because theirs would not fit, are read, `readConcurrency` at a time.
+   *
+   * This runs on the interactive authorization path, where the pre-metadata cost of one
+   * `get()` per grant broke re-authorization for a user with more grants than a Worker
+   * has subrequests. The cost is now one `list()` per thousand grants plus one `get()`
+   * per legacy grant, and every refresh rewrites its grant with metadata, so the legacy
+   * share shrinks on its own.
+   */
+  private async findGrantIds(
+    userId: string,
+    matches: (grant: GrantKeyMetadata) => boolean,
+    readConcurrency: number
+  ): Promise<string[]> {
+    const prefix = `grant:${userId}:`;
+    const found: string[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await this.env.OAUTH_KV.list<unknown>({ prefix, limit: MAX_KV_LIST_LIMIT, cursor });
+      const toRead: string[] = [];
+      for (const key of page.keys) {
+        if (isGrantKeyMetadata(key.metadata)) {
+          if (matches(key.metadata)) found.push(key.name.slice(prefix.length));
+        } else {
+          toRead.push(key.name);
+        }
+      }
+      for (let start = 0; start < toRead.length; start += readConcurrency) {
+        const grants = await Promise.all(
+          toRead
+            .slice(start, start + readConcurrency)
+            .map((name) => this.env.OAUTH_KV.get<Grant>(name, { type: 'json' }))
+        );
+        for (const grant of grants) {
+          if (grant && matches(grant)) found.push(grant.id);
+        }
+      }
+      cursor = page.list_complete ? undefined : page.cursor;
+    } while (cursor);
+    return found;
   }
 
   /**
