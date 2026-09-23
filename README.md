@@ -504,7 +504,7 @@ Calling `OAuthHelpers.updateClient()` with `tokenEndpointAuthMethod` adds the ma
 
 Related options:
 
-- `clientRegistrationTTL` controls the lifetime of dynamically registered clients. The default is 90 days.
+- `clientRegistrationTTL` controls the lifetime of dynamically registered clients. The default is 90 days. A registration still in use does not expire: once it has passed half its lifetime, the next successful token request renews it for the full TTL, so a client that keeps refreshing keeps its `client_id` while an abandoned one is cleaned up.
 - `disallowPublicClientRegistration` rejects DCR clients using `token_endpoint_auth_method: "none"`.
 - `clientRegistrationCallback` can allow or reject registration based on application policy.
 

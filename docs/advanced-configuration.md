@@ -199,7 +199,7 @@ Both classes accept a public `description`, `statusCode`, and response `headers`
 | `accessTokenTTL`        | 3,600 seconds     | Must be at least 60 seconds because of KV limits                                    |
 | `refreshTokenTTL`       | 2,592,000 seconds | 30 days; set to `0` to disable refresh tokens; explicit `undefined` means no expiry |
 | `refreshTokenIdleTTL`   | unset             | Sliding expiry: each successful refresh moves the grant's expiry this far out       |
-| `clientRegistrationTTL` | 7,776,000 seconds | 90 days for DCR clients; explicit `undefined` means no expiry                       |
+| `clientRegistrationTTL` | 7,776,000 seconds | 90 days for DCR clients, renewed while in use; explicit `undefined` means no expiry |
 
 A refresh rotates the token. The newly issued token and the immediately previous token can both recover a refresh whose response was lost. Once the new token is used, the previous token is invalidated and another token is issued.
 

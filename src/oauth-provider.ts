@@ -1054,10 +1054,16 @@ export interface ClientInfo {
 interface StoredClientInfo extends ClientInfo {
   /** Present only when tokenEndpointAuthMethod was explicitly selected. */
   authMethodExplicit?: true;
+  /**
+   * When the record's KV expiration falls, as Unix seconds. Present only on records
+   * written under `clientRegistrationTTL`, which is what marks a registration as one the
+   * provider may renew while it is in use. `createClient()` records never carry it.
+   */
+  registrationExpiresAt?: number;
 }
 
 function toPublicClientInfo(client: StoredClientInfo): ClientInfo {
-  const { authMethodExplicit: _explicit, ...publicClient } = client;
+  const { authMethodExplicit: _explicit, registrationExpiresAt: _expiry, ...publicClient } = client;
   return publicClient;
 }
 
@@ -2350,6 +2356,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       } else {
         response = await this.handleTokenRequest(parsed.body, parsed.clientInfo, env, url, request);
       }
+      // A successful, client-authenticated request is proof the registration is in use.
+      if (response.ok) {
+        await this.renewClientRegistrationIfDue(env, parsed.clientInfo, Math.floor(Date.now() / 1000));
+      }
 
       return this.addCorsHeaders(response, request);
     }
@@ -2616,7 +2626,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   ): Promise<
     | {
         body: any;
-        clientInfo: ClientInfo;
+        clientInfo: StoredClientInfo;
         isRevocationRequest: boolean;
       }
     | Response
@@ -4586,11 +4596,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     // Store client info with optional TTL for DCR clients
-    const clientKvOptions: { expirationTtl?: number } = {};
-    if (this.options.clientRegistrationTTL !== undefined) {
-      clientKvOptions.expirationTtl = this.options.clientRegistrationTTL;
-    }
-    await env.OAUTH_KV.put(`client:${clientInfo.clientId}`, JSON.stringify(clientInfo), clientKvOptions);
+    await this.putRegisteredClient(env, clientInfo, clientInfo.registrationDate!);
 
     // Return client information with the original unhashed secret
     const response: Record<string, any> = {
@@ -4945,6 +4951,51 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * propagate, and a CIMD metadata fetch failure throws `CimdFetchError`), so an
    * upstream outage is distinguishable from an unregistered client.
    */
+  /**
+   * Write a client record that is subject to `clientRegistrationTTL`. The record carries
+   * the expiry it was written with, so a later token request can tell a registration the
+   * provider may renew from a permanent one without listing KV. With the TTL unset the
+   * record is written to last, and any stamp from an earlier configuration is dropped.
+   */
+  async putRegisteredClient(env: Env & ProviderEnv, client: StoredClientInfo, now: number): Promise<void> {
+    const ttl = this.options.clientRegistrationTTL;
+    const { registrationExpiresAt: _previous, ...record } = client;
+    if (ttl === undefined) {
+      await env.OAUTH_KV.put(`client:${client.clientId}`, JSON.stringify(record));
+      return;
+    }
+    await env.OAUTH_KV.put(
+      `client:${client.clientId}`,
+      JSON.stringify({ ...record, registrationExpiresAt: now + ttl }),
+      { expirationTtl: ttl }
+    );
+  }
+
+  /**
+   * Renew a dynamically registered client whose registration has passed half of
+   * `clientRegistrationTTL`, so a client still exchanging tokens does not vanish from
+   * under its live grants. Without this, a grant that outlives its registration fails
+   * every refresh with `invalid_client` although nothing was revoked. Only records
+   * stamped with `registrationExpiresAt` qualify: CIMD clients are never stored,
+   * `createClient()` records never expire, and a record from before the stamp existed
+   * cannot be told from a permanent one, so it keeps its original schedule and
+   * re-registers once. The half-life rule bounds this to one write per client per half
+   * TTL. Best effort: the token response it follows has already been produced.
+   */
+  async renewClientRegistrationIfDue(env: Env & ProviderEnv, client: StoredClientInfo, now: number): Promise<void> {
+    const ttl = this.options.clientRegistrationTTL;
+    if (ttl === undefined || client.registrationExpiresAt === undefined) return;
+    if (client.registrationExpiresAt - now > ttl / 2) return;
+    try {
+      // Re-read rather than re-write the authenticated copy: the record may have been
+      // updated or deleted since this request loaded it.
+      const current: StoredClientInfo | null = await env.OAUTH_KV.get(`client:${client.clientId}`, { type: 'json' });
+      if (current) await this.putRegisteredClient(env, current, now);
+    } catch (error) {
+      console.warn(`Failed to renew client registration ${client.clientId}:`, error);
+    }
+  }
+
   async getClient(env: Env & ProviderEnv, clientId: string): Promise<StoredClientInfo | null> {
     // Check if this is a CIMD (Client ID Metadata Document) URL
     if (this.isClientMetadataUrl(clientId)) {
@@ -6623,11 +6674,7 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
     }
 
     // Preserve TTL for DCR clients: re-apply clientRegistrationTTL if configured
-    const clientKvOptions: { expirationTtl?: number } = {};
-    if (this.provider.options.clientRegistrationTTL !== undefined) {
-      clientKvOptions.expirationTtl = this.provider.options.clientRegistrationTTL;
-    }
-    await this.env.OAUTH_KV.put(`client:${clientId}`, JSON.stringify(updatedClient), clientKvOptions);
+    await this.provider.putRegisteredClient(this.env, updatedClient, Math.floor(Date.now() / 1000));
 
     // Create a response object
     const response = toPublicClientInfo(updatedClient);
