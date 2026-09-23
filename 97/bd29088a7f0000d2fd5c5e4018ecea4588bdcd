@@ -1,0 +1,21 @@
+docs/advanced-configuration.md
+  s_1b1f3dce47e01c::t_e13d2e6be0fd0e 216
+src/oauth-provider.ts
+  s_1b1f3dce47e01c::t_4b39558c623bd0 3677-3680
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "97bd29088a7f0000d2fd5c5e4018ecea4588bdcd",
+  "prompts": {},
+  "sessions": {
+    "s_1b1f3dce47e01c": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a0b3b8-09e5-75fe-ad90-bf9d48da5b83",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Matt Carey <mcarey@cloudflare.com>"
+    }
+  }
+}
