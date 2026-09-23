@@ -1,0 +1,23 @@
+.github/workflows/ci.yml
+  s_1b1f3dce47e01c::t_0c733651e94de1 5,7
+.github/workflows/release.yml
+  s_1b1f3dce47e01c::t_a71b3520688cc8 6,9-14,22,43
+AGENTS.md
+  s_1b1f3dce47e01c::t_1c2f4e4645fb90 214
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "cb0105f5d7cdf3c9bbe50a606fd7d3b71dde7aaa",
+  "prompts": {},
+  "sessions": {
+    "s_1b1f3dce47e01c": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a0b3b8-09e5-75fe-ad90-bf9d48da5b83",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Matt Carey <mcarey@cloudflare.com>"
+    }
+  }
+}
