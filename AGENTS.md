@@ -211,7 +211,7 @@ All checks must pass before merge.
 
 ### 0.x maintenance branch (`v0`)
 
-`main` carries the 1.0 line. Fixes that 0.x users need are cherry-picked to `v0` in a PR against that branch, with their changeset; the release workflow opens a Version Packages PR against `v0` and publishes from it. Once npm's `latest` is 1.x, `.github/changeset-publish.sh` publishes v0 releases under the `v0` dist-tag so they never displace `latest`. Only `main`'s `release.yml` is executed (`workflow_run` reads the default branch); keep `v0`'s copy identical.
+`main` carries the 1.0 line. Fixes that 0.x users need are cherry-picked to `v0` in a PR against that branch, with their changeset. `v0` carries its own `ci.yml` and a push-triggered `release.yml` (a `workflow_run` release would give changesets/action the default branch's `github.sha`), and publishes through `.github/changeset-publish.sh`, which uses the `v0` dist-tag once npm's `latest` is 1.x so a hotfix never displaces `latest`. Both release workflows share the `npm-publish` concurrency group.
 
 ### Bonk (AI code review)
 

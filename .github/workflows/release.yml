@@ -1,14 +1,16 @@
 name: Release
 
-# `workflow_run` always runs this file from the default branch, whatever branch's CI
-# completed. So releases for the `v0` maintenance branch are driven from `main`'s copy
-# of this file, and every step below must act on the branch whose CI run finished
-# rather than on the default branch it was loaded from.
 on:
   workflow_run:
     workflows: ['CI']
-    branches: [main, v0]
+    branches: [main]
     types: [completed]
+
+# `npm publish` moves `latest` unless told otherwise. Never let this publish interleave
+# with one from the v0 maintenance branch; the group is shared with v0's release.yml.
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
 
 jobs:
   release:
@@ -17,7 +19,7 @@ jobs:
       contents: write
       pull-requests: write
 
-    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.repository_owner == 'cloudflare' }}
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.repository_owner == 'cloudflare' }}
     timeout-minutes: 5
     runs-on: ubuntu-latest
 
@@ -25,7 +27,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
-          ref: ${{ github.event.workflow_run.head_branch }}
 
       - uses: actions/setup-node@v4
         with:
@@ -38,9 +39,8 @@ jobs:
       - id: changesets
         uses: changesets/action@v1
         with:
-          branch: ${{ github.event.workflow_run.head_branch }}
           version: ./.github/changeset-version.sh
-          publish: ./.github/changeset-publish.sh
+          publish: npx changeset publish
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NPM_CONFIG_PROVENANCE: true
