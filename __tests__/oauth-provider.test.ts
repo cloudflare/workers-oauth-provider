@@ -11616,7 +11616,50 @@ describe('OAuthProvider', () => {
         expect(api2.status).toBe(200);
       });
 
-      it('paginates the existing-grant listing with the default batch size of 50', async () => {
+      // A grant record as a version before 1.0 wrote it: no KV key metadata, so the scan
+      // has to read it to learn its client.
+      async function seedLegacyGrant(grantId: string, clientId: string, redirectUri?: string): Promise<void> {
+        await reAuthEnv.OAUTH_KV.put(
+          `grant:user-1:${grantId}`,
+          JSON.stringify({
+            id: grantId,
+            clientId,
+            userId: 'user-1',
+            scope: ['read'],
+            metadata: {},
+            encryptedProps: 'legacy',
+            createdAt: 1_700_000_000,
+            refreshTokenId: `refresh-${grantId}`,
+            ...(redirectUri === undefined ? {} : { redirectUri }),
+          })
+        );
+      }
+
+      function grantKeyOps(kv: MockKV) {
+        const listSpy = vi.spyOn(kv, 'list');
+        const getSpy = vi.spyOn(kv, 'get');
+        // Peak number of grant reads in flight at once, which is what the batch size bounds.
+        let inFlight = 0;
+        let peakInFlight = 0;
+        const originalGet = MockKV.prototype.get.bind(kv);
+        getSpy.mockImplementation(async (key: string, options?: any) => {
+          if (!key.startsWith('grant:')) return originalGet(key, options);
+          inFlight++;
+          peakInFlight = Math.max(peakInFlight, inFlight);
+          try {
+            return await originalGet(key, options);
+          } finally {
+            inFlight--;
+          }
+        });
+        return {
+          lists: () => listSpy.mock.calls.filter((call: any[]) => call[0]?.prefix === 'grant:user-1:').map((c) => c[0]),
+          grantReads: () => getSpy.mock.calls.filter((call: any[]) => String(call[0]).startsWith('grant:')).length,
+          peakInFlight: () => peakInFlight,
+        };
+      }
+
+      it("finds the grant to replace from key metadata without reading any of a user's other grants", async () => {
         const provider = new OAuthProvider({
           apiRoute: ['/api/'],
           apiHandler: TestApiHandler,
@@ -11626,72 +11669,101 @@ describe('OAuthProvider', () => {
           clientRegistrationEndpoint: '/oauth/register',
           scopesSupported: ['read', 'write'],
         });
-
         const { clientId, clientSecret } = await registerClient(provider, reAuthEnv, reAuthCtx);
-
-        // Seed an initial grant so the next re-auth exercises the listing loop.
         const code1 = await authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, clientId);
         await exchangeCodeForTokens(provider, reAuthEnv, reAuthCtx, code1, clientId, clientSecret);
 
-        const listSpy = vi.spyOn(reAuthEnv.OAUTH_KV, 'list');
+        // A user with more grants for another client than one KV page holds. Before key
+        // metadata this cost a read per grant, which is more subrequests than a Worker has.
+        const { clientId: otherClientId } = await registerClient(provider, reAuthEnv, reAuthCtx);
+        const otherRequest = {
+          responseType: 'code',
+          clientId: otherClientId,
+          redirectUri: 'https://client.example.com/callback',
+          scope: ['read'],
+          state: '',
+        };
+        for (let i = 0; i < 1200; i++) {
+          await reAuthEnv.OAUTH_PROVIDER!.completeAuthorization({
+            request: otherRequest as any,
+            userId: 'user-1',
+            metadata: {},
+            scope: ['read'],
+            props: {},
+            revokeExistingGrants: false,
+          });
+        }
 
-        // Re-authorize: this is what triggers the grant-listing loop.
+        const ops = grantKeyOps(reAuthEnv.OAUTH_KV);
         const code2 = await authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, clientId);
+        // 1,201 keys is two pages of a thousand, and not one grant record was read.
+        expect(ops.lists().map((args) => args.limit)).toEqual([1000, 1000]);
+        expect(ops.grantReads()).toBe(0);
         await exchangeCodeForTokens(provider, reAuthEnv, reAuthCtx, code2, clientId, clientSecret);
 
-        const grantListCalls = listSpy.mock.calls.filter((call: any[]) => call[0]?.prefix === 'grant:user-1:');
-        expect(grantListCalls.length).toBeGreaterThan(0);
-        for (const [args] of grantListCalls) {
-          expect(args.limit).toBe(50);
-        }
+        // Only the same-client grant was replaced.
+        const remaining: string[] = [];
+        let cursor: string | undefined;
+        do {
+          const page = await reAuthEnv.OAUTH_KV.list({ prefix: 'grant:user-1:', cursor });
+          for (const key of page.keys) remaining.push((key.metadata as any).clientId);
+          cursor = page.cursor;
+        } while (cursor);
+        expect(remaining.filter((id) => id === clientId)).toHaveLength(1);
+        expect(remaining.filter((id) => id === otherClientId)).toHaveLength(1200);
       });
 
-      it('honors a custom revokeExistingGrantsBatchSize', async () => {
-        const customHandler = {
-          async fetch(request: Request, env: any, _ctx: ExecutionContext) {
-            const url = new URL(request.url);
-            if (url.pathname === '/authorize') {
-              const oauthReqInfo = await env.OAUTH_PROVIDER.parseAuthRequest(request);
-              const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
-                request: oauthReqInfo,
-                userId: 'user-1',
-                metadata: {},
-                scope: oauthReqInfo.scope,
-                props: propsFromAuthorize,
-                revokeExistingGrantsBatchSize: 2,
-              });
-              return Response.redirect(redirectTo, 302);
-            }
-            return new Response('OK', { status: 200 });
-          },
-        };
-
+      it('reads only grants written without key metadata, revoking the matching ones and sparing the rest', async () => {
         const provider = new OAuthProvider({
           apiRoute: ['/api/'],
           apiHandler: TestApiHandler,
-          defaultHandler: customHandler,
+          defaultHandler: createDefaultHandlerWithRevoke(() => propsFromAuthorize, {
+            revokeExistingGrantsBatchSize: 2,
+          }),
           authorizeEndpoint: '/authorize',
           tokenEndpoint: '/oauth/token',
           clientRegistrationEndpoint: '/oauth/register',
           scopesSupported: ['read', 'write'],
         });
-
         const { clientId, clientSecret } = await registerClient(provider, reAuthEnv, reAuthCtx);
-
-        // Seed an initial grant.
         const code1 = await authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, clientId);
         await exchangeCodeForTokens(provider, reAuthEnv, reAuthCtx, code1, clientId, clientSecret);
 
-        const listSpy = vi.spyOn(reAuthEnv.OAUTH_KV, 'list');
+        for (let i = 0; i < 5; i++) await seedLegacyGrant(`mine-${i}`, clientId);
+        for (let i = 0; i < 3; i++) await seedLegacyGrant(`theirs-${i}`, 'some-other-client');
 
+        const ops = grantKeyOps(reAuthEnv.OAUTH_KV);
         const code2 = await authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, clientId);
+        // The eight legacy records were read, two at a time; the grant with metadata was not.
+        expect(ops.grantReads()).toBe(8);
+        expect(ops.peakInFlight()).toBe(2);
         await exchangeCodeForTokens(provider, reAuthEnv, reAuthCtx, code2, clientId, clientSecret);
 
-        const grantListCalls = listSpy.mock.calls.filter((call: any[]) => call[0]?.prefix === 'grant:user-1:');
-        expect(grantListCalls.length).toBeGreaterThan(0);
-        for (const [args] of grantListCalls) {
-          expect(args.limit).toBe(2);
-        }
+        const after = await reAuthEnv.OAUTH_PROVIDER!.listUserGrants('user-1');
+        const ids = after.items.map((grant) => grant.id).sort();
+        expect(ids.filter((id) => id.startsWith('mine-'))).toEqual([]);
+        expect(ids.filter((id) => id.startsWith('theirs-'))).toEqual(['theirs-0', 'theirs-1', 'theirs-2']);
+        expect(after.items.filter((grant) => grant.clientId === clientId)).toHaveLength(1);
+      });
+
+      it('reads legacy grants 50 at a time by default', async () => {
+        const provider = new OAuthProvider({
+          apiRoute: ['/api/'],
+          apiHandler: TestApiHandler,
+          defaultHandler: createDefaultHandlerWithRevoke(() => propsFromAuthorize),
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: '/oauth/token',
+          clientRegistrationEndpoint: '/oauth/register',
+          scopesSupported: ['read', 'write'],
+        });
+        const { clientId } = await registerClient(provider, reAuthEnv, reAuthCtx);
+        for (let i = 0; i < 60; i++) await seedLegacyGrant(`legacy-${i}`, 'some-other-client');
+
+        const ops = grantKeyOps(reAuthEnv.OAUTH_KV);
+        await authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, clientId);
+
+        expect(ops.grantReads()).toBe(60);
+        expect(ops.peakInFlight()).toBe(50);
       });
 
       it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])(
@@ -11729,23 +11801,96 @@ describe('OAuthProvider', () => {
           clientRegistrationEndpoint: '/oauth/register',
           scopesSupported: ['read', 'write'],
         });
+        const { clientId } = await registerClient(provider, reAuthEnv, reAuthCtx);
+        for (let i = 0; i < 1001; i++) await seedLegacyGrant(`legacy-${i}`, 'some-other-client');
 
+        const ops = grantKeyOps(reAuthEnv.OAUTH_KV);
+        await authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, clientId);
+
+        expect(ops.grantReads()).toBe(1001);
+        expect(ops.peakInFlight()).toBe(1000);
+      });
+
+      it('writes a grant without key metadata when it would exceed the KV limit, and still replaces it later', async () => {
+        // A redirect URI long enough that clientId + resource + redirectUri cannot fit in a
+        // kilobyte of metadata. The mock rejects oversize metadata exactly as KV does.
+        const longRedirectUri = `https://client.example.com/callback?state=${'x'.repeat(1100)}`;
+        const provider = new OAuthProvider({
+          apiRoute: ['/api/'],
+          apiHandler: TestApiHandler,
+          defaultHandler: createDefaultHandlerWithRevoke(() => propsFromAuthorize),
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: '/oauth/token',
+          clientRegistrationEndpoint: '/oauth/register',
+          scopesSupported: ['read', 'write'],
+        });
+        const registration = await provider.fetch(
+          createMockRequest(
+            'https://example.com/oauth/register',
+            'POST',
+            { 'Content-Type': 'application/json' },
+            JSON.stringify({ redirect_uris: [longRedirectUri], token_endpoint_auth_method: 'none' })
+          ),
+          reAuthEnv,
+          reAuthCtx
+        );
+        const { client_id: clientId } = await registration.json<any>();
+        const authorize = () =>
+          provider.fetch(
+            createMockRequest(
+              `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+                `&redirect_uri=${encodeURIComponent(longRedirectUri)}&scope=read` +
+                `&code_challenge=${'a'.repeat(43)}&code_challenge_method=S256`
+            ),
+            reAuthEnv,
+            reAuthCtx
+          );
+
+        expect((await authorize()).status).toBe(302);
+        const first = await reAuthEnv.OAUTH_KV.list({ prefix: 'grant:user-1:' });
+        expect(first.keys).toHaveLength(1);
+        expect(first.keys[0].metadata).toBeUndefined();
+
+        const ops = grantKeyOps(reAuthEnv.OAUTH_KV);
+        expect((await authorize()).status).toBe(302);
+        expect(ops.grantReads()).toBe(1);
+        const second = await reAuthEnv.OAUTH_KV.list({ prefix: 'grant:user-1:' });
+        expect(second.keys).toHaveLength(1);
+        expect(second.keys[0].name).not.toBe(first.keys[0].name);
+      });
+
+      it('rewrites a legacy grant with key metadata when it is refreshed', async () => {
+        const provider = new OAuthProvider({
+          apiRoute: ['/api/'],
+          apiHandler: TestApiHandler,
+          defaultHandler: createDefaultHandlerWithRevoke(() => propsFromAuthorize),
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: '/oauth/token',
+          clientRegistrationEndpoint: '/oauth/register',
+          scopesSupported: ['read', 'write'],
+        });
         const { clientId, clientSecret } = await registerClient(provider, reAuthEnv, reAuthCtx);
+        const code = await authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, clientId);
+        const tokens = await exchangeCodeForTokens(provider, reAuthEnv, reAuthCtx, code, clientId, clientSecret);
 
-        // Seed an initial grant so the next re-auth exercises the listing loop.
-        const code1 = await authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, clientId);
-        await exchangeCodeForTokens(provider, reAuthEnv, reAuthCtx, code1, clientId, clientSecret);
+        // Strip the metadata, as if a version before 1.0 had written the record.
+        const [{ name: grantKey, metadata }] = (await reAuthEnv.OAUTH_KV.list({ prefix: 'grant:user-1:' })).keys;
+        expect(metadata).toMatchObject({ clientId, redirectUri: 'https://client.example.com/callback' });
+        await reAuthEnv.OAUTH_KV.put(grantKey, (await reAuthEnv.OAUTH_KV.get(grantKey)) as string);
+        expect((await reAuthEnv.OAUTH_KV.list({ prefix: 'grant:user-1:' })).keys[0].metadata).toBeUndefined();
 
-        const listSpy = vi.spyOn(reAuthEnv.OAUTH_KV, 'list');
-
-        const code2 = await authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, clientId);
-        await exchangeCodeForTokens(provider, reAuthEnv, reAuthCtx, code2, clientId, clientSecret);
-
-        const grantListCalls = listSpy.mock.calls.filter((call: any[]) => call[0]?.prefix === 'grant:user-1:');
-        expect(grantListCalls.length).toBeGreaterThan(0);
-        for (const [args] of grantListCalls) {
-          expect(args.limit).toBe(1000);
-        }
+        const refreshed = await refreshTokens(
+          provider,
+          reAuthEnv,
+          reAuthCtx,
+          tokens.refresh_token,
+          clientId,
+          clientSecret
+        );
+        expect(refreshed.status).toBe(200);
+        expect((await reAuthEnv.OAUTH_KV.list({ prefix: 'grant:user-1:' })).keys[0].metadata).toMatchObject({
+          clientId,
+        });
       });
 
       it('revokes every old grant across multiple pages when batch size is smaller than total', async () => {

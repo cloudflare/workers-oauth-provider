@@ -66,6 +66,18 @@ Grant records store information about permissions a user has granted to an appli
 
 **Key format:** `grant:{userId}:{grantId}`
 
+**Key metadata:** Since 1.0, each grant key carries KV metadata mirroring the fields a new authorization matches an existing grant on:
+
+```json
+{
+  "clientId": "client_abc123",
+  "resource": "https://mcp.example.com/mcp",
+  "redirectUri": "https://client.example.com/callback"
+}
+```
+
+`completeAuthorization()` finds the grants a new authorization replaces from `list()` alone, without reading a record per grant, so its KV cost is one `list()` per thousand grants the user has rather than one `get()` per grant. Grants written before 1.0 have no key metadata and are read individually (`revokeExistingGrantsBatchSize` at a time); every refresh rewrites the grant with metadata. A grant whose metadata would exceed KV's 1,024-byte limit is written without it and read individually in the same way. None of these fields is secret: the record itself stores all three in the clear.
+
 **Content Example (during authorization):**
 
 ```json

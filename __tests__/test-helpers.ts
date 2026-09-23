@@ -7,7 +7,7 @@ import type { OAuthHelpers } from '../src/oauth-provider';
  * Mock KV namespace implementation that stores data in memory
  */
 export class MockKV {
-  private storage: Map<string, { value: any; expiration?: number }> = new Map();
+  private storage: Map<string, { value: any; expiration?: number; metadata?: unknown }> = new Map();
 
   // Offset (ms) added to the wall clock. Lets tests deterministically advance time to
   // exercise TTL expiry without real `setTimeout` sleeps. Defaults to 0 (real time).
@@ -28,9 +28,18 @@ export class MockKV {
   async put(
     key: string,
     value: string | ArrayBuffer,
-    options?: { expirationTtl?: number; expiration?: number }
+    options?: { expirationTtl?: number; expiration?: number; metadata?: unknown }
   ): Promise<void> {
     let expirationTime: number | undefined = undefined;
+
+    // Mirror Cloudflare KV's limit on serialised key metadata, so a write that would be
+    // rejected in production is rejected here.
+    if (options?.metadata !== undefined) {
+      const bytes = new TextEncoder().encode(JSON.stringify(options.metadata)).byteLength;
+      if (bytes > 1024) {
+        throw new Error(`KV PUT failed: 413 Metadata length of ${bytes} exceeds limit of 1024.`);
+      }
+    }
 
     // Mirror Cloudflare KV's validation: both relative (`expirationTtl`) and absolute
     // (`expiration`) expirations must be at least 60 seconds in the future, otherwise the
@@ -53,7 +62,7 @@ export class MockKV {
       expirationTime = options.expiration * 1000;
     }
 
-    this.storage.set(key, { value, expiration: expirationTime });
+    this.storage.set(key, { value, expiration: expirationTime, metadata: options?.metadata });
   }
 
   async get(key: string, options?: { type: 'text' | 'json' | 'arrayBuffer' | 'stream' }): Promise<any> {
@@ -80,7 +89,7 @@ export class MockKV {
   }
 
   async list(options: { prefix: string; limit?: number; cursor?: string }): Promise<{
-    keys: { name: string }[];
+    keys: { name: string; metadata?: unknown }[];
     list_complete: boolean;
     cursor?: string;
   }> {
@@ -104,7 +113,10 @@ export class MockKV {
     const listComplete = nextIndex >= allKeys.length;
 
     return {
-      keys: pageKeys.map((name) => ({ name })),
+      keys: pageKeys.map((name) => {
+        const metadata = this.storage.get(name)?.metadata;
+        return metadata === undefined ? { name } : { name, metadata };
+      }),
       list_complete: listComplete,
       cursor: listComplete ? undefined : String(nextIndex),
     };
