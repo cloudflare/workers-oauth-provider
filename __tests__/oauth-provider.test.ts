@@ -13186,6 +13186,21 @@ describe('OAuthProvider', () => {
       expect(writes()).toEqual([]);
     });
 
+    it('does not renew when onError restyles a failure as a 2xx response', async () => {
+      const provider = makeProvider({
+        onError: ({ code, description }) => Response.json({ ok: false, code, description }, { status: 200 }),
+      });
+      const client = await registerDcr(provider);
+      await issueTokens(provider, client);
+      await ageRegistration(client.client_id, 100);
+      const writes = clientWrites();
+
+      const response = await refresh(provider, client, 'not-a-refresh-token');
+      expect(response.status).toBe(200);
+      expect(await response.json<any>()).toMatchObject({ ok: false, code: 'invalid_grant' });
+      expect(writes()).toEqual([]);
+    });
+
     it('never touches a client created through createClient()', async () => {
       const provider = makeProvider({ clientRegistrationTTL: 60 });
       await provider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);

@@ -1738,6 +1738,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   /** Capabilities shared by discovery and client metadata validation. */
   readonly serverCapabilities: OAuthServerCapabilities;
 
+  /**
+   * Every response built by `createErrorResponse`, whatever status `onError` gave it, so
+   * that "the request succeeded" can be read off a response without trusting its status.
+   */
+  private readonly errorResponses = new WeakSet<Response>();
+
   /** In-memory cached IdP JWKS fetcher; only constructed when EMA is configured. */
   private readonly jwksProvider: EmaJwksProvider | undefined;
 
@@ -2356,8 +2362,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       } else {
         response = await this.handleTokenRequest(parsed.body, parsed.clientInfo, env, url, request);
       }
-      // A successful, client-authenticated request is proof the registration is in use.
-      if (response.ok) {
+      // A successful, client-authenticated request is proof the registration is in use. An
+      // error is recognised by construction, not by status, because `onError` may restyle it.
+      if (response.ok && !this.errorResponses.has(response)) {
         await this.renewClientRegistrationIfDue(env, parsed.clientInfo, Math.floor(Date.now() / 1000));
       }
 
@@ -4981,8 +4988,17 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * cannot be told from a permanent one, so it keeps its original schedule and
    * re-registers once. The half-life rule bounds this to one write per client per half
    * TTL. Best effort: the token response it follows has already been produced.
+   *
+   * KV has no compare-and-set, so a `deleteClient()` that lands between the read below and
+   * the write is undone by it, as it would be by a concurrent `updateClient()`. The window
+   * is one KV round trip, once per client per half TTL; closing it needs the serialised
+   * storage of #237.
    */
-  async renewClientRegistrationIfDue(env: Env & ProviderEnv, client: StoredClientInfo, now: number): Promise<void> {
+  private async renewClientRegistrationIfDue(
+    env: Env & ProviderEnv,
+    client: StoredClientInfo,
+    now: number
+  ): Promise<void> {
     const ttl = this.options.clientRegistrationTTL;
     if (ttl === undefined || client.registrationExpiresAt === undefined) return;
     if (client.registrationExpiresAt - now > ttl / 2) return;
@@ -5367,20 +5383,22 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       ...(internal ? { internal } : {}),
       ...(request ? { request } : {}),
     });
-    if (customErrorResponse) return customErrorResponse;
-
     const body = JSON.stringify({
       error: code,
       error_description: description,
     });
 
-    return new Response(body, {
-      status: responseStatus,
-      headers: {
-        'Content-Type': 'application/json',
-        ...responseHeaders,
-      },
-    });
+    const response =
+      customErrorResponse ??
+      new Response(body, {
+        status: responseStatus,
+        headers: {
+          'Content-Type': 'application/json',
+          ...responseHeaders,
+        },
+      });
+    this.errorResponses.add(response);
+    return response;
   }
 }
 
