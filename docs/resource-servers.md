@@ -3,7 +3,7 @@
 An `OAuthAuthorizationServer` issues tokens; a resource server accepts them. Every resource, whether it runs in the authorization server's Worker or in its own, is hosted the same way:
 
 ```ts
-createOAuthResourceServer<Env, Props>({
+new OAuthResourceServer<Env, Props>({
   resourceMetadata: { resource, authorization_servers: [issuer] },
   validateToken: (env, request) => (resource, token) => Promise<{ props; audience; expiresAt? } | null>,
   handler: { fetch(request, env, ctx) {} }, // ctx.props: Props
@@ -25,7 +25,7 @@ const authorizationServer = new OAuthAuthorizationServer<Env>({
 const local = (env: Env) => (resource: string, token: string) =>
   authorizationServer.validateToken(resource, token, env);
 
-const calendar = createOAuthResourceServer<Env, AuthProps>({
+const calendar = new OAuthResourceServer<Env, AuthProps>({
   resourceMetadata: {
     resource: 'https://calendar.example.com/mcp',
     authorization_servers: ['https://auth.example.com'],
@@ -101,13 +101,13 @@ Resource Worker, with a binding to it:
 ```
 
 ```ts
-import { createOAuthResourceServer, type AuthorizationServerBinding } from '@cloudflare/workers-oauth-provider';
+import { OAuthResourceServer, type AuthorizationServerBinding } from '@cloudflare/workers-oauth-provider';
 
 interface Env {
   AUTH_SERVER: AuthorizationServerBinding<AuthProps>; // or Service<AuthServer> from wrangler types
 }
 
-export default createOAuthResourceServer<Env, AuthProps>({
+export default new OAuthResourceServer<Env, AuthProps>({
   resourceMetadata: {
     resource: 'https://calendar.example.com/mcp',
     authorization_servers: ['https://auth.example.com'],
