@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { WorkerEntrypoint } from 'cloudflare:workers';
 import {
-  createOAuthResourceServer,
+  OAuthResourceServer,
   type OAuthResourceServerOptions,
   type OAuthResourceTokenValidation,
 } from '../src/oauth-resource-server';
@@ -34,8 +34,8 @@ class MockExecutionContext<Props = unknown> implements ExecutionContext<Props> {
 
 function createTestServer(
   overrides: Partial<OAuthResourceServerOptions<TestEnv, TestProps>> = {}
-): ReturnType<typeof createOAuthResourceServer<TestEnv, TestProps>> {
-  return createOAuthResourceServer<TestEnv, TestProps>({
+): OAuthResourceServer<TestEnv, TestProps> {
+  return new OAuthResourceServer<TestEnv, TestProps>({
     resourceMetadata: {
       resource: RESOURCE,
       authorization_servers: ['https://auth.example.com'],
@@ -56,7 +56,7 @@ function createTestServer(
   });
 }
 
-describe('createOAuthResourceServer', () => {
+describe('OAuthResourceServer', () => {
   const env: TestEnv = { deployment: 'resource-worker' };
 
   afterEach(() => {

@@ -5,7 +5,7 @@ import {
   ExternalTokenError,
   OAuthAuthorizationServer,
   OAuthProvider,
-  createOAuthResourceServer,
+  OAuthResourceServer,
   getOAuthApi,
   type OAuthHelpers,
   type OAuthProviderOptions,
@@ -148,11 +148,11 @@ export default class McpOAuthConformanceWorker extends WorkerEntrypoint<Conforma
 
   /**
    * Run a resource server whose validator is `env.AUTH_SERVER.validateToken`, the detached RPC
-   * stub the documentation hands to `createOAuthResourceServer`, and report what it answered.
+   * stub the documentation hands to `OAuthResourceServer`, and report what it answered.
    */
   async probeResourceServerOverBinding(token: string | undefined): Promise<ResourceServerProbe> {
     const { origin, resource } = requireConfiguration();
-    const resourceServer = createOAuthResourceServer<ConformanceWorkerEnv, { subject: string }>({
+    const resourceServer = new OAuthResourceServer<ConformanceWorkerEnv, { subject: string }>({
       resourceMetadata: { resource, authorization_servers: [origin] },
       validateToken: (env) => env.AUTH_SERVER.validateToken,
       handler: { fetch: (_request, _env, ctx) => Response.json(ctx.props) },

@@ -12,7 +12,7 @@ import {
   type ResolveExternalTokenResult,
   type Grant,
   type Token,
-  createOAuthResourceServer,
+  OAuthResourceServer,
   type OAuthResourceMetadata,
 } from '../src/oauth-provider';
 import type { ExecutionContext } from '@cloudflare/workers-types';
@@ -13976,7 +13976,7 @@ describe('functional authorization-server and resource-server composition', () =
     resourceMetadata: Partial<OAuthResourceMetadata> & { resource: string },
     name: string
   ) {
-    return createOAuthResourceServer<TestEnv, any>({
+    return new OAuthResourceServer<TestEnv, any>({
       resourceMetadata: { authorization_servers: [issuer], ...resourceMetadata },
       validateToken: (env) => (resource, token) => authorizationServer.validateToken(resource, token, env),
       handler: resourceHandler(name),
@@ -14995,7 +14995,7 @@ describe('functional authorization-server and resource-server composition', () =
       [['https://other.example.com/mcp', calendarResource], 401],
     ];
     for (const [audience, expectedStatus] of cases) {
-      const hosted = createOAuthResourceServer<TestEnv, any>({
+      const hosted = new OAuthResourceServer<TestEnv, any>({
         resourceMetadata: { resource: calendarResource, authorization_servers: [issuer] },
         validateToken: () => async () => ({ props: { userId: 'external' }, audience: audience as string }),
         handler: resourceHandler('calendar'),

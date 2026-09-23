@@ -56,7 +56,7 @@ export type OAuthResourceHandler<Env, Props> =
   | { fetch(request: Request, env: Env, ctx: ExecutionContext<Props>): Response | Promise<Response> }
   | (new (ctx: ExecutionContext<Props>, env: Env) => { fetch(request: Request): Response | Promise<Response> });
 
-/** Configuration for {@link createOAuthResourceServer}. */
+/** Configuration for {@link OAuthResourceServer}. */
 export interface OAuthResourceServerOptions<Env = Cloudflare.Env, Props = unknown> {
   /** RFC 9728 metadata, including this server's one canonical resource. */
   resourceMetadata: OAuthResourceMetadata;
@@ -76,68 +76,32 @@ export interface OAuthResourceServerOptions<Env = Cloudflare.Env, Props = unknow
   validateToken(env: Env, request: Request): OAuthResourceTokenValidator<Props>;
 }
 
-/** Fetch handler returned by {@link createOAuthResourceServer}. */
-export interface OAuthResourceServer<Env = Cloudflare.Env> {
-  fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response>;
-}
-
 type MutableExecutionContext<Props> = Omit<ExecutionContext<Props>, 'props'> & { props: Props };
 
 /**
- * Create a standalone OAuth protected-resource Worker.
+ * One OAuth protected resource, in the authorization server's Worker or its own. Publishes
+ * RFC 9728 metadata, challenges unauthenticated requests, validates the bearer token through
+ * the configured `validateToken`, enforces audience and expiry on what it returns, and routes
+ * only the canonical resource and its descendants to the application handler.
  *
- * The returned handler publishes RFC 9728 metadata, challenges unauthenticated
- * requests, validates bearer-token audience and expiry after the caller's
- * validator succeeds, and routes only the canonical resource and descendants
- * to the application handler.
+ * `export default new OAuthResourceServer({ … })`, or dispatch to `fetch()` from your own
+ * router, exactly as with `OAuthAuthorizationServer`.
  */
-export function createOAuthResourceServer<Env = Cloudflare.Env, Props = unknown>(
-  options: OAuthResourceServerOptions<Env, Props>
-): OAuthResourceServer<Env> {
-  const validated = validateOptions(options);
+export class OAuthResourceServer<Env = Cloudflare.Env, Props = unknown> {
+  readonly #options: OAuthResourceServerOptions<Env, Props>;
+  readonly #validated: ValidatedResourceConfiguration;
 
-  return {
-    async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-      const url = new URL(request.url);
+  constructor(options: OAuthResourceServerOptions<Env, Props>) {
+    this.#validated = validateOptions(options);
+    this.#options = options;
+  }
 
-      if (isProtectedResourceMetadataPath(url)) {
-        if (request.method === 'OPTIONS') {
-          return addCorsHeaders(
-            new Response(null, {
-              status: 204,
-              headers: { 'Content-Length': '0' },
-            }),
-            request
-          );
-        }
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const options = this.#options;
+    const validated = this.#validated;
+    const url = new URL(request.url);
 
-        // RFC 9728 §3 fixes the origin and path; a cache-busting query must not hide the
-        // document, while a resource's own query parameters must still be present.
-        if (!isMetadataUrlRequest(url, validated.metadataUrl)) {
-          return addCorsHeaders(new Response(null, { status: 404 }), request);
-        }
-
-        if (request.method !== 'GET' && request.method !== 'HEAD') {
-          return addCorsHeaders(
-            new Response(null, {
-              status: 405,
-              headers: { Allow: 'GET, HEAD, OPTIONS' },
-            }),
-            request
-          );
-        }
-
-        const metadata = Response.json(validated.metadata, { headers: NO_CACHE_HEADERS });
-        return addCorsHeaders(
-          request.method === 'HEAD' ? new Response(null, { status: 200, headers: metadata.headers }) : metadata,
-          request
-        );
-      }
-
-      if (!isCanonicalResourceRequest(url, validated.resourceUrl)) {
-        return new Response(null, { status: 404 });
-      }
-
+    if (isProtectedResourceMetadataPath(url)) {
       if (request.method === 'OPTIONS') {
         return addCorsHeaders(
           new Response(null, {
@@ -148,30 +112,66 @@ export function createOAuthResourceServer<Env = Cloudflare.Env, Props = unknown>
         );
       }
 
-      const token = parseBearerToken(request.headers.get('Authorization'));
-      if (!token) {
-        return addCorsHeaders(createBearerChallenge(url, validated, false), request);
+      // RFC 9728 §3 fixes the origin and path; a cache-busting query must not hide the
+      // document, while a resource's own query parameters must still be present.
+      if (!isMetadataUrlRequest(url, validated.metadataUrl)) {
+        return addCorsHeaders(new Response(null, { status: 404 }), request);
       }
 
-      let validation: OAuthResourceTokenValidation<Props> | null;
-      try {
-        validation = await options.validateToken(env, request)(validated.resource, token);
-      } catch {
-        return addCorsHeaders(createValidationUnavailableResponse(), request);
+      if (request.method !== 'GET' && request.method !== 'HEAD') {
+        return addCorsHeaders(
+          new Response(null, {
+            status: 405,
+            headers: { Allow: 'GET, HEAD, OPTIONS' },
+          }),
+          request
+        );
       }
 
-      if (!isValidTokenValidation(validation, validated.resource)) {
-        return addCorsHeaders(createBearerChallenge(url, validated, true), request);
-      }
+      const metadata = Response.json(validated.metadata, { headers: NO_CACHE_HEADERS });
+      return addCorsHeaders(
+        request.method === 'HEAD' ? new Response(null, { status: 200, headers: metadata.headers }) : metadata,
+        request
+      );
+    }
 
-      (ctx as MutableExecutionContext<Props>).props = validation.props;
-      const handler = options.handler;
-      const response = isEntrypointClass(handler)
-        ? await new handler(ctx as ExecutionContext<Props>, env).fetch(request)
-        : await handler.fetch(request, env, ctx as ExecutionContext<Props>);
-      return addCorsHeaders(response, request);
-    },
-  };
+    if (!isCanonicalResourceRequest(url, validated.resourceUrl)) {
+      return new Response(null, { status: 404 });
+    }
+
+    if (request.method === 'OPTIONS') {
+      return addCorsHeaders(
+        new Response(null, {
+          status: 204,
+          headers: { 'Content-Length': '0' },
+        }),
+        request
+      );
+    }
+
+    const token = parseBearerToken(request.headers.get('Authorization'));
+    if (!token) {
+      return addCorsHeaders(createBearerChallenge(url, validated, false), request);
+    }
+
+    let validation: OAuthResourceTokenValidation<Props> | null;
+    try {
+      validation = await options.validateToken(env, request)(validated.resource, token);
+    } catch {
+      return addCorsHeaders(createValidationUnavailableResponse(), request);
+    }
+
+    if (!isValidTokenValidation(validation, validated.resource)) {
+      return addCorsHeaders(createBearerChallenge(url, validated, true), request);
+    }
+
+    (ctx as MutableExecutionContext<Props>).props = validation.props;
+    const handler = options.handler;
+    const response = isEntrypointClass(handler)
+      ? await new handler(ctx as ExecutionContext<Props>, env).fetch(request)
+      : await handler.fetch(request, env, ctx as ExecutionContext<Props>);
+    return addCorsHeaders(response, request);
+  }
 }
 
 interface ValidatedResourceConfiguration {

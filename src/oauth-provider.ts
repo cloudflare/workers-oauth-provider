@@ -688,7 +688,7 @@ export type OAuthAuthorizationServerOptions<Env = Cloudflare.Env> = Omit<
 
   /**
    * Canonical identifiers of every protected resource this authorization server issues
-   * tokens for, whether hosted in this Worker through `createOAuthResourceServer()` or by another
+   * tokens for, whether hosted in this Worker through `OAuthResourceServer` or by another
    * Worker or service. At least one is required. The registry is fixed at construction,
    * so `defaultResource` and `legacyGrantResource` are checked before the first request,
    * and `validateToken()` rejects for a resource that is not listed.
@@ -1568,7 +1568,7 @@ export class OAuthProvider<Env = Cloudflare.Env> {
  * registration endpoints from `fetch()`, exposes the interactive authorization flow through
  * `getOAuthApi()`, and validates its access tokens for any declared resource through
  * `validateToken()`. Resources are hosted, in this Worker or another, by
- * `createOAuthResourceServer()`, whose `validateToken` points back here.
+ * `OAuthResourceServer`, whose `validateToken` points back here.
  */
 export class OAuthAuthorizationServer<Env = Cloudflare.Env> {
   #impl: OAuthProviderImpl<Env>;

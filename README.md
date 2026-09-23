@@ -154,7 +154,7 @@ Requests outside the protected route prefixes go to `defaultHandler`. In the exa
 
 ## One authorization server with multiple MCP resources
 
-`OAuthAuthorizationServer` is the authorization-server role on its own: discovery, token, revocation and registration endpoints from `fetch()`, the interactive flow through `getOAuthApi()`, and `validateToken(resource, token, env)` for any resource in its fixed `resources` registry. Each resource is hosted by `createOAuthResourceServer()`, whose `validateToken` option points back at the authorization server — in this Worker or another. Same host, same `ctx.props`, wherever the resource runs.
+`OAuthAuthorizationServer` is the authorization-server role on its own: discovery, token, revocation and registration endpoints from `fetch()`, the interactive flow through `getOAuthApi()`, and `validateToken(resource, token, env)` for any resource in its fixed `resources` registry. Each resource is hosted by `new OAuthResourceServer()`, whose `validateToken` option points back at the authorization server — in this Worker or another. Same host, same `ctx.props`, wherever the resource runs.
 
 **Same Worker.** Route the authorization server's origin to `authorizationServer.fetch()`, your `/authorize` page to `getOAuthApi()`, and each resource to its host. The validator is a direct call:
 
@@ -166,7 +166,7 @@ const authorizationServer = new OAuthAuthorizationServer<Env>({
   tokenEndpoint: '/oauth/token',
 });
 
-const calendar = createOAuthResourceServer<Env, AuthProps>({
+const calendar = new OAuthResourceServer<Env, AuthProps>({
   resourceMetadata: {
     resource: 'https://calendar.example.com/mcp',
     authorization_servers: ['https://auth.example.com'],
@@ -190,7 +190,7 @@ export default class AuthServer extends WorkerEntrypoint<Env> {
 }
 
 // calendar Worker, with `"services": [{ "binding": "AUTH_SERVER", "service": "auth" }]` in wrangler.jsonc
-export default createOAuthResourceServer<Env, AuthProps>({
+export default new OAuthResourceServer<Env, AuthProps>({
   resourceMetadata: {
     resource: 'https://calendar.example.com/mcp',
     authorization_servers: ['https://auth.example.com'],
@@ -259,7 +259,7 @@ That document returns the configured canonical `resource`. The discovery URL is 
 
 A canonical path is the base audience for its path-boundary descendants: a token for `https://mcp.example.com/mcp` is accepted at `/mcp/tools`, and a challenge at `/mcp/tools` advertises the one canonical document for `/mcp`, as RFC 9728 §5.1 permits. A request on another origin, or one that the canonical resource does not cover, gets a challenge without `resource_metadata`. Every protected route must be the canonical resource path or a descendant of it; the provider rejects any other `apiRoute` or `apiHandlers` key at construction, because a token could never validate there.
 
-`authorization_servers` may contain more than one issuer. Each value must use canonical HTTPS issuer spelling: lowercase scheme and host, with no userinfo, default port, dot segments, query, or fragment. As with resources, `http` is accepted only on a loopback host. OAuth issuer comparison is exact. The MCP client chooses an authorization server and must keep credentials and tokens separate for each issuer. `createOAuthResourceServer()` requires it explicitly, wherever the resource runs.
+`authorization_servers` may contain more than one issuer. Each value must use canonical HTTPS issuer spelling: lowercase scheme and host, with no userinfo, default port, dot segments, query, or fragment. As with resources, `http` is accepted only on a loopback host. OAuth issuer comparison is exact. The MCP client chooses an authorization server and must keep credentials and tokens separate for each issuer. `new OAuthResourceServer()` requires it explicitly, wherever the resource runs.
 
 ### Authorization server metadata
 
@@ -529,7 +529,7 @@ The functional role API adds these surfaces without removing `OAuthProvider`:
 | `defaultResource`                                        | Select a deliberate default for new authorization requests that omit it                     |
 | `legacyGrantResource`                                    | Select the server-controlled migration target for old unbound grants                        |
 | `getOAuthApi(env)`                                       | Obtain OAuth helpers for an application-owned authorization route                           |
-| `createOAuthResourceServer({ … })`                       | Host one resource, in this Worker or another; `validateToken` points at the AS or a binding |
+| `new OAuthResourceServer({ … })`                         | Host one resource, in this Worker or another; `validateToken` points at the AS or a binding |
 
 Consult the exported `OAuthProviderOptions`, `OAuthAuthorizationServerOptions`, resource-server callback interfaces, and JSDoc in [`src/oauth-provider.ts`](https://github.com/cloudflare/workers-oauth-provider/blob/main/src/oauth-provider.ts) for the complete typed API.
 
