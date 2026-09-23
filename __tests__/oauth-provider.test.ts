@@ -12,6 +12,8 @@ import {
   type ResolveExternalTokenResult,
   type Grant,
   type Token,
+  createOAuthResourceServer,
+  type OAuthResourceMetadata,
 } from '../src/oauth-provider';
 import type { ExecutionContext } from '@cloudflare/workers-types';
 // We're importing WorkerEntrypoint from our mock implementation
@@ -13968,6 +13970,19 @@ describe('functional authorization-server and resource-server composition', () =
     };
   }
 
+  /** Host a resource in the same Worker: the resource server validates against the local authorization server. */
+  function host(
+    authorizationServer: OAuthAuthorizationServer<TestEnv>,
+    resourceMetadata: Partial<OAuthResourceMetadata> & { resource: string },
+    name: string
+  ) {
+    return createOAuthResourceServer<TestEnv, any>({
+      resourceMetadata: { authorization_servers: [issuer], ...resourceMetadata },
+      validateToken: (env) => (resource, token) => authorizationServer.validateToken(resource, token, env),
+      handler: resourceHandler(name),
+    });
+  }
+
   function createRoles(policy: { defaultResource?: string; legacyGrantResource?: string } = {}) {
     const authorizationServer = new OAuthAuthorizationServer<TestEnv>({
       issuer,
@@ -13978,22 +13993,16 @@ describe('functional authorization-server and resource-server composition', () =
       scopesSupported: ['calendar:read', 'drive:read'],
       ...policy,
     });
-    const calendar = authorizationServer.protectResource({
-      resourceMetadata: {
-        resource: calendarResource,
-        scopes_supported: ['calendar:read'],
-        resource_name: 'Calendar MCP',
-      },
-      handler: resourceHandler('calendar'),
-    });
-    const drive = authorizationServer.protectResource({
-      resourceMetadata: {
-        resource: driveResource,
-        scopes_supported: ['drive:read'],
-        resource_name: 'Drive MCP',
-      },
-      handler: resourceHandler('drive'),
-    });
+    const calendar = host(
+      authorizationServer,
+      { resource: calendarResource, scopes_supported: ['calendar:read'], resource_name: 'Calendar MCP' },
+      'calendar'
+    );
+    const drive = host(
+      authorizationServer,
+      { resource: driveResource, scopes_supported: ['drive:read'], resource_name: 'Drive MCP' },
+      'drive'
+    );
     return { authorizationServer, calendar, drive };
   }
 
@@ -14399,10 +14408,7 @@ describe('functional authorization-server and resource-server composition', () =
       authorizeEndpoint: '/authorize',
       tokenEndpoint: '/oauth/token',
     });
-    const calendar = authorizationServer.protectResource({
-      resourceMetadata,
-      handler: resourceHandler('calendar'),
-    });
+    const calendar = host(authorizationServer, resourceMetadata, 'calendar');
 
     resourceMetadata.resource = 'https://mutated.example.com/mcp';
     resourceMetadata.authorization_servers.push('https://mutated.example.com');
@@ -14462,10 +14468,10 @@ describe('functional authorization-server and resource-server composition', () =
     const client = await registerClient(authorizationServer);
     const calendarTokens = await issueTokens(authorizationServer, client, calendarResource);
     await expect(
-      authorizationServer.resource(calendarResource).validateToken(calendarTokens.access_token, env)
+      authorizationServer.validateToken(calendarResource, calendarTokens.access_token, env)
     ).resolves.toMatchObject({ audience: calendarResource, clientId: client.client_id });
     await expect(
-      authorizationServer.resource(driveResource).validateToken(calendarTokens.access_token, env)
+      authorizationServer.validateToken(driveResource, calendarTokens.access_token, env)
     ).resolves.toBeNull();
 
     const calendarResponse = await calendar.fetch(
@@ -14567,22 +14573,16 @@ describe('functional authorization-server and resource-server composition', () =
     delete oldToken.audience;
     await env.OAUTH_KV.put(tokenKey, JSON.stringify(oldToken));
 
-    await expect(
-      authorizationServer.resource(calendarResource).validateToken(tokens.access_token, env)
-    ).resolves.toMatchObject({
+    await expect(authorizationServer.validateToken(calendarResource, tokens.access_token, env)).resolves.toMatchObject({
       audience: calendarResource,
     });
-    await expect(
-      authorizationServer.resource(driveResource).validateToken(tokens.access_token, env)
-    ).resolves.toBeNull();
+    await expect(authorizationServer.validateToken(driveResource, tokens.access_token, env)).resolves.toBeNull();
 
     const { authorizationServer: withoutMigrationTarget } = createRoles();
-    await expect(
-      withoutMigrationTarget.resource(calendarResource).validateToken(tokens.access_token, env)
-    ).resolves.toBeNull();
+    await expect(withoutMigrationTarget.validateToken(calendarResource, tokens.access_token, env)).resolves.toBeNull();
   });
 
-  it('validates the resource registry and policy options at construction', () => {
+  it('validates the resource registry and policy options at construction', async () => {
     const base = { issuer, authorizeEndpoint: '/authorize', tokenEndpoint: '/oauth/token' };
     expect(() => new OAuthAuthorizationServer<TestEnv>({ ...base, resources: [] })).toThrow(
       'resources must list at least one canonical protected resource identifier'
@@ -14607,27 +14607,14 @@ describe('functional authorization-server and resource-server composition', () =
         })
     ).toThrow('legacyGrantResource must name one of the configured protected resources');
 
+    // A resource the server does not declare is refused when a resource server asks about it.
     const authorizationServer = new OAuthAuthorizationServer<TestEnv>({ ...base, resources: [calendarResource] });
-    expect(() => authorizationServer.resource(driveResource)).toThrow(`${driveResource} is not declared in resources`);
-    expect(() =>
-      authorizationServer.protectResource({
-        resourceMetadata: { resource: driveResource },
-        handler: resourceHandler('drive'),
-      })
-    ).toThrow(`${driveResource} is not declared in resources`);
-    authorizationServer.protectResource({
-      resourceMetadata: { resource: calendarResource },
-      handler: resourceHandler('calendar'),
-    });
-    expect(() =>
-      authorizationServer.protectResource({
-        resourceMetadata: { resource: calendarResource },
-        handler: resourceHandler('calendar'),
-      })
-    ).toThrow(`A protected resource is already hosted for ${calendarResource}`);
+    await expect(authorizationServer.validateToken(driveResource, 'any-token', env)).rejects.toThrow(
+      'resource must name one registered protected resource'
+    );
   });
 
-  it('hosts and validates a declared resource through its handle', async () => {
+  it('hosts a declared resource in the same Worker and validates against the local server', async () => {
     const authorizationServer = new OAuthAuthorizationServer<TestEnv>({
       issuer,
       resources: [calendarResource, driveResource],
@@ -14636,12 +14623,11 @@ describe('functional authorization-server and resource-server composition', () =
       clientRegistrationEndpoint: '/oauth/register',
       scopesSupported: ['calendar:read', 'drive:read'],
     });
-    const calendar = authorizationServer.resource(calendarResource);
-    expect(calendar.resource).toBe(calendarResource);
-    const surface = calendar.protect({
-      resourceMetadata: { scopes_supported: ['calendar:read'], resource_name: 'Calendar MCP' },
-      handler: resourceHandler('calendar'),
-    });
+    const surface = host(
+      authorizationServer,
+      { resource: calendarResource, scopes_supported: ['calendar:read'], resource_name: 'Calendar MCP' },
+      'calendar'
+    );
 
     const metadata = await surface.fetch(
       createMockRequest('https://calendar.example.com/.well-known/oauth-protected-resource/mcp'),
@@ -14657,12 +14643,10 @@ describe('functional authorization-server and resource-server composition', () =
 
     const client = await registerClient(authorizationServer);
     const tokens = await issueTokens(authorizationServer, client, calendarResource);
-    await expect(calendar.validateToken(tokens.access_token, env)).resolves.toMatchObject({
+    await expect(authorizationServer.validateToken(calendarResource, tokens.access_token, env)).resolves.toMatchObject({
       audience: calendarResource,
     });
-    await expect(
-      authorizationServer.resource(driveResource).validateToken(tokens.access_token, env)
-    ).resolves.toBeNull();
+    await expect(authorizationServer.validateToken(driveResource, tokens.access_token, env)).resolves.toBeNull();
   });
 
   it('accepts the Bearer scheme case-insensitively at a hosted resource', async () => {
@@ -14694,14 +14678,8 @@ describe('functional authorization-server and resource-server composition', () =
       authorizeEndpoint: '/authorize',
       tokenEndpoint: '/oauth/token',
     });
-    const a = authorizationServer.protectResource({
-      resourceMetadata: { resource: tenantA },
-      handler: resourceHandler('a'),
-    });
-    const b = authorizationServer.protectResource({
-      resourceMetadata: { resource: tenantB },
-      handler: resourceHandler('b'),
-    });
+    const a = host(authorizationServer, { resource: tenantA }, 'a');
+    const b = host(authorizationServer, { resource: tenantB }, 'b');
 
     const metadataA = await a.fetch(
       createMockRequest('https://calendar.example.com/.well-known/oauth-protected-resource/mcp?tenant=a'),
@@ -14791,19 +14769,13 @@ describe('functional authorization-server and resource-server composition', () =
     oldToken.audience = ['https://other.example.com/mcp', calendarResource];
     await env.OAUTH_KV.put(tokenKey, JSON.stringify(oldToken));
     expect((await calendar.fetch(request(), env, ctx)).status).toBe(200);
-    await expect(
-      authorizationServer.resource(calendarResource).validateToken(tokens.access_token, env)
-    ).resolves.not.toBeNull();
-    await expect(
-      authorizationServer.resource(driveResource).validateToken(tokens.access_token, env)
-    ).resolves.toBeNull();
+    await expect(authorizationServer.validateToken(calendarResource, tokens.access_token, env)).resolves.not.toBeNull();
+    await expect(authorizationServer.validateToken(driveResource, tokens.access_token, env)).resolves.toBeNull();
 
     oldToken.audience = ['https://other.example.com/mcp', 'https://another.example.com/mcp'];
     await env.OAUTH_KV.put(tokenKey, JSON.stringify(oldToken));
     expect((await calendar.fetch(request(), env, ctx)).status).toBe(401);
-    await expect(
-      authorizationServer.resource(calendarResource).validateToken(tokens.access_token, env)
-    ).resolves.toBeNull();
+    await expect(authorizationServer.validateToken(calendarResource, tokens.access_token, env)).resolves.toBeNull();
   });
 
   it('accepts a bare-origin resource sent back with a trailing slash (RFC 3986 §6.2.3)', async () => {
@@ -14816,10 +14788,7 @@ describe('functional authorization-server and resource-server composition', () =
       clientRegistrationEndpoint: '/oauth/register',
       scopesSupported: ['calendar:read'],
     });
-    const hosted = authorizationServer.protectResource({
-      resourceMetadata: { resource: originResource },
-      handler: resourceHandler('origin'),
-    });
+    const hosted = host(authorizationServer, { resource: originResource }, 'origin');
     const client = await registerClient(authorizationServer);
     // The MCP TypeScript SDK selects the resource with `new URL(...)`, which serializes an
     // empty path as "/".
@@ -14852,10 +14821,7 @@ describe('functional authorization-server and resource-server composition', () =
       clientRegistrationEndpoint: '/oauth/register',
       scopesSupported: ['calendar:read'],
     });
-    const hosted = authorizationServer.protectResource({
-      resourceMetadata: { resource: tenantResource },
-      handler: resourceHandler('tenant'),
-    });
+    const hosted = host(authorizationServer, { resource: tenantResource }, 'tenant');
 
     // RFC 9728 §5.1: a descendant that carries the resource's query is covered, and it may
     // add parameters of its own.
@@ -15018,44 +14984,17 @@ describe('functional authorization-server and resource-server composition', () =
     );
     expect(exchanged.status).toBe(200);
   });
-  it('rejects hosted resources on one path whose queries nest, and keeps disjoint tenants apart', () => {
-    const host = (resources: string[]) => {
-      const authorizationServer = new OAuthAuthorizationServer<TestEnv>({
-        issuer,
-        resources,
-        authorizeEndpoint: '/authorize',
-        tokenEndpoint: '/oauth/token',
-      });
-      for (const resource of resources) {
-        authorizationServer.protectResource({ resourceMetadata: { resource }, handler: resourceHandler('tenant') });
-      }
-    };
-    // A request for the more specific resource also carries the less specific one's query.
-    expect(() =>
-      host(['https://tenant.example.com/mcp?tenant=a', 'https://tenant.example.com/mcp?tenant=a&region=eu'])
-    ).toThrow('API routes for different resources must not overlap');
-    expect(() =>
-      host(['https://tenant.example.com/mcp?tenant=a', 'https://tenant.example.com/mcp?tenant=b'])
-    ).not.toThrow();
-  });
-
-  it('requires an external token resolver to return a single string audience', async () => {
+  it('requires any validator to return the single string audience of the resource it serves', async () => {
     const cases: Array<[unknown, number]> = [
       [calendarResource, 200],
       [[calendarResource], 401],
       [['https://other.example.com/mcp', calendarResource], 401],
     ];
     for (const [audience, expectedStatus] of cases) {
-      const authorizationServer = new OAuthAuthorizationServer<TestEnv>({
-        issuer,
-        resources: [calendarResource],
-        authorizeEndpoint: '/authorize',
-        tokenEndpoint: '/oauth/token',
-      });
-      const hosted = authorizationServer.protectResource({
-        resourceMetadata: { resource: calendarResource },
+      const hosted = createOAuthResourceServer<TestEnv, any>({
+        resourceMetadata: { resource: calendarResource, authorization_servers: [issuer] },
+        validateToken: () => async () => ({ props: { userId: 'external' }, audience: audience as string }),
         handler: resourceHandler('calendar'),
-        resolveExternalToken: async () => ({ props: { userId: 'external' }, audience: audience as string }),
       });
       const response = await hosted.fetch(
         createMockRequest(calendarResource, 'GET', { Authorization: 'Bearer external-token' }),

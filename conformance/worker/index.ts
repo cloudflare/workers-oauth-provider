@@ -1,8 +1,11 @@
 import { WorkerEntrypoint } from 'cloudflare:workers';
 import {
   AuthorizationError,
+  type AuthorizationServerBinding,
   ExternalTokenError,
+  OAuthAuthorizationServer,
   OAuthProvider,
+  createOAuthResourceServer,
   getOAuthApi,
   type OAuthHelpers,
   type OAuthProviderOptions,
@@ -24,6 +27,15 @@ import {
 export interface ConformanceWorkerEnv {
   OAUTH_KV: KVNamespace;
   OAUTH_PROVIDER?: OAuthHelpers;
+  /** This Worker, over a Service Binding, as a separate resource Worker would hold it. */
+  AUTH_SERVER: AuthorizationServerBinding<{ subject: string }>;
+}
+
+/** What the resource-server probe returns to the test. */
+export interface ResourceServerProbe {
+  status: number;
+  body: { subject?: string } | null;
+  challenge: string | null;
 }
 
 const apiHandler = {
@@ -101,6 +113,7 @@ function createProviderOptions(configuration: WorkerConfiguration): OAuthProvide
 
 let configuration: WorkerConfiguration | undefined;
 let provider: OAuthProvider<ConformanceWorkerEnv> | undefined;
+let authorizationServer: OAuthAuthorizationServer<ConformanceWorkerEnv> | undefined;
 
 function requireConfiguration(): WorkerConfiguration {
   if (!configuration) throw new Error('Configure the conformance Worker before use');
@@ -116,7 +129,44 @@ export default class McpOAuthConformanceWorker extends WorkerEntrypoint<Conforma
   configure(nextConfiguration: WorkerConfiguration): void {
     configuration = nextConfiguration;
     provider = new OAuthProvider(createProviderOptions(nextConfiguration));
+    // The role-based server over the same KV: tokens the combined provider issues are the
+    // tokens it validates for a separate resource Worker.
+    authorizationServer = new OAuthAuthorizationServer<ConformanceWorkerEnv>({
+      issuer: nextConfiguration.origin,
+      resources: [nextConfiguration.resource],
+      authorizeEndpoint: '/authorize',
+      tokenEndpoint: '/oauth/token',
+    });
     this.env.OAUTH_PROVIDER = undefined;
+  }
+
+  /** RPC: what a separate resource Worker calls over its Service Binding. */
+  validateToken(resource: string, token: string) {
+    if (!authorizationServer) throw new Error('Configure the conformance Worker before use');
+    return authorizationServer.validateToken(resource, token, this.env);
+  }
+
+  /**
+   * Run a resource server whose validator is `env.AUTH_SERVER.validateToken`, the detached RPC
+   * stub the documentation hands to `createOAuthResourceServer`, and report what it answered.
+   */
+  async probeResourceServerOverBinding(token: string | undefined): Promise<ResourceServerProbe> {
+    const { origin, resource } = requireConfiguration();
+    const resourceServer = createOAuthResourceServer<ConformanceWorkerEnv, { subject: string }>({
+      resourceMetadata: { resource, authorization_servers: [origin] },
+      validateToken: (env) => env.AUTH_SERVER.validateToken,
+      handler: { fetch: (_request, _env, ctx) => Response.json(ctx.props) },
+    });
+    const response = await resourceServer.fetch(
+      new Request(resource, { headers: token === undefined ? {} : { Authorization: `Bearer ${token}` } }),
+      this.env,
+      this.ctx
+    );
+    return {
+      status: response.status,
+      body: response.status === 200 ? await response.json<{ subject?: string }>() : null,
+      challenge: response.headers.get('WWW-Authenticate'),
+    };
   }
 
   async fetch(request: Request): Promise<Response> {

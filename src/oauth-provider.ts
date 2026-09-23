@@ -659,15 +659,6 @@ interface OAuthAuthorizationServerConfiguration {
   legacyGrantResource?: string;
 }
 
-/** Internal input used when `protectResource()` registers one hosted role. */
-interface InternalProtectedResourceConfiguration<Env = Cloudflare.Env> {
-  resourceMetadata: OAuthProtectedResourceMetadata;
-  handler:
-    | ExportedHandlerWithFetch<Env, any>
-    | (new (ctx: ExecutionContext, env: Env) => WorkerEntrypointWithFetch<Env, any>);
-  resolveExternalToken?: (input: ResolveExternalTokenInput<Env>) => Promise<ResolveExternalTokenResult | null>;
-}
-
 /** Internal AS-only constructor shape behind the functional public API. */
 type InternalOAuthAuthorizationServerOptions<Env = Cloudflare.Env> = Omit<
   OAuthProviderOptions<Env>,
@@ -683,7 +674,7 @@ type InternalOAuthAuthorizationServerOptions<Env = Cloudflare.Env> = Omit<
 };
 
 /**
- * Functional authorization-server surface used with `protectResource()`.
+ * Functional authorization-server surface for the role-based API.
  * The application owns the interactive authorization route and uses
  * `getOAuthApi()` to parse and complete it; `fetch()` serves protocol-owned AS
  * endpoints such as metadata, token, revocation, and optional registration.
@@ -697,7 +688,7 @@ export type OAuthAuthorizationServerOptions<Env = Cloudflare.Env> = Omit<
 
   /**
    * Canonical identifiers of every protected resource this authorization server issues
-   * tokens for, whether hosted in this Worker through `protectResource()` or by another
+   * tokens for, whether hosted in this Worker through `createOAuthResourceServer()` or by another
    * Worker or service. At least one is required. The registry is fixed at construction,
    * so `defaultResource`, `legacyGrantResource`, and `resource()` are checked before the
    * first request.
@@ -714,45 +705,6 @@ export type OAuthAuthorizationServerOptions<Env = Cloudflare.Env> = Omit<
   legacyGrantResource?: string;
 };
 
-/** Options passed to `OAuthAuthorizationServer.protectResource()`. */
-export interface ProtectResourceOptions<Env = Cloudflare.Env, Props = unknown> {
-  resourceMetadata: OAuthProtectedResourceMetadata;
-  handler:
-    | ExportedHandlerWithFetch<Env, Props>
-    | (new (ctx: ExecutionContext, env: Env) => WorkerEntrypointWithFetch<Env, Props>);
-  resolveExternalToken?: (input: ResolveExternalTokenInput<Env>) => Promise<ResolveExternalTokenResult | null>;
-}
-
-/** A protected-resource fetch surface created by an authorization server. */
-export interface OAuthProtectedResource<Env = Cloudflare.Env> {
-  fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response>;
-}
-
-/** Options for {@link OAuthResourceHandle.protect}; the resource comes from the handle. */
-export interface ProtectResourceHandleOptions<Env = Cloudflare.Env, Props = unknown> {
-  resourceMetadata?: Omit<OAuthProtectedResourceMetadata, 'resource'>;
-  handler: ProtectResourceOptions<Env, Props>['handler'];
-  resolveExternalToken?: ProtectResourceOptions<Env, Props>['resolveExternalToken'];
-}
-
-/**
- * One protected resource declared in `OAuthAuthorizationServerOptions.resources`.
- * Obtained from `OAuthAuthorizationServer.resource()`, so a misspelled identifier fails
- * at module initialization instead of on a request.
- */
-export interface OAuthResourceHandle<Env = Cloudflare.Env> {
-  /** Canonical spelling of the declared resource identifier. */
-  readonly resource: string;
-  /**
-   * Validate an opaque access token for this resource only. A separate Worker can call
-   * this over a private Service Binding; the audience is fixed here, so the caller
-   * cannot ask about another resource's tokens.
-   */
-  validateToken<T = any>(token: string, env: Env): Promise<ValidatedAccessToken<T> | null>;
-  /** Host this resource in the same Worker and return its independently routable fetch surface. */
-  protect<Props = unknown>(options: ProtectResourceHandleOptions<Env, Props>): OAuthProtectedResource<Env>;
-}
-
 /** Audience-checked token context suitable for a private Service Binding. */
 export interface ValidatedAccessToken<T = any> {
   props: T;
@@ -761,6 +713,15 @@ export interface ValidatedAccessToken<T = any> {
   scope: string[];
   userId: string;
   clientId: string;
+}
+
+/**
+ * The RPC surface a `WorkerEntrypoint` exposes around {@link OAuthAuthorizationServer.validateToken},
+ * as a resource Worker sees it through a Service Binding. Hand a resource server the bound
+ * method as its validator: `validateToken: (env) => env.AUTH_SERVER.validateToken`.
+ */
+export interface AuthorizationServerBinding<Props = any> {
+  validateToken(resource: string, token: string): Promise<ValidatedAccessToken<Props> | null>;
 }
 
 // Using ExportedHandler from Cloudflare Workers Types for both API and default handlers
@@ -1604,10 +1565,11 @@ export class OAuthProvider<Env = Cloudflare.Env> {
 }
 
 /**
- * Authorization-server role that can functionally compose multiple protected
- * MCP resources in the same Worker. The application keeps control of routing
- * by dispatching requests to this object or to the handles returned by
- * `protectResource()`.
+ * The authorization-server role on its own. It serves discovery, token, revocation and
+ * registration endpoints from `fetch()`, exposes the interactive authorization flow through
+ * `getOAuthApi()`, and validates its access tokens for any declared resource through
+ * `validateToken()`. Resources are hosted, in this Worker or another, by
+ * `createOAuthResourceServer()`, whose `validateToken` points back here.
  */
 export class OAuthAuthorizationServer<Env = Cloudflare.Env> {
   #impl: OAuthProviderImpl<Env>;
@@ -1641,34 +1603,27 @@ export class OAuthAuthorizationServer<Env = Cloudflare.Env> {
   }
 
   /**
-   * A handle for one resource declared in `resources`. Throws at module initialization
-   * when the identifier was not declared.
+   * Validate an access token for one declared resource: the token's KV record is loaded, its
+   * audience checked against `resource`, and its props decrypted. Resolves `null` for a token
+   * that is not valid for that resource, and rejects for a resource this server does not
+   * declare.
+   *
+   * This is what a resource server calls, whether it shares this Worker or reaches it over a
+   * Service Binding. For the latter, expose it from a `WorkerEntrypoint`:
+   *
+   * ```ts
+   * export default class AuthServer extends WorkerEntrypoint<Env> {
+   *   fetch(request: Request) {
+   *     return authorizationServer.fetch(request, this.env, this.ctx);
+   *   }
+   *   validateToken(resource: string, token: string) {
+   *     return authorizationServer.validateToken(resource, token, this.env);
+   *   }
+   * }
+   * ```
    */
-  resource(resource: string): OAuthResourceHandle<Env> {
-    const canonical = this.#impl.requireDeclaredResource(resource);
-    return {
-      resource: canonical,
-      validateToken: <T = any>(token: string, env: Env) =>
-        this.#impl.validateAccessToken<T>(token, canonical, env as Env & ProviderEnv),
-      protect: <Props = unknown>(options: ProtectResourceHandleOptions<Env, Props>) =>
-        this.protectResource<Props>({
-          resourceMetadata: { ...(options.resourceMetadata ?? {}), resource: canonical },
-          handler: options.handler,
-          resolveExternalToken: options.resolveExternalToken,
-        }),
-    };
-  }
-
-  /** Host one declared resource in this Worker and return its independently routable RS surface. */
-  protectResource<Props = unknown>(options: ProtectResourceOptions<Env, Props>): OAuthProtectedResource<Env> {
-    const resource = this.#impl.registerResourceServer({
-      resourceMetadata: options.resourceMetadata,
-      handler: options.handler,
-      resolveExternalToken: options.resolveExternalToken,
-    });
-    return {
-      fetch: (request, env, ctx) => this.#impl.fetchResourceServer(request, env as Env & ProviderEnv, ctx, resource),
-    };
+  validateToken<T = any>(resource: string, token: string, env: Env): Promise<ValidatedAccessToken<T> | null> {
+    return this.#impl.validateAccessToken<T>(token, resource, env as Env & ProviderEnv);
   }
 
   /** Serve protocol-owned authorization-server endpoints, excluding the application authorization UI. */
@@ -1767,7 +1722,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     let normalizedOptions: InternalOAuthProviderOptions<Env>;
     let configuredResourceServers: Array<{
       resourceMetadata: OAuthProtectedResourceMetadata;
-      resolveExternalToken?: InternalProtectedResourceConfiguration<Env>['resolveExternalToken'];
+      resolveExternalToken?: OAuthProviderOptions<Env>['resolveExternalToken'];
     }>;
 
     if (roleBased) {
@@ -2257,17 +2212,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
   async fetchAuthorizationServer(request: Request, env: Env & ProviderEnv, ctx: ExecutionContext): Promise<Response> {
     return this.fetchForRoles(request, env, ctx, 'authorization-server');
-  }
-
-  async fetchResourceServer(
-    request: Request,
-    env: Env & ProviderEnv,
-    ctx: ExecutionContext,
-    resource: string
-  ): Promise<Response> {
-    const resourceServer = this.resourceServers.find((server) => server.resourceMetadata.resource === resource);
-    if (!resourceServer) throw new TypeError(`No protected resource is registered for ${resource}`);
-    return this.fetchForRoles(request, env, ctx, resourceServer);
   }
 
   private async fetchForRoles(
@@ -4852,49 +4796,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    */
   public createOAuthHelpers(env: Env & ProviderEnv): OAuthHelpers {
     return new OAuthHelpersImpl<Env>(env, this);
-  }
-
-  /** Resolve a declared resource to its canonical spelling, or throw at module initialization. */
-  requireDeclaredResource(resource: string): string {
-    const canonical = typeof resource === 'string' ? this.findConfiguredResource(resource) : undefined;
-    if (!canonical) {
-      throw new TypeError(`${String(resource)} is not declared in resources`);
-    }
-    return canonical;
-  }
-
-  /** Host a declared resource in this Worker during module initialization. */
-  registerResourceServer(configuration: InternalProtectedResourceConfiguration<Env>): string {
-    const canonical = this.requireDeclaredResource(configuration.resourceMetadata?.resource as string);
-    const resourceServer = this.resourceServers.find((server) => server.resourceMetadata.resource === canonical)!;
-    if (resourceServer.apiHandler) {
-      throw new TypeError(`A protected resource is already hosted for ${canonical}`);
-    }
-    const resourceMetadata = this.snapshotResourceMetadata({ ...configuration.resourceMetadata, resource: canonical });
-    this.validateResourceMetadataOptions(resourceMetadata);
-    if (
-      this.explicitIssuer &&
-      resourceMetadata.authorization_servers &&
-      !resourceMetadata.authorization_servers.some((issuer) => resourceMatches(issuer, this.explicitIssuer!))
-    ) {
-      throw new TypeError(
-        `resourceMetadata.authorization_servers for ${canonical} must include ${this.explicitIssuer}`
-      );
-    }
-
-    const previous: NormalizedResourceServer<Env> = { ...resourceServer };
-    resourceServer.resourceMetadata = resourceMetadata;
-    resourceServer.apiHandler = this.validateHandler(configuration.handler, 'handler');
-    resourceServer.resolveExternalToken = configuration.resolveExternalToken;
-    this.typedApiHandlers.push({ route: canonical, handler: resourceServer.apiHandler, resourceServer });
-    try {
-      this.validateResourceRouteIsolation();
-    } catch (error) {
-      this.typedApiHandlers.pop();
-      Object.assign(resourceServer, previous);
-      throw error;
-    }
-    return canonical;
   }
 
   /**

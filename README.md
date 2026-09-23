@@ -154,178 +154,53 @@ Requests outside the protected route prefixes go to `defaultHandler`. In the exa
 
 ## One authorization server with multiple MCP resources
 
-`OAuthAuthorizationServer` separates the authorization-server role from each protected-resource role while keeping them composable. Declare every canonical resource in `resources`, then call `protectResource()` once for each MCP resource hosted by the same Worker. Each call returns a fetch handler that serves only that resource's RFC 9728 metadata, Bearer challenges, and protected API. A declared resource that is never passed to `protectResource()` is hosted by another Worker or service.
+`OAuthAuthorizationServer` is the authorization-server role on its own: discovery, token, revocation and registration endpoints from `fetch()`, the interactive flow through `getOAuthApi()`, and `validateToken(resource, token, env)` for any resource in its fixed `resources` registry. Each resource is hosted by `createOAuthResourceServer()`, whose `validateToken` option points back at the authorization server — in this Worker or another. Same host, same `ctx.props`, wherever the resource runs.
 
-The following optional example (`npm install hono`) binds one Worker to three custom domains and uses Hono's hostname-aware path function to route without a hostname `switch`. The application owns the interactive `/authorize` route; `authorizationServer.fetch()` owns discovery, token, revocation, and optional registration endpoints. The original `Request` is forwarded as `c.req.raw`, so authorization-server and protected-resource URL validation still sees the real origin.
+**Same Worker.** Route the authorization server's origin to `authorizationServer.fetch()`, your `/authorize` page to `getOAuthApi()`, and each resource to its host. The validator is a direct call:
 
 ```ts
-import { Hono } from 'hono';
-import { OAuthAuthorizationServer } from '@cloudflare/workers-oauth-provider';
-
-const AUTH_ISSUER = 'https://auth.example.com';
-const CALENDAR_RESOURCE = 'https://calendar.example.com/mcp';
-const DRIVE_RESOURCE = 'https://drive.example.com/mcp';
-
-interface Env {
-  OAUTH_KV: KVNamespace;
-}
-
-interface AuthProps {
-  userId: string;
-  scopes: string[];
-}
-
 const authorizationServer = new OAuthAuthorizationServer<Env>({
-  issuer: AUTH_ISSUER,
-  resources: [CALENDAR_RESOURCE, DRIVE_RESOURCE],
+  issuer: 'https://auth.example.com',
+  resources: ['https://calendar.example.com/mcp'],
   authorizeEndpoint: '/authorize',
   tokenEndpoint: '/oauth/token',
-  clientRegistrationEndpoint: '/oauth/register',
-  scopesSupported: ['calendar:read', 'drive:read'],
 });
 
-const calendar = authorizationServer.protectResource<AuthProps>({
+const calendar = createOAuthResourceServer<Env, AuthProps>({
   resourceMetadata: {
-    resource: CALENDAR_RESOURCE,
-    scopes_supported: ['calendar:read'],
-    resource_name: 'Calendar MCP',
+    resource: 'https://calendar.example.com/mcp',
+    authorization_servers: ['https://auth.example.com'],
   },
-  handler: {
-    async fetch(_request, _env, ctx) {
-      if (!ctx.props.scopes.includes('calendar:read')) return new Response('Forbidden', { status: 403 });
-      return Response.json({ userId: ctx.props.userId, server: 'calendar' });
-    },
-  },
+  validateToken: (env) => (resource, token) => authorizationServer.validateToken(resource, token, env),
+  handler: { fetch: (_request, _env, ctx) => Response.json({ userId: ctx.props.userId }) },
 });
-
-const drive = authorizationServer.protectResource<AuthProps>({
-  resourceMetadata: {
-    resource: DRIVE_RESOURCE,
-    scopes_supported: ['drive:read'],
-    resource_name: 'Drive MCP',
-  },
-  handler: {
-    async fetch(_request, _env, ctx) {
-      if (!ctx.props.scopes.includes('drive:read')) return new Response('Forbidden', { status: 403 });
-      return Response.json({ userId: ctx.props.userId, server: 'drive' });
-    },
-  },
-});
-
-const app = new Hono<{ Bindings: Env }>({
-  getPath(request) {
-    const url = new URL(request.url);
-    return `/${url.hostname}${url.pathname}`;
-  },
-});
-
-// Authenticate the user and obtain consent here. Production code should render
-// AuthorizationError safely as shown in the quick start.
-app.get('/auth.example.com/authorize', async (c) => {
-  const oauth = authorizationServer.getOAuthApi(c.env);
-  const request = await oauth.parseAuthRequest(c.req.raw);
-  const { redirectTo } = await oauth.completeAuthorization({
-    request,
-    userId: 'user-123',
-    metadata: {},
-    scope: request.scope,
-    props: { userId: 'user-123', scopes: request.scope },
-  });
-  return c.redirect(redirectTo);
-});
-
-app.all('/auth.example.com/*', (c) => authorizationServer.fetch(c.req.raw, c.env, c.executionCtx));
-app.all('/calendar.example.com/*', (c) => calendar.fetch(c.req.raw, c.env, c.executionCtx));
-app.all('/drive.example.com/*', (c) => drive.fetch(c.req.raw, c.env, c.executionCtx));
-
-export default app;
 ```
 
-Route all three custom domains to that Worker:
-
-```jsonc
-{
-  "workers_dev": false,
-  "routes": [
-    { "pattern": "auth.example.com", "custom_domain": true },
-    { "pattern": "calendar.example.com", "custom_domain": true },
-    { "pattern": "drive.example.com", "custom_domain": true },
-  ],
-}
-```
-
-`authorizationServer.fetch()` serves only the AS role at `auth.example.com`; the handles returned by `protectResource()` serve only their registered resource. Authorization server metadata advertises both canonical identifiers in `protected_resources`, while Calendar and Drive publish independent protected resource metadata that points back to `https://auth.example.com`.
-
-The registry is fixed at construction. `resources` must name every audience the server issues tokens for, and `defaultResource`, `legacyGrantResource`, `resource()`, and `protectResource()` are all checked against it during module initialization, so a misspelled identifier fails before the first request. Call `protectResource()` before the first request for each resource hosted in this Worker.
-
-### Resource servers in separate Workers
-
-List a resource in `resources` without calling `protectResource()` when the authorization server issues tokens for a resource it does not host. The standalone resource Worker can use `createOAuthResourceServer()` to publish its own RFC 9728 metadata, issue Bearer challenges, enforce the canonical audience, and expose validated application data as `ctx.props`:
+**Separate Workers.** The authorization Worker exposes `validateToken` from a `WorkerEntrypoint`; the resource Worker holds a Service Binding to it and hands the host that method. Nothing else to configure, and the validator is a binding, not a URL — it is not reachable from the public internet:
 
 ```ts
-import { createOAuthResourceServer, type ValidatedAccessToken } from '@cloudflare/workers-oauth-provider';
-
-const AUTH_ISSUER = 'https://auth.example.com';
-const CALENDAR_RESOURCE = 'https://calendar.example.com/mcp';
-
-interface AuthProps {
-  userId: string;
-  scopes: string[];
-}
-
-interface CalendarEnv {
-  AUTHORIZATION_SERVER: {
-    validateToken(token: string): Promise<ValidatedAccessToken<{ userId: string }> | null>;
-  };
-}
-
-export default createOAuthResourceServer<CalendarEnv, AuthProps>({
-  resourceMetadata: {
-    resource: CALENDAR_RESOURCE,
-    authorization_servers: [AUTH_ISSUER],
-    scopes_supported: ['calendar:read'],
-    resource_name: 'Calendar MCP',
-  },
-  async validateToken({ token, env }) {
-    const validation = await env.AUTHORIZATION_SERVER.validateToken(token);
-    if (!validation) return null;
-    return {
-      audience: validation.audience,
-      expiresAt: validation.expiresAt,
-      props: {
-        ...validation.props,
-        scopes: validation.scope,
-      },
-    };
-  },
-  handler: {
-    async fetch(_request, _env, ctx) {
-      if (!ctx.props.scopes.includes('calendar:read')) {
-        return new Response('Forbidden', { status: 403 });
-      }
-      return Response.json({ userId: ctx.props.userId });
-    },
-  },
-});
-```
-
-The `validateToken` callback is deliberately transport-independent. For Workers, a private Service Binding can expose a resource-specific method backed by the resource handle's `validateToken()`:
-
-```ts
-import { WorkerEntrypoint } from 'cloudflare:workers';
-
-const calendar = authorizationServer.resource(CALENDAR_RESOURCE);
-
-export class CalendarTokenValidator extends WorkerEntrypoint<Env> {
-  validateToken(token: string) {
-    return calendar.validateToken(token, this.env);
+// auth Worker
+export default class AuthServer extends WorkerEntrypoint<Env> {
+  fetch(request: Request) {
+    return authorizationServer.fetch(request, this.env, this.ctx);
+  }
+  validateToken(resource: string, token: string) {
+    return authorizationServer.validateToken(resource, token, this.env);
   }
 }
+
+// calendar Worker, with `"services": [{ "binding": "AUTH_SERVER", "service": "auth" }]` in wrangler.jsonc
+export default createOAuthResourceServer<Env, AuthProps>({
+  resourceMetadata: {
+    resource: 'https://calendar.example.com/mcp',
+    authorization_servers: ['https://auth.example.com'],
+  },
+  validateToken: (env) => env.AUTH_SERVER.validateToken,
+  handler,
+});
 ```
 
-Bind the Calendar Worker to `CalendarTokenValidator`; expose a separate Drive entrypoint built from `authorizationServer.resource(DRIVE_RESOURCE)`. Fixing the resource on the authorization-server side prevents one resource Worker from asking to validate tokens for another audience. `createOAuthResourceServer()` also rejects a successful callback result whose `audience` is not its configured canonical resource and returns `503` when validation infrastructure throws. It passes only the validator's `props` to the handler, so the validator must copy or derive every scope and identity field the handler needs, as above, or enforce authorization itself. The package does not create a public token-introspection or JWT-validation endpoint; applications choose and secure the callback transport.
-
-The existing `OAuthProvider` constructor remains supported. It is the concise combined AS-and-resource API used by the quick start and is appropriate when one Worker protects one canonical resource. Existing applications do not need to move to `OAuthAuthorizationServer` to upgrade.
+Either way the resource server publishes its own RFC 9728 metadata, issues Bearer challenges that point at it, checks the returned audience against its canonical resource, and answers `503` when validation infrastructure fails. Tokens are opaque throughout; a validator returns the decrypted `props` the authorization flow stored. See [docs/resource-servers.md](docs/resource-servers.md) for the three-domain Hono example, the `AuthorizationServerBinding` type for your `Env`, and how to validate tokens from another issuer at your own risk.
 
 ## How MCP authorization discovery works
 
@@ -384,7 +259,7 @@ That document returns the configured canonical `resource`. The discovery URL is 
 
 A canonical path is the base audience for its path-boundary descendants: a token for `https://mcp.example.com/mcp` is accepted at `/mcp/tools`, and a challenge at `/mcp/tools` advertises the one canonical document for `/mcp`, as RFC 9728 §5.1 permits. A request on another origin, or one that the canonical resource does not cover, gets a challenge without `resource_metadata`. Every protected route must be the canonical resource path or a descendant of it; the provider rejects any other `apiRoute` or `apiHandlers` key at construction, because a token could never validate there.
 
-`authorization_servers` may contain more than one issuer. Each value must use canonical HTTPS issuer spelling: lowercase scheme and host, with no userinfo, default port, dot segments, query, or fragment. As with resources, `http` is accepted only on a loopback host. OAuth issuer comparison is exact. The MCP client chooses an authorization server and must keep credentials and tokens separate for each issuer. A resource registered with `OAuthAuthorizationServer.protectResource()` defaults this list to that server's configured `issuer`; the standalone `createOAuthResourceServer()` requires it explicitly.
+`authorization_servers` may contain more than one issuer. Each value must use canonical HTTPS issuer spelling: lowercase scheme and host, with no userinfo, default port, dot segments, query, or fragment. As with resources, `http` is accepted only on a loopback host. OAuth issuer comparison is exact. The MCP client chooses an authorization server and must keep credentials and tokens separate for each issuer. `createOAuthResourceServer()` requires it explicitly, wherever the resource runs.
 
 ### Authorization server metadata
 
@@ -650,12 +525,11 @@ The functional role API adds these surfaces without removing `OAuthProvider`:
 | Surface                                                  | Purpose                                                                                     |
 | -------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
 | `new OAuthAuthorizationServer({ issuer, resources, … })` | Create the AS role with a canonical RFC 8414 issuer and its fixed resource registry         |
-| `protectResource({ resourceMetadata, handler })`         | Host one declared resource in this Worker, returning its fetch surface                      |
-| `resource(uri)`                                          | Obtain a handle for one declared resource, with `validateToken(token, env)` and `protect()` |
+| `validateToken(resource, token, env)`                    | Validate an access token for one declared resource; what a resource server calls            |
 | `defaultResource`                                        | Select a deliberate default for new authorization requests that omit it                     |
 | `legacyGrantResource`                                    | Select the server-controlled migration target for old unbound grants                        |
 | `getOAuthApi(env)`                                       | Obtain OAuth helpers for an application-owned authorization route                           |
-| `createOAuthResourceServer({ … })`                       | Create a standalone resource role around an application validation callback                 |
+| `createOAuthResourceServer({ … })`                       | Host one resource, in this Worker or another; `validateToken` points at the AS or a binding |
 
 Consult the exported `OAuthProviderOptions`, `OAuthAuthorizationServerOptions`, resource-server callback interfaces, and JSDoc in [`src/oauth-provider.ts`](https://github.com/cloudflare/workers-oauth-provider/blob/main/src/oauth-provider.ts) for the complete typed API.
 

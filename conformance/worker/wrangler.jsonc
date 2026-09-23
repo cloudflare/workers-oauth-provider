@@ -10,4 +10,13 @@
       "id": "mcp-oauth-conformance-kv",
     },
   ],
+  // The Worker binds to itself so a test can run a resource server whose validator is the
+  // authorization server's `validateToken` reached over a Service Binding, exactly as the
+  // docs show for two Workers.
+  "services": [
+    {
+      "binding": "AUTH_SERVER",
+      "service": "mcp-oauth-conformance-worker",
+    },
+  ],
 }

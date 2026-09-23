@@ -41,7 +41,7 @@ function createTestServer(
       scopes_supported: ['mcp:read'],
       resource_name: 'Example MCP',
     },
-    validateToken: async () => ({
+    validateToken: () => async () => ({
       props: { userId: 'user-123', scopes: ['mcp:read'] },
       audience: RESOURCE,
       expiresAt: Date.now() / 1000 + 300,
@@ -137,6 +137,60 @@ describe('createOAuthResourceServer', () => {
     expect(response.headers.get('WWW-Authenticate')).toBe(`Bearer realm="OAuth", resource_metadata="${METADATA_URL}"`);
   });
 
+  it('hands the binding its own canonical resource and the token, as a detached method', async () => {
+    // The documented line is `validateToken: (env) => env.AUTH_SERVER.validateToken`: the host
+    // calls the method it was given without its receiver, with this server's resource first.
+    const binding = {
+      validateToken: vi.fn(async (resource: string, token: string) => ({
+        props: { userId: `${token}@${resource}`, scopes: ['mcp:read'] },
+        audience: resource,
+      })),
+    };
+    const server = createTestServer({ validateToken: () => binding.validateToken });
+    const response = await server.fetch(
+      new Request(`${RESOURCE}/tools`, { headers: { Authorization: 'Bearer abc' } }),
+      { deployment: 'resource-worker', AUTH_SERVER: binding } as TestEnv,
+      new MockExecutionContext()
+    );
+    expect(response.status).toBe(200);
+    expect(binding.validateToken).toHaveBeenCalledWith(RESOURCE, 'abc');
+    await expect(response.json()).resolves.toMatchObject({ props: { userId: `abc@${RESOURCE}` } });
+  });
+
+  it('answers 503 when the validator factory itself throws, as for a missing binding', async () => {
+    const server = createTestServer({
+      validateToken: (env) => (env as { AUTH_SERVER?: { validateToken: never } }).AUTH_SERVER!.validateToken,
+    });
+    const response = await server.fetch(
+      new Request(RESOURCE, { headers: { Authorization: 'Bearer token' } }),
+      env,
+      new MockExecutionContext()
+    );
+    expect(response.status).toBe(503);
+    expect(response.headers.get('WWW-Authenticate')).toBeNull();
+  });
+
+  it("serves metadata regardless of a cache-busting query, while still requiring the resource's own query", async () => {
+    const plain = createTestServer();
+    expect((await plain.fetch(new Request(`${METADATA_URL}?cb=1`), env, new MockExecutionContext())).status).toBe(200);
+
+    const tenant = createTestServer({
+      resourceMetadata: {
+        resource: `${RESOURCE}?tenant=acme`,
+        authorization_servers: ['https://auth.example.com'],
+      },
+    });
+    const tenantMetadata = `${METADATA_URL}?tenant=acme`;
+    expect((await tenant.fetch(new Request(tenantMetadata), env, new MockExecutionContext())).status).toBe(200);
+    expect((await tenant.fetch(new Request(`${tenantMetadata}&cb=1`), env, new MockExecutionContext())).status).toBe(
+      200
+    );
+    expect((await tenant.fetch(new Request(METADATA_URL), env, new MockExecutionContext())).status).toBe(404);
+    expect(
+      (await tenant.fetch(new Request(`${METADATA_URL}?tenant=other`), env, new MockExecutionContext())).status
+    ).toBe(404);
+  });
+
   it('validates a bearer token and exposes validator props to the protected handler', async () => {
     const request = new Request(`${RESOURCE}/tools`, {
       headers: { Authorization: 'Bearer opaque-access-token' },
@@ -148,7 +202,7 @@ describe('createOAuthResourceServer', () => {
         expiresAt: Date.now() / 1000 + 60,
       })
     );
-    const server = createTestServer({ validateToken });
+    const server = createTestServer({ validateToken: () => validateToken });
     const ctx = new MockExecutionContext<TestProps>();
 
     const response = await server.fetch(request, env, ctx);
@@ -159,7 +213,7 @@ describe('createOAuthResourceServer', () => {
       props: { userId: 'validated-user', scopes: ['mcp:read'] },
     });
     expect(ctx.props).toEqual({ userId: 'validated-user', scopes: ['mcp:read'] });
-    expect(validateToken).toHaveBeenCalledWith({ token: 'opaque-access-token', request, env });
+    expect(validateToken).toHaveBeenCalledWith(RESOURCE, 'opaque-access-token');
   });
 
   it('preserves handler CORS exposure and varies reflected origins', async () => {
@@ -195,7 +249,7 @@ describe('createOAuthResourceServer', () => {
       props: { userId: 'user-123', scopes: [] },
       audience: RESOURCE,
     }));
-    const server = createTestServer({ validateToken });
+    const server = createTestServer({ validateToken: () => validateToken });
 
     const response = await server.fetch(
       new Request(RESOURCE, { headers: { Authorization: 'bearer token-value' } }),
@@ -211,7 +265,7 @@ describe('createOAuthResourceServer', () => {
     const handler = { fetch: vi.fn(() => new Response('should not run')) };
     const server = createTestServer({
       handler,
-      validateToken: async () => ({
+      validateToken: () => async () => ({
         props: { userId: 'user-123', scopes: [] },
         audience: `${RESOURCE}/other`,
       }),
@@ -234,7 +288,7 @@ describe('createOAuthResourceServer', () => {
   ])('rejects a token with an %s expiresAt value', async (_label, expiresAt) => {
     vi.spyOn(Date, 'now').mockReturnValue(2_000_000_000_000);
     const server = createTestServer({
-      validateToken: async () => ({
+      validateToken: () => async () => ({
         props: { userId: 'user-123', scopes: [] },
         audience: RESOURCE,
         expiresAt,
@@ -253,7 +307,7 @@ describe('createOAuthResourceServer', () => {
 
   it('returns invalid_token when the validator rejects a token', async () => {
     const handler = { fetch: vi.fn(() => new Response('should not run')) };
-    const server = createTestServer({ handler, validateToken: async () => null });
+    const server = createTestServer({ handler, validateToken: () => async () => null });
 
     const response = await server.fetch(
       new Request(RESOURCE, { headers: { Authorization: 'Bearer untrusted-token' } }),
@@ -270,7 +324,7 @@ describe('createOAuthResourceServer', () => {
     const handler = { fetch: vi.fn(() => new Response('should not run')) };
     const server = createTestServer({
       handler,
-      validateToken: async () => {
+      validateToken: () => async () => {
         throw new Error('introspection unavailable');
       },
     });
@@ -293,7 +347,7 @@ describe('createOAuthResourceServer', () => {
       props: { userId: 'user-123', scopes: [] },
       audience: RESOURCE,
     }));
-    const server = createTestServer({ validateToken });
+    const server = createTestServer({ validateToken: () => validateToken });
     const ctx = new MockExecutionContext();
 
     for (const outside of [
@@ -310,7 +364,7 @@ describe('createOAuthResourceServer', () => {
 
   it('answers CORS preflight without validating a token', async () => {
     const validateToken = vi.fn(async () => null);
-    const server = createTestServer({ validateToken });
+    const server = createTestServer({ validateToken: () => validateToken });
     const response = await server.fetch(
       new Request(RESOURCE, {
         method: 'OPTIONS',
@@ -370,7 +424,7 @@ describe('createOAuthResourceServer', () => {
     const localResource = 'http://localhost:8788/mcp';
     const server = createTestServer({
       resourceMetadata: { resource: localResource, authorization_servers: ['http://localhost:8787'] },
-      validateToken: async () => ({
+      validateToken: () => async () => ({
         props: { userId: 'user-123', scopes: ['mcp:read'] },
         audience: localResource,
         expiresAt: Date.now() / 1000 + 300,
@@ -420,7 +474,10 @@ describe('createOAuthResourceServer', () => {
   it('protects every path of a bare-origin resource', async () => {
     const server = createTestServer({
       resourceMetadata: { resource: 'https://mcp.example.com', authorization_servers: ['https://auth.example.com'] },
-      validateToken: async () => ({ props: { userId: 'user-123', scopes: [] }, audience: 'https://mcp.example.com' }),
+      validateToken: () => async () => ({
+        props: { userId: 'user-123', scopes: [] },
+        audience: 'https://mcp.example.com',
+      }),
     });
     const challenge = await server.fetch(
       new Request('https://mcp.example.com/anything/deep'),
@@ -443,7 +500,10 @@ describe('createOAuthResourceServer', () => {
     const server = createTestServer({
       resourceMetadata: { resource: 'https://mcp.example.com', authorization_servers: ['https://auth.example.com'] },
       // RFC 3986 §6.2: scheme and host case-fold, and an empty path equals "/".
-      validateToken: async () => ({ props: { userId: 'user-123', scopes: [] }, audience: 'HTTPS://MCP.example.com/' }),
+      validateToken: () => async () => ({
+        props: { userId: 'user-123', scopes: [] },
+        audience: 'HTTPS://MCP.example.com/',
+      }),
     });
     const served = await server.fetch(
       new Request('https://mcp.example.com/tools', { headers: { Authorization: 'Bearer token' } }),
@@ -457,7 +517,7 @@ describe('createOAuthResourceServer', () => {
     const resource = 'https://mcp.example.com/mcp?tenant=acme';
     const server = createTestServer({
       resourceMetadata: { resource, authorization_servers: ['https://auth.example.com'] },
-      validateToken: async () => ({ props: { userId: 'user-123', scopes: [] }, audience: resource }),
+      validateToken: () => async () => ({ props: { userId: 'user-123', scopes: [] }, audience: resource }),
     });
     const covered = await server.fetch(
       new Request('https://mcp.example.com/mcp/messages?tenant=acme&sessionId=abc'),
@@ -507,7 +567,7 @@ describe('createOAuthResourceServer', () => {
 
   it('rejects a validation result without props', async () => {
     const server = createTestServer({
-      validateToken: async () => ({ audience: RESOURCE }) as unknown as OAuthResourceTokenValidation<TestProps>,
+      validateToken: () => async () => ({ audience: RESOURCE }) as unknown as OAuthResourceTokenValidation<TestProps>,
     });
     const response = await server.fetch(
       new Request(RESOURCE, { headers: { Authorization: 'Bearer token' } }),
