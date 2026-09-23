@@ -1,0 +1,21 @@
+.changeset/refresh-token-idle-ttl.md
+  s_1b1f3dce47e01c::t_845d89dd584669 1-9
+src/oauth-provider.ts
+  s_1b1f3dce47e01c::t_f7199d6e9d892a 199-201,204-215,486-498,1878-1882,3354-3360,3537-3539,3617-3627,3675-3683,3916-3922
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5e90c69149f55ef478ca61ffda019d5f6edf557e",
+  "prompts": {},
+  "sessions": {
+    "s_1b1f3dce47e01c": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a0b3b8-09e5-75fe-ad90-bf9d48da5b83",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Matt Carey <mcarey@cloudflare.com>"
+    }
+  }
+}
