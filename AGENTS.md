@@ -37,10 +37,12 @@ workers-oauth-provider/
 │   ├── oauth-provider.ts      # Core provider implementation
 │   ├── oauth-capabilities.ts  # Pure server/client metadata capability policy
 │   ├── oauth-client-metadata.ts # Typed DCR parsing and CIMD resolution pipeline
+│   ├── jwt-access-tokens.ts   # RFC 9068 signing, JWKS, and the offline validator behind `validateToken.offline`
 │   └── ema/                   # Enterprise-Managed Authorization pipeline
 ├── __tests__/
 │   ├── oauth-provider.test.ts # Comprehensive provider integration suite
 │   ├── oauth-capabilities.test.ts # Pure capability policy tests
+│   ├── jwt-access-tokens.test.ts # JWT flows through the AS and RS public surfaces; adversarial cases as rows
 │   ├── setup.ts               # Vitest setup and mocking
 │   └── mocks/
 │       └── cloudflare-workers.ts
@@ -52,7 +54,8 @@ workers-oauth-provider/
 │   └── worker/                # Real Wrangler Worker with local KV
 ├── dist/                      # Build output (tsdown)
 ├── docs/
-│   └── advanced-configuration.md
+│   ├── advanced-configuration.md
+│   └── jwt-access-tokens.md   # JWT issuance, online/offline validation modes, rollout, rotation
 ├── .github/workflows/
 │   ├── ci.yml                 # PR validation
 │   ├── release.yml            # Changesets-based npm publishing
@@ -63,7 +66,7 @@ workers-oauth-provider/
 └── README.md                  # Usage documentation
 ```
 
-**Audit-oriented architecture:** Request orchestration and storage-backed OAuth behavior remain in `src/oauth-provider.ts`. Typed OAuth client metadata parsing plus CIMD fetching and resolution live in `src/oauth-client-metadata.ts`; pure authorization-server/client capability policy lives in `src/oauth-capabilities.ts`. The experimental Enterprise-Managed Authorization validation pipeline is isolated in `src/ema/` so its JWT and trust-boundary code can be reviewed independently.
+**Audit-oriented architecture:** Request orchestration and storage-backed OAuth behavior remain in `src/oauth-provider.ts`. Typed OAuth client metadata parsing plus CIMD fetching and resolution live in `src/oauth-client-metadata.ts`; pure authorization-server/client capability policy lives in `src/oauth-capabilities.ts`. RFC 9068 access-token signing, JWKS publication, and pinned offline validation live in `src/jwt-access-tokens.ts`. The experimental Enterprise-Managed Authorization validation pipeline is isolated in `src/ema/` so its JWT and trust-boundary code can be reviewed independently.
 
 ## Setup
 
@@ -231,6 +234,7 @@ This library implements multiple OAuth/security RFCs. When making changes, maint
 - OAuth 2.0 Dynamic Client Registration (RFC 7591, deprecated by MCP 2026-07-28)
 - PKCE (RFC 7636)
 - OAuth 2.0 Authorization Server Metadata (RFC 8414)
+- JSON Web Token Profile for OAuth 2.0 Access Tokens (RFC 9068)
 - OAuth 2.0 Token Exchange (RFC 8693)
 - Resource Indicators for OAuth 2.0 (RFC 8707)
 - OAuth 2.0 Authorization Server Issuer Identification (RFC 9207)

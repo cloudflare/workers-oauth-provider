@@ -1,3 +1,4 @@
+import { createJwtAccessTokenValidator, type OfflineTokenValidation } from './jwt-access-tokens';
 import {
   hasAcceptedCanonicalScheme,
   requestCarriesResourceQuery,
@@ -49,6 +50,43 @@ export interface OAuthResourceHandler<Env, Props> {
   fetch(request: Request, env: Env, ctx: ExecutionContext<Props>): Response | Promise<Response>;
 }
 
+/** An application's own token validator. Return `null` for an invalid token; thrown errors fail closed. */
+export type OAuthResourceTokenValidator<Env, Props> = (
+  input: OAuthResourceTokenValidationInput<Env>
+) => Promise<OAuthResourceTokenValidation<Props> | null>;
+
+/**
+ * The authorization server's validator for this resource, as exposed by a
+ * `WorkerEntrypoint` that forwards to `authorizationServer.resource(uri).validateToken()`.
+ * Reached over a Service Binding, so the call never leaves Cloudflare's network.
+ */
+export interface OnlineTokenValidator<Props> {
+  validateToken(token: string): Promise<OAuthResourceTokenValidation<Props> | null>;
+}
+
+/**
+ * How this resource server validates a bearer token issued by an
+ * {@link OAuthAuthorizationServer}. Name at least one mode.
+ */
+export interface OAuthResourceTokenValidationModes<Env, Props> {
+  /**
+   * Offline: verify the authorization server's signed JWT here, against its published
+   * keys. No request to the authorization server per token, only the public claims it
+   * chose to put in the JWT, and no view of a revocation before the token expires.
+   */
+  offline?: OfflineTokenValidation<Env, Props>;
+  /**
+   * Online: ask the authorization server, over a private Service Binding to the Worker
+   * that runs it. Full confidential `props` and immediate revocation, at one RPC per
+   * request. This is a binding, not a URL: the validator is not meant to be reachable
+   * from the public internet.
+   *
+   * With `offline` as well, a token that does not verify offline is asked about online,
+   * which is how opaque tokens keep working while JWT issuance rolls out.
+   */
+  online?: (env: Env) => OnlineTokenValidator<Props> | undefined;
+}
+
 /** Configuration for {@link createOAuthResourceServer}. */
 export interface OAuthResourceServerOptions<Env = Cloudflare.Env, Props = unknown> {
   /** RFC 9728 metadata, including this server's one canonical resource. */
@@ -56,12 +94,11 @@ export interface OAuthResourceServerOptions<Env = Cloudflare.Env, Props = unknow
   /** Application handler for the canonical resource URL and its path descendants. */
   handler: OAuthResourceHandler<Env, Props>;
   /**
-   * Validate a presented bearer token using application-selected infrastructure.
-   *
-   * This can call an RFC 7662 endpoint, a Worker over a Service Binding, or a
-   * JWT verifier. Return `null` for an invalid token. Thrown errors fail closed.
+   * How a presented bearer token is validated: `offline`, `online`, or both, for tokens
+   * from an {@link OAuthAuthorizationServer}; or a function of your own for any other
+   * issuer, such as an RFC 7662 introspection call.
    */
-  validateToken(input: OAuthResourceTokenValidationInput<Env>): Promise<OAuthResourceTokenValidation<Props> | null>;
+  validateToken: OAuthResourceTokenValidationModes<Env, Props> | OAuthResourceTokenValidator<Env, Props>;
 }
 
 /** Fetch handler returned by {@link createOAuthResourceServer}. */
@@ -83,6 +120,7 @@ export function createOAuthResourceServer<Env = Cloudflare.Env, Props = unknown>
   options: OAuthResourceServerOptions<Env, Props>
 ): OAuthResourceServer<Env> {
   const validated = validateOptions(options);
+  const validateToken = resolveTokenValidator(validated.resource, options.validateToken);
 
   return {
     async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -141,7 +179,7 @@ export function createOAuthResourceServer<Env = Cloudflare.Env, Props = unknown>
 
       let validation: OAuthResourceTokenValidation<Props> | null;
       try {
-        validation = await options.validateToken({ token, request, env });
+        validation = await validateToken({ token, request, env });
       } catch {
         return addCorsHeaders(createValidationUnavailableResponse(), request);
       }
@@ -155,6 +193,40 @@ export function createOAuthResourceServer<Env = Cloudflare.Env, Props = unknown>
       return addCorsHeaders(response, request);
     },
   };
+}
+
+/**
+ * Turn the configured mode(s) into one validator. Offline runs first because it costs no
+ * I/O; a token it cannot verify, an opaque one during a rollout or one signed by a key it
+ * does not know, is then asked about online when that mode is present.
+ */
+function resolveTokenValidator<Env, Props>(
+  resource: string,
+  configured: OAuthResourceTokenValidationModes<Env, Props> | OAuthResourceTokenValidator<Env, Props>
+): OAuthResourceTokenValidator<Env, Props> {
+  if (typeof configured === 'function') return configured;
+  const { offline, online } = configured;
+  if (offline === undefined && online === undefined) {
+    throw new TypeError('validateToken must name an offline or online mode');
+  }
+  if (online !== undefined && typeof online !== 'function') {
+    throw new TypeError('validateToken.online must be a function returning the authorization server binding');
+  }
+  const offlineValidator = offline === undefined ? undefined : createJwtAccessTokenValidator(resource, offline);
+  const onlineValidator: OAuthResourceTokenValidator<Env, Props> | undefined =
+    online === undefined
+      ? undefined
+      : async ({ token, env }) => {
+          const authorizationServer = online(env);
+          // A missing binding is a deployment mistake, not an invalid token: fail closed as 503.
+          if (!authorizationServer || typeof authorizationServer.validateToken !== 'function') {
+            throw new TypeError('validateToken.online did not return the authorization server binding');
+          }
+          return authorizationServer.validateToken(token);
+        };
+  if (!offlineValidator) return onlineValidator!;
+  if (!onlineValidator) return offlineValidator;
+  return async (input) => (await offlineValidator(input)) ?? onlineValidator(input);
 }
 
 interface ValidatedResourceConfiguration {
@@ -171,8 +243,11 @@ function validateOptions<Env, Props>(options: OAuthResourceServerOptions<Env, Pr
   if (!options.handler || typeof options.handler.fetch !== 'function') {
     throw new TypeError('handler must provide a fetch function');
   }
-  if (typeof options.validateToken !== 'function') {
-    throw new TypeError('validateToken must be a function');
+  if (
+    typeof options.validateToken !== 'function' &&
+    (typeof options.validateToken !== 'object' || options.validateToken === null)
+  ) {
+    throw new TypeError('validateToken must be a function, or name an offline or online mode');
   }
 
   const resource = options.resourceMetadata?.resource;

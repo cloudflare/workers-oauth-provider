@@ -148,7 +148,7 @@ export default new OAuthProvider<Env>({
 
 `apiRoute` and `apiHandler` protect one or more route prefixes with a single handler. Use `apiHandlers` when different prefixes need different handlers.
 
-Before calling a protected handler, the provider reads the bearer token, rejects missing, invalid, or expired credentials, checks its audience, and exposes the authenticated application data through `ctx.props`. The handler does not need to parse or validate the token, but it must still enforce application permissions such as scope, ownership, and tenancy.
+Before calling a protected handler, the provider reads the bearer token, rejects missing, invalid, or expired credentials, checks its audience, and exposes the authenticated application data through `ctx.props`. The handler does not need to parse or validate the token, but it must still enforce ownership, tenancy, and any application permissions deliberately stored in `props`.
 
 Requests outside the protected route prefixes go to `defaultHandler`. In the example above, that handler owns `/authorize`.
 
@@ -172,10 +172,9 @@ interface Env {
 
 interface AuthProps {
   userId: string;
-  scopes: string[];
 }
 
-const authorizationServer = new OAuthAuthorizationServer<Env>({
+const authorizationServer = new OAuthAuthorizationServer<Env, AuthProps>({
   issuer: AUTH_ISSUER,
   resources: [CALENDAR_RESOURCE, DRIVE_RESOURCE],
   authorizeEndpoint: '/authorize',
@@ -184,7 +183,7 @@ const authorizationServer = new OAuthAuthorizationServer<Env>({
   scopesSupported: ['calendar:read', 'drive:read'],
 });
 
-const calendar = authorizationServer.protectResource<AuthProps>({
+const calendar = authorizationServer.protectResource({
   resourceMetadata: {
     resource: CALENDAR_RESOURCE,
     scopes_supported: ['calendar:read'],
@@ -192,13 +191,12 @@ const calendar = authorizationServer.protectResource<AuthProps>({
   },
   handler: {
     async fetch(_request, _env, ctx) {
-      if (!ctx.props.scopes.includes('calendar:read')) return new Response('Forbidden', { status: 403 });
       return Response.json({ userId: ctx.props.userId, server: 'calendar' });
     },
   },
 });
 
-const drive = authorizationServer.protectResource<AuthProps>({
+const drive = authorizationServer.protectResource({
   resourceMetadata: {
     resource: DRIVE_RESOURCE,
     scopes_supported: ['drive:read'],
@@ -206,7 +204,6 @@ const drive = authorizationServer.protectResource<AuthProps>({
   },
   handler: {
     async fetch(_request, _env, ctx) {
-      if (!ctx.props.scopes.includes('drive:read')) return new Response('Forbidden', { status: 403 });
       return Response.json({ userId: ctx.props.userId, server: 'drive' });
     },
   },
@@ -229,7 +226,7 @@ app.get('/auth.example.com/authorize', async (c) => {
     userId: 'user-123',
     metadata: {},
     scope: request.scope,
-    props: { userId: 'user-123', scopes: request.scope },
+    props: { userId: 'user-123' },
   });
   return c.redirect(redirectTo);
 });
@@ -260,70 +257,40 @@ The registry is fixed at construction. `resources` must name every audience the 
 
 ### Resource servers in separate Workers
 
-List a resource in `resources` without calling `protectResource()` when the authorization server issues tokens for a resource it does not host. The standalone resource Worker can use `createOAuthResourceServer()` to publish its own RFC 9728 metadata, issue Bearer challenges, enforce the canonical audience, and expose validated application data as `ctx.props`:
+List a resource in `resources` without calling `protectResource()` when another Worker serves it. That Worker uses `createOAuthResourceServer()` for its RFC 9728 metadata, Bearer challenges and audience check, and names how it validates tokens:
 
 ```ts
-import { createOAuthResourceServer, type ValidatedAccessToken } from '@cloudflare/workers-oauth-provider';
-
-const AUTH_ISSUER = 'https://auth.example.com';
-const CALENDAR_RESOURCE = 'https://calendar.example.com/mcp';
-
-interface AuthProps {
-  userId: string;
-  scopes: string[];
-}
-
-interface CalendarEnv {
-  AUTHORIZATION_SERVER: {
-    validateToken(token: string): Promise<ValidatedAccessToken<{ userId: string }> | null>;
-  };
-}
-
-export default createOAuthResourceServer<CalendarEnv, AuthProps>({
-  resourceMetadata: {
-    resource: CALENDAR_RESOURCE,
-    authorization_servers: [AUTH_ISSUER],
-    scopes_supported: ['calendar:read'],
-    resource_name: 'Calendar MCP',
+export default createOAuthResourceServer<CalendarEnv, CalendarProps>({
+  resourceMetadata: { resource: CALENDAR_RESOURCE, authorization_servers: [AUTH_ISSUER] },
+  validateToken: {
+    // Online: ask the authorization server over a private Service Binding. Full props, immediate revocation.
+    online: (env) => env.AUTHORIZATION_SERVER,
+    // Offline: verify its signed JWT here against its JWKS. No round trip; public claims only.
+    offline: { issuer: AUTH_ISSUER, algorithms: ['RS256'], keys: { jwksUri: JWKS_URI }, mapClaimsToProps },
   },
-  async validateToken({ token, env }) {
-    const validation = await env.AUTHORIZATION_SERVER.validateToken(token);
-    if (!validation) return null;
-    return {
-      audience: validation.audience,
-      expiresAt: validation.expiresAt,
-      props: {
-        ...validation.props,
-        scopes: validation.scope,
-      },
-    };
-  },
-  handler: {
-    async fetch(_request, _env, ctx) {
-      if (!ctx.props.scopes.includes('calendar:read')) {
-        return new Response('Forbidden', { status: 403 });
-      }
-      return Response.json({ userId: ctx.props.userId });
-    },
-  },
+  handler,
 });
 ```
 
-The `validateToken` callback is deliberately transport-independent. For Workers, a private Service Binding can expose a resource-specific method backed by the resource handle's `validateToken()`:
+Use either mode alone, or both while opaque tokens are still in circulation. `online` takes a binding, not a URL: the validator is not meant to be reachable from the public internet. See [JWT access tokens and separate resource Workers](docs/jwt-access-tokens.md) for the authorization-server side of each mode.
+
+### Signed JWT access tokens
+
+Access tokens are opaque unless you ask for JWTs. `createJwtAccessTokens()` gives an `OAuthAuthorizationServer` signed [RFC 9068](https://www.rfc-editor.org/rfc/rfc9068.html) access tokens and a `jwks_uri`; its `issuance` setting, off by default, decides whether new tokens are JWTs, so readers always ship before the first JWT is written. `props` never enter a token unless `publicClaims` projects them. Authorization codes and refresh tokens stay opaque.
 
 ```ts
-import { WorkerEntrypoint } from 'cloudflare:workers';
+const jwtAccessTokens = createJwtAccessTokens<Env, AuthProps>({
+  issuer: AUTH_ISSUER,
+  jwksUri: `${AUTH_ISSUER}/.well-known/jwks.json`,
+  keys: loadAccessTokenKeys, // (env) => JwtKeySet, memoised per isolate
+  publicClaims: ({ props }) => ({ tenantId: props.tenantId }),
+  issuance: ({ env }) => env.JWT_ISSUANCE_ENABLED,
+});
 
-const calendar = authorizationServer.resource(CALENDAR_RESOURCE);
-
-export class CalendarTokenValidator extends WorkerEntrypoint<Env> {
-  validateToken(token: string) {
-    return calendar.validateToken(token, this.env);
-  }
-}
+const authorizationServer = new OAuthAuthorizationServer<Env, AuthProps>({ ..., jwtAccessTokens });
 ```
 
-Bind the Calendar Worker to `CalendarTokenValidator`; expose a separate Drive entrypoint built from `authorizationServer.resource(DRIVE_RESOURCE)`. Fixing the resource on the authorization-server side prevents one resource Worker from asking to validate tokens for another audience. `createOAuthResourceServer()` also rejects a successful callback result whose `audience` is not its configured canonical resource and returns `503` when validation infrastructure throws. It passes only the validator's `props` to the handler, so the validator must copy or derive every scope and identity field the handler needs, as above, or enforce authorization itself. The package does not create a public token-introspection or JWT-validation endpoint; applications choose and secure the callback transport.
+Same-Worker resources, `resource(uri).validateToken()`, token exchange and revocation still use the encrypted KV record and see the full `props`. Key rotation, the reader-first rollout, and the security properties of both validation modes are in [docs/jwt-access-tokens.md](docs/jwt-access-tokens.md).
 
 The existing `OAuthProvider` constructor remains supported. It is the concise combined AS-and-resource API used by the quick start and is appropriate when one Worker protects one canonical resource. Existing applications do not need to move to `OAuthAuthorizationServer` to upgrade.
 
@@ -394,6 +361,7 @@ The provider publishes RFC 8414 metadata containing:
 - `authorization_endpoint`
 - `token_endpoint`
 - `protected_resources`, containing the authorization server's registered canonical resources
+- `jwks_uri`, when RFC 9068 JWT access tokens are enabled
 - `registration_endpoint`, when DCR is enabled
 - supported response and grant types
 - token endpoint authentication methods
@@ -581,6 +549,7 @@ The package also supports:
 - Custom error observation or responses through `onError`.
 - Experimental MCP Enterprise-Managed Authorization using ID-JAG assertions.
 - One authorization server with multiple same-Worker or separately routed MCP resources.
+- Opt-in RFC 9068 JWT access tokens with stateful confidential props or offline public-claim validation.
 - Multiple protected handlers through `apiHandlers`.
 - Configurable access token, refresh token, and DCR client lifetimes.
 
@@ -650,6 +619,10 @@ The functional role API adds these surfaces without removing `OAuthProvider`:
 | Surface                                                  | Purpose                                                                                     |
 | -------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
 | `new OAuthAuthorizationServer({ issuer, resources, … })` | Create the AS role with a canonical RFC 8414 issuer and its fixed resource registry         |
+| `createJwtAccessTokens({ …, issuance })`                 | Build the JWT signer, reader, and JWKS; `issuance` decides which new tokens are JWTs        |
+| `jwtAccessTokens`                                        | Install that component on the authorization server                                          |
+| `validateToken: { online }`                              | Resource Worker asks the authorization server over a private Service Binding                |
+| `validateToken: { offline }`                             | Resource Worker verifies the JWT locally against the authorization server's JWKS            |
 | `protectResource({ resourceMetadata, handler })`         | Host one declared resource in this Worker, returning its fetch surface                      |
 | `resource(uri)`                                          | Obtain a handle for one declared resource, with `validateToken(token, env)` and `protect()` |
 | `defaultResource`                                        | Select a deliberate default for new authorization requests that omit it                     |
@@ -683,6 +656,7 @@ The package implements or supports the relevant portions of:
 - [OAuth 2.0 Dynamic Client Registration, RFC 7591](https://datatracker.ietf.org/doc/html/rfc7591)
 - [Proof Key for Code Exchange, RFC 7636](https://datatracker.ietf.org/doc/html/rfc7636)
 - [OAuth 2.0 Authorization Server Metadata, RFC 8414](https://datatracker.ietf.org/doc/html/rfc8414)
+- [JSON Web Token Profile for OAuth 2.0 Access Tokens, RFC 9068](https://www.rfc-editor.org/rfc/rfc9068.html)
 - [OAuth 2.0 Token Exchange, RFC 8693](https://datatracker.ietf.org/doc/html/rfc8693)
 - [Resource Indicators for OAuth 2.0, RFC 8707](https://datatracker.ietf.org/doc/html/rfc8707)
 - [OAuth 2.0 Authorization Server Issuer Identification, RFC 9207](https://datatracker.ietf.org/doc/html/rfc9207)
