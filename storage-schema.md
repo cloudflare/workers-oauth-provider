@@ -60,6 +60,8 @@ Client records store OAuth client application information.
 
 **TTL:** Dynamically registered clients (DCR) default to 90 days. Clients created via `OAuthHelpers.createClient()` have no expiration. Configurable via the `clientRegistrationTTL` option.
 
+> **Renewal:** A record written under `clientRegistrationTTL` also stores `registrationExpiresAt`, the Unix time its KV expiration falls. After a successful, client-authenticated token endpoint request, a registration with less than half its TTL remaining is rewritten with a fresh TTL and stamp, so a client that keeps exchanging tokens does not expire from under its grants. This is at most one write per client per half TTL. Records without the stamp are never renewed: `createClient()` records, which have no TTL, and registrations written before the stamp existed, which cannot be told apart from them and so expire on their original schedule. `OAuthHelpers` never returns the stamp.
+
 ### Authorization Grants
 
 Grant records store information about permissions a user has granted to an application, along with the authorization code (initially) and refresh token (after code exchange).

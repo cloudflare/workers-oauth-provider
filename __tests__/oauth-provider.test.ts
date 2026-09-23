@@ -13025,6 +13025,241 @@ describe('OAuthProvider', () => {
     });
   });
 
+  describe('Active client registrations are renewed', () => {
+    const NINETY_DAYS = 90 * 24 * 60 * 60;
+    const REDIRECT_URI = 'https://app.example.com/callback';
+    type Credentials = { client_id: string; client_secret: string };
+
+    // Explicit `clientRegistrationTTL: undefined` disables the TTL, so overrides are spread
+    // rather than passed positionally, where `undefined` would select a default.
+    function makeProvider(overrides: Partial<OAuthProviderOptions<TestEnv>> = {}) {
+      return new OAuthProvider<TestEnv>({
+        apiRoute: '/api/',
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        clientRegistrationTTL: NINETY_DAYS,
+        ...overrides,
+      });
+    }
+
+    async function registerDcr(provider: OAuthProvider<TestEnv>): Promise<Credentials> {
+      const response = await provider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify({ redirect_uris: [REDIRECT_URI], token_endpoint_auth_method: 'client_secret_post' })
+        ),
+        mockEnv,
+        mockCtx
+      );
+      expect(response.status).toBe(201);
+      return response.json<any>();
+    }
+
+    async function tokenRequest(provider: OAuthProvider<TestEnv>, client: Credentials, params: Record<string, string>) {
+      return provider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          new URLSearchParams({
+            client_id: client.client_id,
+            client_secret: client.client_secret,
+            ...params,
+          }).toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+    }
+
+    async function issueTokens(provider: OAuthProvider<TestEnv>, client: Credentials) {
+      const authResponse = await provider.fetch(
+        createMockRequest(
+          `https://example.com/authorize?response_type=code&client_id=${client.client_id}` +
+            `&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&scope=read%20write&state=s`
+        ),
+        mockEnv,
+        mockCtx
+      );
+      const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
+      const response = await tokenRequest(provider, client, {
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: REDIRECT_URI,
+      });
+      expect(response.status).toBe(200);
+      return response.json<any>();
+    }
+
+    const refresh = (provider: OAuthProvider<TestEnv>, client: Credentials, refreshToken: string) =>
+      tokenRequest(provider, client, { grant_type: 'refresh_token', refresh_token: refreshToken });
+
+    const readClient = (clientId: string) => mockEnv.OAUTH_KV.get(`client:${clientId}`, { type: 'json' });
+
+    /** Rewrite a stored registration so that it expires `inSeconds` from now, as an old registration would. */
+    async function ageRegistration(clientId: string, inSeconds: number) {
+      const record = await readClient(clientId);
+      const registrationExpiresAt = Math.floor(Date.now() / 1000) + inSeconds;
+      await mockEnv.OAUTH_KV.put(`client:${clientId}`, JSON.stringify({ ...record, registrationExpiresAt }), {
+        expirationTtl: inSeconds,
+      });
+    }
+
+    function clientWrites() {
+      const put = vi.spyOn(mockEnv.OAUTH_KV, 'put');
+      return () => put.mock.calls.filter(([key]) => String(key).startsWith('client:'));
+    }
+
+    const nowSeconds = () => Math.floor(Date.now() / 1000);
+
+    it('stamps a dynamically registered client with the expiry it was written under, and keeps the stamp internal', async () => {
+      const provider = makeProvider();
+      const client = await registerDcr(provider);
+      const stored = await readClient(client.client_id);
+      expect(stored.registrationExpiresAt).toBe(stored.registrationDate + NINETY_DAYS);
+
+      await provider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
+      const seen = await mockEnv.OAUTH_PROVIDER!.lookupClient(client.client_id);
+      expect(seen).not.toBeNull();
+      expect(seen).not.toHaveProperty('registrationExpiresAt');
+    });
+
+    it('does not touch a registration with more than half its lifetime left', async () => {
+      const provider = makeProvider();
+      const client = await registerDcr(provider);
+      const tokens = await issueTokens(provider, client);
+      const writes = clientWrites();
+
+      expect((await refresh(provider, client, tokens.refresh_token)).status).toBe(200);
+      expect(writes()).toEqual([]);
+    });
+
+    it('renews a registration past half its lifetime on the next successful token request, once', async () => {
+      const provider = makeProvider();
+      const client = await registerDcr(provider);
+      const tokens = await issueTokens(provider, client);
+      await ageRegistration(client.client_id, 100);
+      const writes = clientWrites();
+
+      const first = await refresh(provider, client, tokens.refresh_token);
+      expect(first.status).toBe(200);
+      expect(writes()).toHaveLength(1);
+      expect(writes()[0][2]).toEqual({ expirationTtl: NINETY_DAYS });
+      const renewed = await readClient(client.client_id);
+      expect(renewed.registrationExpiresAt).toBeGreaterThanOrEqual(nowSeconds() + NINETY_DAYS - 5);
+      expect(renewed.clientSecret).toBeDefined();
+
+      // The record outlives the expiry it had, and the next request does not write again.
+      mockEnv.OAUTH_KV.advanceTime(101_000);
+      expect(await readClient(client.client_id)).not.toBeNull();
+      const second = await refresh(provider, client, (await first.json<any>()).refresh_token);
+      expect(second.status).toBe(200);
+      expect(writes()).toHaveLength(1);
+    });
+
+    it('renews on a successful revocation request as well', async () => {
+      const provider = makeProvider();
+      const client = await registerDcr(provider);
+      const tokens = await issueTokens(provider, client);
+      await ageRegistration(client.client_id, 100);
+      const writes = clientWrites();
+
+      const response = await tokenRequest(provider, client, { token: tokens.access_token });
+      expect(response.status).toBe(200);
+      expect(writes()).toHaveLength(1);
+    });
+
+    it('does not renew when the token request fails', async () => {
+      const provider = makeProvider();
+      const client = await registerDcr(provider);
+      await issueTokens(provider, client);
+      await ageRegistration(client.client_id, 100);
+      const writes = clientWrites();
+
+      const response = await refresh(provider, client, 'not-a-refresh-token');
+      expect(response.status).toBe(400);
+      expect(writes()).toEqual([]);
+    });
+
+    it('does not renew when onError restyles a failure as a 2xx response', async () => {
+      const provider = makeProvider({
+        onError: ({ code, description }) => Response.json({ ok: false, code, description }, { status: 200 }),
+      });
+      const client = await registerDcr(provider);
+      await issueTokens(provider, client);
+      await ageRegistration(client.client_id, 100);
+      const writes = clientWrites();
+
+      const response = await refresh(provider, client, 'not-a-refresh-token');
+      expect(response.status).toBe(200);
+      expect(await response.json<any>()).toMatchObject({ ok: false, code: 'invalid_grant' });
+      expect(writes()).toEqual([]);
+    });
+
+    it('never touches a client created through createClient()', async () => {
+      const provider = makeProvider({ clientRegistrationTTL: 60 });
+      await provider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
+      const created = await mockEnv.OAUTH_PROVIDER!.createClient({
+        redirectUris: [REDIRECT_URI],
+        tokenEndpointAuthMethod: 'client_secret_post',
+      });
+      const client = { client_id: created.clientId, client_secret: created.clientSecret! };
+      expect(await readClient(client.client_id)).not.toHaveProperty('registrationExpiresAt');
+
+      const tokens = await issueTokens(provider, client);
+      const writes = clientWrites();
+      expect((await refresh(provider, client, tokens.refresh_token)).status).toBe(200);
+      expect(writes()).toEqual([]);
+
+      // Still there long after a dynamically registered client would have expired.
+      mockEnv.OAUTH_KV.advanceTime(61_000);
+      expect(await readClient(client.client_id)).not.toBeNull();
+    });
+
+    it('leaves a registration from before the stamp existed on its original schedule', async () => {
+      const provider = makeProvider();
+      const client = await registerDcr(provider);
+      // A record written by a version that did not stamp `registrationExpiresAt`, with 100s left.
+      const { registrationExpiresAt: _stamp, ...legacy } = await readClient(client.client_id);
+      await mockEnv.OAUTH_KV.put(`client:${client.client_id}`, JSON.stringify(legacy), { expirationTtl: 100 });
+      const tokens = await issueTokens(provider, client);
+      const writes = clientWrites();
+
+      expect((await refresh(provider, client, tokens.refresh_token)).status).toBe(200);
+      expect(writes()).toEqual([]);
+      mockEnv.OAUTH_KV.advanceTime(101_000);
+      expect(await readClient(client.client_id)).toBeNull();
+    });
+
+    it('stamps and renews nothing when clientRegistrationTTL is unset', async () => {
+      const provider = makeProvider({ clientRegistrationTTL: undefined });
+      const client = await registerDcr(provider);
+      expect(await readClient(client.client_id)).not.toHaveProperty('registrationExpiresAt');
+      const tokens = await issueTokens(provider, client);
+      const writes = clientWrites();
+
+      expect((await refresh(provider, client, tokens.refresh_token)).status).toBe(200);
+      expect(writes()).toEqual([]);
+    });
+
+    it('re-stamps the expiry when updateClient() re-applies the TTL', async () => {
+      const provider = makeProvider();
+      const client = await registerDcr(provider);
+      await ageRegistration(client.client_id, 100);
+      await provider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
+
+      await mockEnv.OAUTH_PROVIDER!.updateClient(client.client_id, { clientName: 'Renamed' });
+      const updated = await readClient(client.client_id);
+      expect(updated.clientName).toBe('Renamed');
+      expect(updated.registrationExpiresAt).toBeGreaterThanOrEqual(nowSeconds() + NINETY_DAYS - 5);
+    });
+  });
+
   describe('deleteClient cascading to grants', () => {
     let provider: OAuthProvider<TestEnv>;
     let clientId: string;
