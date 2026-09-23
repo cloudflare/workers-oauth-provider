@@ -1,0 +1,20 @@
+src/oauth-provider.ts
+  s_1b1f3dce47e01c::t_93ba2bc8fd1215 6393
+  s_1b1f3dce47e01c::t_c5de6c3a545f5e 6383,6388,6391
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "2b195b113680b98786c49e55275a4f6d23b37f26",
+  "prompts": {},
+  "sessions": {
+    "s_1b1f3dce47e01c": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a0b3b8-09e5-75fe-ad90-bf9d48da5b83",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Matt Carey <mcarey@cloudflare.com>"
+    }
+  }
+}
