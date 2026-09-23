@@ -6430,6 +6430,304 @@ describe('OAuthProvider', () => {
     });
   });
 
+  describe('Sliding refresh token expiry (refreshTokenIdleTTL)', () => {
+    const REDIRECT_URI = 'https://client.example.com/callback';
+    const ONE_WEEK = 7 * 24 * 60 * 60;
+    let clientId: string;
+    let clientSecret: string;
+
+    beforeEach(async () => {
+      const response = await oauthProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify({ redirect_uris: [REDIRECT_URI], token_endpoint_auth_method: 'client_secret_post' })
+        ),
+        mockEnv,
+        mockCtx
+      );
+      const client = await response.json<any>();
+      clientId = client.client_id;
+      clientSecret = client.client_secret;
+    });
+
+    function makeProvider(overrides: Partial<OAuthProviderOptions<TestEnv>> = {}) {
+      return new OAuthProvider<TestEnv>({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        accessTokenTTL: 3600,
+        refreshTokenTTL: 7200,
+        ...overrides,
+      });
+    }
+
+    async function tokenRequest(provider: OAuthProvider<TestEnv>, params: Record<string, string>) {
+      return provider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          new URLSearchParams({ client_id: clientId, client_secret: clientSecret, ...params }).toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+    }
+
+    async function issueTokens(provider: OAuthProvider<TestEnv>) {
+      const authResponse = await provider.fetch(
+        createMockRequest(
+          `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+            `&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&scope=read%20write&state=s`
+        ),
+        mockEnv,
+        mockCtx
+      );
+      const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
+      return tokenRequest(provider, { grant_type: 'authorization_code', code, redirect_uri: REDIRECT_URI });
+    }
+
+    async function refresh(provider: OAuthProvider<TestEnv>, refreshToken: string) {
+      return tokenRequest(provider, { grant_type: 'refresh_token', refresh_token: refreshToken });
+    }
+
+    async function grantKey(): Promise<string> {
+      const { keys } = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      expect(keys).toHaveLength(1);
+      return keys[0].name;
+    }
+
+    async function readGrant(): Promise<any> {
+      return mockEnv.OAUTH_KV.get(await grantKey(), { type: 'json' });
+    }
+
+    const nowSeconds = () => Math.floor(Date.now() / 1000);
+
+    it('moves the grant expiry to refreshTokenIdleTTL after every successful refresh', async () => {
+      const provider = makeProvider({ refreshTokenIdleTTL: ONE_WEEK });
+      const tokens = await (await issueTokens(provider)).json<any>();
+      // A new grant still gets the fixed refreshTokenTTL.
+      expect((await readGrant()).expiresAt).toBeLessThanOrEqual(nowSeconds() + 7200);
+
+      const first = await refresh(provider, tokens.refresh_token);
+      expect(first.status).toBe(200);
+      const afterFirst = (await readGrant()).expiresAt;
+      expect(afterFirst).toBeGreaterThanOrEqual(nowSeconds() + ONE_WEEK - 5);
+      expect(afterFirst).toBeLessThanOrEqual(nowSeconds() + ONE_WEEK);
+
+      // The KV expiration moved with it: the record outlives its original two hours.
+      mockEnv.OAUTH_KV.advanceTime(7200 * 1000 + 1000);
+      expect(await readGrant()).not.toBeNull();
+
+      const second = await refresh(provider, (await first.json<any>()).refresh_token);
+      expect(second.status).toBe(200);
+      expect((await readGrant()).expiresAt).toBeGreaterThanOrEqual(afterFirst);
+    });
+
+    it('lets the callback set the idle lifetime for one refresh, and falls back to the option otherwise', async () => {
+      let idleTTL: number | undefined = 3600;
+      const provider = makeProvider({
+        refreshTokenIdleTTL: ONE_WEEK,
+        tokenExchangeCallback: ({ grantType }) =>
+          grantType === 'refresh_token' && idleTTL !== undefined ? { refreshTokenIdleTTL: idleTTL } : undefined,
+      });
+      const tokens = await (await issueTokens(provider)).json<any>();
+
+      // The callback sets, rather than extends: an hour from now is shorter than the week the option would give.
+      const first = await refresh(provider, tokens.refresh_token);
+      expect(first.status).toBe(200);
+      expect((await readGrant()).expiresAt).toBeLessThanOrEqual(nowSeconds() + 3600);
+
+      idleTTL = undefined;
+      const second = await refresh(provider, (await first.json<any>()).refresh_token);
+      expect(second.status).toBe(200);
+      expect((await readGrant()).expiresAt).toBeGreaterThanOrEqual(nowSeconds() + ONE_WEEK - 5);
+    });
+
+    it('extends from the callback alone, without the provider option', async () => {
+      const provider = makeProvider({
+        tokenExchangeCallback: ({ grantType }) =>
+          grantType === 'refresh_token' ? { refreshTokenIdleTTL: ONE_WEEK } : undefined,
+      });
+      const tokens = await (await issueTokens(provider)).json<any>();
+      expect((await refresh(provider, tokens.refresh_token)).status).toBe(200);
+      expect((await readGrant()).expiresAt).toBeGreaterThanOrEqual(nowSeconds() + ONE_WEEK - 5);
+    });
+
+    it('leaves the expiry alone when the callback throws', async () => {
+      const provider = makeProvider({
+        refreshTokenIdleTTL: ONE_WEEK,
+        tokenExchangeCallback: ({ grantType }) => {
+          if (grantType === 'refresh_token') {
+            throw new OAuthError('temporarily_unavailable', {
+              description: 'upstream refresh failed',
+              statusCode: 503,
+            });
+          }
+          return undefined;
+        },
+      });
+      const tokens = await (await issueTokens(provider)).json<any>();
+      const before = (await readGrant()).expiresAt;
+
+      const response = await refresh(provider, tokens.refresh_token);
+      expect(response.status).toBe(503);
+      expect((await readGrant()).expiresAt).toBe(before);
+    });
+
+    it('does not revive a grant that has already expired', async () => {
+      const provider = makeProvider({ refreshTokenIdleTTL: ONE_WEEK });
+      const tokens = await (await issueTokens(provider)).json<any>();
+      const key = await grantKey();
+      const grant = await readGrant();
+      grant.expiresAt = nowSeconds() + 30;
+      await mockEnv.OAUTH_KV.put(key, JSON.stringify(grant), { expiration: nowSeconds() + 120 });
+
+      const response = await refresh(provider, tokens.refresh_token);
+      expect(response.status).toBe(400);
+      expect(await response.json<any>()).toMatchObject({
+        error: 'invalid_grant',
+        error_description: 'Refresh token has expired',
+      });
+      expect((await readGrant()).expiresAt).toBe(grant.expiresAt);
+    });
+
+    it('does not revive a grant that expires while the callback is running', async () => {
+      const realNow = Date.now;
+      let skewMs = 0;
+      const clock = vi.spyOn(Date, 'now').mockImplementation(() => realNow() + skewMs);
+      try {
+        const provider = makeProvider({
+          refreshTokenIdleTTL: ONE_WEEK,
+          tokenExchangeCallback: ({ grantType }) => {
+            // A slow upstream: by the time it answers, the two-hour grant has expired.
+            if (grantType === 'refresh_token') skewMs = 7200 * 1000 + 1000;
+            return undefined;
+          },
+        });
+        const tokens = await (await issueTokens(provider)).json<any>();
+        const response = await refresh(provider, tokens.refresh_token);
+        expect(response.status).toBe(400);
+        expect(await response.json<any>()).toMatchObject({ error: 'invalid_grant' });
+      } finally {
+        clock.mockRestore();
+      }
+    });
+
+    it('extends on a retry with the previous refresh token', async () => {
+      const provider = makeProvider({ refreshTokenIdleTTL: ONE_WEEK });
+      const tokens = await (await issueTokens(provider)).json<any>();
+      expect((await refresh(provider, tokens.refresh_token)).status).toBe(200);
+      const afterFirst = (await readGrant()).expiresAt;
+
+      // The client lost the response and retries with the token it still holds.
+      const retry = await refresh(provider, tokens.refresh_token);
+      expect(retry.status).toBe(200);
+      expect((await readGrant()).expiresAt).toBeGreaterThanOrEqual(afterFirst);
+    });
+
+    it('issues an access token that outlives the expiry being replaced', async () => {
+      const provider = makeProvider({ refreshTokenIdleTTL: ONE_WEEK });
+      const tokens = await (await issueTokens(provider)).json<any>();
+      const key = await grantKey();
+      const grant = await readGrant();
+      grant.expiresAt = nowSeconds() + 120;
+      await mockEnv.OAUTH_KV.put(key, JSON.stringify(grant), { expiration: grant.expiresAt });
+
+      const response = await refresh(provider, tokens.refresh_token);
+      expect(response.status).toBe(200);
+      // Without the slide, the access token would have been clamped to the two minutes left.
+      expect((await response.json<any>()).expires_in).toBe(3600);
+    });
+
+    it('gives a never-expiring grant an idle expiry once it is refreshed', async () => {
+      const provider = makeProvider({ refreshTokenTTL: undefined, refreshTokenIdleTTL: ONE_WEEK });
+      const tokens = await (await issueTokens(provider)).json<any>();
+      expect((await readGrant()).expiresAt).toBeUndefined();
+
+      expect((await refresh(provider, tokens.refresh_token)).status).toBe(200);
+      expect((await readGrant()).expiresAt).toBeGreaterThanOrEqual(nowSeconds() + ONE_WEEK - 5);
+    });
+
+    it.each([30, 1.5, -1, Number.NaN])('rejects a callback refreshTokenIdleTTL of %s', async (bad) => {
+      const provider = makeProvider({
+        tokenExchangeCallback: ({ grantType }) =>
+          grantType === 'refresh_token' ? { refreshTokenIdleTTL: bad as number } : undefined,
+      });
+      const tokens = await (await issueTokens(provider)).json<any>();
+      const before = (await readGrant()).expiresAt;
+
+      const response = await refresh(provider, tokens.refresh_token);
+      expect(response.status).toBe(400);
+      expect(await response.json<any>()).toMatchObject({
+        error: 'invalid_request',
+        error_description: 'refreshTokenIdleTTL must be an integer of at least 60 seconds',
+      });
+      expect((await readGrant()).expiresAt).toBe(before);
+    });
+
+    it('rejects refreshTokenIdleTTL on authorization code exchange', async () => {
+      const provider = makeProvider({
+        tokenExchangeCallback: ({ grantType }) =>
+          grantType === 'authorization_code' ? { refreshTokenIdleTTL: ONE_WEEK } : undefined,
+      });
+      const response = await issueTokens(provider);
+      expect(response.status).toBe(400);
+      expect(await response.json<any>()).toMatchObject({
+        error: 'invalid_request',
+        error_description: 'refreshTokenIdleTTL is only honored during refresh token exchange',
+      });
+    });
+
+    it('rejects refreshTokenIdleTTL on token exchange', async () => {
+      const provider = makeProvider({
+        allowTokenExchangeGrant: true,
+        tokenExchangeCallback: ({ grantType }) =>
+          grantType === 'urn:ietf:params:oauth:grant-type:token-exchange'
+            ? { refreshTokenIdleTTL: ONE_WEEK }
+            : undefined,
+      });
+      // Registered grant types are enforced, so this client must opt into token exchange.
+      const registration = await provider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify({
+            redirect_uris: [REDIRECT_URI],
+            token_endpoint_auth_method: 'client_secret_post',
+            grant_types: ['authorization_code', 'refresh_token', 'urn:ietf:params:oauth:grant-type:token-exchange'],
+          })
+        ),
+        mockEnv,
+        mockCtx
+      );
+      ({ client_id: clientId, client_secret: clientSecret } = await registration.json<any>());
+      const tokens = await (await issueTokens(provider)).json<any>();
+      const response = await tokenRequest(provider, {
+        grant_type: 'urn:ietf:params:oauth:grant-type:token-exchange',
+        subject_token: tokens.access_token,
+        subject_token_type: 'urn:ietf:params:oauth:token-type:access_token',
+      });
+      expect(response.status).toBe(400);
+      expect(await response.json<any>()).toMatchObject({
+        error: 'invalid_request',
+        error_description: 'refreshTokenIdleTTL is only honored during refresh token exchange',
+      });
+    });
+
+    it.each([0, 30, 1.5, -1])('rejects a refreshTokenIdleTTL option of %s at construction', (bad) => {
+      expect(() => makeProvider({ refreshTokenIdleTTL: bad })).toThrow(
+        "refreshTokenIdleTTL must be an integer of at least 60 seconds (Cloudflare KV's minimum expiration window)."
+      );
+    });
+  });
+
   describe('Token Validation and API Access', () => {
     let accessToken: string;
 
