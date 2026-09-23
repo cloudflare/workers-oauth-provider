@@ -1513,7 +1513,6 @@ type InternalOAuthProviderOptions<Env> = Omit<OAuthProviderOptions<Env>, 'resour
 
 interface NormalizedResourceServer<Env> {
   resourceMetadata: OAuthProtectedResourceMetadata;
-  apiHandler?: TypedHandler<Env>;
   resolveExternalToken?: (input: ResolveExternalTokenInput<Env>) => Promise<ResolveExternalTokenResult | null>;
 }
 
@@ -1812,7 +1811,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       const resourceServer = this.resourceServers[0];
       if (hasSingleHandlerConfig) {
         const handler = this.validateHandler(legacyOptions.apiHandler!, 'apiHandler');
-        resourceServer.apiHandler = handler;
         const routes = Array.isArray(legacyOptions.apiRoute) ? legacyOptions.apiRoute : [legacyOptions.apiRoute!];
         routes.forEach((route, index) => {
           this.validateEndpoint(route, Array.isArray(legacyOptions.apiRoute) ? `apiRoute[${index}]` : 'apiRoute');
@@ -2186,30 +2184,23 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     request: Request,
     env: Env & ProviderEnv,
     ctx: ExecutionContext,
-    role: 'combined' | 'authorization-server' | NormalizedResourceServer<Env>
+    role: 'combined' | 'authorization-server'
   ): Promise<Response> {
     const url = new URL(request.url);
 
-    const servesAuthorizationServer = role === 'combined' || role === 'authorization-server';
-    const servesProtectedResources = role !== 'authorization-server';
-    const metadataResourceServer = servesProtectedResources
-      ? this.findResourceServerForMetadataUrl(url, typeof role === 'object' ? role : undefined)
-      : undefined;
-    const matchedApiRoute = servesProtectedResources ? this.findApiRouteForUrl(url) : undefined;
-    const apiRoute =
-      matchedApiRoute && (typeof role !== 'object' || matchedApiRoute.resourceServer === role)
-        ? matchedApiRoute
-        : undefined;
+    const servesProtectedResources = role === 'combined';
+    const metadataResourceServer = servesProtectedResources ? this.findResourceServerForMetadataUrl(url) : undefined;
+    const apiRoute = servesProtectedResources ? this.findApiRouteForUrl(url) : undefined;
 
     // Special handling for OPTIONS requests (CORS preflight)
     if (request.method === 'OPTIONS') {
       // For API routes and OAuth endpoints, respond with CORS headers
       if (
         apiRoute !== undefined ||
-        (servesAuthorizationServer && this.isAuthorizationServerMetadataRequest(url)) ||
+        this.isAuthorizationServerMetadataRequest(url) ||
         (servesProtectedResources && this.isProtectedResourceMetadataPath(url)) ||
-        (servesAuthorizationServer && this.isTokenEndpoint(url)) ||
-        (servesAuthorizationServer && this.options.clientRegistrationEndpoint && this.isClientRegistrationEndpoint(url))
+        this.isTokenEndpoint(url) ||
+        (this.options.clientRegistrationEndpoint && this.isClientRegistrationEndpoint(url))
       ) {
         // Create an empty 204 No Content response with CORS headers
         return this.addCorsHeaders(
@@ -2225,7 +2216,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     // Handle .well-known/oauth-authorization-server
-    if (servesAuthorizationServer && this.isAuthorizationServerMetadataRequest(url)) {
+    if (this.isAuthorizationServerMetadataRequest(url)) {
       if (request.method !== 'GET' && request.method !== 'HEAD') {
         return this.addCorsHeaders(
           new Response(null, {
@@ -2260,7 +2251,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     // Handle token endpoint (including revocation)
-    if (servesAuthorizationServer && this.isTokenEndpoint(url)) {
+    if (this.isTokenEndpoint(url)) {
       const parsed = await this.parseTokenEndpointRequest(request, env);
 
       // If parsing failed, return the error response
@@ -2284,11 +2275,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     // Handle client registration endpoint
-    if (
-      servesAuthorizationServer &&
-      this.options.clientRegistrationEndpoint &&
-      this.isClientRegistrationEndpoint(url)
-    ) {
+    if (this.options.clientRegistrationEndpoint && this.isClientRegistrationEndpoint(url)) {
       const response = await this.handleClientRegistration(request, env);
       return this.addCorsHeaders(response, request);
     }
@@ -2470,12 +2457,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * Only the well-known URL constructed from the configured canonical resource
    * may return its document; aliases would violate RFC 9728 §3.3.
    */
-  private findResourceServerForMetadataUrl(
-    url: URL,
-    onlyResourceServer?: NormalizedResourceServer<Env>
-  ): NormalizedResourceServer<Env> | undefined {
-    const candidates = onlyResourceServer ? [onlyResourceServer] : this.resourceServers;
-    return candidates.find((server) => {
+  private findResourceServerForMetadataUrl(url: URL): NormalizedResourceServer<Env> | undefined {
+    return this.resourceServers.find((server) => {
       // RFC 9728 §3 fixes the origin and path; a cache-busting query must not hide the
       // document, while a resource's own query parameters must still be present.
       const expected = new URL(this.getConfiguredResourceMetadataUrl(server.resourceMetadata.resource));
@@ -2749,15 +2732,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         url.origin === apiUrl.origin && pathMatches(apiUrl.pathname, true) && requestCarriesResourceQuery(url, apiUrl)
       );
     }
-  }
-
-  /**
-   * Checks if a URL is an API request based on the configured API route(s)
-   * @param url - The URL to check
-   * @returns True if the URL matches any of the API routes
-   */
-  private isApiRequest(url: URL): boolean {
-    return this.findApiRouteForUrl(url) !== undefined;
   }
 
   /**
