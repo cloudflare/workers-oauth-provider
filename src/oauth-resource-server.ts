@@ -1,3 +1,4 @@
+import { WorkerEntrypoint } from 'cloudflare:workers';
 import {
   hasAcceptedCanonicalScheme,
   requestCarriesResourceQuery,
@@ -46,10 +47,14 @@ export type OAuthResourceTokenValidator<Props> = (
   token: string
 ) => Promise<OAuthResourceTokenValidation<Props> | null>;
 
-/** Protected application handler called after successful token validation. */
-export interface OAuthResourceHandler<Env, Props> {
-  fetch(request: Request, env: Env, ctx: ExecutionContext<Props>): Response | Promise<Response>;
-}
+/**
+ * Protected application handler called after successful token validation: an object with
+ * `fetch`, or a `WorkerEntrypoint` subclass instantiated per request with `(ctx, env)`. Either
+ * way `ctx.props` carries what the validator returned.
+ */
+export type OAuthResourceHandler<Env, Props> =
+  | { fetch(request: Request, env: Env, ctx: ExecutionContext<Props>): Response | Promise<Response> }
+  | (new (ctx: ExecutionContext<Props>, env: Env) => { fetch(request: Request): Response | Promise<Response> });
 
 /** Configuration for {@link createOAuthResourceServer}. */
 export interface OAuthResourceServerOptions<Env = Cloudflare.Env, Props = unknown> {
@@ -160,7 +165,10 @@ export function createOAuthResourceServer<Env = Cloudflare.Env, Props = unknown>
       }
 
       (ctx as MutableExecutionContext<Props>).props = validation.props;
-      const response = await options.handler.fetch(request, env, ctx as ExecutionContext<Props>);
+      const handler = options.handler;
+      const response = isEntrypointClass(handler)
+        ? await new handler(ctx as ExecutionContext<Props>, env).fetch(request)
+        : await handler.fetch(request, env, ctx as ExecutionContext<Props>);
       return addCorsHeaders(response, request);
     },
   };
@@ -177,8 +185,11 @@ function validateOptions<Env, Props>(options: OAuthResourceServerOptions<Env, Pr
   if (!options || typeof options !== 'object') {
     throw new TypeError('OAuth resource server options are required');
   }
-  if (!options.handler || typeof options.handler.fetch !== 'function') {
-    throw new TypeError('handler must provide a fetch function');
+  if (
+    !options.handler ||
+    (!isEntrypointClass(options.handler) && typeof (options.handler as { fetch?: unknown }).fetch !== 'function')
+  ) {
+    throw new TypeError('handler must provide a fetch function or extend WorkerEntrypoint');
   }
   if (typeof options.validateToken !== 'function') {
     throw new TypeError('validateToken must be a function');
@@ -278,6 +289,16 @@ function getResourceMetadataUrl(resource: string): string {
   const parsed = new URL(resource);
   const suffix = parsed.pathname === '/' ? '' : parsed.pathname;
   return `${parsed.origin}${PROTECTED_RESOURCE_WELL_KNOWN_PREFIX}${suffix}${parsed.search}`;
+}
+
+/** The same test the combined provider applies to its handlers. */
+function isEntrypointClass<Env, Props>(
+  handler: OAuthResourceHandler<Env, Props>
+): handler is new (
+  ctx: ExecutionContext<Props>,
+  env: Env
+) => { fetch(request: Request): Response | Promise<Response> } {
+  return typeof handler === 'function' && handler.prototype instanceof WorkerEntrypoint;
 }
 
 function isProtectedResourceMetadataPath(url: URL): boolean {

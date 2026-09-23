@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { WorkerEntrypoint } from 'cloudflare:workers';
 import {
   createOAuthResourceServer,
   type OAuthResourceServerOptions,
@@ -135,6 +136,39 @@ describe('createOAuthResourceServer', () => {
     // 401 at /mcp/tools still points the client at the one canonical document.
     expect(response.status).toBe(401);
     expect(response.headers.get('WWW-Authenticate')).toBe(`Bearer realm="OAuth", resource_metadata="${METADATA_URL}"`);
+  });
+
+  it('hosts a WorkerEntrypoint class as the handler, like the combined provider does', async () => {
+    class CalendarHandler extends WorkerEntrypoint<TestEnv> {
+      fetch(request: Request) {
+        return Response.json({
+          path: new URL(request.url).pathname,
+          env: this.env.deployment,
+          props: (this.ctx as MockExecutionContext<TestProps>).props,
+        });
+      }
+    }
+    const server = createTestServer({ handler: CalendarHandler });
+    const response = await server.fetch(
+      new Request(`${RESOURCE}/tools`, { headers: { Authorization: 'Bearer opaque-access-token' } }),
+      env,
+      new MockExecutionContext()
+    );
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      path: '/mcp/tools',
+      env: 'resource-worker',
+      props: { userId: 'user-123', scopes: ['mcp:read'] },
+    });
+
+    class NotAnEntrypoint {
+      fetch() {
+        return new Response('no');
+      }
+    }
+    expect(() => createTestServer({ handler: NotAnEntrypoint as any })).toThrow(
+      'handler must provide a fetch function or extend WorkerEntrypoint'
+    );
   });
 
   it('hands the binding its own canonical resource and the token, as a detached method', async () => {

@@ -690,8 +690,8 @@ export type OAuthAuthorizationServerOptions<Env = Cloudflare.Env> = Omit<
    * Canonical identifiers of every protected resource this authorization server issues
    * tokens for, whether hosted in this Worker through `createOAuthResourceServer()` or by another
    * Worker or service. At least one is required. The registry is fixed at construction,
-   * so `defaultResource`, `legacyGrantResource`, and `resource()` are checked before the
-   * first request.
+   * so `defaultResource` and `legacyGrantResource` are checked before the first request,
+   * and `validateToken()` rejects for a resource that is not listed.
    */
   resources: readonly string[];
 
@@ -1739,6 +1739,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       if (!Array.isArray(declared) || declared.length === 0 || declared.some((value) => typeof value !== 'string')) {
         throw new TypeError('resources must list at least one canonical protected resource identifier');
       }
+      const duplicate = declared.find((resource, index) =>
+        declared.slice(0, index).some((earlier) => isExactResource(earlier, resource))
+      );
+      if (duplicate !== undefined) {
+        throw new TypeError(`resources must be unique; duplicate ${duplicate}`);
+      }
       configuredResourceServers = declared.map((resource) => ({ resourceMetadata: { resource } }));
     } else {
       this.explicitIssuer = undefined;
@@ -1944,44 +1950,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       throw new TypeError(
         'clientRegistrationEndpoint must not collide with the authorization server metadata endpoint'
       );
-    }
-  }
-
-  /** Reject resource and route layouts where dispatch could choose the wrong audience. */
-  private validateResourceRouteIsolation(): void {
-    for (let left = 0; left < this.resourceServers.length; left++) {
-      for (let right = left + 1; right < this.resourceServers.length; right++) {
-        const leftResource = this.resourceServers[left].resourceMetadata.resource;
-        const rightResource = this.resourceServers[right].resourceMetadata.resource;
-        if (isExactResource(leftResource, rightResource)) {
-          throw new TypeError(`resourceServers must use unique resources; duplicate ${leftResource}`);
-        }
-      }
-    }
-
-    for (let left = 0; left < this.typedApiHandlers.length; left++) {
-      for (let right = left + 1; right < this.typedApiHandlers.length; right++) {
-        const a = this.typedApiHandlers[left];
-        const b = this.typedApiHandlers[right];
-        if (a.resourceServer === b.resourceServer) continue;
-        const aUrl = new URL(a.route);
-        const bUrl = new URL(b.route);
-        if (aUrl.origin !== bUrl.origin) continue;
-        // Two resources on one path with disjoint queries are told apart by the query a
-        // request carries. A query-less route would match any query, and a query that is a
-        // subset of the other's would match that resource's requests too.
-        if (
-          aUrl.search &&
-          bUrl.search &&
-          !requestCarriesResourceQuery(aUrl, bUrl) &&
-          !requestCarriesResourceQuery(bUrl, aUrl)
-        ) {
-          continue;
-        }
-        if (pathsOverlapOnBoundary(aUrl.pathname, bUrl.pathname)) {
-          throw new TypeError(`API routes for different resources must not overlap: ${a.route} and ${b.route}`);
-        }
-      }
     }
   }
 
@@ -5649,15 +5617,6 @@ function audienceMatches(resourceServerUrl: string, audienceValue: string): bool
   } catch {
     return false;
   }
-}
-
-/** Whether either URL path is the other path or one of its descendants. */
-function pathsOverlapOnBoundary(leftPath: string, rightPath: string): boolean {
-  const normalize = (path: string) => (path === '/' ? '/' : path.replace(/\/$/, ''));
-  const left = normalize(leftPath);
-  const right = normalize(rightPath);
-  if (left === right || left === '/' || right === '/') return true;
-  return left.startsWith(right + '/') || right.startsWith(left + '/');
 }
 
 function appendHeaderValue(headers: Headers, name: string, value: string): void {

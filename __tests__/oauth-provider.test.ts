@@ -14607,6 +14607,10 @@ describe('functional authorization-server and resource-server composition', () =
         })
     ).toThrow('legacyGrantResource must name one of the configured protected resources');
 
+    expect(
+      () => new OAuthAuthorizationServer<TestEnv>({ ...base, resources: [calendarResource, `${calendarResource}`] })
+    ).toThrow(`resources must be unique; duplicate ${calendarResource}`);
+
     // A resource the server does not declare is refused when a resource server asks about it.
     const authorizationServer = new OAuthAuthorizationServer<TestEnv>({ ...base, resources: [calendarResource] });
     await expect(authorizationServer.validateToken(driveResource, 'any-token', env)).rejects.toThrow(
