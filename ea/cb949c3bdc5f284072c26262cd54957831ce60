@@ -1,0 +1,29 @@
+.changeset/renew-active-client-registrations.md
+  s_1b1f3dce47e01c::t_180d2f6ee4704b 1-9
+README.md
+  s_1b1f3dce47e01c::t_8c477485fdb2c1 507
+__tests__/oauth-provider.test.ts
+  s_1b1f3dce47e01c::t_865e075934321e 12585-12804
+docs/advanced-configuration.md
+  s_1b1f3dce47e01c::t_1b257cf723d051 198
+src/oauth-provider.ts
+  s_1b1f3dce47e01c::t_251c3e5bbefd07 1031-1036,1040,2326-2329,2596,4528,4883-4927,6517
+storage-schema.md
+  s_1b1f3dce47e01c::t_b5d8ff958bd553 63-64
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "eacb949c3bdc5f284072c26262cd54957831ce60",
+  "prompts": {},
+  "sessions": {
+    "s_1b1f3dce47e01c": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a0b3b8-09e5-75fe-ad90-bf9d48da5b83",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Matt Carey <mcarey@cloudflare.com>"
+    }
+  }
+}
