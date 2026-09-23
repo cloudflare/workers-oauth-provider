@@ -52,7 +52,8 @@ workers-oauth-provider/
 │   └── worker/                # Real Wrangler Worker with local KV
 ├── dist/                      # Build output (tsdown)
 ├── docs/
-│   └── advanced-configuration.md
+│   ├── advanced-configuration.md
+│   └── resource-servers.md    # Hosting resources in the same Worker or over a Service Binding
 ├── .github/workflows/
 │   ├── ci.yml                 # PR validation
 │   ├── release.yml            # Changesets-based npm publishing

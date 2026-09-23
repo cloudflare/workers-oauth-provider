@@ -659,15 +659,6 @@ interface OAuthAuthorizationServerConfiguration {
   legacyGrantResource?: string;
 }
 
-/** Internal input used when `protectResource()` registers one hosted role. */
-interface InternalProtectedResourceConfiguration<Env = Cloudflare.Env> {
-  resourceMetadata: OAuthProtectedResourceMetadata;
-  handler:
-    | ExportedHandlerWithFetch<Env, any>
-    | (new (ctx: ExecutionContext, env: Env) => WorkerEntrypointWithFetch<Env, any>);
-  resolveExternalToken?: (input: ResolveExternalTokenInput<Env>) => Promise<ResolveExternalTokenResult | null>;
-}
-
 /** Internal AS-only constructor shape behind the functional public API. */
 type InternalOAuthAuthorizationServerOptions<Env = Cloudflare.Env> = Omit<
   OAuthProviderOptions<Env>,
@@ -683,7 +674,7 @@ type InternalOAuthAuthorizationServerOptions<Env = Cloudflare.Env> = Omit<
 };
 
 /**
- * Functional authorization-server surface used with `protectResource()`.
+ * Functional authorization-server surface for the role-based API.
  * The application owns the interactive authorization route and uses
  * `getOAuthApi()` to parse and complete it; `fetch()` serves protocol-owned AS
  * endpoints such as metadata, token, revocation, and optional registration.
@@ -697,10 +688,10 @@ export type OAuthAuthorizationServerOptions<Env = Cloudflare.Env> = Omit<
 
   /**
    * Canonical identifiers of every protected resource this authorization server issues
-   * tokens for, whether hosted in this Worker through `protectResource()` or by another
+   * tokens for, whether hosted in this Worker through `createOAuthResourceServer()` or by another
    * Worker or service. At least one is required. The registry is fixed at construction,
-   * so `defaultResource`, `legacyGrantResource`, and `resource()` are checked before the
-   * first request.
+   * so `defaultResource` and `legacyGrantResource` are checked before the first request,
+   * and `validateToken()` rejects for a resource that is not listed.
    */
   resources: readonly string[];
 
@@ -714,45 +705,6 @@ export type OAuthAuthorizationServerOptions<Env = Cloudflare.Env> = Omit<
   legacyGrantResource?: string;
 };
 
-/** Options passed to `OAuthAuthorizationServer.protectResource()`. */
-export interface ProtectResourceOptions<Env = Cloudflare.Env, Props = unknown> {
-  resourceMetadata: OAuthProtectedResourceMetadata;
-  handler:
-    | ExportedHandlerWithFetch<Env, Props>
-    | (new (ctx: ExecutionContext, env: Env) => WorkerEntrypointWithFetch<Env, Props>);
-  resolveExternalToken?: (input: ResolveExternalTokenInput<Env>) => Promise<ResolveExternalTokenResult | null>;
-}
-
-/** A protected-resource fetch surface created by an authorization server. */
-export interface OAuthProtectedResource<Env = Cloudflare.Env> {
-  fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response>;
-}
-
-/** Options for {@link OAuthResourceHandle.protect}; the resource comes from the handle. */
-export interface ProtectResourceHandleOptions<Env = Cloudflare.Env, Props = unknown> {
-  resourceMetadata?: Omit<OAuthProtectedResourceMetadata, 'resource'>;
-  handler: ProtectResourceOptions<Env, Props>['handler'];
-  resolveExternalToken?: ProtectResourceOptions<Env, Props>['resolveExternalToken'];
-}
-
-/**
- * One protected resource declared in `OAuthAuthorizationServerOptions.resources`.
- * Obtained from `OAuthAuthorizationServer.resource()`, so a misspelled identifier fails
- * at module initialization instead of on a request.
- */
-export interface OAuthResourceHandle<Env = Cloudflare.Env> {
-  /** Canonical spelling of the declared resource identifier. */
-  readonly resource: string;
-  /**
-   * Validate an opaque access token for this resource only. A separate Worker can call
-   * this over a private Service Binding; the audience is fixed here, so the caller
-   * cannot ask about another resource's tokens.
-   */
-  validateToken<T = any>(token: string, env: Env): Promise<ValidatedAccessToken<T> | null>;
-  /** Host this resource in the same Worker and return its independently routable fetch surface. */
-  protect<Props = unknown>(options: ProtectResourceHandleOptions<Env, Props>): OAuthProtectedResource<Env>;
-}
-
 /** Audience-checked token context suitable for a private Service Binding. */
 export interface ValidatedAccessToken<T = any> {
   props: T;
@@ -761,6 +713,15 @@ export interface ValidatedAccessToken<T = any> {
   scope: string[];
   userId: string;
   clientId: string;
+}
+
+/**
+ * The RPC surface a `WorkerEntrypoint` exposes around {@link OAuthAuthorizationServer.validateToken},
+ * as a resource Worker sees it through a Service Binding. Hand a resource server the bound
+ * method as its validator: `validateToken: (env) => env.AUTH_SERVER.validateToken`.
+ */
+export interface AuthorizationServerBinding<Props = any> {
+  validateToken(resource: string, token: string): Promise<ValidatedAccessToken<Props> | null>;
 }
 
 // Using ExportedHandler from Cloudflare Workers Types for both API and default handlers
@@ -1552,7 +1513,6 @@ type InternalOAuthProviderOptions<Env> = Omit<OAuthProviderOptions<Env>, 'resour
 
 interface NormalizedResourceServer<Env> {
   resourceMetadata: OAuthProtectedResourceMetadata;
-  apiHandler?: TypedHandler<Env>;
   resolveExternalToken?: (input: ResolveExternalTokenInput<Env>) => Promise<ResolveExternalTokenResult | null>;
 }
 
@@ -1604,10 +1564,11 @@ export class OAuthProvider<Env = Cloudflare.Env> {
 }
 
 /**
- * Authorization-server role that can functionally compose multiple protected
- * MCP resources in the same Worker. The application keeps control of routing
- * by dispatching requests to this object or to the handles returned by
- * `protectResource()`.
+ * The authorization-server role on its own. It serves discovery, token, revocation and
+ * registration endpoints from `fetch()`, exposes the interactive authorization flow through
+ * `getOAuthApi()`, and validates its access tokens for any declared resource through
+ * `validateToken()`. Resources are hosted, in this Worker or another, by
+ * `createOAuthResourceServer()`, whose `validateToken` points back here.
  */
 export class OAuthAuthorizationServer<Env = Cloudflare.Env> {
   #impl: OAuthProviderImpl<Env>;
@@ -1641,34 +1602,27 @@ export class OAuthAuthorizationServer<Env = Cloudflare.Env> {
   }
 
   /**
-   * A handle for one resource declared in `resources`. Throws at module initialization
-   * when the identifier was not declared.
+   * Validate an access token for one declared resource: the token's KV record is loaded, its
+   * audience checked against `resource`, and its props decrypted. Resolves `null` for a token
+   * that is not valid for that resource, and rejects for a resource this server does not
+   * declare.
+   *
+   * This is what a resource server calls, whether it shares this Worker or reaches it over a
+   * Service Binding. For the latter, expose it from a `WorkerEntrypoint`:
+   *
+   * ```ts
+   * export default class AuthServer extends WorkerEntrypoint<Env> {
+   *   fetch(request: Request) {
+   *     return authorizationServer.fetch(request, this.env, this.ctx);
+   *   }
+   *   validateToken(resource: string, token: string) {
+   *     return authorizationServer.validateToken(resource, token, this.env);
+   *   }
+   * }
+   * ```
    */
-  resource(resource: string): OAuthResourceHandle<Env> {
-    const canonical = this.#impl.requireDeclaredResource(resource);
-    return {
-      resource: canonical,
-      validateToken: <T = any>(token: string, env: Env) =>
-        this.#impl.validateAccessToken<T>(token, canonical, env as Env & ProviderEnv),
-      protect: <Props = unknown>(options: ProtectResourceHandleOptions<Env, Props>) =>
-        this.protectResource<Props>({
-          resourceMetadata: { ...(options.resourceMetadata ?? {}), resource: canonical },
-          handler: options.handler,
-          resolveExternalToken: options.resolveExternalToken,
-        }),
-    };
-  }
-
-  /** Host one declared resource in this Worker and return its independently routable RS surface. */
-  protectResource<Props = unknown>(options: ProtectResourceOptions<Env, Props>): OAuthProtectedResource<Env> {
-    const resource = this.#impl.registerResourceServer({
-      resourceMetadata: options.resourceMetadata,
-      handler: options.handler,
-      resolveExternalToken: options.resolveExternalToken,
-    });
-    return {
-      fetch: (request, env, ctx) => this.#impl.fetchResourceServer(request, env as Env & ProviderEnv, ctx, resource),
-    };
+  validateToken<T = any>(resource: string, token: string, env: Env): Promise<ValidatedAccessToken<T> | null> {
+    return this.#impl.validateAccessToken<T>(token, resource, env as Env & ProviderEnv);
   }
 
   /** Serve protocol-owned authorization-server endpoints, excluding the application authorization UI. */
@@ -1767,7 +1721,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     let normalizedOptions: InternalOAuthProviderOptions<Env>;
     let configuredResourceServers: Array<{
       resourceMetadata: OAuthProtectedResourceMetadata;
-      resolveExternalToken?: InternalProtectedResourceConfiguration<Env>['resolveExternalToken'];
+      resolveExternalToken?: OAuthProviderOptions<Env>['resolveExternalToken'];
     }>;
 
     if (roleBased) {
@@ -1783,6 +1737,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       const declared = authorizationServer.resources;
       if (!Array.isArray(declared) || declared.length === 0 || declared.some((value) => typeof value !== 'string')) {
         throw new TypeError('resources must list at least one canonical protected resource identifier');
+      }
+      const duplicate = declared.find((resource, index) =>
+        declared.slice(0, index).some((earlier) => isExactResource(earlier, resource))
+      );
+      if (duplicate !== undefined) {
+        throw new TypeError(`resources must be unique; duplicate ${duplicate}`);
       }
       configuredResourceServers = declared.map((resource) => ({ resourceMetadata: { resource } }));
     } else {
@@ -1851,7 +1811,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       const resourceServer = this.resourceServers[0];
       if (hasSingleHandlerConfig) {
         const handler = this.validateHandler(legacyOptions.apiHandler!, 'apiHandler');
-        resourceServer.apiHandler = handler;
         const routes = Array.isArray(legacyOptions.apiRoute) ? legacyOptions.apiRoute : [legacyOptions.apiRoute!];
         routes.forEach((route, index) => {
           this.validateEndpoint(route, Array.isArray(legacyOptions.apiRoute) ? `apiRoute[${index}]` : 'apiRoute');
@@ -1989,44 +1948,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       throw new TypeError(
         'clientRegistrationEndpoint must not collide with the authorization server metadata endpoint'
       );
-    }
-  }
-
-  /** Reject resource and route layouts where dispatch could choose the wrong audience. */
-  private validateResourceRouteIsolation(): void {
-    for (let left = 0; left < this.resourceServers.length; left++) {
-      for (let right = left + 1; right < this.resourceServers.length; right++) {
-        const leftResource = this.resourceServers[left].resourceMetadata.resource;
-        const rightResource = this.resourceServers[right].resourceMetadata.resource;
-        if (isExactResource(leftResource, rightResource)) {
-          throw new TypeError(`resourceServers must use unique resources; duplicate ${leftResource}`);
-        }
-      }
-    }
-
-    for (let left = 0; left < this.typedApiHandlers.length; left++) {
-      for (let right = left + 1; right < this.typedApiHandlers.length; right++) {
-        const a = this.typedApiHandlers[left];
-        const b = this.typedApiHandlers[right];
-        if (a.resourceServer === b.resourceServer) continue;
-        const aUrl = new URL(a.route);
-        const bUrl = new URL(b.route);
-        if (aUrl.origin !== bUrl.origin) continue;
-        // Two resources on one path with disjoint queries are told apart by the query a
-        // request carries. A query-less route would match any query, and a query that is a
-        // subset of the other's would match that resource's requests too.
-        if (
-          aUrl.search &&
-          bUrl.search &&
-          !requestCarriesResourceQuery(aUrl, bUrl) &&
-          !requestCarriesResourceQuery(bUrl, aUrl)
-        ) {
-          continue;
-        }
-        if (pathsOverlapOnBoundary(aUrl.pathname, bUrl.pathname)) {
-          throw new TypeError(`API routes for different resources must not overlap: ${a.route} and ${b.route}`);
-        }
-      }
     }
   }
 
@@ -2259,45 +2180,27 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     return this.fetchForRoles(request, env, ctx, 'authorization-server');
   }
 
-  async fetchResourceServer(
-    request: Request,
-    env: Env & ProviderEnv,
-    ctx: ExecutionContext,
-    resource: string
-  ): Promise<Response> {
-    const resourceServer = this.resourceServers.find((server) => server.resourceMetadata.resource === resource);
-    if (!resourceServer) throw new TypeError(`No protected resource is registered for ${resource}`);
-    return this.fetchForRoles(request, env, ctx, resourceServer);
-  }
-
   private async fetchForRoles(
     request: Request,
     env: Env & ProviderEnv,
     ctx: ExecutionContext,
-    role: 'combined' | 'authorization-server' | NormalizedResourceServer<Env>
+    role: 'combined' | 'authorization-server'
   ): Promise<Response> {
     const url = new URL(request.url);
 
-    const servesAuthorizationServer = role === 'combined' || role === 'authorization-server';
-    const servesProtectedResources = role !== 'authorization-server';
-    const metadataResourceServer = servesProtectedResources
-      ? this.findResourceServerForMetadataUrl(url, typeof role === 'object' ? role : undefined)
-      : undefined;
-    const matchedApiRoute = servesProtectedResources ? this.findApiRouteForUrl(url) : undefined;
-    const apiRoute =
-      matchedApiRoute && (typeof role !== 'object' || matchedApiRoute.resourceServer === role)
-        ? matchedApiRoute
-        : undefined;
+    const servesProtectedResources = role === 'combined';
+    const metadataResourceServer = servesProtectedResources ? this.findResourceServerForMetadataUrl(url) : undefined;
+    const apiRoute = servesProtectedResources ? this.findApiRouteForUrl(url) : undefined;
 
     // Special handling for OPTIONS requests (CORS preflight)
     if (request.method === 'OPTIONS') {
       // For API routes and OAuth endpoints, respond with CORS headers
       if (
         apiRoute !== undefined ||
-        (servesAuthorizationServer && this.isAuthorizationServerMetadataRequest(url)) ||
+        this.isAuthorizationServerMetadataRequest(url) ||
         (servesProtectedResources && this.isProtectedResourceMetadataPath(url)) ||
-        (servesAuthorizationServer && this.isTokenEndpoint(url)) ||
-        (servesAuthorizationServer && this.options.clientRegistrationEndpoint && this.isClientRegistrationEndpoint(url))
+        this.isTokenEndpoint(url) ||
+        (this.options.clientRegistrationEndpoint && this.isClientRegistrationEndpoint(url))
       ) {
         // Create an empty 204 No Content response with CORS headers
         return this.addCorsHeaders(
@@ -2313,7 +2216,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     // Handle .well-known/oauth-authorization-server
-    if (servesAuthorizationServer && this.isAuthorizationServerMetadataRequest(url)) {
+    if (this.isAuthorizationServerMetadataRequest(url)) {
       if (request.method !== 'GET' && request.method !== 'HEAD') {
         return this.addCorsHeaders(
           new Response(null, {
@@ -2348,7 +2251,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     // Handle token endpoint (including revocation)
-    if (servesAuthorizationServer && this.isTokenEndpoint(url)) {
+    if (this.isTokenEndpoint(url)) {
       const parsed = await this.parseTokenEndpointRequest(request, env);
 
       // If parsing failed, return the error response
@@ -2372,11 +2275,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     // Handle client registration endpoint
-    if (
-      servesAuthorizationServer &&
-      this.options.clientRegistrationEndpoint &&
-      this.isClientRegistrationEndpoint(url)
-    ) {
+    if (this.options.clientRegistrationEndpoint && this.isClientRegistrationEndpoint(url)) {
       const response = await this.handleClientRegistration(request, env);
       return this.addCorsHeaders(response, request);
     }
@@ -2558,12 +2457,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * Only the well-known URL constructed from the configured canonical resource
    * may return its document; aliases would violate RFC 9728 §3.3.
    */
-  private findResourceServerForMetadataUrl(
-    url: URL,
-    onlyResourceServer?: NormalizedResourceServer<Env>
-  ): NormalizedResourceServer<Env> | undefined {
-    const candidates = onlyResourceServer ? [onlyResourceServer] : this.resourceServers;
-    return candidates.find((server) => {
+  private findResourceServerForMetadataUrl(url: URL): NormalizedResourceServer<Env> | undefined {
+    return this.resourceServers.find((server) => {
       // RFC 9728 §3 fixes the origin and path; a cache-busting query must not hide the
       // document, while a resource's own query parameters must still be present.
       const expected = new URL(this.getConfiguredResourceMetadataUrl(server.resourceMetadata.resource));
@@ -2837,15 +2732,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         url.origin === apiUrl.origin && pathMatches(apiUrl.pathname, true) && requestCarriesResourceQuery(url, apiUrl)
       );
     }
-  }
-
-  /**
-   * Checks if a URL is an API request based on the configured API route(s)
-   * @param url - The URL to check
-   * @returns True if the URL matches any of the API routes
-   */
-  private isApiRequest(url: URL): boolean {
-    return this.findApiRouteForUrl(url) !== undefined;
   }
 
   /**
@@ -4854,49 +4740,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     return new OAuthHelpersImpl<Env>(env, this);
   }
 
-  /** Resolve a declared resource to its canonical spelling, or throw at module initialization. */
-  requireDeclaredResource(resource: string): string {
-    const canonical = typeof resource === 'string' ? this.findConfiguredResource(resource) : undefined;
-    if (!canonical) {
-      throw new TypeError(`${String(resource)} is not declared in resources`);
-    }
-    return canonical;
-  }
-
-  /** Host a declared resource in this Worker during module initialization. */
-  registerResourceServer(configuration: InternalProtectedResourceConfiguration<Env>): string {
-    const canonical = this.requireDeclaredResource(configuration.resourceMetadata?.resource as string);
-    const resourceServer = this.resourceServers.find((server) => server.resourceMetadata.resource === canonical)!;
-    if (resourceServer.apiHandler) {
-      throw new TypeError(`A protected resource is already hosted for ${canonical}`);
-    }
-    const resourceMetadata = this.snapshotResourceMetadata({ ...configuration.resourceMetadata, resource: canonical });
-    this.validateResourceMetadataOptions(resourceMetadata);
-    if (
-      this.explicitIssuer &&
-      resourceMetadata.authorization_servers &&
-      !resourceMetadata.authorization_servers.some((issuer) => resourceMatches(issuer, this.explicitIssuer!))
-    ) {
-      throw new TypeError(
-        `resourceMetadata.authorization_servers for ${canonical} must include ${this.explicitIssuer}`
-      );
-    }
-
-    const previous: NormalizedResourceServer<Env> = { ...resourceServer };
-    resourceServer.resourceMetadata = resourceMetadata;
-    resourceServer.apiHandler = this.validateHandler(configuration.handler, 'handler');
-    resourceServer.resolveExternalToken = configuration.resolveExternalToken;
-    this.typedApiHandlers.push({ route: canonical, handler: resourceServer.apiHandler, resourceServer });
-    try {
-      this.validateResourceRouteIsolation();
-    } catch (error) {
-      this.typedApiHandlers.pop();
-      Object.assign(resourceServer, previous);
-      throw error;
-    }
-    return canonical;
-  }
-
   /**
    * Saves a grant to KV with appropriate TTL based on expiration
    * @param env - The environment bindings
@@ -5748,15 +5591,6 @@ function audienceMatches(resourceServerUrl: string, audienceValue: string): bool
   } catch {
     return false;
   }
-}
-
-/** Whether either URL path is the other path or one of its descendants. */
-function pathsOverlapOnBoundary(leftPath: string, rightPath: string): boolean {
-  const normalize = (path: string) => (path === '/' ? '/' : path.replace(/\/$/, ''));
-  const left = normalize(leftPath);
-  const right = normalize(rightPath);
-  if (left === right || left === '/' || right === '/') return true;
-  return left.startsWith(right + '/') || right.startsWith(left + '/');
 }
 
 function appendHeaderValue(headers: Headers, name: string, value: string): void {

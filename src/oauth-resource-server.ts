@@ -1,3 +1,4 @@
+import { WorkerEntrypoint } from 'cloudflare:workers';
 import {
   hasAcceptedCanonicalScheme,
   requestCarriesResourceQuery,
@@ -37,17 +38,23 @@ export interface OAuthResourceTokenValidation<Props> {
   expiresAt?: number;
 }
 
-/** Input supplied to the application's token validator. */
-export interface OAuthResourceTokenValidationInput<Env> {
-  token: string;
-  request: Request;
-  env: Env;
-}
+/**
+ * Validates a bearer token presented to one resource. `null` for a token that is not
+ * valid for that resource; a thrown error fails closed as `503`.
+ */
+export type OAuthResourceTokenValidator<Props> = (
+  resource: string,
+  token: string
+) => Promise<OAuthResourceTokenValidation<Props> | null>;
 
-/** Protected application handler called after successful token validation. */
-export interface OAuthResourceHandler<Env, Props> {
-  fetch(request: Request, env: Env, ctx: ExecutionContext<Props>): Response | Promise<Response>;
-}
+/**
+ * Protected application handler called after successful token validation: an object with
+ * `fetch`, or a `WorkerEntrypoint` subclass instantiated per request with `(ctx, env)`. Either
+ * way `ctx.props` carries what the validator returned.
+ */
+export type OAuthResourceHandler<Env, Props> =
+  | { fetch(request: Request, env: Env, ctx: ExecutionContext<Props>): Response | Promise<Response> }
+  | (new (ctx: ExecutionContext<Props>, env: Env) => { fetch(request: Request): Response | Promise<Response> });
 
 /** Configuration for {@link createOAuthResourceServer}. */
 export interface OAuthResourceServerOptions<Env = Cloudflare.Env, Props = unknown> {
@@ -56,12 +63,17 @@ export interface OAuthResourceServerOptions<Env = Cloudflare.Env, Props = unknow
   /** Application handler for the canonical resource URL and its path descendants. */
   handler: OAuthResourceHandler<Env, Props>;
   /**
-   * Validate a presented bearer token using application-selected infrastructure.
+   * The validator for a request. The host calls what you return with this server's
+   * canonical resource and the bearer token, so neither is repeated here.
    *
-   * This can call an RFC 7662 endpoint, a Worker over a Service Binding, or a
-   * JWT verifier. Return `null` for an invalid token. Thrown errors fail closed.
+   * - The authorization server in another Worker, over a Service Binding to a
+   *   `WorkerEntrypoint` that exposes `OAuthAuthorizationServer.validateToken()`:
+   *   `(env) => env.AUTH_SERVER.validateToken`
+   * - The authorization server in this Worker:
+   *   `(env) => (resource, token) => authorizationServer.validateToken(resource, token, env)`
+   * - Anything else, at your own risk: a function that validates the token for `resource`.
    */
-  validateToken(input: OAuthResourceTokenValidationInput<Env>): Promise<OAuthResourceTokenValidation<Props> | null>;
+  validateToken(env: Env, request: Request): OAuthResourceTokenValidator<Props>;
 }
 
 /** Fetch handler returned by {@link createOAuthResourceServer}. */
@@ -99,7 +111,9 @@ export function createOAuthResourceServer<Env = Cloudflare.Env, Props = unknown>
           );
         }
 
-        if (!isExactUrl(url, validated.metadataUrl)) {
+        // RFC 9728 §3 fixes the origin and path; a cache-busting query must not hide the
+        // document, while a resource's own query parameters must still be present.
+        if (!isMetadataUrlRequest(url, validated.metadataUrl)) {
           return addCorsHeaders(new Response(null, { status: 404 }), request);
         }
 
@@ -141,7 +155,7 @@ export function createOAuthResourceServer<Env = Cloudflare.Env, Props = unknown>
 
       let validation: OAuthResourceTokenValidation<Props> | null;
       try {
-        validation = await options.validateToken({ token, request, env });
+        validation = await options.validateToken(env, request)(validated.resource, token);
       } catch {
         return addCorsHeaders(createValidationUnavailableResponse(), request);
       }
@@ -151,7 +165,10 @@ export function createOAuthResourceServer<Env = Cloudflare.Env, Props = unknown>
       }
 
       (ctx as MutableExecutionContext<Props>).props = validation.props;
-      const response = await options.handler.fetch(request, env, ctx as ExecutionContext<Props>);
+      const handler = options.handler;
+      const response = isEntrypointClass(handler)
+        ? await new handler(ctx as ExecutionContext<Props>, env).fetch(request)
+        : await handler.fetch(request, env, ctx as ExecutionContext<Props>);
       return addCorsHeaders(response, request);
     },
   };
@@ -168,8 +185,11 @@ function validateOptions<Env, Props>(options: OAuthResourceServerOptions<Env, Pr
   if (!options || typeof options !== 'object') {
     throw new TypeError('OAuth resource server options are required');
   }
-  if (!options.handler || typeof options.handler.fetch !== 'function') {
-    throw new TypeError('handler must provide a fetch function');
+  if (
+    !options.handler ||
+    (!isEntrypointClass(options.handler) && typeof (options.handler as { fetch?: unknown }).fetch !== 'function')
+  ) {
+    throw new TypeError('handler must provide a fetch function or extend WorkerEntrypoint');
   }
   if (typeof options.validateToken !== 'function') {
     throw new TypeError('validateToken must be a function');
@@ -271,6 +291,16 @@ function getResourceMetadataUrl(resource: string): string {
   return `${parsed.origin}${PROTECTED_RESOURCE_WELL_KNOWN_PREFIX}${suffix}${parsed.search}`;
 }
 
+/** The same test the combined provider applies to its handlers. */
+function isEntrypointClass<Env, Props>(
+  handler: OAuthResourceHandler<Env, Props>
+): handler is new (
+  ctx: ExecutionContext<Props>,
+  env: Env
+) => { fetch(request: Request): Response | Promise<Response> } {
+  return typeof handler === 'function' && handler.prototype instanceof WorkerEntrypoint;
+}
+
 function isProtectedResourceMetadataPath(url: URL): boolean {
   return (
     url.pathname === PROTECTED_RESOURCE_WELL_KNOWN_PREFIX ||
@@ -278,8 +308,12 @@ function isProtectedResourceMetadataPath(url: URL): boolean {
   );
 }
 
-function isExactUrl(actual: URL, expected: URL): boolean {
-  return actual.href === expected.href;
+function isMetadataUrlRequest(requestUrl: URL, metadataUrl: URL): boolean {
+  return (
+    requestUrl.origin === metadataUrl.origin &&
+    requestUrl.pathname === metadataUrl.pathname &&
+    requestCarriesResourceQuery(requestUrl, metadataUrl)
+  );
 }
 
 function isCanonicalResourceRequest(requestUrl: URL, resourceUrl: URL): boolean {
