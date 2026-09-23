@@ -10,6 +10,9 @@ import {
   type JwtAlgorithm,
   type JwtPublicKey,
 } from '../../src/oauth-provider';
+// The Worker exercises the provider's own signing and verification paths, which application
+// code cannot reach: the component is opaque outside the authorization server.
+import { jwtInternals } from '../../src/jwt-access-tokens';
 import {
   CLIENT_REDIRECT_URI,
   DENIED_SCOPE,
@@ -150,7 +153,7 @@ export default class McpOAuthConformanceWorker extends WorkerEntrypoint<Conforma
       }),
     });
     const now = Math.floor(Date.now() / 1000);
-    const issued = await accessTokens.issue({
+    const issued = await jwtInternals(accessTokens).issue({
       props: { secret: 'not-in-the-jwt' },
       userId: 'workerd-user',
       grantId: 'workerd-grant',
@@ -165,7 +168,9 @@ export default class McpOAuthConformanceWorker extends WorkerEntrypoint<Conforma
     const header = JSON.parse(atob(encodedHeader.padEnd(Math.ceil(encodedHeader.length / 4) * 4, '=')));
     return {
       header,
-      verified: (await accessTokens.verify(issued.token, [audience], this.env))?.userId === 'workerd-user',
+      verified:
+        (await jwtInternals(accessTokens).verifyForAudiences(issued.token, [audience], this.env))?.userId ===
+        'workerd-user',
     };
   }
 

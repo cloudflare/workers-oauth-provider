@@ -1,1176 +1,676 @@
-import { describe, expect, it, vi } from 'vitest';
+/**
+ * RFC 9068 JWT access tokens, exercised only through what a deployer can reach: an
+ * `OAuthAuthorizationServer` issuing over its token endpoint and publishing JWKS, and a
+ * `createOAuthResourceServer` validating `offline`, `online`, or both. Adversarial cases
+ * are rows in the flow they attack rather than tests of internal functions.
+ */
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   JWT_ACCESS_TOKEN_GRANT_ID_CLAIM,
   JWT_ACCESS_TOKEN_PUBLIC_CLAIMS,
+  OAuthAuthorizationServer,
   createJwtAccessTokens,
-  createJwksKeyResolver,
-  createJwtAccessTokenValidator,
-  jwtInternals,
+  createOAuthResourceServer,
   type JwtAlgorithm,
+  type JwtKeySet,
   type JwtPublicKey,
-} from '../src/jwt-access-tokens';
-import { createOAuthResourceServer } from '../src/oauth-resource-server';
+  type JwtAccessTokensOptions,
+  type OfflineTokenValidation,
+} from '../src/oauth-provider';
+import { MockExecutionContext, createMockEnv, createMockRequest, type TestEnv } from './test-helpers';
 
 const ISSUER = 'https://auth.example.com';
-const RESOURCE = 'https://calendar.example.com/mcp';
 const JWKS_URI = `${ISSUER}/.well-known/jwks.json`;
+const CALENDAR = 'https://calendar.example.com/mcp';
+const DRIVE = 'https://drive.example.com/mcp';
+const REDIRECT_URI = 'https://client.example.com/callback';
 
-interface TestProps {
-  userId: string;
-  tenantId: string;
-  upstreamAccessToken: string;
-}
+type AuthProps = { userId: string; tenantId: string; upstreamAccessToken: string };
+const PROPS: AuthProps = { userId: 'user-123', tenantId: 'tenant-a', upstreamAccessToken: 'sk-confidential' };
 
-async function createKey(alg: JwtAlgorithm, kid: string) {
+// ---------------------------------------------------------------------------------------
+// Fixtures
+// ---------------------------------------------------------------------------------------
+
+async function createKey(alg: JwtAlgorithm, kid: string, modulusLength = 2048) {
   const keyPair = (await crypto.subtle.generateKey(
     alg === 'RS256'
-      ? {
-          name: 'RSASSA-PKCS1-v1_5',
-          modulusLength: 2048,
-          publicExponent: new Uint8Array([1, 0, 1]),
-          hash: 'SHA-256',
-        }
+      ? { name: 'RSASSA-PKCS1-v1_5', modulusLength, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' }
       : { name: 'ECDSA', namedCurve: 'P-256' },
     true,
     ['sign', 'verify']
   )) as CryptoKeyPair;
-  const exported = (await crypto.subtle.exportKey('jwk', keyPair.publicKey)) as JsonWebKey;
   const publicJwk: JwtPublicKey = {
-    ...exported,
+    ...((await crypto.subtle.exportKey('jwk', keyPair.publicKey)) as JsonWebKey),
     kid,
     alg,
     use: 'sig',
     key_ops: ['verify'],
   };
-  return { privateKey: keyPair.privateKey, publicJwk };
+  return { kid, alg, privateKey: keyPair.privateKey, publicJwk };
+}
+type Key = Awaited<ReturnType<typeof createKey>>;
+const signingWith = (key: Key, verificationKeys: Key[] = []): JwtKeySet => ({
+  signingKey: { kid: key.kid, alg: key.alg, privateKey: key.privateKey, publicJwk: key.publicJwk },
+  verificationKeys: verificationKeys.map((k) => k.publicJwk),
+});
+
+function base64url(bytes: Uint8Array): string {
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+const encodePart = (value: unknown) => base64url(new TextEncoder().encode(JSON.stringify(value)));
+function decodePart(token: string, part: number): Record<string, any> {
+  const encoded = token.split('.')[part].replace(/-/g, '+').replace(/_/g, '/');
+  return JSON.parse(atob(encoded.padEnd(Math.ceil(encoded.length / 4) * 4, '=')));
 }
 
-function issueInput(props: TestProps, overrides: Record<string, unknown> = {}) {
-  const now = Math.floor(Date.now() / 1000);
+/** Mint a token outside the authorization server, the way an attacker or another issuer would. */
+async function signJwt(header: Record<string, unknown>, claims: unknown, key: Key | null): Promise<string> {
+  const signingInput = `${encodePart(header)}.${encodePart(claims)}`;
+  if (!key) return `${signingInput}.`;
+  const algorithm = key.alg === 'RS256' ? { name: 'RSASSA-PKCS1-v1_5' } : { name: 'ECDSA', hash: 'SHA-256' };
+  const signature = await crypto.subtle.sign(algorithm, key.privateKey, new TextEncoder().encode(signingInput));
+  return `${signingInput}.${base64url(new Uint8Array(signature))}`;
+}
+
+/** Claims the authorization server would have put in a calendar token, for forgeries to start from. */
+function claimsFor(overrides: Record<string, unknown> = {}, now = Math.floor(Date.now() / 1000)) {
   return {
-    props,
-    userId: 'user-123',
-    grantId: 'grant-123',
-    clientId: 'client-123',
-    scope: ['calendar:read'],
-    audience: RESOURCE,
-    issuedAt: now,
-    expiresAt: now + 3600,
-    env: {},
+    iss: ISSUER,
+    sub: 'user-123',
+    aud: CALENDAR,
+    client_id: 'client-123',
+    scope: 'calendar:read',
+    jti: 'jti-1',
+    iat: now,
+    exp: now + 3600,
+    [JWT_ACCESS_TOKEN_GRANT_ID_CLAIM]: 'grant-123',
     ...overrides,
   };
 }
 
-function decodePart(token: string, part: number): Record<string, unknown> {
-  const encoded = token.split('.')[part].replace(/-/g, '+').replace(/_/g, '/');
-  const json = atob(encoded.padEnd(Math.ceil(encoded.length / 4) * 4, '='));
-  return JSON.parse(json);
-}
+// ---------------------------------------------------------------------------------------
+// The two Workers
+// ---------------------------------------------------------------------------------------
 
-function encodePart(value: Record<string, unknown>): string {
-  const bytes = new TextEncoder().encode(JSON.stringify(value));
-  let binary = '';
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
-}
-
-function encodeBinary(bytes: Uint8Array): string {
-  let binary = '';
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
-}
-
-async function signCustomJwt(
-  header: Record<string, unknown>,
-  claims: Record<string, unknown>,
-  privateKey: CryptoKey
-): Promise<string> {
-  const signingInput = `${encodePart(header)}.${encodePart(claims)}`;
-  const signature = await crypto.subtle.sign(
-    { name: 'RSASSA-PKCS1-v1_5' },
-    privateKey,
-    new TextEncoder().encode(signingInput)
-  );
-  return `${signingInput}.${encodeBinary(new Uint8Array(signature))}`;
-}
-
-describe('JWT access tokens', () => {
-  it('passes the token kid and alg to the keys resolver so a rotated key can be fetched', async () => {
-    const key = await createKey('RS256', 'rotated-key');
-    const accessTokens = createJwtAccessTokens<{}, TestProps>({
-      issuer: ISSUER,
-      jwksUri: JWKS_URI,
-      keys: () => ({
-        signingKey: { kid: 'rotated-key', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
-      }),
-    });
-    const issued = await accessTokens.issue(
-      issueInput({ userId: 'user-123', tenantId: 'tenant-1', upstreamAccessToken: 'secret' })
-    );
-    // A resolver that only holds the key the token names, as a cache refreshed on a miss would.
-    const keys = vi.fn((_env: {}, hint: { kid?: string; alg: string }) =>
-      hint.kid === 'rotated-key' ? [key.publicJwk] : []
-    );
-    const validate = createJwtAccessTokenValidator<{}, { userId: string }>({
-      issuer: ISSUER,
-      audience: RESOURCE,
-      algorithms: ['RS256'],
+function authorizationServer(
+  env: TestEnv,
+  keys: () => JwtKeySet,
+  options: Partial<Pick<JwtAccessTokensOptions<TestEnv, AuthProps>, 'issuance' | 'publicClaims'>> & {
+    issuer?: string;
+    resources?: string[];
+  } = {}
+) {
+  const issuer = options.issuer ?? ISSUER;
+  return new OAuthAuthorizationServer<TestEnv, AuthProps>({
+    issuer,
+    resources: options.resources ?? [CALENDAR, DRIVE],
+    authorizeEndpoint: '/authorize',
+    tokenEndpoint: '/oauth/token',
+    clientRegistrationEndpoint: '/oauth/register',
+    scopesSupported: ['calendar:read', 'drive:read'],
+    jwtAccessTokens: createJwtAccessTokens<TestEnv, AuthProps>({
+      issuer,
+      jwksUri: `${issuer}/.well-known/jwks.json`,
       keys,
-      mapClaimsToProps: ({ userId }) => ({ userId }),
-    });
-    await expect(validate({ token: issued.token, request: new Request(RESOURCE), env: {} })).resolves.toMatchObject({
-      props: { userId: 'user-123' },
-    });
-    expect(keys).toHaveBeenCalledWith({}, { kid: 'rotated-key', alg: 'RS256' });
+      publicClaims: options.publicClaims ?? (({ props }) => ({ tenantId: props.tenantId })),
+      issuance: options.issuance ?? true,
+    }),
   });
+}
+type AS = ReturnType<typeof authorizationServer>;
 
-  it('rejects an RSA public key whose exponent makes signatures forgeable', async () => {
-    const key = await createKey('RS256', 'weak-exponent');
-    const accessTokens = createJwtAccessTokens<{}, TestProps>({
-      issuer: ISSUER,
-      jwksUri: JWKS_URI,
-      keys: () => ({
-        signingKey: { kid: 'weak-exponent', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
-      }),
-    });
-    const issued = await accessTokens.issue(
-      issueInput({ userId: 'user-123', tenantId: 'tenant-1', upstreamAccessToken: 'secret' })
+/** Register a client, authorize, and return the code: everything before the token endpoint. */
+async function authorize(as: AS, env: TestEnv, ctx: MockExecutionContext, resource = CALENDAR, issuer = ISSUER) {
+  const registration = await as.fetch(
+    createMockRequest(
+      `${issuer}/oauth/register`,
+      'POST',
+      { 'Content-Type': 'application/json' },
+      JSON.stringify({ redirect_uris: [REDIRECT_URI], token_endpoint_auth_method: 'client_secret_post' })
+    ),
+    env,
+    ctx
+  );
+  expect(registration.status).toBe(201);
+  const client = await registration.json<any>();
+  const url = new URL(`${issuer}/authorize`);
+  url.searchParams.set('response_type', 'code');
+  url.searchParams.set('client_id', client.client_id);
+  url.searchParams.set('redirect_uri', REDIRECT_URI);
+  url.searchParams.set('scope', resource === DRIVE ? 'drive:read' : 'calendar:read');
+  url.searchParams.set('resource', resource);
+  const oauth = as.getOAuthApi(env);
+  const request = await oauth.parseAuthRequest(createMockRequest(url.href));
+  const { redirectTo } = await oauth.completeAuthorization({
+    request,
+    userId: PROPS.userId,
+    metadata: {},
+    scope: request.scope,
+    props: PROPS,
+  });
+  const exchange = () =>
+    as.fetch(
+      createMockRequest(
+        `${issuer}/oauth/token`,
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        new URLSearchParams({
+          grant_type: 'authorization_code',
+          code: new URL(redirectTo).searchParams.get('code')!,
+          redirect_uri: REDIRECT_URI,
+          client_id: client.client_id,
+          client_secret: client.client_secret,
+        }).toString()
+      ),
+      env,
+      ctx
     );
-    // e = 1 and e = 2: WebCrypto imports both, and PKCS#1 v1.5 verification under them is trivial.
-    for (const e of ['AQ', 'Ag']) {
-      const validate = createJwtAccessTokenValidator<{}, { userId: string }>({
-        issuer: ISSUER,
-        audience: RESOURCE,
-        algorithms: ['RS256'],
-        keys: () => [{ ...key.publicJwk, e }],
-        mapClaimsToProps: ({ userId }) => ({ userId }),
-      });
-      // A resource server is handed someone else's JWKS: an unusable key is skipped, and a
-      // token left with no key to verify against is invalid_token rather than an outage.
-      await expect(validate({ token: issued.token, request: new Request(RESOURCE), env: {} })).resolves.toBeNull();
-      const publisher = createJwtAccessTokens<{}, TestProps>({
-        issuer: ISSUER,
-        jwksUri: JWKS_URI,
-        keys: () => ({
-          signingKey: {
-            kid: 'weak-exponent',
-            alg: 'RS256',
-            privateKey: key.privateKey,
-            publicJwk: { ...key.publicJwk, e },
-          },
-        }),
-      });
-      await expect(publisher.getJwks({})).rejects.toThrow('odd public exponent of at least 3');
-    }
-  });
+  return { client, exchange };
+}
+async function issueToken(as: AS, env: TestEnv, ctx: MockExecutionContext, resource = CALENDAR): Promise<string> {
+  const response = await (await authorize(as, env, ctx, resource)).exchange();
+  expect(response.status).toBe(200);
+  return (await response.json<any>()).access_token;
+}
 
-  it('skips a foreign or unusable key rather than failing every request', async () => {
-    const key = await createKey('RS256', 'signing');
-    const accessTokens = createJwtAccessTokens<{}, TestProps>({
-      issuer: ISSUER,
+/** The resource Worker's view of the authorization server's JWKS: a Service Binding, with a call log. */
+function jwksBinding(as: AS, env: TestEnv, ctx: MockExecutionContext, log: string[] = []) {
+  return {
+    log,
+    source: {
       jwksUri: JWKS_URI,
-      keys: () => ({
-        signingKey: { kid: 'signing', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
-      }),
-    });
-    const issued = await accessTokens.issue(
-      issueInput({ userId: 'user-123', tenantId: 'tenant-1', upstreamAccessToken: 'secret' })
-    );
-
-    // RFC 7517 §4.4 makes `alg` optional, and an authorization server may publish keys for
-    // other purposes alongside its access-token key. Neither may take the resource down.
-    const { alg: _alg, ...algLess } = key.publicJwk;
-    const foreignKeys = [
-      algLess as JwtPublicKey,
-      { ...key.publicJwk, kid: 'encryption', use: 'enc' } as JwtPublicKey,
-      key.publicJwk,
-    ];
-    const validate = createJwtAccessTokenValidator<{}, { userId: string }>({
-      issuer: ISSUER,
-      audience: RESOURCE,
-      algorithms: ['RS256'],
-      keys: () => foreignKeys,
-      mapClaimsToProps: ({ userId }) => ({ userId }),
-    });
-    await expect(validate({ token: issued.token, request: new Request(RESOURCE), env: {} })).resolves.toMatchObject({
-      props: { userId: 'user-123' },
-    });
-
-    // A resolver that has no key for this token answers invalid_token, not a 503.
-    const empty = createJwtAccessTokenValidator<{}, { userId: string }>({
-      issuer: ISSUER,
-      audience: RESOURCE,
-      algorithms: ['RS256'],
-      keys: () => [],
-      mapClaimsToProps: ({ userId }) => ({ userId }),
-    });
-    await expect(empty({ token: issued.token, request: new Request(RESOURCE), env: {} })).resolves.toBeNull();
-  });
-
-  it('publishes only JWK members and keeps a __proto__ public claim inert', async () => {
-    const key = await createKey('RS256', 'published');
-    const accessTokens = createJwtAccessTokens<{}, TestProps>({
-      issuer: ISSUER,
-      jwksUri: JWKS_URI,
-      keys: () => ({
-        signingKey: {
-          kid: 'published',
-          alg: 'RS256',
-          privateKey: key.privateKey,
-          // An application key record carries its own bookkeeping beside the JWK.
-          publicJwk: { ...key.publicJwk, kmsKeyId: 'arn:secret', retireAfter: 1 } as JwtPublicKey,
+      fetcher: () => ({
+        fetch: (request: Request) => {
+          log.push(request.url);
+          return as.fetch(request, env, ctx);
         },
       }),
-    });
-    const jwks = await accessTokens.getJwks({});
-    expect(Object.keys(jwks.keys[0]).sort()).toEqual(['alg', 'e', 'kid', 'kty', 'n', 'use']);
+    },
+  };
+}
 
-    // The application owns publicClaims, so a __proto__ member is a loud error rather than
-    // a silent drop: no resource server can copy such a claim onto an object safely.
-    const withProto = createJwtAccessTokens<{}, TestProps>({
-      issuer: ISSUER,
-      jwksUri: JWKS_URI,
-      keys: () => ({
-        signingKey: { kid: 'published', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
-      }),
-      publicClaims: () => JSON.parse('{"attrs":{"__proto__":{"isAdmin":true}}}'),
-    });
-    await expect(
-      withProto.issue(issueInput({ userId: 'user-123', tenantId: 'tenant-1', upstreamAccessToken: 'secret' }))
-    ).rejects.toThrow('__proto__');
+function offline(
+  keys: OfflineTokenValidation<TestEnv, any>['keys'],
+  overrides: Partial<OfflineTokenValidation<TestEnv, any>> = {}
+): OfflineTokenValidation<TestEnv, any> {
+  return {
+    issuer: ISSUER,
+    algorithms: ['RS256'],
+    keys,
+    mapClaimsToProps: ({ userId, scope, publicClaims, grantId, clientId }) =>
+      publicClaims && typeof publicClaims === 'object' && !Array.isArray(publicClaims) && publicClaims.deny === true
+        ? null
+        : { userId, scope, grantId, clientId, tenantId: (publicClaims as any)?.tenantId, publicClaims },
+    ...overrides,
+  };
+}
+
+function resourceServer(
+  validateToken: Parameters<typeof createOAuthResourceServer<TestEnv, any>>[0]['validateToken'],
+  resource = CALENDAR,
+  issuer = ISSUER
+) {
+  return createOAuthResourceServer<TestEnv, any>({
+    resourceMetadata: { resource, authorization_servers: [issuer] },
+    validateToken,
+    handler: {
+      fetch: (_request, _env, executionContext) => Response.json((executionContext as MockExecutionContext).props),
+    },
+  });
+}
+type RS = ReturnType<typeof resourceServer>;
+
+async function call(rs: RS, env: TestEnv, ctx: MockExecutionContext, token: string, resource = CALENDAR) {
+  const response = await rs.fetch(createMockRequest(resource, 'GET', { Authorization: `Bearer ${token}` }), env, ctx);
+  return { status: response.status, body: response.status === 200 ? await response.json<any>() : null };
+}
+
+const jwksResponse = (keys: unknown[], headers: Record<string, string> = {}) =>
+  new Response(JSON.stringify({ keys }), { headers: { 'Content-Type': 'application/json', ...headers } });
+
+// ---------------------------------------------------------------------------------------
+
+describe('JWT access tokens, end to end', () => {
+  let env: TestEnv;
+  let ctx: MockExecutionContext;
+  let key: Key;
+
+  beforeEach(async () => {
+    env = createMockEnv();
+    ctx = new MockExecutionContext();
+    key = await createKey('RS256', 'key-2026-09');
   });
 
-  it('drops a __proto__ member from a public claim minted elsewhere', async () => {
-    const key = await createKey('RS256', 'foreign');
-    const accessTokens = createJwtAccessTokens<{}, TestProps>({
-      issuer: ISSUER,
-      jwksUri: JWKS_URI,
-      keys: () => ({
-        signingKey: { kid: 'foreign', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
-      }),
+  it('issues a JWT the resource server verifies offline through the JWKS, and asks online for the rest', async () => {
+    const jwtFor = new Set([CALENDAR]);
+    const as = authorizationServer(env, () => signingWith(key), {
+      issuance: ({ resource }) => jwtFor.has(resource),
     });
-    const issued = await accessTokens.issue(
-      issueInput({ userId: 'user-123', tenantId: 'tenant-1', upstreamAccessToken: 'secret' })
-    );
-    const header = decodePart(issued.token, 0);
-    const claims = decodePart(issued.token, 1);
-    const polluted = await signCustomJwt(
-      header,
-      { ...claims, [JWT_ACCESS_TOKEN_PUBLIC_CLAIMS]: JSON.parse('{"__proto__":{"isAdmin":true}}') },
-      key.privateKey
-    );
-    const validate = createJwtAccessTokenValidator<{}, { admin: boolean }>({
-      issuer: ISSUER,
-      audience: RESOURCE,
-      algorithms: ['RS256'],
-      keys: () => [key.publicJwk],
-      mapClaimsToProps: ({ publicClaims }) => {
-        // The obvious thing a resource server writes, and it must stay safe.
-        const copied = Object.assign({}, publicClaims as object) as { isAdmin?: boolean };
-        return { admin: copied.isAdmin === true };
+
+    // Issued over the token endpoint: the token is a signed at+jwt with the documented claims.
+    const jwt = await issueToken(as, env, ctx);
+    expect(decodePart(jwt, 0)).toEqual({ typ: 'at+jwt', alg: 'RS256', kid: key.kid });
+    const claims = decodePart(jwt, 1);
+    expect(claims).toMatchObject({ iss: ISSUER, sub: PROPS.userId, aud: CALENDAR, scope: 'calendar:read' });
+    expect(claims[JWT_ACCESS_TOKEN_GRANT_ID_CLAIM]).toEqual(expect.any(String));
+    expect(claims[JWT_ACCESS_TOKEN_PUBLIC_CLAIMS]).toEqual({ tenantId: PROPS.tenantId });
+    expect(JSON.stringify(claims)).not.toContain(PROPS.upstreamAccessToken);
+    expect(claims.exp - claims.iat).toBe(3600);
+
+    // Issuance is per token: drive stays opaque, and so does calendar once switched off.
+    expect((await issueToken(as, env, ctx, DRIVE)).split(':')).toHaveLength(3);
+    jwtFor.clear();
+    const opaque = await issueToken(as, env, ctx);
+    expect(opaque.split(':')).toHaveLength(3);
+
+    // The JWKS is cacheable, carries only JWK members, and never private material.
+    const jwks = await as.fetch(createMockRequest(JWKS_URI), env, ctx);
+    expect(jwks.status).toBe(200);
+    expect(jwks.headers.get('Cache-Control')).toBe('public, max-age=300');
+    const published = (await jwks.json<{ keys: Record<string, unknown>[] }>()).keys;
+    expect(published).toHaveLength(1);
+    expect(Object.keys(published[0]).sort()).toEqual(['alg', 'e', 'kid', 'kty', 'n', 'use']);
+
+    // Offline: the JWT verifies with one JWKS fetch over the binding; opaque cannot.
+    const binding = jwksBinding(as, env, ctx);
+    const offlineOnly = resourceServer({ offline: offline(binding.source) });
+    expect(await call(offlineOnly, env, ctx, jwt)).toMatchObject({
+      status: 200,
+      body: { userId: PROPS.userId, tenantId: PROPS.tenantId, scope: ['calendar:read'] },
+    });
+    expect((await call(offlineOnly, env, ctx, opaque)).status).toBe(401);
+    expect(binding.log).toEqual([JWKS_URI]);
+
+    // Online: the authorization server, over what is a Service Binding in production.
+    const onlineCalls: string[] = [];
+    const online = () => ({
+      validateToken: (token: string) => {
+        onlineCalls.push(token);
+        return as.resource(CALENDAR).validateToken<AuthProps>(token, env);
       },
     });
-    await expect(validate({ token: polluted, request: new Request(RESOURCE), env: {} })).resolves.toMatchObject({
-      props: { admin: false },
-    });
+    const onlineOnly = resourceServer({ online });
+    expect((await call(onlineOnly, env, ctx, opaque)).body).toMatchObject({ upstreamAccessToken: 'sk-confidential' });
+    expect((await call(onlineOnly, env, ctx, jwt)).status).toBe(200);
+
+    // Both: offline answers what it can without a round trip; the rest goes online.
+    onlineCalls.length = 0;
+    const both = resourceServer({ offline: offline(binding.source), online });
+    expect((await call(both, env, ctx, jwt)).status).toBe(200);
+    expect(onlineCalls).toEqual([]);
+    expect((await call(both, env, ctx, opaque)).status).toBe(200);
+    expect(onlineCalls).toEqual([opaque]);
+
+    // A token for another resource is refused in every mode.
+    const driveJwt = (jwtFor.add(DRIVE), await issueToken(as, env, ctx, DRIVE));
+    for (const rs of [offlineOnly, onlineOnly, both]) expect((await call(rs, env, ctx, driveJwt)).status).toBe(401);
   });
 
-  it('rejects a foreign issuer, a disallowed algorithm, and each missing required claim', async () => {
-    // Every one of these is a rejection the offline validator is solely responsible for:
-    // unlike verify()/isOwnJwt(), it has no separate issuer or typ pre-check.
-    const key = await createKey('RS256', 'required-claims');
+  it('rejects forged, foreign and malformed tokens at the resource server, and fetches only the JWKS', async () => {
     const es256 = await createKey('ES256', 'es-key');
-    const accessTokens = createJwtAccessTokens<{}, TestProps>({
-      issuer: ISSUER,
-      jwksUri: JWKS_URI,
-      keys: () => ({
-        signingKey: { kid: 'required-claims', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
-      }),
+    const foreign = await createKey('RS256', key.kid); // an attacker's key, wearing the real kid
+    const as = authorizationServer(env, () => signingWith(key, [es256]));
+    const binding = jwksBinding(as, env, ctx);
+    const rs = resourceServer({ offline: offline(binding.source) });
+    const now = Math.floor(Date.now() / 1000);
+    const header = (overrides: Record<string, unknown> = {}) => ({
+      typ: 'at+jwt',
+      alg: 'RS256',
+      kid: key.kid,
+      ...overrides,
     });
-    const issued = await accessTokens.issue(
-      issueInput({ userId: 'user-123', tenantId: 'tenant-1', upstreamAccessToken: 'secret' })
-    );
-    const header = decodePart(issued.token, 0);
-    const claims = decodePart(issued.token, 1);
-    const mapClaimsToProps = vi.fn(({ userId }: { userId: string }) => ({ userId }));
-    const keys = vi.fn(() => [key.publicJwk, es256.publicJwk]);
-    const validate = createJwtAccessTokenValidator<{}, { userId: string }>({
-      issuer: ISSUER,
-      audience: RESOURCE,
-      algorithms: ['RS256'],
-      keys,
-      mapClaimsToProps,
-    });
-    const run = (token: string) => validate({ token, request: new Request(RESOURCE), env: {} });
-
-    // Control: the untampered token is accepted, so each rejection below is the claim.
-    await expect(run(issued.token)).resolves.toMatchObject({ props: { userId: 'user-123' } });
-
-    const omit = (name: string) => {
-      const { [name]: _removed, ...rest } = claims;
+    const withoutClaim = (name: string) => {
+      const rest: Record<string, unknown> = { ...claimsFor() };
+      delete rest[name];
       return rest;
     };
-    const variants: Array<[string, Record<string, unknown>, Record<string, unknown>]> = [
-      ['foreign issuer', header, { ...claims, iss: 'https://attacker.example.com' }],
-      ['foreign audience', header, { ...claims, aud: 'https://other.example.com/mcp' }],
-      ['generic typ', { ...header, typ: 'JWT' }, claims],
-      ['no kid', { alg: 'RS256', typ: 'at+jwt' }, claims],
-      ['no sub', header, omit('sub')],
-      ['no client_id', header, omit('client_id')],
-      ['no jti', header, omit('jti')],
-      ['no grant id', header, omit(JWT_ACCESS_TOKEN_GRANT_ID_CLAIM)],
+
+    const rows: [string, () => Promise<string>, number][] = [
+      ['a genuine token', () => signJwt(header(), claimsFor(), key), 200],
+      ['typ application/at+jwt', () => signJwt(header({ typ: 'application/at+jwt' }), claimsFor(), key), 200],
+      [
+        'an aud array that contains the resource',
+        () => signJwt(header(), claimsFor({ aud: [DRIVE, CALENDAR] }), key),
+        200,
+      ],
+      ['a token in its last seconds', () => signJwt(header(), claimsFor({ exp: now + 5 }), key), 200],
+      ['iat within the 30s skew', () => signJwt(header(), claimsFor({ iat: now + 29 }), key), 200],
+      ['nbf within the 30s skew', () => signJwt(header(), claimsFor({ nbf: now + 29 }), key), 200],
+      ['a signature from a foreign key with the real kid', () => signJwt(header(), claimsFor(), foreign), 401],
+      ['alg none', () => signJwt(header({ alg: 'none' }), claimsFor(), null), 401],
+      ['alg HS256', () => signJwt(header({ alg: 'HS256' }), claimsFor(), key), 401],
+      [
+        'an ES256 token when only RS256 is allowed',
+        () => signJwt(header({ alg: 'ES256', kid: es256.kid }), claimsFor(), es256),
+        401,
+      ],
+      ['a jku header', () => signJwt(header({ jku: 'https://attacker.example/jwks.json' }), claimsFor(), key), 401],
+      ['a jwk header', () => signJwt(header({ jwk: foreign.publicJwk }), claimsFor(), key), 401],
+      ['an x5u header', () => signJwt(header({ x5u: 'https://attacker.example/cert' }), claimsFor(), key), 401],
+      ['an x5c header', () => signJwt(header({ x5c: ['MIIB'] }), claimsFor(), key), 401],
+      ['a b64 header', () => signJwt(header({ b64: false }), claimsFor(), key), 401],
+      ['a crit header', () => signJwt(header({ crit: ['exp'] }), claimsFor(), key), 401],
+      ['typ JWT', () => signJwt(header({ typ: 'JWT' }), claimsFor(), key), 401],
+      ['no kid', () => signJwt({ typ: 'at+jwt', alg: 'RS256' }, claimsFor(), key), 401],
+      ['a kid over 128 characters', () => signJwt(header({ kid: 'k'.repeat(129) }), claimsFor(), key), 401],
+      ['another issuer', () => signJwt(header(), claimsFor({ iss: 'https://other.example.com' }), key), 401],
+      ['another audience', () => signJwt(header(), claimsFor({ aud: DRIVE }), key), 401],
+      ['an expired token, even inside the skew', () => signJwt(header(), claimsFor({ exp: now - 5 }), key), 401],
+      ['nbf beyond the skew', () => signJwt(header(), claimsFor({ nbf: now + 31 }), key), 401],
+      ['iat in the future', () => signJwt(header(), claimsFor({ iat: now + 31, exp: now + 3600 }), key), 401],
+      ['a non-string scope', () => signJwt(header(), claimsFor({ scope: 123 }), key), 401],
+      ...(['sub', 'client_id', 'jti', 'exp', 'iat', JWT_ACCESS_TOKEN_GRANT_ID_CLAIM] as const).map(
+        (name): [string, () => Promise<string>, number] => [
+          `no ${name}`,
+          () => signJwt(header(), withoutClaim(name), key),
+          401,
+        ]
+      ),
+      [
+        'a tampered payload',
+        async () => {
+          const [h, p, s] = (await signJwt(header(), claimsFor(), key)).split('.');
+          return `${h}.${encodePart({ ...decodePart(`${h}.${p}.${s}`, 1), scope: 'calendar:admin' })}.${s}`;
+        },
+        401,
+      ],
+      [
+        'a token over 16 KiB',
+        () => signJwt(header(), claimsFor({ [JWT_ACCESS_TOKEN_PUBLIC_CLAIMS]: { pad: 'x'.repeat(17_000) } }), key),
+        401,
+      ],
+      [
+        'a public claim the mapper declines',
+        () => signJwt(header(), claimsFor({ [JWT_ACCESS_TOKEN_PUBLIC_CLAIMS]: { deny: true } }), key),
+        401,
+      ],
+      ['not a JWT at all', async () => 'user:grant:secret', 401],
     ];
-    for (const [label, variantHeader, variantClaims] of variants) {
-      mapClaimsToProps.mockClear();
-      const token = await signCustomJwt(variantHeader, variantClaims, key.privateKey);
-      await expect(run(token), label).resolves.toBeNull();
-      expect(mapClaimsToProps, label).not.toHaveBeenCalled();
+    for (const [name, mint, status] of rows) {
+      expect({ name, status: (await call(rs, env, ctx, await mint())).status }).toEqual({ name, status });
     }
 
-    // An algorithm outside the allowlist is refused even though its key is in the set,
-    // and it is refused before the resolver is consulted.
-    keys.mockClear();
-    const esToken = await signEs256Jwt({ alg: 'ES256', typ: 'at+jwt', kid: 'es-key' }, claims, es256.privateKey);
-    await expect(run(esToken)).resolves.toBeNull();
-    expect(keys).not.toHaveBeenCalled();
-
-    // `alg: none` with a structurally valid third segment, so parsing is not what rejects it.
-    const unsigned = `${encodePart({ alg: 'none', typ: 'at+jwt', kid: 'required-claims' })}.${encodePart(claims)}.AAAA`;
-    await expect(run(unsigned)).resolves.toBeNull();
-    expect(keys).not.toHaveBeenCalled();
-  });
-
-  it('accepts an http issuer, JWKS URI, and audience on loopback hosts for local development', async () => {
-    const localIssuer = 'http://localhost:8787';
-    const localResource = 'http://localhost:8788/mcp';
-    const key = await createKey('RS256', 'local-current');
-    const accessTokens = createJwtAccessTokens<{}, TestProps>({
-      issuer: localIssuer,
-      jwksUri: `${localIssuer}/.well-known/jwks.json`,
-      keys: () => ({
-        signingKey: { kid: 'local-current', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
-      }),
-    });
-    const props: TestProps = { userId: 'user-123', tenantId: 'tenant-1', upstreamAccessToken: 'secret' };
-    const issued = await accessTokens.issue(issueInput(props, { audience: localResource }));
-    expect(decodePart(issued.token, 1)).toMatchObject({ iss: localIssuer, aud: localResource });
-
-    const validate = createJwtAccessTokenValidator({
-      issuer: localIssuer,
-      audience: localResource,
-      algorithms: ['RS256'],
-      keys: () => [key.publicJwk],
-      mapClaimsToProps: ({ userId }) => ({ userId }),
-    });
-    await expect(
-      validate({ token: issued.token, request: new Request(localResource), env: {} })
-    ).resolves.toMatchObject({ audience: localResource, props: { userId: 'user-123' } });
-
-    expect(() =>
-      createJwtAccessTokens<{}, TestProps>({
-        issuer: 'http://auth.example.com',
-        jwksUri: 'http://auth.example.com/.well-known/jwks.json',
-        keys: () => ({ signingKey: { kid: 'x', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk } }),
-      })
-    ).toThrow('issuer must be an absolute HTTPS URL');
-  });
-
-  it.each(['RS256', 'ES256'] as const)('issues and verifies an RFC 9068 %s access token', async (alg) => {
-    const key = await createKey(alg, `${alg}-current`);
-    const props: TestProps = {
-      userId: 'user-123',
-      tenantId: 'tenant-a',
-      upstreamAccessToken: 'must-not-leak',
-    };
-    const accessTokens = createJwtAccessTokens<{}, TestProps>({
-      issuer: ISSUER,
-      jwksUri: JWKS_URI,
-      keys: () => ({
-        signingKey: { kid: key.publicJwk.kid, alg, privateKey: key.privateKey, publicJwk: key.publicJwk },
-      }),
-    });
-
-    const issued = await accessTokens.issue(issueInput(props));
-    expect(issued.token.split('.')).toHaveLength(3);
-    expect(decodePart(issued.token, 0)).toEqual({ typ: 'at+jwt', alg, kid: `${alg}-current` });
-    expect(decodePart(issued.token, 1)).toMatchObject({
-      iss: ISSUER,
-      sub: 'user-123',
-      aud: RESOURCE,
-      client_id: 'client-123',
-      scope: 'calendar:read',
-      [JWT_ACCESS_TOKEN_GRANT_ID_CLAIM]: 'grant-123',
-    });
-    expect(JSON.stringify(decodePart(issued.token, 1))).not.toContain('must-not-leak');
-    expect(await accessTokens.verify(issued.token, [RESOURCE], {})).toMatchObject({
-      audience: RESOURCE,
-      userId: 'user-123',
-      clientId: 'client-123',
-      grantId: 'grant-123',
-      scope: ['calendar:read'],
-    });
-    expect(jwtInternals(accessTokens).isOwnJwt(issued.token)).toBe(true);
-  });
-
-  it('includes only the explicitly projected client-readable claim', async () => {
-    const key = await createKey('RS256', 'public-claims');
-    const accessTokens = createJwtAccessTokens<{}, TestProps>({
-      issuer: ISSUER,
-      jwksUri: JWKS_URI,
-      keys: () => ({
-        signingKey: { kid: 'public-claims', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
-      }),
-      publicClaims: ({ props, audience }) => ({ tenantId: props.tenantId, audience }),
-    });
-    const issued = await accessTokens.issue(
-      issueInput({ userId: 'user-123', tenantId: 'tenant-a', upstreamAccessToken: 'must-not-leak' })
+    // A __proto__ member in a public claim minted elsewhere is dropped before the mapper sees it.
+    const proto = await signJwt(
+      header(),
+      claimsFor({ [JWT_ACCESS_TOKEN_PUBLIC_CLAIMS]: JSON.parse('{"tenantId":"t","__proto__":{"polluted":true}}') }),
+      key
     );
-    const claims = decodePart(issued.token, 1);
+    const seen = await call(rs, env, ctx, proto);
+    expect(seen.status).toBe(200);
+    expect(Object.getOwnPropertyNames(seen.body.publicClaims)).toEqual(['tenantId']);
+    expect(({} as any).polluted).toBeUndefined();
 
-    expect(claims[JWT_ACCESS_TOKEN_PUBLIC_CLAIMS]).toEqual({ tenantId: 'tenant-a', audience: RESOURCE });
-    expect(JSON.stringify(claims)).not.toContain('must-not-leak');
+    // Every kid above was either known or rejected before key resolution, so one fetch served
+    // the whole table, and nothing named by a token was ever fetched.
+    expect(binding.log).toEqual([JWKS_URI]);
+
+    // The same ES256 token is fine for a resource server that allows ES256.
+    const es = resourceServer({ offline: offline(binding.source, { algorithms: ['ES256'] }) });
+    expect(
+      (await call(es, env, ctx, await signJwt(header({ alg: 'ES256', kid: es256.kid }), claimsFor(), es256))).status
+    ).toBe(200);
   });
 
-  it('snapshots validated issue fields before running the public-claims projector', async () => {
-    const key = await createKey('RS256', 'snapshot-input');
-    const callerScope = ['calendar:read'];
-    const accessTokens = createJwtAccessTokens<{}, TestProps>({
-      issuer: ISSUER,
-      jwksUri: JWKS_URI,
-      keys: () => ({
-        signingKey: {
-          kid: 'snapshot-input',
-          alg: 'RS256',
-          privateKey: key.privateKey,
-          publicJwk: key.publicJwk,
-        },
-      }),
-      publicClaims: (input) => {
-        try {
-          (input.scope as string[]).push('admin');
-        } catch {
-          // The runtime snapshot is frozen as well as readonly in the type.
-        }
-        try {
-          (input as { userId: string }).userId = 'attacker';
-        } catch {
-          // Canonical fields are snapshotted before application code runs.
-        }
-        return { scope: [...input.scope], frozen: Object.isFrozen(input.scope) };
-      },
-    });
-    const issued = await accessTokens.issue(
-      issueInput({ userId: 'user-123', tenantId: 'tenant-a', upstreamAccessToken: 'secret' }, { scope: callerScope })
-    );
-    const claims = decodePart(issued.token, 1);
-
-    expect(callerScope).toEqual(['calendar:read']);
-    expect(claims).toMatchObject({
-      sub: 'user-123',
-      scope: 'calendar:read',
-      [JWT_ACCESS_TOKEN_PUBLIC_CLAIMS]: { scope: ['calendar:read'], frozen: true },
-    });
-  });
-
-  it('maps verified public claims to typed resource-server props', async () => {
-    const key = await createKey('RS256', 'validator');
-    const accessTokens = createJwtAccessTokens<{}, TestProps>({
-      issuer: ISSUER,
-      jwksUri: JWKS_URI,
-      keys: () => ({
-        signingKey: { kid: 'validator', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
-      }),
-      publicClaims: ({ props }) => ({ tenantId: props.tenantId }),
-    });
-    const issued = await accessTokens.issue(
-      issueInput({ userId: 'user-123', tenantId: 'tenant-a', upstreamAccessToken: 'secret' })
-    );
-    const mapper = vi.fn(({ userId, scope, publicClaims }) => ({
-      userId,
-      scopes: scope,
-      tenantId: (publicClaims as { tenantId: string }).tenantId,
-    }));
-    const validate = createJwtAccessTokenValidator<{}, { userId: string; scopes: string[]; tenantId: string }>({
-      issuer: ISSUER,
-      audience: RESOURCE,
-      algorithms: ['RS256'],
-      keys: () => [key.publicJwk],
-      mapClaimsToProps: mapper,
-    });
-
-    await expect(validate({ token: issued.token, request: new Request(RESOURCE), env: {} })).resolves.toEqual({
-      audience: RESOURCE,
-      expiresAt: issued.claims.exp,
-      props: { userId: 'user-123', scopes: ['calendar:read'], tenantId: 'tenant-a' },
-    });
-    expect(mapper).toHaveBeenCalledOnce();
-
-    const resourceServer = createOAuthResourceServer<{}, { userId: string; scopes: string[]; tenantId: string }>({
-      resourceMetadata: { resource: RESOURCE, authorization_servers: [ISSUER] },
-      validateToken: validate,
-      handler: {
-        fetch(_request, _env, ctx) {
-          return Response.json(ctx.props);
-        },
-      },
-    });
-    const executionContext = {
-      waitUntil() {},
-      passThroughOnException() {},
-    } as unknown as ExecutionContext;
-    const response = await resourceServer.fetch(
-      new Request(RESOURCE, { headers: { Authorization: `Bearer ${issued.token}` } }),
-      {},
-      executionContext
-    );
-    expect(response.status).toBe(200);
-    await expect(response.json()).resolves.toEqual({
-      userId: 'user-123',
-      scopes: ['calendar:read'],
-      tenantId: 'tenant-a',
-    });
-  });
-
-  it('rejects tampering, the wrong audience, and expired tokens before mapping props', async () => {
-    const key = await createKey('RS256', 'validation');
-    const accessTokens = createJwtAccessTokens<{}, TestProps>({
-      issuer: ISSUER,
-      jwksUri: JWKS_URI,
-      keys: () => ({
-        signingKey: { kid: 'validation', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
-      }),
-    });
-    const issued = await accessTokens.issue(
-      issueInput({ userId: 'user-123', tenantId: 'tenant-a', upstreamAccessToken: 'secret' })
-    );
-    const mapClaimsToProps = vi.fn(() => ({ userId: 'user-123' }));
-    const validate = createJwtAccessTokenValidator<{}, { userId: string }>({
-      issuer: ISSUER,
-      audience: RESOURCE,
-      algorithms: ['RS256'],
-      keys: () => [key.publicJwk],
-      mapClaimsToProps,
-    });
-
-    const parts = issued.token.split('.');
-    const changedClaims = { ...decodePart(issued.token, 1), sub: 'attacker' };
-    const tampered = `${parts[0]}.${encodePart(changedClaims)}.${parts[2]}`;
-    await expect(validate({ token: tampered, request: new Request(RESOURCE), env: {} })).resolves.toBeNull();
-
-    const wrongAudience = createJwtAccessTokenValidator<{}, { userId: string }>({
-      issuer: ISSUER,
-      audience: 'https://drive.example.com/mcp',
-      algorithms: ['RS256'],
-      keys: () => [key.publicJwk],
-      mapClaimsToProps,
-    });
-    await expect(wrongAudience({ token: issued.token, request: new Request(RESOURCE), env: {} })).resolves.toBeNull();
-
-    const expired = await accessTokens.issue(
-      issueInput(
-        { userId: 'user-123', tenantId: 'tenant-a', upstreamAccessToken: 'secret' },
-        { issuedAt: 100, expiresAt: 200 }
-      )
-    );
-    await expect(validate({ token: expired.token, request: new Request(RESOURCE), env: {} })).resolves.toBeNull();
-    expect(mapClaimsToProps).not.toHaveBeenCalled();
-  });
-
-  it('handles RFC JWT syntax while rejecting premature or malformed claims before key resolution', async () => {
-    const key = await createKey('RS256', 'syntax');
-    const accessTokens = createJwtAccessTokens<{}, TestProps>({
-      issuer: ISSUER,
-      jwksUri: JWKS_URI,
-      keys: () => ({
-        signingKey: { kid: 'syntax', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
-      }),
-    });
-    const issued = await accessTokens.issue(
-      issueInput({ userId: 'user-123', tenantId: 'tenant-a', upstreamAccessToken: 'secret' })
-    );
-    const header = decodePart(issued.token, 0);
-    const claims = decodePart(issued.token, 1);
-    const keys = vi.fn(() => [key.publicJwk]);
-    const validate = createJwtAccessTokenValidator<{}, { userId: string }>({
-      issuer: ISSUER,
-      audience: RESOURCE,
-      algorithms: ['RS256'],
-      keys,
-      mapClaimsToProps: ({ userId }) => ({ userId }),
-    });
-
-    const interoperable = await signCustomJwt(
-      { ...header, typ: 'at+JWT' },
-      { ...claims, aud: [RESOURCE, 'https://another.example.com/mcp'] },
-      key.privateKey
-    );
-    await expect(validate({ token: interoperable, request: new Request(RESOURCE), env: {} })).resolves.toMatchObject({
-      props: { userId: 'user-123' },
-    });
-    await expect(accessTokens.verify(interoperable, [RESOURCE], {})).resolves.toBeNull();
-
-    const future = await signCustomJwt(header, { ...claims, nbf: Math.floor(Date.now() / 1000) + 300 }, key.privateKey);
-    await expect(validate({ token: future, request: new Request(RESOURCE), env: {} })).resolves.toBeNull();
-
-    const malformedScope = await signCustomJwt(header, { ...claims, scope: 'read  write' }, key.privateKey);
-    await expect(validate({ token: malformedScope, request: new Request(RESOURCE), env: {} })).resolves.toBeNull();
-
-    const controlledEncoding = await signCustomJwt({ ...header, b64: false }, claims, key.privateKey);
-    await expect(validate({ token: controlledEncoding, request: new Request(RESOURCE), env: {} })).resolves.toBeNull();
-
-    const tokenParts = issued.token.split('.');
-    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
-    const finalSignatureCharacter = alphabet.indexOf(tokenParts[2].slice(-1));
-    tokenParts[2] = `${tokenParts[2].slice(0, -1)}${alphabet[finalSignatureCharacter + 1]}`;
-    await expect(
-      validate({ token: tokenParts.join('.'), request: new Request(RESOURCE), env: {} })
-    ).resolves.toBeNull();
-
-    keys.mockClear();
-    const wrongIssuer = `${encodePart(header)}.${encodePart({ ...claims, iss: 'https://attacker.example.com' })}.signature`;
-    await expect(validate({ token: wrongIssuer, request: new Request(RESOURCE), env: {} })).resolves.toBeNull();
-    const invalidUtf8 = `${encodeBinary(new Uint8Array([0xc3, 0x28]))}.${encodePart(claims)}.signature`;
-    await expect(validate({ token: invalidUtf8, request: new Request(RESOURCE), env: {} })).resolves.toBeNull();
-    expect(keys).not.toHaveBeenCalled();
-  });
-
-  it('does not follow token-controlled keys or accept an untrusted algorithm', async () => {
-    const key = await createKey('RS256', 'headers');
-    const accessTokens = createJwtAccessTokens<{}, TestProps>({
-      issuer: ISSUER,
-      jwksUri: JWKS_URI,
-      keys: () => ({
-        signingKey: { kid: 'headers', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
-      }),
-    });
-    const issued = await accessTokens.issue(
-      issueInput({ userId: 'user-123', tenantId: 'tenant-a', upstreamAccessToken: 'secret' })
-    );
-    const validate = createJwtAccessTokenValidator<{}, {}>({
-      issuer: ISSUER,
-      audience: RESOURCE,
-      algorithms: ['RS256'],
-      keys: () => [key.publicJwk],
-      mapClaimsToProps: () => ({}),
-    });
-    const parts = issued.token.split('.');
-    const controlledJku = `${encodePart({ ...decodePart(issued.token, 0), jku: 'https://attacker.example/jwks' })}.${parts[1]}.${parts[2]}`;
-    const none = `${encodePart({ typ: 'at+jwt', alg: 'none', kid: 'headers' })}.${parts[1]}.forged`;
-
-    await expect(validate({ token: controlledJku, request: new Request(RESOURCE), env: {} })).resolves.toBeNull();
-    await expect(validate({ token: none, request: new Request(RESOURCE), env: {} })).resolves.toBeNull();
-  });
-
-  it('publishes the current and retiring public keys and verifies tokens across rotation', async () => {
-    const oldKey = await createKey('RS256', 'old');
-    const newKey = await createKey('RS256', 'new');
-    const oldTokens = createJwtAccessTokens<{}, TestProps>({
-      issuer: ISSUER,
-      jwksUri: JWKS_URI,
-      keys: () => ({
-        signingKey: { kid: 'old', alg: 'RS256', privateKey: oldKey.privateKey, publicJwk: oldKey.publicJwk },
-      }),
-    });
-    const oldToken = await oldTokens.issue(
-      issueInput({ userId: 'user-123', tenantId: 'tenant-a', upstreamAccessToken: 'secret' })
-    );
-    const jwksCachedBeforePrepublication = (await oldTokens.getJwks({})).keys;
-    const rotatedTokens = createJwtAccessTokens<{}, TestProps>({
-      issuer: ISSUER,
-      jwksUri: JWKS_URI,
-      keys: () => ({
-        signingKey: { kid: 'new', alg: 'RS256', privateKey: newKey.privateKey, publicJwk: newKey.publicJwk },
-        verificationKeys: [oldKey.publicJwk],
-      }),
-    });
-
-    await expect(rotatedTokens.verify(oldToken.token, [RESOURCE], {})).resolves.toMatchObject({
-      jti: oldToken.claims.jti,
-    });
-    await expect(rotatedTokens.getJwks({})).resolves.toMatchObject({ keys: [{ kid: 'new' }, { kid: 'old' }] });
-    expect((await rotatedTokens.getJwks({})).keys.every((jwk) => !('d' in jwk))).toBe(true);
-
-    const prepublishedTokens = createJwtAccessTokens<{}, TestProps>({
-      issuer: ISSUER,
-      jwksUri: JWKS_URI,
-      keys: () => ({
-        signingKey: { kid: 'old', alg: 'RS256', privateKey: oldKey.privateKey, publicJwk: oldKey.publicJwk },
-        verificationKeys: [newKey.publicJwk],
-      }),
-    });
-    const jwksCachedAfterPrepublication = (await prepublishedTokens.getJwks({})).keys;
-    const newToken = await rotatedTokens.issue(
-      issueInput({ userId: 'user-123', tenantId: 'tenant-a', upstreamAccessToken: 'secret' })
-    );
-    const validateWithPrepublishedCache = createJwtAccessTokenValidator<{}, {}>({
-      issuer: ISSUER,
-      audience: RESOURCE,
-      algorithms: ['RS256'],
-      keys: () => jwksCachedAfterPrepublication,
-      mapClaimsToProps: () => ({}),
-    });
-    await expect(
-      validateWithPrepublishedCache({ token: newToken.token, request: new Request(RESOURCE), env: {} })
-    ).resolves.toMatchObject({ audience: RESOURCE });
-    const validateWithStaleCache = createJwtAccessTokenValidator<{}, {}>({
-      issuer: ISSUER,
-      audience: RESOURCE,
-      algorithms: ['RS256'],
-      keys: () => jwksCachedBeforePrepublication,
-      mapClaimsToProps: () => ({}),
-    });
-    await expect(
-      validateWithStaleCache({ token: newToken.token, request: new Request(RESOURCE), env: {} })
-    ).resolves.toBeNull();
-  });
-
-  it('rejects private material, duplicate kids, unsafe public claims, and oversized tokens', async () => {
-    const key = await createKey('RS256', 'invalid');
-    const privateJwk = (await crypto.subtle.exportKey('jwk', key.privateKey)) as JwtPublicKey;
-    const privateMaterial = createJwtAccessTokens<{}, TestProps>({
-      issuer: ISSUER,
-      jwksUri: JWKS_URI,
-      keys: () => ({
-        signingKey: {
-          kid: 'invalid',
-          alg: 'RS256',
-          privateKey: key.privateKey,
-          publicJwk: { ...privateJwk, kid: 'invalid', alg: 'RS256' },
-        },
-      }),
-    });
-    await expect(privateMaterial.getJwks({})).rejects.toThrow('must not contain private key material');
-
-    // Checked on the caller's own record: the published-member allowlist drops `key_ops`,
-    // so a check running after the copy could never see it.
-    const signOnlyKeyOps = createJwtAccessTokens<{}, TestProps>({
-      issuer: ISSUER,
-      jwksUri: JWKS_URI,
-      keys: () => ({
-        signingKey: {
-          kid: 'invalid',
-          alg: 'RS256',
-          privateKey: key.privateKey,
-          publicJwk: { ...key.publicJwk, key_ops: ['sign'] },
-        },
-      }),
-    });
-    await expect(signOnlyKeyOps.getJwks({})).rejects.toThrow("key_ops must include 'verify'");
-
-    const duplicateKids = createJwtAccessTokens<{}, TestProps>({
-      issuer: ISSUER,
-      jwksUri: JWKS_URI,
-      keys: () => ({
-        signingKey: { kid: 'invalid', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
-        verificationKeys: [key.publicJwk],
-      }),
-    });
-    await expect(duplicateKids.getJwks({})).rejects.toThrow('unique kid');
-
-    const circular: Record<string, unknown> = {};
-    circular.self = circular;
-    const unsafeClaims = createJwtAccessTokens<{}, TestProps>({
-      issuer: ISSUER,
-      jwksUri: JWKS_URI,
-      keys: () => ({
-        signingKey: { kid: 'invalid', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
-      }),
-      publicClaims: () => circular as never,
-    });
-    await expect(
-      unsafeClaims.issue(issueInput({ userId: 'user-123', tenantId: 'tenant-a', upstreamAccessToken: 'secret' }))
-    ).rejects.toThrow('finite JSON');
-
-    let deeplyNested: unknown = null;
-    for (let depth = 0; depth < 128; depth++) deeplyNested = [deeplyNested];
-    const deepClaims = createJwtAccessTokens<{}, TestProps>({
-      issuer: ISSUER,
-      jwksUri: JWKS_URI,
-      keys: () => ({
-        signingKey: { kid: 'invalid', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
-      }),
-      publicClaims: () => deeplyNested as never,
-    });
-    await expect(
-      deepClaims.issue(issueInput({ userId: 'user-123', tenantId: 'tenant-a', upstreamAccessToken: 'secret' }))
-    ).rejects.toThrow('maximum JSON depth');
-
-    const oversized = createJwtAccessTokens<{}, TestProps>({
-      issuer: ISSUER,
-      jwksUri: JWKS_URI,
-      keys: () => ({
-        signingKey: { kid: 'invalid', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
-      }),
-      publicClaims: () => 'x'.repeat(20_000),
-    });
-    const sign = vi.spyOn(crypto.subtle, 'sign');
-    await expect(
-      oversized.issue(issueInput({ userId: 'user-123', tenantId: 'tenant-a', upstreamAccessToken: 'secret' }))
-    ).rejects.toThrow('exceeds');
-    expect(sign).not.toHaveBeenCalled();
-    sign.mockRestore();
-
-    await expect(
-      oversized.issue(
-        issueInput(
-          { userId: 'user-123', tenantId: 'tenant-a', upstreamAccessToken: 'secret' },
-          { scope: ['read write'] }
-        )
-      )
-    ).rejects.toThrow('valid OAuth scope tokens');
-  });
-
-  it('rejects weak, incompatible, and mismatched signing keys', async () => {
-    const strong = await createKey('RS256', 'strong');
-    const unrelated = await createKey('RS256', 'unrelated');
-    const mismatched = createJwtAccessTokens<{}, TestProps>({
-      issuer: ISSUER,
-      jwksUri: JWKS_URI,
-      keys: () => ({
-        signingKey: {
-          kid: 'unrelated',
-          alg: 'RS256',
-          privateKey: strong.privateKey,
-          publicJwk: unrelated.publicJwk,
-        },
-      }),
-    });
-    await expect(
-      mismatched.issue(issueInput({ userId: 'user-123', tenantId: 'tenant-a', upstreamAccessToken: 'secret' }))
-    ).rejects.toThrow('does not match publicJwk');
-    await expect(mismatched.getJwks({})).rejects.toThrow('does not match publicJwk');
-
-    const weakPair = (await crypto.subtle.generateKey(
-      {
-        name: 'RSASSA-PKCS1-v1_5',
-        modulusLength: 1024,
-        publicExponent: new Uint8Array([1, 0, 1]),
-        hash: 'SHA-256',
-      },
-      true,
-      ['sign', 'verify']
-    )) as CryptoKeyPair;
-    const weakJwk = {
-      ...((await crypto.subtle.exportKey('jwk', weakPair.publicKey)) as JsonWebKey),
-      kid: 'weak',
-      alg: 'RS256' as const,
-    } as JwtPublicKey;
-    const weak = createJwtAccessTokens<{}, TestProps>({
-      issuer: ISSUER,
-      jwksUri: JWKS_URI,
-      keys: () => ({ signingKey: { kid: 'weak', alg: 'RS256', privateKey: weakPair.privateKey, publicJwk: weakJwk } }),
-    });
-    await expect(weak.getJwks({})).rejects.toThrow('at least 2048 bits');
-
-    const sha384Pair = (await crypto.subtle.generateKey(
-      {
-        name: 'RSASSA-PKCS1-v1_5',
-        modulusLength: 2048,
-        publicExponent: new Uint8Array([1, 0, 1]),
-        hash: 'SHA-384',
-      },
-      true,
-      ['sign', 'verify']
-    )) as CryptoKeyPair;
-    const sha384Jwk = {
-      ...((await crypto.subtle.exportKey('jwk', sha384Pair.publicKey)) as JsonWebKey),
-      kid: 'sha384',
-      alg: 'RS256' as const,
-    } as JwtPublicKey;
-    const wrongHash = createJwtAccessTokens<{}, TestProps>({
-      issuer: ISSUER,
-      jwksUri: JWKS_URI,
-      keys: () => ({
-        signingKey: { kid: 'sha384', alg: 'RS256', privateKey: sha384Pair.privateKey, publicJwk: sha384Jwk },
-      }),
-    });
-    await expect(wrongHash.getJwks({})).rejects.toThrow('PKCS#1 SHA-256');
-  });
-
-  it('rejects a nullish props mapping and snapshots explicitly public JSON claims', async () => {
-    const key = await createKey('RS256', 'snapshot');
-    const shared = { label: 'safe' };
-    const projected = { first: shared, second: shared };
-    const accessTokens = createJwtAccessTokens<{}, TestProps>({
-      issuer: ISSUER,
-      jwksUri: JWKS_URI,
-      keys: () => ({
-        signingKey: { kid: 'snapshot', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
-      }),
-      publicClaims: () => projected,
-    });
-    const issued = await accessTokens.issue(
-      issueInput({ userId: 'user-123', tenantId: 'tenant-a', upstreamAccessToken: 'secret' })
-    );
-    shared.label = 'mutated-after-issuance';
-    expect(decodePart(issued.token, 1)[JWT_ACCESS_TOKEN_PUBLIC_CLAIMS]).toEqual({
-      first: { label: 'safe' },
-      second: { label: 'safe' },
-    });
-
-    const specialKeyClaims = createJwtAccessTokens<{}, TestProps>({
-      issuer: ISSUER,
-      jwksUri: JWKS_URI,
-      keys: () => ({
-        signingKey: { kid: 'snapshot', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
-      }),
-      publicClaims: () => JSON.parse('{"__proto__":{"polluted":true},"safe":"value"}') as never,
-    });
-    // A null-prototype clone keeps such a key inert here, but the claim is consumed by
-    // resource servers this issuer does not control, and the ordinary way to read it
-    // (Object.assign or a spread onto a plain object) reassigns that object's prototype.
-    // The hazard cannot be exported, so issuance refuses it.
-    await expect(
-      specialKeyClaims.issue(issueInput({ userId: 'user-123', tenantId: 'tenant-a', upstreamAccessToken: 'secret' }))
-    ).rejects.toThrow('__proto__');
-
-    const validate = createJwtAccessTokenValidator<{}, {}>({
-      issuer: ISSUER,
-      audience: RESOURCE,
-      algorithms: ['RS256'],
-      keys: () => [key.publicJwk],
-      mapClaimsToProps: () => undefined as never,
-    });
-    await expect(validate({ token: issued.token, request: new Request(RESOURCE), env: {} })).resolves.toBeNull();
-  });
-
-  it('rejects deeply nested unverified public claims before resolving keys or mapping props', async () => {
-    const key = await createKey('RS256', 'deep-input');
-    const now = Math.floor(Date.now() / 1000);
-    let deeplyNested: unknown = null;
-    for (let depth = 0; depth < 128; depth++) deeplyNested = [deeplyNested];
-    const header = encodePart({ typ: 'at+jwt', alg: 'RS256', kid: 'deep-input' });
-    const claims = encodePart({
-      iss: ISSUER,
-      sub: 'user-123',
-      aud: RESOURCE,
-      exp: now + 3600,
-      iat: now,
-      jti: 'deep-input',
-      client_id: 'client-123',
-      scope: 'calendar:read',
-      [JWT_ACCESS_TOKEN_GRANT_ID_CLAIM]: 'grant-123',
-      [JWT_ACCESS_TOKEN_PUBLIC_CLAIMS]: deeplyNested,
-    });
-    const keys = vi.fn(() => [key.publicJwk]);
-    const mapper = vi.fn(() => ({}));
-    const validate = createJwtAccessTokenValidator({
-      issuer: ISSUER,
-      audience: RESOURCE,
-      algorithms: ['RS256'],
-      keys,
-      mapClaimsToProps: mapper,
-    });
-
-    await expect(
-      validate({ token: `${header}.${claims}.c2ln`, request: new Request(RESOURCE), env: {} })
-    ).resolves.toBeNull();
-    expect(keys).not.toHaveBeenCalled();
-    expect(mapper).not.toHaveBeenCalled();
-  });
-});
-
-async function signEs256Jwt(
-  header: Record<string, unknown>,
-  claims: Record<string, unknown>,
-  privateKey: CryptoKey
-): Promise<string> {
-  const signingInput = `${encodePart(header)}.${encodePart(claims)}`;
-  const signature = await crypto.subtle.sign(
-    { name: 'ECDSA', hash: 'SHA-256' },
-    privateKey,
-    new TextEncoder().encode(signingInput)
-  );
-  return `${signingInput}.${encodeBinary(new Uint8Array(signature))}`;
-}
-
-describe('createJwksKeyResolver', () => {
-  function jwksResponse(keys: unknown[], headers: Record<string, string> = {}): Response {
-    return new Response(JSON.stringify({ keys }), {
-      headers: { 'Content-Type': 'application/json', ...headers },
-    });
-  }
-
-  it('caches a key set, and refreshes for an unknown kid at most once per cooldown', async () => {
-    const first = await createKey('RS256', 'key-1');
-    const second = await createKey('RS256', 'key-2');
-    let served = [first.publicJwk];
-    const fetch = vi.fn(async () => jwksResponse(served));
-    const resolve = createJwksKeyResolver<{}>({ jwksUri: JWKS_URI, fetcher: () => ({ fetch }) });
-    const now = Math.floor(Date.now() / 1000);
-    const clock = vi.spyOn(Date, 'now').mockReturnValue(now * 1000);
-
+  it('rotates keys without invalidating tokens in flight, and refreshes for an unknown kid at most once per cooldown', async () => {
+    const next = await createKey('RS256', 'key-2026-10');
+    let keySet = signingWith(key);
+    const as = authorizationServer(env, () => keySet);
+    const binding = jwksBinding(as, env, ctx);
+    const rs = resourceServer({ offline: offline(binding.source) });
+    const realNow = Date.now;
+    let skewMs = 0;
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => realNow() + skewMs);
     try {
-      await expect(resolve({}, { kid: 'key-1', alg: 'RS256' })).resolves.toMatchObject([{ kid: 'key-1' }]);
-      expect(fetch).toHaveBeenCalledTimes(1);
-      expect((fetch.mock.calls[0] as unknown as [Request])[0].url).toBe(JWKS_URI);
+      const first = await issueToken(as, env, ctx);
+      expect((await call(rs, env, ctx, first)).status).toBe(200);
+      expect(binding.log).toHaveLength(1);
 
-      // A known kid is served from cache.
-      await resolve({}, { kid: 'key-1', alg: 'RS256' });
-      expect(fetch).toHaveBeenCalledTimes(1);
+      // 1. Stage the next public key. The resource server's cache does not need it yet.
+      keySet = signingWith(key, [next]);
+      expect((await call(rs, env, ctx, first)).status).toBe(200);
+      expect(binding.log).toHaveLength(1);
 
-      // Invented kids inside the cooldown window never reach the authorization server:
-      // `kid` is unauthenticated attacker-chosen input, and a refresh per miss would make
-      // every resource server an amplifier. Serving a stale set is safe — verification
-      // still has to succeed against it.
-      served = [first.publicJwk, second.publicJwk];
-      for (let i = 0; i < 25; i++) {
-        await expect(resolve({}, { kid: `invented-${i}`, alg: 'RS256' })).resolves.toHaveLength(1);
-      }
-      expect(fetch).toHaveBeenCalledTimes(1);
+      // 2. Promote it. The first token signed with it names a kid the cache lacks. Inside the
+      // refresh cooldown that is indistinguishable from a guess and is refused; once the
+      // cooldown has passed it costs exactly one refresh, which is why the rotation guidance
+      // says to wait after publishing before signing.
+      keySet = signingWith(next, [key]);
+      const second = await issueToken(as, env, ctx);
+      expect(decodePart(second, 0).kid).toBe(next.kid);
+      expect((await call(rs, env, ctx, second)).status).toBe(401);
+      expect(binding.log).toHaveLength(1);
+      skewMs = 31_000;
+      expect((await call(rs, env, ctx, second)).status).toBe(200);
+      expect(binding.log).toHaveLength(2);
+      expect((await call(rs, env, ctx, first)).status).toBe(200);
 
-      // Past the cooldown, one unknown kid picks up the rotation.
-      clock.mockReturnValue((now + 31) * 1000);
-      await expect(resolve({}, { kid: 'key-2', alg: 'RS256' })).resolves.toHaveLength(2);
-      expect(fetch).toHaveBeenCalledTimes(2);
+      // An invented kid is attacker input: inside the cooldown it never reaches the JWKS.
+      const invented = (kid: string) => signJwt({ typ: 'at+jwt', alg: 'RS256', kid }, claimsFor(), next);
+      for (let i = 0; i < 20; i++) expect((await call(rs, env, ctx, await invented(`guess-${i}`))).status).toBe(401);
+      expect(binding.log).toHaveLength(2);
+      skewMs = 62_000;
+      expect((await call(rs, env, ctx, await invented('guess-later'))).status).toBe(401);
+      expect(binding.log).toHaveLength(3);
+
+      // 3. Retire the old key. It keeps verifying until the cache lifetime passes, then stops.
+      keySet = signingWith(next);
+      expect((await call(rs, env, ctx, first)).status).toBe(200);
+      skewMs = 62_000 + 301_000;
+      expect((await call(rs, env, ctx, first)).status).toBe(401);
+      expect((await call(rs, env, ctx, second)).status).toBe(200);
     } finally {
       clock.mockRestore();
     }
   });
 
-  it('honours a shorter max-age than the configured TTL', async () => {
-    const key = await createKey('RS256', 'short-lived');
-    const fetch = vi.fn(async () => jwksResponse([key.publicJwk], { 'Cache-Control': 'public, max-age=1' }));
-    const resolve = createJwksKeyResolver<{}>({
-      jwksUri: JWKS_URI,
-      fetcher: () => ({ fetch }),
-      cacheTtlSeconds: 3600,
-    });
-    const now = Math.floor(Date.now() / 1000);
-    const clock = vi.spyOn(Date, 'now').mockReturnValue(now * 1000);
-    try {
-      await resolve({}, { kid: 'short-lived', alg: 'RS256' });
-      await resolve({}, { kid: 'short-lived', alg: 'RS256' });
-      expect(fetch).toHaveBeenCalledTimes(1);
-
-      clock.mockReturnValue((now + 2) * 1000);
-      await resolve({}, { kid: 'short-lived', alg: 'RS256' });
-      expect(fetch).toHaveBeenCalledTimes(2);
-    } finally {
-      clock.mockRestore();
-    }
-  });
-
-  it('never reuses a key set longer than its Cache-Control allows', async () => {
-    const key = await createKey('RS256', 'key-1');
-    const now = Math.floor(Date.now() / 1000);
-    const clock = vi.spyOn(Date, 'now').mockReturnValue(now * 1000);
+  it('caches the key set no longer than its Cache-Control allows, coalesces refreshes, and fails closed on a bad JWKS', async () => {
+    const token = await signJwt({ typ: 'at+jwt', alg: 'RS256', kid: key.kid }, claimsFor(), key);
+    const realNow = Date.now;
+    let skewMs = 0;
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => realNow() + skewMs);
     // Fetch count after two validations at one instant, then after a third two seconds later.
-    const fetchesFor = async (cacheControl: string): Promise<[number, number]> => {
-      const fetch = vi.fn(async () => jwksResponse([key.publicJwk], { 'Cache-Control': cacheControl }));
-      const resolve = createJwksKeyResolver<{}>({
-        jwksUri: JWKS_URI,
-        fetcher: () => ({ fetch }),
-        cacheTtlSeconds: 3600,
+    const fetchesFor = async (
+      cacheControl: string,
+      respond = () => jwksResponse([key.publicJwk], { 'Cache-Control': cacheControl })
+    ) => {
+      const fetch = vi.fn(async () => respond());
+      const rs = resourceServer({
+        offline: offline({ jwksUri: JWKS_URI, fetcher: () => ({ fetch }), cacheTtlSeconds: 3600 }),
       });
-      clock.mockReturnValue(now * 1000);
-      await resolve({}, { kid: 'key-1', alg: 'RS256' });
-      await resolve({}, { kid: 'key-1', alg: 'RS256' });
+      skewMs = 0;
+      expect((await call(rs, env, ctx, token)).status).toBe(200);
+      await call(rs, env, ctx, token);
       const atOnce = fetch.mock.calls.length;
-      clock.mockReturnValue((now + 2) * 1000);
-      await resolve({}, { kid: 'key-1', alg: 'RS256' });
+      skewMs = 2000;
+      await call(rs, env, ctx, token);
       return [atOnce, fetch.mock.calls.length];
     };
-
     try {
-      // A response that forbids reuse is fetched for every validation.
       await expect(fetchesFor('no-store')).resolves.toEqual([2, 3]);
       await expect(fetchesFor('no-cache')).resolves.toEqual([2, 3]);
       await expect(fetchesFor('public, max-age=0')).resolves.toEqual([2, 3]);
-      // Directive names are case-insensitive, and the most restrictive one wins.
       await expect(fetchesFor('NO-CACHE, max-age=300')).resolves.toEqual([2, 3]);
-      await expect(fetchesFor('max-age=3600, max-age=1')).resolves.toEqual([1, 2]);
-      // Invalid freshness is stale: a misconfigured server fetches more, never less.
       await expect(fetchesFor('max-age=soon')).resolves.toEqual([2, 3]);
-      await expect(fetchesFor('max-age=-1')).resolves.toEqual([2, 3]);
-      await expect(fetchesFor('max-age')).resolves.toEqual([2, 3]);
-      // Delta-seconds may be a token or quoted, in any case.
+      await expect(fetchesFor('max-age=3600, max-age=1')).resolves.toEqual([1, 2]);
       await expect(fetchesFor('Public, Max-Age="1"')).resolves.toEqual([1, 2]);
-      // Shared-cache directives, and ones that only extend reuse, do not shorten it.
-      await expect(fetchesFor('private, s-maxage=0, max-age=1, stale-while-revalidate=30')).resolves.toEqual([1, 2]);
-      await expect(fetchesFor('private, s-maxage=0')).resolves.toEqual([1, 1]);
-      // No freshness directive at all leaves the configured TTL in charge.
+      await expect(fetchesFor('private, s-maxage=0, stale-while-revalidate=30')).resolves.toEqual([1, 1]);
       await expect(fetchesFor('public')).resolves.toEqual([1, 1]);
+
+      // Ten validations during one in-flight fetch share it, even when the response forbids reuse.
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => (release = resolve));
+      const gated = vi.fn(async () => {
+        await gate;
+        return jwksResponse([key.publicJwk], { 'Cache-Control': 'no-store' });
+      });
+      const shared = resourceServer({ offline: offline({ jwksUri: JWKS_URI, fetcher: () => ({ fetch: gated }) }) });
+      const pending = Array.from({ length: 10 }, () => call(shared, env, ctx, token));
+      release();
+      for (const result of await Promise.all(pending)) expect(result.status).toBe(200);
+      expect(gated).toHaveBeenCalledTimes(1);
+
+      // A JWKS that cannot be used is an outage, not an invalid token: 503, never 401.
+      for (const respond of [
+        () => new Response('nope', { status: 503 }),
+        () => new Response('{}', { headers: { 'Content-Type': 'application/json' } }),
+        () => jwksResponse([{ kid: 'x'.repeat(70_000) }]),
+      ]) {
+        const rs = resourceServer({
+          offline: offline({ jwksUri: JWKS_URI, fetcher: () => ({ fetch: async () => respond() }) }),
+        });
+        expect((await call(rs, env, ctx, token)).status).toBe(503);
+      }
+      // A key set that simply lacks the token's key is an invalid token.
+      const other = await createKey('RS256', 'someone-else');
+      const noKey = resourceServer({
+        offline: offline({
+          jwksUri: JWKS_URI,
+          fetcher: () => ({ fetch: async () => jwksResponse([other.publicJwk]) }),
+        }),
+      });
+      expect((await call(noKey, env, ctx, token)).status).toBe(401);
     } finally {
       clock.mockRestore();
     }
   });
 
-  it('shares one request between concurrent validations when the response forbids reuse', async () => {
-    const key = await createKey('RS256', 'key-1');
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
+  it('refuses unsafe key material at both endpoints and leaves the authorization code retryable', async () => {
+    const other = await createKey('RS256', 'other');
+    const weak = await createKey('RS256', 'weak', 1024);
+    const withJwk = (patch: Partial<JsonWebKey> & Record<string, unknown>): JwtKeySet => ({
+      signingKey: { ...signingWith(key).signingKey, publicJwk: { ...key.publicJwk, ...patch } as JwtPublicKey },
     });
-    const fetch = vi.fn(async () => {
-      await gate;
-      return jwksResponse([key.publicJwk], { 'Cache-Control': 'no-store' });
-    });
-    const resolve = createJwksKeyResolver<{}>({ jwksUri: JWKS_URI, fetcher: () => ({ fetch }) });
+    const rows: [string, JwtKeySet][] = [
+      ['private material in the public JWK', withJwk({ d: 'AQAB' })],
+      ['a public exponent of 3', withJwk({ e: 'Aw' })],
+      ['an even public exponent', withJwk({ e: 'AQAC' })],
+      ['key_ops that allow signing', withJwk({ key_ops: ['sign'] })],
+      ['a 1024-bit RSA key', signingWith(weak)],
+      [
+        'a public JWK that is not the private key\u2019s pair',
+        { signingKey: { ...signingWith(key).signingKey, publicJwk: other.publicJwk } },
+      ],
+      ['a duplicate kid', signingWith(key, [key])],
+    ];
+    for (const [name, bad] of rows) {
+      let keySet = bad;
+      const as = authorizationServer(env, () => keySet);
+      const jwks = await as.fetch(createMockRequest(JWKS_URI), env, ctx);
+      expect({ name, status: jwks.status }).toEqual({ name, status: 503 });
 
-    // Ten validations arrive while the first fetch is in flight: one request serves all of them.
-    const pending = Array.from({ length: 10 }, () => resolve({}, { kid: 'key-1', alg: 'RS256' }));
-    release();
-    for (const keys of await Promise.all(pending)) expect(keys).toMatchObject([{ kid: 'key-1' }]);
-    expect(fetch).toHaveBeenCalledTimes(1);
-
-    // The next validation after that fetches again, as `no-store` asks.
-    await resolve({}, { kid: 'key-1', alg: 'RS256' });
-    expect(fetch).toHaveBeenCalledTimes(2);
+      const { exchange } = await authorize(as, env, ctx);
+      const failed = await exchange();
+      expect({ name, status: failed.status, error: (await failed.json<any>()).error }).toEqual({
+        name,
+        status: 500,
+        error: 'server_error',
+      });
+      // Signing failed before the grant write, so the same code still exchanges once the keys are fixed.
+      keySet = signingWith(key);
+      expect({ name, status: (await exchange()).status }).toEqual({ name, status: 200 });
+    }
   });
 
-  it('rejects a failed, malformed, or oversized response and validates its own configuration', async () => {
-    expect(() => createJwksKeyResolver<{}>({ jwksUri: 'http://auth.example.com/jwks.json' })).toThrow(
-      'jwksUri must be an absolute HTTPS URL'
+  it('projects only public claims from a snapshot, and refuses a projection that cannot travel in a token', async () => {
+    let projection: (input: { props: AuthProps; scope: readonly string[] }) => unknown = ({ props }) => ({
+      tenantId: props.tenantId,
+    });
+    const as = authorizationServer(env, () => signingWith(key), {
+      publicClaims: (input) => projection(input) as any,
+    });
+
+    // The projector sees a frozen snapshot: its attempts to change the token change nothing.
+    projection = (input) => {
+      expect(Object.isFrozen(input)).toBe(true);
+      expect(() => ((input as any).scope = ['calendar:admin'])).toThrow();
+      return { tenantId: input.props.tenantId, scope: [...input.scope] };
+    };
+    const claims = decodePart(await issueToken(as, env, ctx), 1);
+    expect(claims.scope).toBe('calendar:read');
+    expect(claims[JWT_ACCESS_TOKEN_PUBLIC_CLAIMS]).toEqual({ tenantId: PROPS.tenantId, scope: ['calendar:read'] });
+
+    const deep = (depth: number): unknown => (depth === 0 ? true : { next: deep(depth - 1) });
+    const rows: [string, unknown][] = [
+      ['a __proto__ member', JSON.parse('{"__proto__":{"polluted":true}}')],
+      ['a value that is not JSON', { when: () => 'now' }],
+      ['nesting deeper than 64 levels', deep(65)],
+      ['more than a token can carry', { pad: 'x'.repeat(17_000) }],
+    ];
+    for (const [name, value] of rows) {
+      projection = () => value;
+      const { exchange } = await authorize(as, env, ctx);
+      const failed = await exchange();
+      expect({ name, status: failed.status }).toEqual({ name, status: 500 });
+      projection = () => ({ ok: true });
+      expect({ name, retried: (await exchange()).status }).toEqual({ name, retried: 200 });
+    }
+
+    // Omitting the projection leaves the public claim out entirely.
+    const bare = authorizationServer(env, () => signingWith(key), { publicClaims: () => undefined });
+    expect(decodePart(await issueToken(bare, env, ctx), 1)).not.toHaveProperty(JWT_ACCESS_TOKEN_PUBLIC_CLAIMS);
+  });
+
+  it('runs on plain http for loopback development, and only there', async () => {
+    const issuer = 'http://localhost:8787';
+    const resource = 'http://127.0.0.1:8788/mcp';
+    const as = authorizationServer(env, () => signingWith(key), { issuer, resources: [resource] });
+    const { exchange } = await authorize(as, env, ctx, resource, issuer);
+    const token = (await (await exchange()).json<any>()).access_token as string;
+    expect(decodePart(token, 1)).toMatchObject({ iss: issuer, aud: resource });
+
+    const rs = resourceServer(
+      {
+        offline: offline(
+          {
+            jwksUri: `${issuer}/.well-known/jwks.json`,
+            fetcher: () => ({ fetch: (request: Request) => as.fetch(request, env, ctx) }),
+          },
+          { issuer }
+        ),
+      },
+      resource,
+      issuer
     );
-    expect(() => createJwksKeyResolver<{}>({ jwksUri: JWKS_URI, cacheTtlSeconds: 0 })).toThrow(
+    expect((await call(rs, env, ctx, token, resource)).status).toBe(200);
+
+    expect(() =>
+      createJwtAccessTokens<TestEnv>({
+        issuer: 'http://auth.example.com',
+        jwksUri: 'http://auth.example.com/jwks',
+        keys: () => signingWith(key),
+      })
+    ).toThrow();
+    expect(() => resourceServer({ offline: offline({ jwksUri: 'http://auth.example.com/jwks' }) })).toThrow();
+  });
+
+  it('validates its configuration up front', async () => {
+    expect(() =>
+      createJwtAccessTokens<TestEnv>({
+        issuer: ISSUER,
+        jwksUri: JWKS_URI,
+        keys: () => signingWith(key),
+        issuance: 'jwt' as any,
+      })
+    ).toThrow('issuance must be a boolean or a function');
+    expect(() => createJwtAccessTokens<TestEnv>({ issuer: ISSUER, jwksUri: JWKS_URI, keys: 'nope' as any })).toThrow(
+      'keys must be a function'
+    );
+    expect(() => resourceServer({})).toThrow('validateToken must name an offline or online mode');
+    expect(() => resourceServer({ online: 'binding' as any })).toThrow('validateToken.online must be a function');
+    expect(() => resourceServer({ offline: offline({ jwksUri: JWKS_URI }, { algorithms: [] as any }) })).toThrow();
+    expect(() =>
+      resourceServer({ offline: offline({ jwksUri: JWKS_URI }, { mapClaimsToProps: undefined as any }) })
+    ).toThrow('mapClaimsToProps must be a function');
+    expect(() => resourceServer({ offline: offline({ jwksUri: JWKS_URI, cacheTtlSeconds: 0 }) })).toThrow(
       'cacheTtlSeconds must be an integer between 1 and 86400'
     );
 
-    const failing = createJwksKeyResolver<{}>({
-      jwksUri: JWKS_URI,
-      fetcher: () => ({ fetch: async () => new Response('nope', { status: 503 }) }),
-    });
-    await expect(failing({}, { kid: 'any', alg: 'RS256' })).rejects.toThrow('status 503');
-
-    const malformed = createJwksKeyResolver<{}>({
-      jwksUri: JWKS_URI,
-      fetcher: () => ({ fetch: async () => new Response('{}', { headers: { 'Content-Type': 'application/json' } }) }),
-    });
-    await expect(malformed({}, { kid: 'any', alg: 'RS256' })).rejects.toThrow('no keys array');
-
-    const oversized = createJwksKeyResolver<{}>({
-      jwksUri: JWKS_URI,
-      fetcher: () => ({ fetch: async () => jwksResponse([{ kid: 'x'.repeat(70_000) }]) }),
-    });
-    await expect(oversized({}, { kid: 'any', alg: 'RS256' })).rejects.toThrow('exceeds the size limit');
-  });
-
-  it('validates a token end to end through the resolver', async () => {
-    const key = await createKey('RS256', 'resolver-key');
-    const accessTokens = createJwtAccessTokens<{}, TestProps>({
-      issuer: ISSUER,
-      jwksUri: JWKS_URI,
-      keys: () => ({
-        signingKey: { kid: 'resolver-key', alg: 'RS256', privateKey: key.privateKey, publicJwk: key.publicJwk },
-      }),
-    });
-    const issued = await accessTokens.issue(
-      issueInput({ userId: 'user-123', tenantId: 'tenant-a', upstreamAccessToken: 'secret' })
-    );
-    const validate = createJwtAccessTokenValidator<{}, { userId: string }>({
-      issuer: ISSUER,
-      audience: RESOURCE,
-      algorithms: ['RS256'],
-      keys: createJwksKeyResolver<{}>({
-        jwksUri: JWKS_URI,
-        fetcher: () => ({ fetch: async () => jwksResponse((await accessTokens.getJwks({})).keys) }),
-      }),
-      mapClaimsToProps: ({ userId }) => ({ userId }),
-    });
-    await expect(validate({ token: issued.token, request: new Request(RESOURCE), env: {} })).resolves.toMatchObject({
-      props: { userId: 'user-123' },
-      audience: RESOURCE,
-    });
+    // An online binding that is missing at request time is an outage, not an invalid token.
+    const rs = resourceServer({ online: () => undefined });
+    expect((await call(rs, env, ctx, 'any')).status).toBe(503);
   });
 });

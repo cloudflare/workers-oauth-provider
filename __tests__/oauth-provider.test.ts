@@ -3,7 +3,6 @@ import {
   AuthorizationError,
   CimdFetchError,
   ExternalTokenError,
-  createJwtAccessTokenValidator,
   createJwtAccessTokens,
   createOAuthResourceServer,
   OAuthError,
@@ -16,9 +15,9 @@ import {
   type Grant,
   type Token,
   type JwtPublicKey,
-  type JwtAccessTokenIssueInput,
+  type JwtPublicClaimsInput,
   type JwtJsonValue,
-  type AccessTokenFormatInput,
+  type JwtIssuanceInput,
 } from '../src/oauth-provider';
 import type { ExecutionContext } from '@cloudflare/workers-types';
 // We're importing WorkerEntrypoint from our mock implementation
@@ -14088,8 +14087,9 @@ describe('functional authorization-server and resource-server composition', () =
 
   async function createTestJwtAccessTokens(
     publicClaims: (
-      input: JwtAccessTokenIssueInput<TestEnv, FunctionalAuthProps>
-    ) => JwtJsonValue | undefined | Promise<JwtJsonValue | undefined> = ({ props }) => ({ userId: props.userId })
+      input: JwtPublicClaimsInput<TestEnv, FunctionalAuthProps>
+    ) => JwtJsonValue | undefined | Promise<JwtJsonValue | undefined> = ({ props }) => ({ userId: props.userId }),
+    issuance?: boolean | ((input: JwtIssuanceInput<TestEnv>) => boolean | Promise<boolean>)
   ) {
     const keyPair = (await crypto.subtle.generateKey(
       {
@@ -14120,6 +14120,7 @@ describe('functional authorization-server and resource-server composition', () =
         },
       }),
       publicClaims,
+      ...(issuance === undefined ? {} : { issuance }),
     });
   }
 
@@ -14278,6 +14279,7 @@ describe('functional authorization-server and resource-server composition', () =
         if (keyLookups === 1) throw new Error('key store unavailable');
         return { signingKey: { kid: publicJwk.kid, alg: 'RS256', privateKey: keyPair.privateKey, publicJwk } };
       },
+      issuance: true,
     });
     const authorizationServer = new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>({
       issuer,
@@ -14287,7 +14289,6 @@ describe('functional authorization-server and resource-server composition', () =
       clientRegistrationEndpoint: '/oauth/register',
       scopesSupported: ['calendar:read'],
       jwtAccessTokens,
-      accessTokenFormat: () => 'jwt',
     });
     authorizationServer.protectResource({
       resourceMetadata: { resource: calendarResource, scopes_supported: ['calendar:read'] },
@@ -14597,36 +14598,17 @@ describe('functional authorization-server and resource-server composition', () =
     ).toThrow('jwtAccessTokens issuer must exactly match');
   });
 
-  it('requires a valid access-token format policy and JWT reader', () => {
-    expect(
-      () =>
-        new OAuthAuthorizationServer<TestEnv>({
-          issuer,
-          resources: [calendarResource],
-          authorizeEndpoint: '/authorize',
-          tokenEndpoint: '/oauth/token',
-          accessTokenFormat: () => 'opaque',
-        })
-    ).toThrow('accessTokenFormat requires jwtAccessTokens');
-
-    const jwtAccessTokens = createJwtAccessTokens<TestEnv>({
-      issuer,
-      jwksUri: `${issuer}/.well-known/jwks.json`,
-      keys: () => {
-        throw new Error('not reached during policy validation');
-      },
-    });
-    expect(
-      () =>
-        new OAuthAuthorizationServer<TestEnv>({
-          issuer,
-          resources: [calendarResource],
-          authorizeEndpoint: '/authorize',
-          tokenEndpoint: '/oauth/token',
-          jwtAccessTokens,
-          accessTokenFormat: 'jwt' as unknown as () => 'jwt',
-        })
-    ).toThrow('accessTokenFormat must be a function');
+  it('rejects an issuance setting that is neither a boolean nor a function', () => {
+    expect(() =>
+      createJwtAccessTokens<TestEnv>({
+        issuer,
+        jwksUri: `${issuer}/.well-known/jwks.json`,
+        keys: () => {
+          throw new Error('not reached during validation');
+        },
+        issuance: 'jwt' as unknown as boolean,
+      })
+    ).toThrow('issuance must be a boolean or a function');
   });
 
   it('retains static authorization queries and distinguishes same-path AS endpoints', async () => {
@@ -15040,7 +15022,7 @@ describe('functional authorization-server and resource-server composition', () =
   });
 
   it('serves JWKS and preserves confidential ctx.props with state-backed JWT access tokens', async () => {
-    const jwtAccessTokens = await createTestJwtAccessTokens();
+    const jwtAccessTokens = await createTestJwtAccessTokens(undefined, true);
     expect(
       () =>
         new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>({
@@ -15064,7 +15046,6 @@ describe('functional authorization-server and resource-server composition', () =
       clientRegistrationEndpoint: '/oauth/register',
       scopesSupported: ['calendar:read'],
       jwtAccessTokens,
-      accessTokenFormat: () => 'jwt',
     });
     const calendar = authorizationServer.protectResource({
       resourceMetadata: { resource: calendarResource, scopes_supported: ['calendar:read'] },
@@ -15176,7 +15157,7 @@ describe('functional authorization-server and resource-server composition', () =
 
   it('installs the JWT reader and JWKS without starting to issue JWTs', async () => {
     // `jwtAccessTokens` alone is the reader half of the rollout: the JWKS is published and a
-    // JWT still validates, but issuance stays opaque until `accessTokenFormat` says otherwise.
+    // JWT still validates, but issuance stays opaque until the component's `issuance` says otherwise.
     const jwtAccessTokens = await createTestJwtAccessTokens();
     const readerOnly = new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>({
       issuer,
@@ -15258,15 +15239,15 @@ describe('functional authorization-server and resource-server composition', () =
     expect(opaqueTokens.access_token.split(':')).toHaveLength(3);
 
     env.JWT_ISSUANCE_ENABLED = false;
-    const publicClaims = vi.fn(({ props }: JwtAccessTokenIssueInput<TestEnv, FunctionalAuthProps>) => ({
+    const publicClaims = vi.fn(({ props }: JwtPublicClaimsInput<TestEnv, FunctionalAuthProps>) => ({
       userId: props.userId,
     }));
-    const jwtAccessTokens = await createTestJwtAccessTokens(publicClaims);
-    let observedInput: AccessTokenFormatInput<TestEnv> | undefined;
-    const accessTokenFormat = vi.fn(async (input: AccessTokenFormatInput<TestEnv>) => {
+    let observedInput: JwtIssuanceInput<TestEnv> | undefined;
+    const issuance = vi.fn(async (input: JwtIssuanceInput<TestEnv>) => {
       observedInput = input;
-      return input.env.JWT_ISSUANCE_ENABLED ? ('jwt' as const) : ('opaque' as const);
+      return input.env.JWT_ISSUANCE_ENABLED === true;
     });
+    const jwtAccessTokens = await createTestJwtAccessTokens(publicClaims, issuance);
     const migrationServer = new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>({
       issuer,
       resources: [calendarResource],
@@ -15275,7 +15256,6 @@ describe('functional authorization-server and resource-server composition', () =
       clientRegistrationEndpoint: '/oauth/register',
       scopesSupported: ['calendar:read'],
       jwtAccessTokens,
-      accessTokenFormat,
     });
     const calendar = migrationServer.protectResource({
       resourceMetadata: { resource: calendarResource, scopes_supported: ['calendar:read'] },
@@ -15311,7 +15291,7 @@ describe('functional authorization-server and resource-server composition', () =
     const readerPhaseTokens = await readerPhaseResponse.json<any>();
     expect(readerPhaseTokens.access_token.split(':')).toHaveLength(3);
     expect(readerPhaseTokens.refresh_token.split(':')).toHaveLength(3);
-    expect(accessTokenFormat).toHaveBeenCalledTimes(1);
+    expect(issuance).toHaveBeenCalledTimes(1);
     expect(publicClaims).not.toHaveBeenCalled();
     expect(observedInput).toMatchObject({ env, resource: calendarResource });
     expect(observedInput).not.toHaveProperty('clientId');
@@ -15325,7 +15305,7 @@ describe('functional authorization-server and resource-server composition', () =
     const writerPhaseTokens = await writerPhaseResponse.json<any>();
     expect(writerPhaseTokens.access_token.split('.')).toHaveLength(3);
     expect(writerPhaseTokens.refresh_token.split(':')).toHaveLength(3);
-    expect(accessTokenFormat).toHaveBeenCalledTimes(2);
+    expect(issuance).toHaveBeenCalledTimes(2);
     expect(publicClaims).toHaveBeenCalledTimes(1);
 
     // A rollback changes only the writer. Keep the JWT component installed so
@@ -15335,7 +15315,7 @@ describe('functional authorization-server and resource-server composition', () =
     expect(rollbackResponse.status).toBe(200);
     const rollbackTokens = await rollbackResponse.json<any>();
     expect(rollbackTokens.access_token.split(':')).toHaveLength(3);
-    expect(accessTokenFormat).toHaveBeenCalledTimes(3);
+    expect(issuance).toHaveBeenCalledTimes(3);
     expect(publicClaims).toHaveBeenCalledTimes(1);
 
     for (const accessToken of [
@@ -15357,8 +15337,11 @@ describe('functional authorization-server and resource-server composition', () =
   });
 
   it('fails closed without consuming authorization codes or refresh tokens', async () => {
-    const jwtAccessTokens = await createTestJwtAccessTokens();
-    let selectedFormat = 'automatic';
+    // 'automatic' stands in for a policy that returns something other than a boolean.
+    let selectedFormat: 'automatic' | 'opaque' | 'jwt' = 'automatic';
+    const jwtAccessTokens = await createTestJwtAccessTokens(undefined, () =>
+      selectedFormat === 'automatic' ? ('automatic' as unknown as boolean) : selectedFormat === 'jwt'
+    );
     const authorizationServer = new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>({
       issuer,
       resources: [calendarResource],
@@ -15367,7 +15350,6 @@ describe('functional authorization-server and resource-server composition', () =
       clientRegistrationEndpoint: '/oauth/register',
       scopesSupported: ['calendar:read'],
       jwtAccessTokens,
-      accessTokenFormat: () => selectedFormat as 'opaque' | 'jwt',
     });
     authorizationServer.protectResource({
       resourceMetadata: { resource: calendarResource, scopes_supported: ['calendar:read'] },
@@ -15416,9 +15398,11 @@ describe('functional authorization-server and resource-server composition', () =
     });
 
     try {
-      const jwtAccessTokens = await createTestJwtAccessTokens();
-      let selectedFormat = 'automatic';
-      const accessTokenFormat = vi.fn(() => selectedFormat as 'opaque' | 'jwt');
+      let selectedFormat: 'automatic' | 'opaque' | 'jwt' = 'automatic';
+      const issuance = vi.fn(() =>
+        selectedFormat === 'automatic' ? ('automatic' as unknown as boolean) : selectedFormat === 'jwt'
+      );
+      const jwtAccessTokens = await createTestJwtAccessTokens(undefined, issuance);
       const authorizationServer = new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>({
         issuer,
         resources: [calendarResource],
@@ -15427,7 +15411,6 @@ describe('functional authorization-server and resource-server composition', () =
         clientRegistrationEndpoint: '/oauth/register',
         scopesSupported: ['calendar:read'],
         jwtAccessTokens,
-        accessTokenFormat,
         enterpriseManagedAuthorization: {
           trustedIssuers: async () => ({
             issuer: idpIssuer,
@@ -15501,7 +15484,7 @@ describe('functional authorization-server and resource-server composition', () =
       expect(jwtResponse.status).toBe(200);
       const jwt = await jwtResponse.json<any>();
       expect(jwt.access_token.split('.')).toHaveLength(3);
-      expect(accessTokenFormat).toHaveBeenCalledTimes(3);
+      expect(issuance).toHaveBeenCalledTimes(3);
 
       for (const accessToken of [opaque.access_token, jwt.access_token]) {
         expect(
@@ -15520,7 +15503,7 @@ describe('functional authorization-server and resource-server composition', () =
   });
 
   it('revokes a stored JWT after its resource is removed from the live registry', async () => {
-    const jwtAccessTokens = await createTestJwtAccessTokens();
+    const jwtAccessTokens = await createTestJwtAccessTokens(undefined, true);
     const issuerOptions = {
       issuer,
       resources: [calendarResource],
@@ -15529,7 +15512,6 @@ describe('functional authorization-server and resource-server composition', () =
       clientRegistrationEndpoint: '/oauth/register',
       scopesSupported: ['calendar:read'],
       jwtAccessTokens,
-      accessTokenFormat: () => 'jwt' as const,
     };
     const issuingServer = new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>(issuerOptions);
     issuingServer.protectResource({
@@ -15575,8 +15557,8 @@ describe('functional authorization-server and resource-server composition', () =
   });
 
   it('applies the access-token format policy to implicit and token-exchange flows', async () => {
-    const implicitTokens = await createTestJwtAccessTokens();
-    const implicitFormat = vi.fn(() => 'opaque' as const);
+    const implicitIssuance = vi.fn(() => false);
+    const implicitTokens = await createTestJwtAccessTokens(undefined, implicitIssuance);
     const implicitServer = new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>({
       issuer,
       resources: [calendarResource],
@@ -15584,7 +15566,6 @@ describe('functional authorization-server and resource-server composition', () =
       tokenEndpoint: '/oauth/token',
       allowImplicitFlow: true,
       jwtAccessTokens: implicitTokens,
-      accessTokenFormat: implicitFormat,
     });
     const implicitCalendar = implicitServer.protectResource({
       resourceMetadata: { resource: calendarResource, scopes_supported: ['calendar:read'] },
@@ -15617,7 +15598,7 @@ describe('functional authorization-server and resource-server composition', () =
       'access_token'
     )!;
     expect(implicitAccessToken.split(':')).toHaveLength(3);
-    expect(implicitFormat).toHaveBeenCalledTimes(1);
+    expect(implicitIssuance).toHaveBeenCalledTimes(1);
     expect(
       (
         await implicitCalendar.fetch(
@@ -15629,9 +15610,9 @@ describe('functional authorization-server and resource-server composition', () =
     ).toBe(200);
 
     env = createMockEnv();
-    const exchangeTokens = await createTestJwtAccessTokens();
     let issueJwt = false;
-    const exchangeFormat = vi.fn(() => (issueJwt ? ('jwt' as const) : ('opaque' as const)));
+    const exchangeIssuance = vi.fn(() => issueJwt);
+    const exchangeTokens = await createTestJwtAccessTokens(undefined, exchangeIssuance);
     const exchangeServer = new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>({
       issuer,
       resources: [calendarResource],
@@ -15643,7 +15624,6 @@ describe('functional authorization-server and resource-server composition', () =
       // The exchanging client differs from the subject token's client below.
       tokenExchangeCallback: () => ({ allowCrossClientExchange: true }),
       jwtAccessTokens: exchangeTokens,
-      accessTokenFormat: exchangeFormat,
     });
     const exchangeCalendar = exchangeServer.protectResource({
       resourceMetadata: { resource: calendarResource, scopes_supported: ['calendar:read'] },
@@ -15718,7 +15698,7 @@ describe('functional authorization-server and resource-server composition', () =
 
     const exchanged = await exchangeSubject();
     expect(exchanged.access_token.split('.')).toHaveLength(3);
-    expect(exchangeFormat).toHaveBeenCalledTimes(2);
+    expect(exchangeIssuance).toHaveBeenCalledTimes(2);
     const encodedPayload = exchanged.access_token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
     const exchangedPayload = JSON.parse(atob(encodedPayload.padEnd(Math.ceil(encodedPayload.length / 4) * 4, '=')));
     expect(exchangedPayload.client_id).toBe(exchangeClient.client_id);
@@ -15735,7 +15715,7 @@ describe('functional authorization-server and resource-server composition', () =
     // Client deletion also finds exchanged tokens stored under another
     // client's source-grant prefix, while leaving that source token intact.
     const tokenForClientDeletion = await exchangeSubject();
-    expect(exchangeFormat).toHaveBeenCalledTimes(3);
+    expect(exchangeIssuance).toHaveBeenCalledTimes(3);
     expect(await tokenStatus(tokenForClientDeletion.access_token)).toBe(200);
     await exchangeServer.getOAuthApi(env).deleteClient(exchangeClient.client_id);
     expect(await tokenStatus(tokenForClientDeletion.access_token)).toBe(401);
@@ -15787,7 +15767,6 @@ describe('functional authorization-server and resource-server composition', () =
       clientRegistrationEndpoint: '/oauth/register',
       scopesSupported: ['calendar:read'],
       jwtAccessTokens: exchangeTokens,
-      accessTokenFormat: () => 'jwt',
     });
     await exchangeDisabled.getOAuthApi(env).deleteClient(laterClient.client_id);
     expect(await tokenStatus(laterToken.access_token)).toBe(401);
@@ -16220,8 +16199,8 @@ describe('functional authorization-server and resource-server composition', () =
   });
 
   it('validates provider-minted JWTs offline in a separate resource Worker and falls back for opaque tokens', async () => {
-    const jwtAccessTokens = await createTestJwtAccessTokens();
     let format: 'jwt' | 'opaque' = 'jwt';
+    const jwtAccessTokens = await createTestJwtAccessTokens(undefined, () => format === 'jwt');
     const authorizationServer = new OAuthAuthorizationServer<TestEnv, FunctionalAuthProps>({
       issuer,
       resources: [calendarResource, driveResource],
@@ -16230,7 +16209,6 @@ describe('functional authorization-server and resource-server composition', () =
       clientRegistrationEndpoint: '/oauth/register',
       scopesSupported: ['calendar:read', 'drive:read'],
       jwtAccessTokens,
-      accessTokenFormat: () => format,
     });
     const client = await registerClient(authorizationServer);
     const calendarJwt = await issueTokens(authorizationServer, client, calendarResource);
@@ -16248,36 +16226,26 @@ describe('functional authorization-server and resource-server composition', () =
     expect(jwksResponse.status).toBe(200);
     const jwks = await jwksResponse.json<{ keys: JwtPublicKey[] }>();
 
-    type CalendarProps = { userId: string; scopes: string[] };
-    const validateJwt = createJwtAccessTokenValidator<TestEnv, CalendarProps>({
-      issuer,
-      audience: calendarResource,
-      algorithms: ['RS256'],
-      keys: () => jwks.keys,
-      mapClaimsToProps: ({ userId, scope }) => ({ userId, scopes: scope }),
-    });
-    // The README's migration pattern: offline validation first, then the resource-pinned
-    // authorization-server binding for tokens issued before JWTs were switched on.
-    const validateDuringMigration = async (input: Parameters<typeof validateJwt>[0]) => {
-      const jwt = await validateJwt(input);
-      if (jwt) return jwt;
-      const validated = await authorizationServer
-        .resource(calendarResource)
-        .validateToken<FunctionalAuthProps>(input.token, env);
-      if (!validated) return null;
-      return {
-        props: { userId: validated.props.userId, scopes: validated.scope },
-        audience: validated.audience,
-        expiresAt: validated.expiresAt,
-      };
-    };
-    const resourceWorker = createOAuthResourceServer<TestEnv, CalendarProps>({
+    // The README's migration shape: offline first, then the authorization server over what
+    // is a Service Binding in production, for tokens issued before JWTs were switched on.
+    const resourceWorker = createOAuthResourceServer<TestEnv, { userId: string }>({
       resourceMetadata: {
         resource: calendarResource,
         authorization_servers: [issuer],
         scopes_supported: ['calendar:read'],
       },
-      validateToken: validateDuringMigration,
+      validateToken: {
+        offline: {
+          issuer,
+          algorithms: ['RS256'],
+          keys: () => jwks.keys,
+          mapClaimsToProps: ({ userId }) => ({ userId }),
+        },
+        online: () => ({
+          validateToken: (token: string) =>
+            authorizationServer.resource(calendarResource).validateToken<FunctionalAuthProps>(token, env),
+        }),
+      },
       handler: {
         fetch: (_request, _env, executionContext) => Response.json((executionContext as MockExecutionContext).props),
       },
@@ -16550,6 +16518,7 @@ describe('enterprise-managed authorization with JWT access tokens', () => {
           },
         };
       },
+      issuance: true,
     });
     const authorizationServer = new OAuthAuthorizationServer<TestEnv, { userId: string }>({
       issuer,
@@ -16559,7 +16528,6 @@ describe('enterprise-managed authorization with JWT access tokens', () => {
       clientRegistrationEndpoint: '/oauth/register',
       scopesSupported: ['calendar:read'],
       jwtAccessTokens,
-      accessTokenFormat: () => 'jwt',
       enterpriseManagedAuthorization: {
         trustedIssuers: async () => ({ issuer: idpIssuer, jwksUri: `${idpIssuer}/jwks.json`, algorithms: ['RS256'] }),
         mapClaims,
@@ -16640,11 +16608,11 @@ describe('enterprise-managed authorization with JWT access tokens', () => {
   });
 });
 
-/** A misconfigured accessTokenFormat policy is a server_error in the OAuth envelope. */
+/** A misconfigured `issuance` policy is a server_error in the OAuth envelope. */
 async function expectFormatPolicyError(response: Response): Promise<void> {
   expect(response.status).toBe(500);
   await expect(response.json()).resolves.toMatchObject({
     error: 'server_error',
-    error_description: "accessTokenFormat must return either 'opaque' or 'jwt'",
+    error_description: 'issuance must return a boolean',
   });
 }

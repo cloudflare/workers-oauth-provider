@@ -37,12 +37,12 @@ workers-oauth-provider/
 │   ├── oauth-provider.ts      # Core provider implementation
 │   ├── oauth-capabilities.ts  # Pure server/client metadata capability policy
 │   ├── oauth-client-metadata.ts # Typed DCR parsing and CIMD resolution pipeline
-│   ├── jwt-access-tokens.ts   # RFC 9068 signing, JWKS, and pinned offline validation
+│   ├── jwt-access-tokens.ts   # RFC 9068 signing, JWKS, and the offline validator behind `validateToken.offline`
 │   └── ema/                   # Enterprise-Managed Authorization pipeline
 ├── __tests__/
 │   ├── oauth-provider.test.ts # Comprehensive provider integration suite
 │   ├── oauth-capabilities.test.ts # Pure capability policy tests
-│   ├── jwt-access-tokens.test.ts # RFC 9068 signing and validation tests
+│   ├── jwt-access-tokens.test.ts # JWT flows through the AS and RS public surfaces; adversarial cases as rows
 │   ├── setup.ts               # Vitest setup and mocking
 │   └── mocks/
 │       └── cloudflare-workers.ts
@@ -54,7 +54,8 @@ workers-oauth-provider/
 │   └── worker/                # Real Wrangler Worker with local KV
 ├── dist/                      # Build output (tsdown)
 ├── docs/
-│   └── advanced-configuration.md
+│   ├── advanced-configuration.md
+│   └── jwt-access-tokens.md   # JWT issuance, online/offline validation modes, rollout, rotation
 ├── .github/workflows/
 │   ├── ci.yml                 # PR validation
 │   ├── release.yml            # Changesets-based npm publishing

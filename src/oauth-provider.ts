@@ -44,12 +44,7 @@ import {
   validateIdJagClaims,
   validateIdJagHeader,
 } from './ema/validators';
-import {
-  jwtInternals,
-  type JwtPublicKey,
-  type JwtAccessTokens,
-  type VerifiedJwtAccessToken,
-} from './jwt-access-tokens';
+import { jwtInternals, type JwtPublicKey, type JwtAccessTokens } from './jwt-access-tokens';
 import {
   foldResourceSchemeAndHost,
   hasAcceptedCanonicalScheme,
@@ -63,25 +58,21 @@ export { AuthorizationError } from './oauth-capabilities';
 export type { AuthorizationErrorCode, AuthorizationErrorOptions } from './oauth-capabilities';
 export { JWT_ACCESS_TOKEN_GRANT_ID_CLAIM, JWT_ACCESS_TOKEN_PUBLIC_CLAIMS } from './jwt-access-tokens';
 export {
-  createJwksKeyResolver,
   createJwtAccessTokens,
-  createJwtAccessTokenValidator,
-  type IssuedJwtAccessToken,
+  type JwksSource,
   type JwtAccessTokenClaims,
-  type JwtAccessTokenIssueInput,
   type JwtAccessTokens,
   type JwtAccessTokensOptions,
-  type JwtAccessTokenValidatorOptions,
   type JwtAlgorithm,
   type JwtClaimsToPropsInput,
+  type JwtIssuanceInput,
   type JwtJsonValue,
-  type JwksFetcher,
-  type JwksKeyResolverOptions,
   type JwtKeyHint,
   type JwtKeySet,
+  type JwtPublicClaimsInput,
   type JwtPublicKey,
   type JwtSigningKey,
-  type VerifiedJwtAccessToken,
+  type OfflineTokenValidation,
 } from './jwt-access-tokens';
 export * from './oauth-resource-server';
 
@@ -682,9 +673,6 @@ interface OAuthAuthorizationServerConfiguration<Env = Cloudflare.Env> {
   /** Optional RFC 9068 JWT access-token issuer created by `createJwtAccessTokens()`. */
   jwtAccessTokens?: InternalJwtAccessTokens<Env>;
 
-  /** Functional policy selecting the format of each newly issued access token. */
-  accessTokenFormat?: (input: AccessTokenFormatInput<Env>) => AccessTokenFormat | Promise<AccessTokenFormat>;
-
   /**
    * Resource selected when a new authorization request omits `resource`.
    * Omit this in a multi-resource deployment to require clients to choose.
@@ -700,14 +688,8 @@ interface OAuthAuthorizationServerConfiguration<Env = Cloudflare.Env> {
   legacyGrantResource?: string;
 }
 
-/** Access-token representations supported by the authorization server. */
-export type AccessTokenFormat = 'opaque' | 'jwt';
-
-/** Immutable input passed to an access-token format policy before issuance. */
-export interface AccessTokenFormatInput<Env = Cloudflare.Env> {
-  readonly env: Env;
-  readonly resource: string;
-}
+/** Access-token representations the authorization server issues. */
+type AccessTokenFormat = 'opaque' | 'jwt';
 
 /** Internal input used when `protectResource()` registers one hosted role. */
 interface InternalProtectedResourceConfiguration<Env = Cloudflare.Env> {
@@ -770,26 +752,13 @@ export type OAuthAuthorizationServerOptions<Env = Cloudflare.Env, Props = any> =
   legacyGrantResource?: string;
 
   /**
-   * Installs RFC 9068 access-token signing and validation and publishes
-   * `jwks_uri`. When configured, the authorization server accepts both its
-   * valid JWT access tokens and compatible legacy opaque access tokens.
-   *
-   * This installs the reader, the signer and the JWKS; it does not change what is
-   * issued. Set `accessTokenFormat` to start writing JWTs once every consumer can
-   * validate them. Authorization codes and refresh tokens remain opaque.
+   * RFC 9068 JWT access tokens, from `createJwtAccessTokens()`. Installing it publishes
+   * `jwks_uri` and makes the server accept its own JWTs alongside opaque tokens; whether
+   * new tokens are JWTs is the component's `issuance` setting, off by default so readers
+   * always ship before the first JWT is written. Authorization codes and refresh tokens
+   * stay opaque either way.
    */
   jwtAccessTokens?: JwtAccessTokens<Env, Props>;
-
-  /**
-   * Selects the representation of each newly issued access token. This controls
-   * issuance only: it does not restrict accepted token formats, rewrite existing
-   * tokens, or change refresh-token format.
-   *
-   * Requires `jwtAccessTokens`. Without it, access tokens stay opaque. A thrown
-   * error or invalid result fails issuance; the provider never silently
-   * downgrades to opaque.
-   */
-  accessTokenFormat?: (input: AccessTokenFormatInput<Env>) => AccessTokenFormat | Promise<AccessTokenFormat>;
 
   /** Typed props refresh/exchange hook for this authorization server. */
   tokenExchangeCallback?: (
@@ -1755,7 +1724,6 @@ export class OAuthAuthorizationServer<Env = Cloudflare.Env, Props = any> {
       tokenEndpoint,
       clientRegistrationEndpoint,
       jwtAccessTokens,
-      accessTokenFormat,
       ...commonOptions
     } = options;
     this.#impl = new OAuthProviderImpl<Env>({
@@ -1770,7 +1738,6 @@ export class OAuthAuthorizationServer<Env = Cloudflare.Env, Props = any> {
         tokenEndpoint,
         clientRegistrationEndpoint,
         jwtAccessTokens,
-        accessTokenFormat,
         defaultResource,
         legacyGrantResource,
       },
@@ -1854,11 +1821,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   /** Optional RFC 9068 access-token component for the role-based AS. */
   private readonly jwtAccessTokens: InternalJwtAccessTokens<Env> | undefined;
 
-  /** Optional reader-first rollout policy for newly issued access tokens. */
-  private readonly accessTokenFormatPolicy:
-    | ((input: AccessTokenFormatInput<Env>) => AccessTokenFormat | Promise<AccessTokenFormat>)
-    | undefined;
-
   /** Every protected-resource role hosted by this provider. */
   private readonly resourceServers: NormalizedResourceServer<Env>[];
 
@@ -1920,13 +1882,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       this.validateAuthorizationServerIssuer(authorizationServer.issuer);
       this.explicitIssuer = authorizationServer.issuer;
       this.jwtAccessTokens = authorizationServer.jwtAccessTokens;
-      this.accessTokenFormatPolicy = authorizationServer.accessTokenFormat;
-      if (this.accessTokenFormatPolicy !== undefined && typeof this.accessTokenFormatPolicy !== 'function') {
-        throw new TypeError('accessTokenFormat must be a function');
-      }
-      if (this.accessTokenFormatPolicy && !this.jwtAccessTokens) {
-        throw new TypeError('accessTokenFormat requires jwtAccessTokens');
-      }
       if (this.jwtAccessTokens && this.jwtAccessTokens.issuer !== authorizationServer.issuer) {
         throw new TypeError('jwtAccessTokens issuer must exactly match authorizationServer.issuer');
       }
@@ -1945,7 +1900,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     } else {
       this.explicitIssuer = undefined;
       this.jwtAccessTokens = undefined;
-      this.accessTokenFormatPolicy = undefined;
       normalizedOptions = options;
       configuredResourceServers = [
         {
@@ -2522,7 +2476,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       }
       let jwks: { keys: JwtPublicKey[] };
       try {
-        jwks = await this.jwtAccessTokens.getJwks(env);
+        jwks = await jwtInternals(this.jwtAccessTokens).getJwks(env);
       } catch (error) {
         // The deployer's key store is the only thing that can fail here, and every
         // resource server polls this endpoint, so the failure has to reach `onError`
@@ -2652,7 +2606,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         audienceSource === 'token-audience'
           ? await jwtInternals(this.jwtAccessTokens).verify(token, env)
           : registeredResources.length > 0
-            ? await this.jwtAccessTokens.verify(token, registeredResources, env)
+            ? await jwtInternals(this.jwtAccessTokens).verifyForAudiences(token, registeredResources, env)
             : null;
       if (!verified) return { tokenData: null, isOwnJwt: true };
 
@@ -2676,7 +2630,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   }
 
   /** The signed JWT and encrypted state record must describe exactly the same token. */
-  private jwtClaimsMatchStoredToken(id: string, verified: VerifiedJwtAccessToken, tokenData: Token): boolean {
+  private jwtClaimsMatchStoredToken(
+    id: string,
+    verified: NonNullable<Awaited<ReturnType<ReturnType<typeof jwtInternals<Env, any>>['verify']>>>,
+    tokenData: Token
+  ): boolean {
     return (
       tokenData.format === 'jwt' &&
       tokenData.id === id &&
@@ -4497,7 +4455,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     if (accessTokenFormat === 'jwt' && this.jwtAccessTokens) {
       // Resolve and prove the signing key before the one-use assertion is spent. `getJwks`
       // is that resolution, minus the published document nobody reads here.
-      await this.jwtAccessTokens.getJwks(env);
+      await jwtInternals(this.jwtAccessTokens).getJwks(env);
     }
 
     // Consume the assertion before any application code runs. Single use has to mean the
@@ -5507,26 +5465,19 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     };
   }
 
-  async selectAccessTokenFormat(input: AccessTokenFormatInput<Env>): Promise<AccessTokenFormat> {
+  async selectAccessTokenFormat(input: { env: Env; resource: string }): Promise<AccessTokenFormat> {
     if (!this.jwtAccessTokens) return 'opaque';
-    // Installing `jwtAccessTokens` turns on the reader, the signer and the JWKS; it does not
-    // start writing JWTs. A deployment that flipped issuance the moment the component was
-    // configured would mint tokens its resource servers cannot yet verify, which is the
-    // one ordering the rollout procedure exists to prevent.
-    if (!this.accessTokenFormatPolicy) return 'opaque';
-
-    // Policies may be shared with application code. Give them an immutable
-    // snapshot of only the canonical rollout inputs available before any
-    // grant, authorization-code, replay-marker, or token mutation.
-    const policyInput = Object.freeze({ ...input });
-    const format = await this.accessTokenFormatPolicy(policyInput);
-    if (format !== 'opaque' && format !== 'jwt') {
-      throw new OAuthError('server_error', {
-        description: "accessTokenFormat must return either 'opaque' or 'jwt'",
-        statusCode: 500,
-      });
+    // Installing `jwtAccessTokens` turns on the reader, the signer and the JWKS; whether a
+    // JWT is written is the component's own `issuance` decision, which is off by default so
+    // that no token is minted before the resource servers that must verify it are deployed.
+    try {
+      return (await jwtInternals(this.jwtAccessTokens).shouldIssue(input)) ? 'jwt' : 'opaque';
+    } catch (error) {
+      if (error instanceof TypeError) {
+        throw new OAuthError('server_error', { description: error.message, statusCode: 500 });
+      }
+      throw error;
     }
-    return format;
   }
 
   /**
@@ -5609,7 +5560,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       const props = await decryptProps(encryptionKey, encryptedProps);
       let issued;
       try {
-        issued = await jwtAccessTokens.issue({
+        issued = await jwtInternals(jwtAccessTokens).issue({
           props,
           userId,
           grantId,

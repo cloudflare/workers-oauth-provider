@@ -257,274 +257,40 @@ The registry is fixed at construction. `resources` must name every audience the 
 
 ### Resource servers in separate Workers
 
-List a resource in `resources` without calling `protectResource()` when the authorization server issues tokens for a resource it does not host. The standalone resource Worker can use `createOAuthResourceServer()` to publish its own RFC 9728 metadata, issue Bearer challenges, enforce the canonical audience, and expose validated application data as `ctx.props`:
+List a resource in `resources` without calling `protectResource()` when another Worker serves it. That Worker uses `createOAuthResourceServer()` for its RFC 9728 metadata, Bearer challenges and audience check, and names how it validates tokens:
 
 ```ts
-import { createOAuthResourceServer, type ValidatedAccessToken } from '@cloudflare/workers-oauth-provider';
-
-const AUTH_ISSUER = 'https://auth.example.com';
-const CALENDAR_RESOURCE = 'https://calendar.example.com/mcp';
-
-interface AuthProps {
-  userId: string;
-  scopes: string[];
-}
-
-interface CalendarEnv {
-  AUTHORIZATION_SERVER: {
-    validateToken(token: string): Promise<ValidatedAccessToken<{ userId: string }> | null>;
-  };
-}
-
-export default createOAuthResourceServer<CalendarEnv, AuthProps>({
-  resourceMetadata: {
-    resource: CALENDAR_RESOURCE,
-    authorization_servers: [AUTH_ISSUER],
-    scopes_supported: ['calendar:read'],
-    resource_name: 'Calendar MCP',
+export default createOAuthResourceServer<CalendarEnv, CalendarProps>({
+  resourceMetadata: { resource: CALENDAR_RESOURCE, authorization_servers: [AUTH_ISSUER] },
+  validateToken: {
+    // Online: ask the authorization server over a private Service Binding. Full props, immediate revocation.
+    online: (env) => env.AUTHORIZATION_SERVER,
+    // Offline: verify its signed JWT here against its JWKS. No round trip; public claims only.
+    offline: { issuer: AUTH_ISSUER, algorithms: ['RS256'], keys: { jwksUri: JWKS_URI }, mapClaimsToProps },
   },
-  async validateToken({ token, env }) {
-    const validation = await env.AUTHORIZATION_SERVER.validateToken(token);
-    if (!validation) return null;
-    return {
-      audience: validation.audience,
-      expiresAt: validation.expiresAt,
-      props: {
-        ...validation.props,
-        scopes: validation.scope,
-      },
-    };
-  },
-  handler: {
-    async fetch(_request, _env, ctx) {
-      if (!ctx.props.scopes.includes('calendar:read')) {
-        return new Response('Forbidden', { status: 403 });
-      }
-      return Response.json({ userId: ctx.props.userId });
-    },
-  },
+  handler,
 });
 ```
 
-The `validateToken` callback is deliberately transport-independent. For Workers, a private Service Binding can expose a resource-specific method backed by the resource handle's `validateToken()`:
-
-```ts
-import { WorkerEntrypoint } from 'cloudflare:workers';
-
-const calendar = authorizationServer.resource(CALENDAR_RESOURCE);
-
-export class CalendarTokenValidator extends WorkerEntrypoint<Env> {
-  validateToken(token: string) {
-    return calendar.validateToken(token, this.env);
-  }
-}
-```
-
-Bind the Calendar Worker to `CalendarTokenValidator`; expose a separate Drive entrypoint built from `authorizationServer.resource(DRIVE_RESOURCE)`. Fixing the resource on the authorization-server side prevents one resource Worker from asking to validate tokens for another audience. `createOAuthResourceServer()` also rejects a successful callback result whose `audience` is not its configured canonical resource and returns `503` when validation infrastructure throws. It passes only the validator's `props` to the handler, so the validator must copy or derive every scope and identity field the handler needs, as above, or enforce authorization itself. The package does not create a public token-introspection or JWT-validation endpoint; applications choose and secure the callback transport.
+Use either mode alone, or both while opaque tokens are still in circulation. `online` takes a binding, not a URL: the validator is not meant to be reachable from the public internet. See [JWT access tokens and separate resource Workers](docs/jwt-access-tokens.md) for the authorization-server side of each mode.
 
 ### Signed JWT access tokens
 
-Access tokens are opaque unless you ask for JWTs. `createJwtAccessTokens()` gives an `OAuthAuthorizationServer` signed [RFC 9068](https://www.rfc-editor.org/rfc/rfc9068.html) access-token support in two separately controlled halves: passing it as `jwtAccessTokens` installs the reader, the signer and the JWKS endpoint, and `accessTokenFormat` decides what each new access token is written as. Until you set `accessTokenFormat`, issuance stays opaque, so the reader is always deployed before the writer. Authorization codes and refresh tokens remain opaque throughout.
-
-Tokens carry `typ: at+jwt`, the provider grant ID in `https://workers.cloudflare.com/oauth-provider/claims/grant-id`, and any `publicClaims` value in `https://workers.cloudflare.com/oauth-provider/claims/public`. Both claim URIs are exported as `JWT_ACCESS_TOKEN_GRANT_ID_CLAIM` and `JWT_ACCESS_TOKEN_PUBLIC_CLAIMS` for a consumer that reads the token without this package.
-
-OAuth clients must continue treating the access-token string as opaque; JWT validation is a resource-server concern.
-
-Signed does not mean encrypted. The JWT's issuer, subject (`userId`), audience, client ID, scope, timestamps, token ID, and provider grant ID are readable by the client. Application `props` are not copied into the JWT. Use `publicClaims` only to project non-secret JSON data that is safe for the client and anyone holding the access token to read:
+Access tokens are opaque unless you ask for JWTs. `createJwtAccessTokens()` gives an `OAuthAuthorizationServer` signed [RFC 9068](https://www.rfc-editor.org/rfc/rfc9068.html) access tokens and a `jwks_uri`; its `issuance` setting, off by default, decides whether new tokens are JWTs, so readers always ship before the first JWT is written. `props` never enter a token unless `publicClaims` projects them. Authorization codes and refresh tokens stay opaque.
 
 ```ts
-import { createJwtAccessTokens, OAuthAuthorizationServer, type JwtKeySet } from '@cloudflare/workers-oauth-provider';
-
-const AUTH_ISSUER = 'https://auth.example.com';
-const CALENDAR_RESOURCE = 'https://calendar.example.com/mcp';
-
-interface Env {
-  OAUTH_KV: KVNamespace;
-  JWT_ISSUANCE_ENABLED: boolean;
-}
-
-interface AuthProps {
-  userId: string;
-  tenantId: string;
-  upstreamAccessToken: string; // Confidential: never put this in publicClaims.
-}
-
-// Resolve a non-extractable signing key and its public JWK from your
-// application-owned key store. See the rotation guidance below.
-declare function loadAccessTokenKeys(env: Env): Promise<JwtKeySet>;
-
 const jwtAccessTokens = createJwtAccessTokens<Env, AuthProps>({
   issuer: AUTH_ISSUER,
   jwksUri: `${AUTH_ISSUER}/.well-known/jwks.json`,
-  keys: loadAccessTokenKeys,
+  keys: loadAccessTokenKeys, // (env) => JwtKeySet, memoised per isolate
   publicClaims: ({ props }) => ({ tenantId: props.tenantId }),
+  issuance: ({ env }) => env.JWT_ISSUANCE_ENABLED,
 });
 
-const authorizationServer = new OAuthAuthorizationServer<Env, AuthProps>({
-  issuer: AUTH_ISSUER,
-  resources: [CALENDAR_RESOURCE],
-  authorizeEndpoint: '/authorize',
-  tokenEndpoint: '/oauth/token',
-  jwtAccessTokens,
-  // Issue JWTs. Omit this while the resource servers that read them are still shipping.
-  accessTokenFormat: () => 'jwt',
-});
-
-const calendar = authorizationServer.protectResource({
-  resourceMetadata: {
-    resource: CALENDAR_RESOURCE,
-    scopes_supported: ['calendar:read'],
-  },
-  handler: {
-    async fetch(_request, _env, ctx) {
-      // Same-Worker validation still checks the KV token record and decrypts
-      // the complete props. The confidential upstream token is not in the JWT.
-      return Response.json({
-        userId: ctx.props.userId,
-        hasUpstreamToken: Boolean(ctx.props.upstreamAccessToken),
-      });
-    },
-  },
-});
+const authorizationServer = new OAuthAuthorizationServer<Env, AuthProps>({ ..., jwtAccessTokens });
 ```
 
-The authorization server publishes `jwks_uri` in its RFC 8414 metadata and serves the resolver's public keys at that exact URL. It also retains the encrypted token-context record in KV. Consequently, resources returned by `protectResource()`, `authorizationServer.resource(uri).validateToken()`, token exchange, and revocation keep their stateful behavior and can use the full confidential `ctx.props`; the JWT is not the source of those props.
-
-A separate resource Worker that needs only public data can validate the JWT locally. List that remote audience in the authorization server's `resources` without calling `protectResource()`; the declaration advertises and permits the audience but does not attach a handler. `createJwtAccessTokenValidator()` validates the package-specific profile emitted by `createJwtAccessTokens()`, including its provider grant-ID claim; it is not a generic verifier for arbitrary RFC 9068 issuers. The resource Worker's verifier pins the issuer, audience, allowed algorithm, and trusted key source. `mapClaimsToProps` receives verified claims and must validate the application-specific public claim before exposing it to the handler:
-
-```ts
-import {
-  createJwksKeyResolver,
-  createJwtAccessTokenValidator,
-  createOAuthResourceServer,
-  type ValidatedAccessToken,
-} from '@cloudflare/workers-oauth-provider';
-
-const AUTH_ISSUER = 'https://auth.example.com';
-const CALENDAR_RESOURCE = 'https://calendar.example.com/mcp';
-const JWKS_URI = `${AUTH_ISSUER}/.well-known/jwks.json`;
-
-interface StatefulCalendarProps {
-  userId: string;
-  tenantId: string;
-}
-
-interface CalendarEnv {
-  // Fetch Service Binding to the authorization Worker's default entrypoint.
-  AUTHORIZATION_SERVER_JWKS: Fetcher;
-  // Temporary RPC Service Binding to the resource-pinned validator shown above.
-  LEGACY_TOKEN_VALIDATOR?: {
-    validateToken(token: string): Promise<ValidatedAccessToken<StatefulCalendarProps> | null>;
-  };
-}
-
-interface CalendarProps {
-  userId: string;
-  tenantId: string;
-  scopes: string[];
-}
-
-// Fetches only this URL, caches the result, and refreshes for an unknown `kid` at most
-// once per cooldown window. A token names the `kid` it wants, and that name is
-// unauthenticated attacker-chosen input, so a refresh per miss would turn this Worker
-// into an amplifier pointed at the authorization server.
-const loadTrustedAccessTokenKeys = createJwksKeyResolver<CalendarEnv>({
-  jwksUri: JWKS_URI,
-  fetcher: (env) => env.AUTHORIZATION_SERVER_JWKS,
-});
-
-const validateCalendarJwt = createJwtAccessTokenValidator<CalendarEnv, CalendarProps>({
-  issuer: AUTH_ISSUER,
-  audience: CALENDAR_RESOURCE,
-  // Required, never defaulted: an authorization server signing ES256 against a validator
-  // that assumed RS256 rejects every token as `invalid_token`.
-  algorithms: ['RS256'],
-  keys: loadTrustedAccessTokenKeys,
-  mapClaimsToProps({ userId, scope, publicClaims }) {
-    const tenantId =
-      publicClaims !== null && typeof publicClaims === 'object' && !Array.isArray(publicClaims)
-        ? publicClaims.tenantId
-        : undefined;
-    if (typeof tenantId !== 'string') return null;
-    return { userId, tenantId, scopes: scope };
-  },
-});
-
-export default createOAuthResourceServer<CalendarEnv, CalendarProps>({
-  resourceMetadata: {
-    resource: CALENDAR_RESOURCE,
-    authorization_servers: [AUTH_ISSUER],
-    scopes_supported: ['calendar:read'],
-  },
-  validateToken: validateCalendarJwt,
-  handler: {
-    async fetch(_request, _env, ctx) {
-      if (!ctx.props.scopes.includes('calendar:read')) return new Response('Forbidden', { status: 403 });
-      return Response.json({ userId: ctx.props.userId, tenantId: ctx.props.tenantId });
-    },
-  },
-});
-```
-
-Offline verification cannot observe deletion of a token or grant record. Use short access-token lifetimes, or make `mapClaimsToProps` perform an application status check when immediate revocation is required. If a separate Worker needs confidential props, individual-token revocation, or grant revocation without waiting for expiry, use the private Service Binding and `authorizationServer.resource(uri).validateToken()` pattern above instead.
-
-During migration, a separate Worker can try offline JWT validation first and fall back only to its resource-pinned authorization-server binding for old opaque tokens:
-
-```ts
-async function validateDuringMigration(input: Parameters<typeof validateCalendarJwt>[0]) {
-  const jwt = await validateCalendarJwt(input);
-  if (jwt) return jwt;
-
-  const legacyValidator = input.env.LEGACY_TOKEN_VALIDATOR;
-  if (!legacyValidator) return null;
-  const legacy = await legacyValidator.validateToken(input.token);
-  if (!legacy) return null;
-  return {
-    audience: legacy.audience,
-    expiresAt: legacy.expiresAt,
-    props: {
-      userId: legacy.props.userId,
-      tenantId: legacy.props.tenantId,
-      scopes: legacy.scope,
-    },
-  };
-}
-
-// Temporarily use this instead of validateCalendarJwt in createOAuthResourceServer().
-```
-
-Do not fall through to a permissive external-token resolver. The fallback above is the `CalendarTokenValidator` Service Binding from the preceding example, so its authorization-server-side call is fixed to `CALENDAR_RESOURCE`. Remove it only after the rollout checks and maximum-lifetime window below.
-
-Rotate keys in this order:
-
-1. Add the next public JWK to `verificationKeys` while the old key stays `signingKey`.
-2. Wait at least the JWKS cache lifetime after publication—currently five minutes from the authorization server's `Cache-Control` header—before signing with the new key.
-3. Promote the new private key to `signingKey`, remove its now-duplicate public JWK from `verificationKeys`, and add the retiring key's public JWK there.
-4. Keep the old public JWK until the last token signed with it has passed the maximum effective access-token lifetime, plus JWKS cache time and clock skew; then remove it.
-
-Resource Workers should fetch only the configured `jwks_uri`, never cache longer than its response's `Cache-Control` allows, and select exactly one key by `kid` and pinned algorithm. `createJwksKeyResolver()` does all three: a smaller `max-age` shortens its cache, and `no-store` or `no-cache` makes it fetch for every validation.
-
-Roll this out reader before writer. `jwtAccessTokens` installs the JWT reader, signer, and JWKS; `accessTokenFormat` controls only the representation of each newly issued access token:
-
-```ts
-const authorizationServer = new OAuthAuthorizationServer<Env, AuthProps>({
-  issuer: AUTH_ISSUER,
-  resources: [CALENDAR_RESOURCE],
-  authorizeEndpoint: '/authorize',
-  tokenEndpoint: '/oauth/token',
-  jwtAccessTokens,
-  accessTokenFormat: ({ env }) => (env.JWT_ISSUANCE_ENABLED ? 'jwt' : 'opaque'),
-});
-```
-
-`accessTokenFormat` runs for every access-token issuance. Its immutable input contains `env` and the canonical `resource`, so a deployment can flip the writer globally with one flag or stage it one resource at a time as each resource Worker's validator ships. The client is deliberately absent: a client never inspects an access token, so it cannot be what decides the token's representation. Keep `accessTokenFormat` local and highly available — throwing, rejecting, or returning anything except `opaque` or `jwt` fails the request before one-use authorization state is consumed, rather than silently downgrading security.
-
-1. Configure `jwtAccessTokens` and leave `accessTokenFormat` unset, then deploy the authorization server everywhere. It publishes `jwks_uri`, serves the future signing key, and accepts both compatible opaque tokens and JWTs while continuing to issue opaque access tokens.
-2. Deploy JWT validation to every token consumer. A separate resource Worker must temporarily fall back to its resource-pinned Service Binding validator for old opaque tokens.
-3. Verify the deployment and wait at least the JWKS cache lifetime before adding an `accessTokenFormat` that returns `jwt`. New authorization-code, refresh, implicit, token-exchange, and enterprise-managed access tokens now become JWTs. Existing access tokens are not converted or invalidated, and authorization codes and refresh tokens remain opaque.
-4. Confirm every issuer instance and every resource now returns `jwt`, then keep the opaque fallback for the maximum effective access-token lifetime measured from the last possible opaque issuance, including any TTL overrides. To roll back after removing that fallback, first restore the resource-pinned opaque fallback to every JWT-only consumer, then return `opaque`; retain `jwtAccessTokens`, its JWKS, and every required verification key until all previously issued JWTs have expired plus cache time and clock skew.
-
-State-backed provider surfaces continue accepting compatible access tokens issued in the old opaque format until those tokens expire. A JWT-only offline validator does not understand an old opaque token, which is why the temporary fallback is required. Never roll back to a package version or configuration that cannot read still-live JWT access tokens. This token-format rollout does not bypass the resource migration policy: a pre-resource opaque access token is treated as bound to the server-selected migration resource until it expires, and its refresh grant migrates according to `legacyGrantResource`.
+Same-Worker resources, `resource(uri).validateToken()`, token exchange and revocation still use the encrypted KV record and see the full `props`. Key rotation, the reader-first rollout, and the security properties of both validation modes are in [docs/jwt-access-tokens.md](docs/jwt-access-tokens.md).
 
 The existing `OAuthProvider` constructor remains supported. It is the concise combined AS-and-resource API used by the quick start and is appropriate when one Worker protects one canonical resource. Existing applications do not need to move to `OAuthAuthorizationServer` to upgrade.
 
@@ -853,11 +619,10 @@ The functional role API adds these surfaces without removing `OAuthProvider`:
 | Surface                                                  | Purpose                                                                                     |
 | -------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
 | `new OAuthAuthorizationServer({ issuer, resources, … })` | Create the AS role with a canonical RFC 8414 issuer and its fixed resource registry         |
-| `createJwtAccessTokens({ … })`                           | Build the JWT signer, reader, and JWKS, keeping the stateful token record                   |
-| `jwtAccessTokens`                                        | Install that component on the authorization server; issuance stays opaque until asked       |
-| `accessTokenFormat`                                      | Return `opaque` or `jwt` per issuance; unset means opaque                                   |
-| `createJwtAccessTokenValidator({ … })`                   | Validate pinned JWT claims offline for one fixed resource                                   |
-| `createJwksKeyResolver({ … })`                           | Fetch and cache an authorization server's JWKS for that validator, with a refresh limit     |
+| `createJwtAccessTokens({ …, issuance })`                 | Build the JWT signer, reader, and JWKS; `issuance` decides which new tokens are JWTs        |
+| `jwtAccessTokens`                                        | Install that component on the authorization server                                          |
+| `validateToken: { online }`                              | Resource Worker asks the authorization server over a private Service Binding                |
+| `validateToken: { offline }`                             | Resource Worker verifies the JWT locally against the authorization server's JWKS            |
 | `protectResource({ resourceMetadata, handler })`         | Host one declared resource in this Worker, returning its fetch surface                      |
 | `resource(uri)`                                          | Obtain a handle for one declared resource, with `validateToken(token, env)` and `protect()` |
 | `defaultResource`                                        | Select a deliberate default for new authorization requests that omit it                     |

@@ -76,8 +76,15 @@ export interface JwtAccessTokenClaims {
   [JWT_ACCESS_TOKEN_PUBLIC_CLAIMS]?: JwtJsonValue;
 }
 
-/** Input to the explicit public-claim projection. */
-export interface JwtAccessTokenIssueInput<Env, Props> {
+/** What the authorization server knows about a token as it decides whether to issue a JWT. */
+export interface JwtIssuanceInput<Env> {
+  readonly env: Env;
+  /** The canonical resource the token is bound to. */
+  readonly resource: string;
+}
+
+/** Input to the explicit public-claim projection, and to issuance itself. */
+export interface JwtPublicClaimsInput<Env, Props> {
   readonly props: Props;
   readonly userId: string;
   readonly grantId: string;
@@ -90,7 +97,7 @@ export interface JwtAccessTokenIssueInput<Env, Props> {
 }
 
 /** Signed token plus its validated claims, returned to the provider's storage layer. */
-export interface IssuedJwtAccessToken {
+interface IssuedJwtAccessToken {
   token: string;
   claims: JwtAccessTokenClaims;
 }
@@ -110,13 +117,20 @@ export interface JwtAccessTokensOptions<Env = Cloudflare.Env, Props = unknown> {
    * that serializes `props`, because existing deployments commonly keep upstream
    * access and refresh tokens there.
    */
-  publicClaims?(
-    input: JwtAccessTokenIssueInput<Env, Props>
-  ): JwtJsonValue | undefined | Promise<JwtJsonValue | undefined>;
+  publicClaims?(input: JwtPublicClaimsInput<Env, Props>): JwtJsonValue | undefined | Promise<JwtJsonValue | undefined>;
+  /**
+   * Whether a newly issued access token is a JWT. Omit it, or return `false`, and the
+   * reader, signer and JWKS are installed while issuance stays opaque, which is the
+   * reader-first order a rollout needs: every resource server must be able to verify a
+   * JWT before the first one is written. A function decides per token, so issuance can
+   * be switched on per resource or per environment. Authorization codes and refresh
+   * tokens are opaque regardless.
+   */
+  issuance?: boolean | ((input: JwtIssuanceInput<Env>) => boolean | Promise<boolean>);
 }
 
 /** Verified JWT context before a resource-specific props mapper runs. */
-export interface VerifiedJwtAccessToken {
+interface VerifiedJwtAccessToken {
   claims: JwtAccessTokenClaims;
   audience: string;
   expiresAt: number;
@@ -128,45 +142,68 @@ export interface VerifiedJwtAccessToken {
   publicClaims: JwtJsonValue | undefined;
 }
 
-/** RFC 9068 issuer/verifier created for an {@link OAuthAuthorizationServer}. */
+/**
+ * The RFC 9068 issuer, reader and JWKS publisher an {@link OAuthAuthorizationServer} is
+ * given as `jwtAccessTokens`. Opaque to application code: the server mints, verifies and
+ * publishes through it, and nothing else should. A token minted outside the token endpoint
+ * has no grant behind it, and a verification outside the server skips the revocation
+ * check its own resources get.
+ */
 export interface JwtAccessTokens<Env = Cloudflare.Env, Props = unknown> {
   readonly issuer: string;
   readonly jwksUri: string;
-  /** Mint one signed access token from provider-validated grant state. */
-  issue: (input: JwtAccessTokenIssueInput<Env, Props>) => Promise<IssuedJwtAccessToken>;
-  /** Verify against an explicit finite set of audiences owned by the caller. */
-  verify: (token: string, allowedAudiences: readonly string[], env: Env) => Promise<VerifiedJwtAccessToken | null>;
-  /** Resolve the sanitized public key set published by the authorization server. */
-  getJwks: (env: Env) => Promise<{ keys: JwtPublicKey[] }>;
+  /** @internal Binds the `Props` type parameter; never set. */
+  readonly __props?: Props;
 }
 
 /** Capabilities the provider needs from a component and no npm consumer may reach. */
-interface JwtInternals<Env> {
+interface JwtInternals<Env, Props> {
+  /** Whether the token about to be issued for `input.resource` should be a JWT. */
+  readonly shouldIssue: (input: JwtIssuanceInput<Env>) => Promise<boolean>;
+  /** Mint one signed access token from provider-validated grant state. */
+  readonly issue: (input: JwtPublicClaimsInput<Env, Props>) => Promise<IssuedJwtAccessToken>;
+  /** Verify against an explicit finite set of audiences owned by the caller. */
+  readonly verifyForAudiences: (
+    token: string,
+    allowedAudiences: readonly string[],
+    env: Env
+  ) => Promise<VerifiedJwtAccessToken | null>;
   /** Verify against the token's own audience for a provider-owned state cross-check. */
   readonly verify: (token: string, env: Env) => Promise<VerifiedJwtAccessToken | null>;
   /** Cheaply identify a structurally valid token that claims this component's issuer and type. */
   readonly isOwnJwt: (token: string) => boolean;
+  /** The sanitized public key set the authorization server publishes. */
+  readonly getJwks: (env: Env) => Promise<{ keys: JwtPublicKey[] }>;
 }
 /**
  * Brands the objects this factory returns. A WeakMap rather than a property so that a
  * spread copy of the component is not branded, which is what makes the factory-only
  * invariant detectable rather than merely documented.
  */
-const internals = new WeakMap<object, JwtInternals<any>>();
+const internals = new WeakMap<object, JwtInternals<any, any>>();
 const NOT_FROM_FACTORY = 'jwtAccessTokens must be created by createJwtAccessTokens';
 
 /**
  * @internal The provider's only door into a branded component. Called for its throw at
  * construction time, and for the hooks on every request that carries a token.
  */
-export function jwtInternals<Env>(accessTokens: JwtAccessTokens<Env, any>): JwtInternals<Env> {
+export function jwtInternals<Env, Props>(accessTokens: JwtAccessTokens<Env, Props>): JwtInternals<Env, Props> {
   const hooks = internals.get(accessTokens);
   if (!hooks) throw new TypeError(NOT_FROM_FACTORY);
   return hooks;
 }
 
-/** Input passed to a stateless resource server's claim-to-props mapper. */
-export interface JwtClaimsToPropsInput<Env> extends VerifiedJwtAccessToken {
+/** Verified claims handed to a resource server's `mapClaimsToProps`. */
+export interface JwtClaimsToPropsInput<Env> {
+  claims: JwtAccessTokenClaims;
+  audience: string;
+  expiresAt: number;
+  scope: string[];
+  userId: string;
+  clientId: string;
+  grantId: string;
+  jti: string;
+  publicClaims: JwtJsonValue | undefined;
   request: Request;
   env: Env;
 }
@@ -179,12 +216,36 @@ export interface JwtKeyHint {
   readonly alg: JwtAlgorithm;
 }
 
-/** Configuration for {@link createJwtAccessTokenValidator}. */
-export interface JwtAccessTokenValidatorOptions<Env = Cloudflare.Env, Props = unknown> {
+/**
+ * Where a resource server gets the authorization server's public keys: its `jwks_uri`,
+ * fetched and cached by this package, optionally over a Service Binding to keep the
+ * request off the public internet. Only the key set travels over that binding; the token
+ * being verified never leaves the resource server.
+ */
+export interface JwksSource<Env = Cloudflare.Env> {
+  /** The authorization server's exact `jwks_uri`. The only URL ever fetched. */
+  jwksUri: string;
+  /** Where to send the JWKS request. Defaults to global `fetch`. */
+  fetcher?: (env: Env) => { fetch(request: Request): Promise<Response> } | undefined;
+  /**
+   * How long a fetched key set is reused, in seconds. The response's `Cache-Control`
+   * can only shorten this. Defaults to 300 seconds, which is what this package's own
+   * authorization server publishes.
+   */
+  cacheTtlSeconds?: number;
+}
+
+/**
+ * Offline validation of the JWT access tokens an {@link OAuthAuthorizationServer} issues:
+ * the signature is checked here, against the authorization server's published keys, and
+ * no request is made to it per token. What that buys and costs: no per-request
+ * round trip, but only the claims the authorization server chose to make public, and no
+ * way to see a token or grant revoked before it expires. When either of those matters,
+ * validate online over a Service Binding instead.
+ */
+export interface OfflineTokenValidation<Env = Cloudflare.Env, Props = unknown> {
   /** Exact authorization-server issuer expected in `iss`. */
   issuer: string;
-  /** One fixed canonical resource expected in `aud`. */
-  audience: string;
   /**
    * Allowed algorithms. Never derived from the token, and never defaulted: an
    * authorization server signing `ES256` against a validator that assumed `RS256`
@@ -193,17 +254,18 @@ export interface JwtAccessTokenValidatorOptions<Env = Cloudflare.Env, Props = un
    */
   algorithms: JwtAlgorithm[];
   /**
-   * Resolve trusted public keys. Token-controlled key URLs are never followed.
+   * Trusted public keys: the authorization server's `jwks_uri`, or a resolver of your own.
+   * Token-controlled key URLs are never followed.
    *
-   * The hint carries the `kid` and `alg` the token names, so a cached key set can be
+   * A resolver receives the `kid` and `alg` the token names, so a cached key set can be
    * refreshed when the authorization server has rotated to a key it lacks. That hint is
    * read from the JOSE header before any signature has been checked, so it is
    * unauthenticated attacker-chosen input: a resolver that fetches per unknown `kid` must
-   * bound that work, for example by refreshing at most once per interval and remembering
-   * which `kid` values it has already failed to find. Returning an empty array, or a set
-   * without the named key, is answered as `invalid_token`.
+   * bound that work, as the built-in one does by refreshing at most once per cooldown.
+   * Returning an empty array, or a set without the named key, is answered as
+   * `invalid_token`.
    */
-  keys(env: Env, hint: JwtKeyHint): JwtPublicKey[] | Promise<JwtPublicKey[]>;
+  keys: JwksSource<Env> | ((env: Env, hint: JwtKeyHint) => JwtPublicKey[] | Promise<JwtPublicKey[]>);
   /** Map already verified claims to the typed context exposed as `ctx.props`. */
   mapClaimsToProps(input: JwtClaimsToPropsInput<Env>): Props | null | Promise<Props | null>;
 }
@@ -244,6 +306,10 @@ export function createJwtAccessTokens<Env = Cloudflare.Env, Props = unknown>(
   if (options.publicClaims !== undefined && typeof options.publicClaims !== 'function') {
     throw new TypeError('publicClaims must be a function');
   }
+  const issuance = options.issuance ?? false;
+  if (typeof issuance !== 'boolean' && typeof issuance !== 'function') {
+    throw new TypeError('issuance must be a boolean or a function');
+  }
 
   const verifyAgainstAudiences = async (
     parsed: ParsedJwt,
@@ -272,9 +338,16 @@ export function createJwtAccessTokens<Env = Cloudflare.Env, Props = unknown>(
     });
   };
 
-  const accessTokens: JwtAccessTokens<Env, Props> = {
-    issuer,
-    jwksUri,
+  const accessTokens: JwtAccessTokens<Env, Props> = { issuer, jwksUri };
+
+  internals.set(accessTokens, {
+    async shouldIssue(input): Promise<boolean> {
+      if (typeof issuance === 'boolean') return issuance;
+      // The decision may be shared with application code: give it an immutable snapshot.
+      const decision = await issuance(Object.freeze({ ...input }));
+      if (typeof decision !== 'boolean') throw new TypeError('issuance must return a boolean');
+      return decision;
+    },
 
     async issue(input): Promise<IssuedJwtAccessToken> {
       const snapshot = snapshotIssueInput(input);
@@ -316,7 +389,7 @@ export function createJwtAccessTokens<Env = Cloudflare.Env, Props = unknown>(
       return { token, claims };
     },
 
-    async verify(token, allowedAudiences, env): Promise<VerifiedJwtAccessToken | null> {
+    async verifyForAudiences(token, allowedAudiences, env): Promise<VerifiedJwtAccessToken | null> {
       if (!Array.isArray(allowedAudiences) || allowedAudiences.length === 0) {
         throw new TypeError('allowedAudiences must contain at least one canonical resource URI');
       }
@@ -332,9 +405,7 @@ export function createJwtAccessTokens<Env = Cloudflare.Env, Props = unknown>(
       await assertSigningKeyPair(keySet.signingKey);
       return { keys: keySet.publicKeys.map(cloneJwk) };
     },
-  };
 
-  internals.set(accessTokens, {
     verify: async (token, env) => {
       const parsed = parseCompactJwt(token);
       if (!parsed || !isAcceptedJwtType(parsed.header.typ) || parsed.claims.iss !== issuer) return null;
@@ -347,29 +418,24 @@ export function createJwtAccessTokens<Env = Cloudflare.Env, Props = unknown>(
       return !!parsed && isAcceptedJwtType(parsed.header.typ) && parsed.claims.iss === issuer;
     },
   });
-  // Frozen so the branded object the provider re-reads on every request cannot have its
-  // methods swapped after construction validated it.
+  // Frozen: the branded handle is what the provider re-reads on every request.
   return Object.freeze(accessTokens);
 }
 
 /**
- * Create a fixed-issuer, fixed-audience validator for the JWT profile emitted
- * by {@link createJwtAccessTokens}. It is not a generic RFC 9068 verifier.
- * The result is suitable for `createOAuthResourceServer({ validateToken })`
- * or `resolveExternalToken`.
- *
- * This path validates offline and therefore cannot observe token-record or
- * grant revocation unless `keys` or `mapClaimsToProps` performs an application
- * status check. Keep access-token lifetimes short when using it without state.
+ * @internal The offline validator behind `createOAuthResourceServer({ validateToken: { offline } })`,
+ * pinned to the one resource the host serves. It validates the JWT profile emitted by
+ * {@link createJwtAccessTokens} and is not a generic RFC 9068 verifier.
  */
 export function createJwtAccessTokenValidator<Env = Cloudflare.Env, Props = unknown>(
-  options: JwtAccessTokenValidatorOptions<Env, Props>
+  audience: string,
+  options: OfflineTokenValidation<Env, Props>
 ): (input: JwtAccessTokenValidationInput<Env>) => Promise<JwtAccessTokenValidation<Props> | null> {
   const issuer = validateIssuer(options?.issuer);
-  const audience = validateCanonicalResource(options?.audience);
+  validateCanonicalResource(audience);
   const algorithms = validateAlgorithms(options?.algorithms);
-  if (typeof options?.keys !== 'function') throw new TypeError('keys must be a function');
   if (typeof options?.mapClaimsToProps !== 'function') throw new TypeError('mapClaimsToProps must be a function');
+  const keys = typeof options?.keys === 'function' ? options.keys : createJwksKeyResolver(options?.keys);
 
   return async ({ token, request, env }) => {
     const parsed = parseCompactJwt(token);
@@ -390,7 +456,7 @@ export function createJwtAccessTokenValidator<Env = Cloudflare.Env, Props = unkn
       kid: parsed.header.kid as string,
       alg: parsed.header.alg as JwtAlgorithm,
     };
-    const publicKeys = selectUsableKeys(await options.keys(env, hint), algorithms);
+    const publicKeys = selectUsableKeys(await keys(env, hint), algorithms);
     // No key for this token is an unverifiable token, not a broken validator: returning
     // null makes it a 401 invalid_token (RFC 9068 §4) instead of a 503.
     if (publicKeys.length === 0) return null;
@@ -409,37 +475,9 @@ export function createJwtAccessTokenValidator<Env = Cloudflare.Env, Props = unkn
   };
 }
 
-/** Configuration for {@link createJwksKeyResolver}. */
-export interface JwksKeyResolverOptions<Env = Cloudflare.Env> {
-  /**
-   * The authorization server's exact `jwks_uri`. This is the only URL ever fetched: a
-   * key URL named by a token is never followed.
-   */
-  jwksUri: string;
-  /**
-   * Where to send the request. Return a Service Binding to the authorization Worker to
-   * keep the fetch on Cloudflare's network and off the public internet. Defaults to
-   * global `fetch`.
-   */
-  fetcher?: (env: Env) => JwksFetcher | undefined;
-  /**
-   * How long a fetched key set is reused, in seconds. The response's `Cache-Control`
-   * can only shorten this: a smaller `max-age` wins, and `no-store` or `no-cache`
-   * fetches on every validation. Defaults to 300 seconds, which is what this package's
-   * own authorization server publishes.
-   */
-  cacheTtlSeconds?: number;
-}
-
-/** Anything that can perform the JWKS request: a Service Binding, or global `fetch`. */
-export interface JwksFetcher {
-  fetch(request: Request): Promise<Response>;
-}
-
 /**
- * Resolve an authorization server's public keys for `createJwtAccessTokenValidator`,
- * with the caching every resource server needs and the refresh limit it is easy to
- * forget.
+ * @internal The key resolver behind `OfflineTokenValidation.keys` when it names a JWKS:
+ * the caching every resource server needs and the refresh limit it is easy to forget.
  *
  * A token names the `kid` it wants, and that name is attacker-chosen and unauthenticated
  * at the point this runs. So an unknown `kid` refreshes the key set at most once per
@@ -455,7 +493,7 @@ export interface JwksFetcher {
  * than its own `Cache-Control` allows.
  */
 export function createJwksKeyResolver<Env = Cloudflare.Env>(
-  options: JwksKeyResolverOptions<Env>
+  options: JwksSource<Env>
 ): (env: Env, hint: JwtKeyHint) => Promise<JwtPublicKey[]> {
   const jwksUri = validateAbsoluteHttpsUrl(options?.jwksUri, 'jwksUri');
   const maxCacheTtlSeconds = validateCacheTtl(options?.cacheTtlSeconds);
@@ -500,7 +538,10 @@ interface FetchedJwks {
   freshnessSeconds?: number;
 }
 
-async function fetchJwks(jwksUri: string, fetcher: JwksFetcher | undefined): Promise<FetchedJwks> {
+async function fetchJwks(
+  jwksUri: string,
+  fetcher: { fetch(request: Request): Promise<Response> } | undefined
+): Promise<FetchedJwks> {
   const abort = new AbortController();
   const timeout = setTimeout(() => abort.abort(), JWKS_FETCH_TIMEOUT_MS);
   try {
@@ -885,9 +926,7 @@ function containsPrivateJwkMaterial(key: JwtPublicKey): boolean {
   );
 }
 
-function snapshotIssueInput<Env, Props>(
-  input: JwtAccessTokenIssueInput<Env, Props>
-): JwtAccessTokenIssueInput<Env, Props> {
+function snapshotIssueInput<Env, Props>(input: JwtPublicClaimsInput<Env, Props>): JwtPublicClaimsInput<Env, Props> {
   if (!isNonEmptyString(input.userId)) throw new TypeError('JWT access token userId is required');
   if (!isNonEmptyString(input.grantId)) throw new TypeError('JWT access token grantId is required');
   if (!isNonEmptyString(input.clientId)) throw new TypeError('JWT access token clientId is required');
