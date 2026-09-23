@@ -196,10 +196,23 @@ export interface TokenExchangeCallbackResult {
   /**
    * Override the default refresh token TTL (time-to-live) for this specific grant.
    * Value should be in seconds.
-   * Note: This is only honored during authorization code exchange. If returned during
-   * refresh token exchange, it will be ignored.
+   * Note: This is only honored during authorization code exchange. Returning it during
+   * refresh token exchange is rejected with `invalid_request`; to extend a grant on
+   * refresh, return `refreshTokenIdleTTL`.
    */
   refreshTokenTTL?: number;
+  /**
+   * Idle lifetime for this grant's refresh token, in seconds from this refresh. The
+   * grant then expires that long after this refresh unless it is refreshed again. Only
+   * honored during refresh token exchange; returning it for another grant type is
+   * rejected with `invalid_request`. Overrides the provider's `refreshTokenIdleTTL`
+   * for this refresh.
+   *
+   * Useful when the Worker is itself an OAuth client and has just rotated an upstream
+   * refresh token: return the upstream lifetime and the grant lives exactly as long as
+   * the credentials it proxies. Must be an integer of at least 60 seconds.
+   */
+  refreshTokenIdleTTL?: number;
 
   /**
    * Optional scopes for the new access token. Values outside the scope ceiling
@@ -469,6 +482,19 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
    * For example: 3600 = 1 hour, 2592000 = 30 days
    */
   refreshTokenTTL?: number;
+
+  /**
+   * Idle lifetime for refresh tokens in seconds. When set, every successful refresh
+   * moves the grant's expiry to this many seconds after the refresh, so a grant lives
+   * for as long as the client keeps using it and expires once it has been idle for
+   * this long. `refreshTokenTTL` still sets the lifetime of a new grant, and
+   * `tokenExchangeCallback` can override the idle lifetime per refresh by returning
+   * `refreshTokenIdleTTL`. Must be an integer of at least 60 seconds.
+   *
+   * Leave unset for a fixed lifetime, where a grant expires `refreshTokenTTL` seconds
+   * after the code exchange however often it is refreshed.
+   */
+  refreshTokenIdleTTL?: number;
 
   /**
    * Time-to-live for dynamically registered clients in seconds.
@@ -1849,6 +1875,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     if (!isValidAccessTokenTTL(this.options.accessTokenTTL!)) {
       throw new TypeError(
         `accessTokenTTL must be an integer of at least ${KV_MIN_EXPIRATION_TTL_SECONDS} seconds (Cloudflare KV's minimum expiration window).`
+      );
+    }
+    if (this.options.refreshTokenIdleTTL !== undefined && !isValidAccessTokenTTL(this.options.refreshTokenIdleTTL)) {
+      throw new TypeError(
+        `refreshTokenIdleTTL must be an integer of at least ${KV_MIN_EXPIRATION_TTL_SECONDS} seconds (Cloudflare KV's minimum expiration window).`
       );
     }
 
@@ -3322,6 +3353,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
           refreshTokenTTL = callbackResult.refreshTokenTTL;
         }
 
+        // A new grant's lifetime is `refreshTokenTTL`; the idle lifetime only applies to a refresh.
+        if (callbackResult.refreshTokenIdleTTL !== undefined) {
+          return this.createErrorResponse('invalid_request', {
+            description: 'refreshTokenIdleTTL is only honored during refresh token exchange',
+          });
+        }
+
         // If accessTokenScope was specified, use it for this token
         if (callbackResult.accessTokenScope) {
           tokenScopes = this.downscope(callbackResult.accessTokenScope, grantData.scope);
@@ -3498,6 +3536,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Define the access token TTL, may be updated by callback if provided
     let accessTokenTTL = this.options.accessTokenTTL!;
+    // Idle lifetime for the refreshed grant: the callback's answer for this refresh, else the
+    // provider's setting, else none, which leaves the grant's expiry where the code exchange put it.
+    let refreshTokenIdleTTL = this.options.refreshTokenIdleTTL;
 
     // Determine which wrapped key to use for unwrapping
     let wrappedKeyToUse: string;
@@ -3575,6 +3616,17 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
           });
         }
 
+        // The callback may set this refresh's idle lifetime, typically to match an upstream
+        // refresh token it has just rotated.
+        if (callbackResult.refreshTokenIdleTTL !== undefined) {
+          if (!isValidAccessTokenTTL(callbackResult.refreshTokenIdleTTL)) {
+            return this.createErrorResponse('invalid_request', {
+              description: `refreshTokenIdleTTL must be an integer of at least ${KV_MIN_EXPIRATION_TTL_SECONDS} seconds`,
+            });
+          }
+          refreshTokenIdleTTL = callbackResult.refreshTokenIdleTTL;
+        }
+
         // If accessTokenScope was specified, use it for this token
         if (callbackResult.accessTokenScope) {
           tokenScopes = this.downscope(callbackResult.accessTokenScope, grantData.scope);
@@ -3620,6 +3672,16 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // mutation or token write has happened yet, so returning now leaves no partial state.
     if (grantData.expiresAt !== undefined && grantData.expiresAt - now < KV_MIN_EXPIRATION_TTL_SECONDS) {
       return this.createErrorResponse('invalid_grant', { description: 'Refresh token has expired' });
+    }
+
+    // Sliding expiry. This runs after the re-check above, so a grant that expired while the
+    // callback ran is not revived, and before the access-token clamp below, so the new access
+    // token may outlive the expiry being replaced. The grant write further down commits the
+    // new expiry, as the record's KV expiration, together with the refresh-token rotation: a
+    // refresh that fails before that write leaves the old expiry, and one that fails after it
+    // leaves a rotated, extended grant that the client's still-valid previous token retries.
+    if (refreshTokenIdleTTL !== undefined) {
+      grantData.expiresAt = now + refreshTokenIdleTTL;
     }
 
     // Clamp access token TTL to not exceed refresh token's remaining lifetime
@@ -3853,6 +3915,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         if (callbackResult.accessTokenTTL !== undefined) {
           // Clamp to subject token's remaining lifetime
           accessTokenTTL = Math.min(callbackResult.accessTokenTTL, subjectTokenRemainingLifetime);
+        }
+
+        // Token exchange issues no refresh token, so there is no grant lifetime to slide.
+        if (callbackResult.refreshTokenIdleTTL !== undefined) {
+          throw new OAuthError('invalid_request', {
+            description: 'refreshTokenIdleTTL is only honored during refresh token exchange',
+          });
         }
 
         // Re-encrypt the access token props if they changed

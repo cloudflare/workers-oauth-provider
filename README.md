@@ -524,6 +524,8 @@ allowPlainPKCE: true;
 
 The provider owns `tokenEndpoint`. It exchanges authorization codes for tokens, refreshes access tokens, and handles RFC 7009 revocation. Refresh tokens rotate on use. The immediately previous token remains valid until its replacement is first used, allowing a client to retry after losing a refresh response.
 
+A grant expires `refreshTokenTTL` seconds after the code exchange (30 days by default) however often it is refreshed. Set `refreshTokenIdleTTL` to make that lifetime slide instead: each successful refresh moves the expiry to that many seconds later, so a grant lives while the client keeps using it and expires once idle. `tokenExchangeCallback` can return `refreshTokenIdleTTL` to set the lifetime for one refresh, which lets a Worker that proxies an upstream OAuth service match the lifetime of the upstream refresh token it just rotated. See [Advanced configuration](docs/advanced-configuration.md#token-and-client-lifetimes).
+
 ## Resources and token audiences
 
 An authorization server may register one or more protected resources. Each resource has one canonical `resourceMetadata.resource`: an absolute HTTPS URI without a fragment, with lowercase `https` and a lowercase host, and an RFC 3986-safe producer serialization. Userinfo, default ports, dot-segment paths, and an empty path before a query are rejected because `Request` would rewrite them before RFC 9728 comparison. A bare origin is the only empty-path exception; use `/` before a query. Query components are supported but discouraged by RFC 9728.

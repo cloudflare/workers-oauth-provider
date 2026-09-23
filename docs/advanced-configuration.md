@@ -37,6 +37,8 @@ new OAuthProvider({
           upstreamRefreshToken: upstream.refresh_token,
         },
         accessTokenTTL: upstream.expires_in,
+        // The upstream just issued a new refresh token; let this grant live as long as it does.
+        refreshTokenIdleTTL: upstream.refresh_expires_in,
       };
     }
   },
@@ -49,6 +51,7 @@ The callback receives the grant type, client ID, user ID, grant ID, grant scopes
 - `newProps` for the grant and future refreshes.
 - `accessTokenTTL` for the current access token.
 - `refreshTokenTTL` during authorization code exchange.
+- `refreshTokenIdleTTL` during refresh token exchange, to move the grant's expiry to that many seconds from now.
 - `accessTokenScope` to narrow the current token.
 
 Return nothing to keep the existing values. If `newProps` is returned without `accessTokenProps`, the current access token also uses `newProps`.
@@ -195,11 +198,24 @@ Both classes accept a public `description`, `statusCode`, and response `headers`
 | ----------------------- | ----------------- | ----------------------------------------------------------------------------------- |
 | `accessTokenTTL`        | 3,600 seconds     | Must be at least 60 seconds because of KV limits                                    |
 | `refreshTokenTTL`       | 2,592,000 seconds | 30 days; set to `0` to disable refresh tokens; explicit `undefined` means no expiry |
+| `refreshTokenIdleTTL`   | unset             | Sliding expiry: each successful refresh moves the grant's expiry this far out       |
 | `clientRegistrationTTL` | 7,776,000 seconds | 90 days for DCR clients; explicit `undefined` means no expiry                       |
 
 A refresh rotates the token. The newly issued token and the immediately previous token can both recover a refresh whose response was lost. Once the new token is used, the previous token is invalidated and another token is issued.
 
 Per-token `accessTokenTTL` and `refreshTokenTTL` overrides are available through `tokenExchangeCallback`.
+
+### Sliding expiry
+
+By default a grant's lifetime is fixed at the code exchange: it expires `refreshTokenTTL` seconds later no matter how often it is refreshed, which is the right policy when users must re-authenticate on a schedule. A Worker that proxies an upstream OAuth service usually wants the opposite: the grant should live as long as the upstream credentials it holds, and no longer.
+
+`refreshTokenIdleTTL` makes the lifetime slide. Every successful refresh moves the grant's expiry, and the KV expiration of its record, to that many seconds after the refresh. `refreshTokenTTL` still sets a new grant's lifetime, so "30 days to start, then at least weekly" is `refreshTokenTTL: 30 * 86400` with `refreshTokenIdleTTL: 7 * 86400`. A grant that never expired keeps that status until its first refresh, after which it too idles out.
+
+Returning `refreshTokenIdleTTL` from `tokenExchangeCallback` sets the lifetime for that one refresh and overrides the option, as in the example above. It sets rather than extends, so returning the upstream's remaining lifetime makes the grant track it exactly; return nothing when the upstream did not rotate and the option, or the fixed lifetime, applies.
+
+The slide is committed by the same grant write that rotates the refresh token. A callback that throws fails the refresh before that write, so a failed upstream refresh never renews the downstream grant. A grant that has already expired, including one that expires while a slow callback runs, is rejected with `invalid_grant` and is not revived. If the access-token write after the grant write fails, the grant is already rotated and extended, and the client's previous refresh token is still valid to retry with; that retry slides the expiry again.
+
+There is no built-in absolute maximum. A grant with `refreshTokenTTL: undefined` already lives indefinitely, and the callback is the place for lifetime policy: record the authorization time in `props` when the grant is created, and return a shrinking `refreshTokenIdleTTL`, or throw, once the grant is older than you allow.
 
 ## KV cleanup
 
