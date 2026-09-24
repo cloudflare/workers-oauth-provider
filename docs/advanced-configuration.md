@@ -235,7 +235,7 @@ Both classes accept a public `description`, `statusCode`, and response `headers`
 
 A refresh rotates the token. The newly issued token and the immediately previous token can both recover a refresh whose response was lost. Once the new token is used, the previous token is invalidated and another token is issued.
 
-Per-token `accessTokenTTL` and `refreshTokenTTL` overrides are available through `tokenExchangeCallback`.
+Per-token `accessTokenTTL` and `refreshTokenTTL` overrides are available through `tokenExchangeCallback`. Each lifetime a callback returns applies where it belongs and is ignored elsewhere, so one callback can return all of them for every grant type: `refreshTokenTTL` at code exchange (`0` for no refresh token, otherwise at least 60 seconds), `refreshTokenIdleTTL` on refresh. In a callback result `undefined` means not set, never no expiry.
 
 ### Sliding expiry
 

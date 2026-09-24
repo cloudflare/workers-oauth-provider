@@ -6453,7 +6453,7 @@ describe('OAuthProvider', () => {
       expect(grant2.expiresAt).toBe(originalExpiration);
     });
 
-    it('should reject callback attempts to change TTL during refresh', async () => {
+    it("ignores a callback's refreshTokenTTL on refresh: the grant keeps its expiry", async () => {
       // Create provider with callback that tries to change TTL during refresh
       const providerWithBadCallback = new OAuthProvider({
         apiRoute: ['/api/', 'https://example.com/v2/'],
@@ -6502,7 +6502,11 @@ describe('OAuthProvider', () => {
       const tokens = await tokenResponse.json<any>();
       expect(tokens.refresh_token).toBeDefined();
 
-      // Try to refresh - this should return an error
+      const [grantKey] = (await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys.map((key) => key.name);
+      const { expiresAt } = (await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' })) as any;
+
+      // A callback shared between grant types returns refreshTokenTTL on refresh too. Rejecting it would
+      // fail the refresh after the callback's side effects, such as rotating an upstream refresh token.
       const refreshParams = new URLSearchParams();
       refreshParams.append('grant_type', 'refresh_token');
       refreshParams.append('refresh_token', tokens.refresh_token);
@@ -6517,11 +6521,8 @@ describe('OAuthProvider', () => {
       );
 
       const refreshResponse = await providerWithBadCallback.fetch(refreshRequest, mockEnv, mockCtx);
-      expect(refreshResponse.status).toBe(400);
-
-      const error = await refreshResponse.json<any>();
-      expect(error.error).toBe('invalid_request');
-      expect(error.error_description).toBe('refreshTokenTTL cannot be changed during refresh token exchange');
+      expect(refreshResponse.status).toBe(200);
+      expect(((await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' })) as any).expiresAt).toBe(expiresAt);
     });
   });
 
@@ -6766,26 +6767,12 @@ describe('OAuthProvider', () => {
       expect((await readGrant()).expiresAt).toBe(before);
     });
 
-    it('rejects refreshTokenIdleTTL on authorization code exchange', async () => {
-      const provider = makeProvider({
-        tokenExchangeCallback: ({ grantType }) =>
-          grantType === 'authorization_code' ? { refreshTokenIdleTTL: ONE_WEEK } : undefined,
-      });
-      const response = await issueTokens(provider);
-      expect(response.status).toBe(400);
-      expect(await response.json<any>()).toMatchObject({
-        error: 'invalid_request',
-        error_description: 'refreshTokenIdleTTL is only honored during refresh token exchange',
-      });
-    });
-
-    it('rejects refreshTokenIdleTTL on token exchange', async () => {
+    it('lets one callback return both lifetimes for every grant type: each applies where it belongs', async () => {
+      // A proxy's callback returns what its upstream said, whatever the grant type. refreshTokenTTL sets a
+      // new grant's lifetime, refreshTokenIdleTTL a refresh's; neither fails the other grant types.
       const provider = makeProvider({
         allowTokenExchangeGrant: true,
-        tokenExchangeCallback: ({ grantType }) =>
-          grantType === 'urn:ietf:params:oauth:grant-type:token-exchange'
-            ? { refreshTokenIdleTTL: ONE_WEEK }
-            : undefined,
+        tokenExchangeCallback: () => ({ refreshTokenTTL: 2 * ONE_WEEK, refreshTokenIdleTTL: ONE_WEEK }),
       });
       // Registered grant types are enforced, so this client must opt into token exchange.
       const registration = await provider.fetch(
@@ -6803,18 +6790,47 @@ describe('OAuthProvider', () => {
         mockCtx
       );
       ({ client_id: clientId, client_secret: clientSecret } = await registration.json<any>());
-      const tokens = await (await issueTokens(provider)).json<any>();
-      const response = await tokenRequest(provider, {
+
+      const issued = await issueTokens(provider);
+      expect(issued.status).toBe(200);
+      const tokens = await issued.json<any>();
+      expect((await readGrant()).expiresAt).toBeGreaterThanOrEqual(nowSeconds() + 2 * ONE_WEEK - 5);
+
+      const refreshed = await refresh(provider, tokens.refresh_token);
+      expect(refreshed.status).toBe(200);
+      const grantExpiry = (await readGrant()).expiresAt;
+      expect(grantExpiry).toBeLessThanOrEqual(nowSeconds() + ONE_WEEK + 5);
+
+      const exchanged = await tokenRequest(provider, {
         grant_type: 'urn:ietf:params:oauth:grant-type:token-exchange',
-        subject_token: tokens.access_token,
+        subject_token: (await refreshed.json<any>()).access_token,
         subject_token_type: 'urn:ietf:params:oauth:token-type:access_token',
       });
-      expect(response.status).toBe(400);
-      expect(await response.json<any>()).toMatchObject({
-        error: 'invalid_request',
-        error_description: 'refreshTokenIdleTTL is only honored during refresh token exchange',
-      });
+      expect(exchanged.status).toBe(200);
+      expect((await readGrant()).expiresAt).toBe(grantExpiry);
     });
+
+    it('keeps the provider lifetime when the callback returns refreshTokenTTL: undefined', async () => {
+      // `refreshTokenTTL: upstream.refresh_expires_in` against an upstream that omits the field.
+      const provider = makeProvider({ tokenExchangeCallback: () => ({ refreshTokenTTL: undefined }) });
+      expect((await issueTokens(provider)).status).toBe(200);
+      const { expiresAt } = await readGrant();
+      expect(expiresAt).toBeGreaterThanOrEqual(nowSeconds() + 7200 - 5);
+      expect(expiresAt).toBeLessThanOrEqual(nowSeconds() + 7200 + 5);
+    });
+
+    it.each([30, 1.5, -1, Number.NaN, '3600'])(
+      'rejects a callback refreshTokenTTL of %s at code exchange',
+      async (bad) => {
+        const provider = makeProvider({ tokenExchangeCallback: () => ({ refreshTokenTTL: bad as number }) });
+        const response = await issueTokens(provider);
+        expect(response.status).toBe(400);
+        expect(await response.json<any>()).toMatchObject({
+          error: 'invalid_request',
+          error_description: 'refreshTokenTTL must be 0 (no refresh token) or an integer of at least 60 seconds',
+        });
+      }
+    );
 
     it.each([0, 30, 1.5, -1])('rejects a refreshTokenIdleTTL option of %s at construction', (bad) => {
       expect(() => makeProvider({ refreshTokenIdleTTL: bad })).toThrow(
