@@ -15539,8 +15539,10 @@ describe('onError.internal coverage across generic error paths', () => {
     expect(expired.status).toBe(401);
     expect(last()).toEqual({ category: 'protected-resource', reason: 'token_not_found' });
 
-    // A forgery of our format is ours too: never forwarded as an external credential.
+    // A forgery of our format is ours too: never forwarded as an external credential, including
+    // for a user ID that itself contains colons.
     expect((await api(`someone:${'a'.repeat(16)}:${'b'.repeat(32)}`)).status).toBe(401);
+    expect((await api(`tenant:acme:user-7:${'a'.repeat(16)}:${'b'.repeat(32)}`)).status).toBe(401);
     expect(resolver).not.toHaveBeenCalled();
 
     // A genuinely external credential still reaches the resolver.

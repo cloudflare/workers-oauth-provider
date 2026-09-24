@@ -6113,25 +6113,26 @@ function decodeFormUrlEncodedComponent(value: string): string {
 }
 
 /**
+ * Whether a bearer credential has the exact shape of a token this provider issues:
+ * `{userId}:{grantId}:{secret}`, with a 16-character grant ID and a TOKEN_LENGTH secret from
+ * generateRandomString's alphabet. Parsed from the right, because a deployer's user ID may itself
+ * contain `:`. An external credential with exactly this shape would be treated as ours; opaque API
+ * keys, PATs and JWTs don't have it.
+ */
+function isIssuedTokenFormat(token: string): boolean {
+  const parts = token.split(':');
+  if (parts.length < 3) return false;
+  const secret = parts[parts.length - 1];
+  const grantId = parts[parts.length - 2];
+  const userId = parts.slice(0, -2).join(':');
+  return userId.length > 0 && ISSUED_GRANT_ID_PATTERN.test(grantId) && ISSUED_TOKEN_SECRET_PATTERN.test(secret);
+}
+
+/**
  * Generates a cryptographically secure random string
  * @param length - The length of the string to generate
  * @returns A random string of the specified length
  */
-/**
- * Whether a bearer credential has the exact shape of a token this provider issues:
- * `{userId}:{grantId}:{secret}`, with a 16-character grant ID and a TOKEN_LENGTH secret from
- * generateRandomString's alphabet.
- */
-function isIssuedTokenFormat(token: string): boolean {
-  const parts = token.split(':');
-  return (
-    parts.length === 3 &&
-    parts[0].length > 0 &&
-    ISSUED_GRANT_ID_PATTERN.test(parts[1]) &&
-    ISSUED_TOKEN_SECRET_PATTERN.test(parts[2])
-  );
-}
-
 function generateRandomString(length: number): string {
   const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
   let result = '';
