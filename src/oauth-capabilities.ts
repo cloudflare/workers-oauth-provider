@@ -19,8 +19,6 @@ export interface AuthorizationErrorOptions {
   state?: string;
   /** Authorization server issuer for RFC 9207 error responses. */
   issuer?: string;
-  /** The request's `response_type`: `token` (implicit flow) carries errors in the fragment. */
-  responseType?: string;
 }
 
 /**
@@ -36,23 +34,17 @@ export interface AuthorizationErrorOptions {
  * ```
  */
 export function authorizationErrorRedirect(
-  request: { redirectUri: string; state?: string; issuer?: string; responseType?: string },
+  request: { redirectUri: string; state?: string; issuer?: string },
   code: AuthorizationErrorCode,
   description?: string
 ): string {
   const redirect = new URL(request.redirectUri);
   // A registered redirect URI may carry its own query; never let a stale value stand in for ours.
   for (const key of ERROR_RESPONSE_PARAMETERS) redirect.searchParams.delete(key);
-  const params = new URLSearchParams({ error: code });
-  if (description) params.set('error_description', description);
-  if (request.state) params.set('state', request.state);
-  if (request.issuer) params.set('iss', request.issuer);
-  if (request.responseType === 'token') {
-    // RFC 6749 §4.2.2.1: implicit-flow errors travel in the fragment, where those clients read them.
-    redirect.hash = params.toString();
-  } else {
-    for (const [key, value] of params) redirect.searchParams.set(key, value);
-  }
+  redirect.searchParams.set('error', code);
+  if (description) redirect.searchParams.set('error_description', description);
+  if (request.state) redirect.searchParams.set('state', request.state);
+  if (request.issuer) redirect.searchParams.set('iss', request.issuer);
   return redirect.href;
 }
 
@@ -94,7 +86,6 @@ function safeErrorRedirect(code: AuthorizationErrorCode, options: AuthorizationE
         redirectUri: options.redirectUri!,
         state: options.state,
         issuer: options.issuer,
-        responseType: options.responseType,
       },
       code,
       options.description
@@ -109,15 +100,13 @@ export function withAuthorizationRedirect(
   error: AuthorizationError,
   redirectUri: string,
   state: string | undefined,
-  issuer: string,
-  responseType?: string
+  issuer: string
 ): AuthorizationError {
   return new AuthorizationError(error.code, {
     description: error.description,
     redirectUri,
     state,
     issuer,
-    responseType,
   });
 }
 
@@ -148,7 +137,6 @@ export interface ClientMetadataCapabilities {
 }
 
 export function buildOAuthServerCapabilities(options: {
-  allowImplicitFlow: boolean;
   allowPlainPKCE: boolean;
   allowTokenExchangeGrant: boolean;
   enterpriseManagedAuthorization: boolean;
@@ -158,11 +146,10 @@ export function buildOAuthServerCapabilities(options: {
     grantTypes: [
       'authorization_code',
       'refresh_token',
-      ...(options.allowImplicitFlow ? ['implicit'] : []),
       ...(options.allowTokenExchangeGrant ? ['urn:ietf:params:oauth:grant-type:token-exchange'] : []),
       ...(options.enterpriseManagedAuthorization ? ['urn:ietf:params:oauth:grant-type:jwt-bearer'] : []),
     ],
-    responseTypes: options.allowImplicitFlow ? ['code', 'token'] : ['code'],
+    responseTypes: ['code'],
     tokenEndpointAuthMethods: ['client_secret_basic', 'client_secret_post', 'none'],
     codeChallengeMethods: options.allowPlainPKCE ? ['plain', 'S256'] : ['S256'],
     allowPrivateUseRedirectUris: options.allowPrivateUseRedirectUris,
@@ -182,9 +169,6 @@ export function validateClientCapabilities(server: OAuthServerCapabilities, clie
 
   if (client.grantTypes.includes('authorization_code') !== client.responseTypes.includes('code')) {
     throw new Error('grant_types authorization_code and response_types code must be registered together');
-  }
-  if (client.grantTypes.includes('implicit') !== client.responseTypes.includes('token')) {
-    throw new Error('grant_types implicit and response_types token must be registered together');
   }
 }
 

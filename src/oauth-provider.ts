@@ -539,13 +539,6 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
   scopesSupported?: string[];
 
   /**
-   * Controls whether the OAuth implicit flow is allowed.
-   * This flow is discouraged in OAuth 2.1 due to security concerns.
-   * Defaults to false.
-   */
-  allowImplicitFlow?: boolean;
-
-  /**
    * Controls whether the legacy plain PKCE method is allowed.
    * Defaults to false so PKCE challenges use S256 exclusively.
    * Set to true only for compatibility with clients that cannot use S256.
@@ -1971,6 +1964,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         `refreshTokenIdleTTL must be an integer of at least ${KV_MIN_EXPIRATION_TTL_SECONDS} seconds (Cloudflare KV's minimum expiration window).`
       );
     }
+    // Removed in 1.2: OAuth 2.1 dropped the implicit grant and MCP requires the code flow with PKCE.
+    // Say so rather than silently ignoring it, which would look like implicit clients broke at random.
+    if ((this.options as { allowImplicitFlow?: unknown }).allowImplicitFlow) {
+      throw new TypeError(
+        'allowImplicitFlow has been removed: OAuth 2.1 and MCP use the authorization code flow with PKCE.'
+      );
+    }
     // The same KV floor applies to the grant a code exchange writes and to a DCR client record.
     if (this.options.refreshTokenTTL !== undefined && !isValidRefreshTokenTTL(this.options.refreshTokenTTL)) {
       throw new TypeError(
@@ -1987,7 +1987,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     this.serverCapabilities = buildOAuthServerCapabilities({
-      allowImplicitFlow: !!this.options.allowImplicitFlow,
       allowPlainPKCE: this.options.allowPlainPKCE === true,
       allowTokenExchangeGrant: !!this.options.allowTokenExchangeGrant,
       enterpriseManagedAuthorization: !!this.options.enterpriseManagedAuthorization,
@@ -3018,7 +3017,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       registration_endpoint: registrationEndpoint,
       scopes_supported: this.options.scopesSupported,
       response_types_supported: responseTypesSupported,
-      response_modes_supported: this.options.allowImplicitFlow ? ['query', 'fragment'] : ['query'],
+      response_modes_supported: ['query'],
       grant_types_supported: grantTypesSupported,
       // MCP Enterprise-Managed Authorization grant profile (only when EMA is configured).
       ...(authorizationGrantProfilesSupported.length > 0
@@ -6519,7 +6518,7 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
     }
 
     const withRedirect = (error: AuthorizationError): never => {
-      throw withAuthorizationRedirect(error, redirectUri, state || undefined, issuer, responseType);
+      throw withAuthorizationRedirect(error, redirectUri, state || undefined, issuer);
     };
 
     // Resource, response type, and PKCE errors are redirectable only after the
@@ -6574,9 +6573,7 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
   }
 
   /**
-   * Completes an authorization request by creating a grant and either:
-   * - For authorization code flow: generating an authorization code
-   * - For implicit flow: generating an access token directly
+   * Completes an authorization request by creating a grant and an authorization code.
    * @param options - Options specifying the grant details
    * @returns A Promise resolving to an object containing the redirect URL
    * @throws Error when the request's response type is not permitted
@@ -6647,153 +6644,64 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
     // Get current timestamp
     const now = Math.floor(Date.now() / 1000);
 
-    // Check if this is an implicit flow request (response_type=token)
-    if (options.request.responseType === 'token') {
-      // For implicit flow, we skip the authorization code and directly issue an access token
-      const accessTokenSecret = generateRandomString(TOKEN_LENGTH);
-      const accessToken = `${options.userId}:${grantId}:${accessTokenSecret}`;
+    // Standard authorization code flow
+    // Generate an authorization code with embedded user and grant IDs
+    const authCodeSecret = generateRandomString(32);
+    const authCode = `${options.userId}:${grantId}:${authCodeSecret}`;
 
-      // Generate token ID from the full token string
-      const accessTokenId = await generateTokenId(accessToken);
+    // Hash the authorization code
+    const authCodeId = await hashSecret(authCode);
 
-      // Determine token expiration
-      const accessTokenTTL = this.provider.options.accessTokenTTL || DEFAULT_ACCESS_TOKEN_TTL;
-      const accessTokenExpiresAt = now + accessTokenTTL;
+    // Wrap the encryption key with the auth code
+    const authCodeWrappedKey = await wrapKeyWithToken(authCode, encryptionKey);
 
-      // Wrap the encryption key with the access token
-      const accessTokenWrappedKey = await wrapKeyWithToken(accessToken, encryptionKey);
+    // Store the grant with the auth code hash
+    const grant: Grant = {
+      id: grantId,
+      clientId: options.request.clientId,
+      userId: options.userId,
+      scope: options.scope,
+      metadata: options.metadata,
+      encryptedProps: encryptedData,
+      createdAt: now,
+      authCodeId: authCodeId, // Store the auth code hash in the grant
+      authCodeWrappedKey: authCodeWrappedKey, // Store the wrapped key
+      // Store PKCE parameters if provided
+      codeChallenge: options.request.codeChallenge,
+      codeChallengeMethod: options.request.codeChallengeMethod,
+      resource: effectiveResource,
+      redirectUri: options.request.redirectUri,
+    };
 
-      // Resource selection was validated before any grant or token mutation.
-      const audience = effectiveResource;
+    // Store the grant with a key that includes the user ID
+    const grantKey = `grant:${options.userId}:${grantId}`;
 
-      // Store the grant without an auth code (will be referenced by the access token)
-      const grant: Grant = {
-        id: grantId,
-        clientId: options.request.clientId,
-        userId: options.userId,
-        scope: options.scope,
-        metadata: options.metadata,
-        encryptedProps: encryptedData,
-        createdAt: now,
-        resource: effectiveResource,
-        redirectUri: options.request.redirectUri,
-      };
+    // Set 10-minute TTL for the grant (will be extended when code is exchanged)
+    const codeExpiresIn = 600; // 10 minutes
+    await this.env.OAUTH_KV.put(
+      grantKey,
+      JSON.stringify(grant),
+      grantPutOptions(grant, { expirationTtl: codeExpiresIn })
+    );
 
-      // Store the grant with a key that includes the user ID
-      const grantKey = `grant:${options.userId}:${grantId}`;
-      await this.env.OAUTH_KV.put(grantKey, JSON.stringify(grant), grantPutOptions(grant));
-
-      // Store access token with denormalized grant information
-      const accessTokenData: Token = {
-        id: accessTokenId,
-        grantId: grantId,
-        userId: options.userId,
-        createdAt: now,
-        expiresAt: accessTokenExpiresAt,
-        audience: audience,
-        scope: options.scope,
-        wrappedEncryptionKey: accessTokenWrappedKey,
-        grant: {
-          clientId: options.request.clientId,
-          scope: options.scope,
-          encryptedProps: encryptedData,
-        },
-      };
-
-      // Save access token with TTL
-      await this.env.OAUTH_KV.put(
-        `token:${options.userId}:${grantId}:${accessTokenId}`,
-        JSON.stringify(accessTokenData),
-        { expirationTtl: accessTokenTTL }
-      );
-
-      // Build the redirect URL for implicit flow (token in fragment, not query params)
-      const redirectUrl = new URL(options.request.redirectUri);
-      const fragment = new URLSearchParams();
-      fragment.set('access_token', accessToken);
-      fragment.set('token_type', 'bearer');
-      fragment.set('expires_in', accessTokenTTL.toString());
-      fragment.set('scope', options.scope.join(' '));
-      fragment.set('resource', effectiveResource);
-
-      if (options.request.state) {
-        fragment.set('state', options.request.state);
-      }
-      if (options.request.issuer) {
-        fragment.set('iss', options.request.issuer);
-      }
-
-      // Set the fragment (hash) part of the URL
-      redirectUrl.hash = fragment.toString();
-
-      // Revoke old grants AFTER the new grant is successfully stored
-      try {
-        await Promise.allSettled(grantsToRevoke.map((oldGrantId) => this.revokeGrant(oldGrantId, options.userId)));
-      } catch {
-        // Best-effort revocation — new grant is already stored, don't fail the authorization
-      }
-
-      return { redirectTo: redirectUrl.toString() };
-    } else {
-      // Standard authorization code flow
-      // Generate an authorization code with embedded user and grant IDs
-      const authCodeSecret = generateRandomString(32);
-      const authCode = `${options.userId}:${grantId}:${authCodeSecret}`;
-
-      // Hash the authorization code
-      const authCodeId = await hashSecret(authCode);
-
-      // Wrap the encryption key with the auth code
-      const authCodeWrappedKey = await wrapKeyWithToken(authCode, encryptionKey);
-
-      // Store the grant with the auth code hash
-      const grant: Grant = {
-        id: grantId,
-        clientId: options.request.clientId,
-        userId: options.userId,
-        scope: options.scope,
-        metadata: options.metadata,
-        encryptedProps: encryptedData,
-        createdAt: now,
-        authCodeId: authCodeId, // Store the auth code hash in the grant
-        authCodeWrappedKey: authCodeWrappedKey, // Store the wrapped key
-        // Store PKCE parameters if provided
-        codeChallenge: options.request.codeChallenge,
-        codeChallengeMethod: options.request.codeChallengeMethod,
-        resource: effectiveResource,
-        redirectUri: options.request.redirectUri,
-      };
-
-      // Store the grant with a key that includes the user ID
-      const grantKey = `grant:${options.userId}:${grantId}`;
-
-      // Set 10-minute TTL for the grant (will be extended when code is exchanged)
-      const codeExpiresIn = 600; // 10 minutes
-      await this.env.OAUTH_KV.put(
-        grantKey,
-        JSON.stringify(grant),
-        grantPutOptions(grant, { expirationTtl: codeExpiresIn })
-      );
-
-      // Build the redirect URL for authorization code flow
-      const redirectUrl = new URL(options.request.redirectUri);
-      redirectUrl.searchParams.set('code', authCode);
-      if (options.request.state) {
-        redirectUrl.searchParams.set('state', options.request.state);
-      }
-      if (options.request.issuer) {
-        redirectUrl.searchParams.set('iss', options.request.issuer);
-      }
-
-      // Revoke old grants AFTER the new grant is successfully stored
-      try {
-        await Promise.allSettled(grantsToRevoke.map((oldGrantId) => this.revokeGrant(oldGrantId, options.userId)));
-      } catch {
-        // Best-effort revocation — new grant is already stored, don't fail the authorization
-      }
-
-      return { redirectTo: redirectUrl.toString() };
+    // Build the redirect URL for authorization code flow
+    const redirectUrl = new URL(options.request.redirectUri);
+    redirectUrl.searchParams.set('code', authCode);
+    if (options.request.state) {
+      redirectUrl.searchParams.set('state', options.request.state);
     }
+    if (options.request.issuer) {
+      redirectUrl.searchParams.set('iss', options.request.issuer);
+    }
+
+    // Revoke old grants AFTER the new grant is successfully stored
+    try {
+      await Promise.allSettled(grantsToRevoke.map((oldGrantId) => this.revokeGrant(oldGrantId, options.userId)));
+    } catch {
+      // Best-effort revocation — new grant is already stored, don't fail the authorization
+    }
+
+    return { redirectTo: redirectUrl.toString() };
   }
 
   /**

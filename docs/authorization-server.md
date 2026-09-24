@@ -117,7 +117,7 @@ Legacy deployments with clients that cannot use S256 can opt back into plain PKC
 allowPlainPKCE: true;
 ```
 
-`allowImplicitFlow` defaults to `false`; leave it disabled for MCP and other new OAuth deployments.
+The implicit grant (`response_type=token`) is not supported: OAuth 2.1 removed it, and MCP clients use the authorization code flow with PKCE.
 
 The provider owns `tokenEndpoint`. It exchanges authorization codes for tokens, refreshes access tokens, and handles RFC 7009 revocation. Refresh tokens rotate on use. The immediately previous token remains valid until its replacement is first used, allowing a client to retry after losing a refresh response.
 
@@ -186,7 +186,6 @@ The existing `OAuthProvider` combined configuration uses these options:
 | `allowPrivateUseRedirectUris`      | Accept RFC 8252 private-use scheme redirect URIs for native apps            | `false`                                  |
 | `cookiePrefix`                     | Prefix for the consent and upstream helpers' cookies (must be `__Host-…`)   | `__Host-oauth-`                          |
 | `allowPlainPKCE`                   | Permit the legacy plain PKCE method                                         | `false`                                  |
-| `allowImplicitFlow`                | Enable implicit token responses                                             | `false`                                  |
 | `disallowPublicClientRegistration` | Reject public clients at DCR                                                | `false`                                  |
 | `clientRegistrationCallback`       | Apply application policy before storing a DCR client                        | None                                     |
 | `allowTokenExchangeGrant`          | Enable RFC 8693                                                             | `false`                                  |

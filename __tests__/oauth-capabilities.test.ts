@@ -13,7 +13,6 @@ import {
 } from '../src/oauth-capabilities';
 
 const defaults = buildOAuthServerCapabilities({
-  allowImplicitFlow: false,
   allowPlainPKCE: false,
   allowTokenExchangeGrant: false,
   enterpriseManagedAuthorization: false,
@@ -21,7 +20,6 @@ const defaults = buildOAuthServerCapabilities({
 });
 
 const withPlainPkce = buildOAuthServerCapabilities({
-  allowImplicitFlow: false,
   allowPlainPKCE: true,
   allowTokenExchangeGrant: false,
   enterpriseManagedAuthorization: false,
@@ -31,7 +29,6 @@ const withPlainPkce = buildOAuthServerCapabilities({
 describe('OAuth server capabilities', () => {
   it('derives advertised capabilities from enabled provider features', () => {
     const enabled = buildOAuthServerCapabilities({
-      allowImplicitFlow: true,
       allowPlainPKCE: true,
       allowTokenExchangeGrant: true,
       enterpriseManagedAuthorization: true,
@@ -48,11 +45,10 @@ describe('OAuth server capabilities', () => {
     expect(enabled.grantTypes).toEqual([
       'authorization_code',
       'refresh_token',
-      'implicit',
       'urn:ietf:params:oauth:grant-type:token-exchange',
       'urn:ietf:params:oauth:grant-type:jwt-bearer',
     ]);
-    expect(enabled.responseTypes).toEqual(['code', 'token']);
+    expect(enabled.responseTypes).toEqual(['code']);
     expect(enabled.codeChallengeMethods).toEqual(['plain', 'S256']);
   });
 
@@ -125,7 +121,6 @@ describe('OAuth server capabilities', () => {
 
   it('retains JWT bearer when enterprise-managed authorization is enabled', () => {
     const withEnterpriseManagedAuthorization = buildOAuthServerCapabilities({
-      allowImplicitFlow: false,
       allowPlainPKCE: false,
       allowTokenExchangeGrant: false,
       enterpriseManagedAuthorization: true,
