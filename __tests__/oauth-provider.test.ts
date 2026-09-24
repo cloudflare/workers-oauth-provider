@@ -13641,6 +13641,39 @@ describe('OAuthProvider', () => {
       return tokenResponse.json<any>();
     }
 
+    it('deletes the client before its grants, and reads no grant it can match from metadata', async () => {
+      await authorizeAndGetTokens('user-1');
+      // Plenty of other clients' grants, as a real namespace has: matched from key metadata, never read.
+      for (let i = 0; i < 20; i++) {
+        await mockEnv.OAUTH_KV.put(`grant:other-${i}:othergrant${String(i).padStart(6, '0')}`, '{}', {
+          metadata: { clientId: 'other-client' },
+        });
+      }
+      const reads: string[] = [];
+      const get = mockEnv.OAUTH_KV.get.bind(mockEnv.OAUTH_KV);
+      mockEnv.OAUTH_KV.get = ((key: string, options?: any) => {
+        reads.push(key);
+        return get(key, options);
+      }) as typeof mockEnv.OAUTH_KV.get;
+
+      // Revocation fails partway (a subrequest limit, say): the client must already be gone.
+      const del = mockEnv.OAUTH_KV.delete.bind(mockEnv.OAUTH_KV);
+      mockEnv.OAUTH_KV.delete = (async (key: string) => {
+        if (key.startsWith('token:')) throw new Error('Too many subrequests');
+        return del(key);
+      }) as typeof mockEnv.OAUTH_KV.delete;
+      await expect(mockEnv.OAUTH_PROVIDER!.deleteClient(clientId)).rejects.toThrow('Too many subrequests');
+      expect(await get(`client:${clientId}`)).toBeNull();
+      expect(reads.filter((key) => key.startsWith('grant:other-'))).toEqual([]);
+
+      // Calling it again finishes the job.
+      mockEnv.OAUTH_KV.delete = del as typeof mockEnv.OAUTH_KV.delete;
+      await mockEnv.OAUTH_PROVIDER!.deleteClient(clientId);
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'grant:user-1:' })).keys).toHaveLength(0);
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'token:user-1:' })).keys).toHaveLength(0);
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'grant:other-' })).keys).toHaveLength(20);
+    });
+
     it('should delete all grants and tokens when a client is deleted', async () => {
       // Create grants for two different users
       const tokens1 = await authorizeAndGetTokens('user-1');

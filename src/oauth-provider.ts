@@ -6030,6 +6030,14 @@ function grantPutOptions(grant: Grant, expiry: KVNamespacePutOptions = {}): KVNa
 }
 
 /** Whether a listed key carries metadata this version can match a grant on. */
+/** Splits `grant:{userId}:{grantId}`. Grant IDs never contain `:`, so the last one separates them. */
+function parseGrantKey(name: string): { userId: string; grantId: string } | undefined {
+  const rest = name.slice('grant:'.length);
+  const separator = rest.lastIndexOf(':');
+  if (!name.startsWith('grant:') || separator <= 0 || separator === rest.length - 1) return undefined;
+  return { userId: rest.slice(0, separator), grantId: rest.slice(separator + 1) };
+}
+
 function isGrantKeyMetadata(value: unknown): value is GrantKeyMetadata {
   if (typeof value !== 'object' || value === null) return false;
   const { clientId, resource, redirectUri } = value as Record<string, unknown>;
@@ -6812,30 +6820,42 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
     matches: (grant: GrantKeyMetadata) => boolean,
     readConcurrency: number
   ): Promise<string[]> {
-    const prefix = `grant:${userId}:`;
-    const found: string[] = [];
+    const grants = await this.findGrants(userId, matches, readConcurrency);
+    return grants.map((grant) => grant.grantId);
+  }
+
+  /**
+   * Finds grants matching `matches`, for one user or, with `userId` undefined, for every user.
+   * Metadata-carrying keys are matched without a read; legacy grants are read,
+   * `readConcurrency` at a time.
+   */
+  private async findGrants(
+    userId: string | undefined,
+    matches: (grant: GrantKeyMetadata) => boolean,
+    readConcurrency: number
+  ): Promise<Array<{ userId: string; grantId: string }>> {
+    const prefix = userId === undefined ? 'grant:' : `grant:${userId}:`;
+    const found: Array<{ userId: string; grantId: string }> = [];
     let cursor: string | undefined;
     do {
       const page = await this.env.OAUTH_KV.list<unknown>({ prefix, limit: MAX_KV_LIST_LIMIT, cursor });
-      const toRead: string[] = [];
+      const toRead: Array<{ name: string; userId: string; grantId: string }> = [];
       for (const key of page.keys) {
+        const owner = parseGrantKey(key.name);
         // `grant:a:` also matches a legacy `grant:a:b:{grantId}` belonging to user `a:b`.
-        if (key.name.slice(prefix.length).includes(':')) continue;
+        if (!owner || (userId !== undefined && owner.userId !== userId)) continue;
         if (isGrantKeyMetadata(key.metadata)) {
-          if (matches(key.metadata)) found.push(key.name.slice(prefix.length));
+          if (matches(key.metadata)) found.push(owner);
         } else {
-          toRead.push(key.name);
+          toRead.push({ name: key.name, ...owner });
         }
       }
       for (let start = 0; start < toRead.length; start += readConcurrency) {
-        const grants = await Promise.all(
-          toRead
-            .slice(start, start + readConcurrency)
-            .map((name) => this.env.OAUTH_KV.get<Grant>(name, { type: 'json' }))
-        );
-        for (const grant of grants) {
-          if (grant && matches(grant)) found.push(grant.id);
-        }
+        const batch = toRead.slice(start, start + readConcurrency);
+        const grants = await Promise.all(batch.map(({ name }) => this.env.OAUTH_KV.get<Grant>(name, { type: 'json' })));
+        grants.forEach((grant, index) => {
+          if (grant && matches(grant)) found.push({ userId: batch[index].userId, grantId: batch[index].grantId });
+        });
       }
       cursor = page.list_complete ? undefined : page.cursor;
     } while (cursor);
@@ -7024,36 +7044,19 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
    * @returns A Promise resolving when the deletion is confirmed.
    */
   async deleteClient(clientId: string): Promise<void> {
-    // Revoke all grants associated with this client across all users.
-    // Grants are keyed as grant:{userId}:{grantId}, so we scan all grants
-    // and check the clientId stored in each one.
-    let cursor: string | undefined;
-    let allProcessed = false;
-
-    while (!allProcessed) {
-      const listOptions: { prefix: string; cursor?: string } = { prefix: 'grant:' };
-      if (cursor) {
-        listOptions.cursor = cursor;
-      }
-
-      const result = await this.env.OAUTH_KV.list(listOptions);
-
-      for (const key of result.keys) {
-        const grantData: Grant | null = await this.env.OAUTH_KV.get(key.name, { type: 'json' });
-        if (grantData && grantData.clientId === clientId) {
-          await this.revokeGrant(grantData.id, grantData.userId);
-        }
-      }
-
-      if (result.list_complete) {
-        allProcessed = true;
-      } else {
-        cursor = result.cursor;
-      }
-    }
-
-    // Delete the client record
+    // The client goes first: from here on it can't authenticate, authorize or refresh, even if
+    // revoking its grants below fails partway. Calling deleteClient again finishes the job.
     await this.env.OAUTH_KV.delete(`client:${clientId}`);
+
+    // Then its grants across all users, matched from key metadata; only legacy grants are read.
+    const grants = await this.findGrants(
+      undefined,
+      (grant) => grant.clientId === clientId,
+      DEFAULT_REVOKE_EXISTING_GRANTS_BATCH_SIZE
+    );
+    for (const { userId, grantId } of grants) {
+      await this.revokeGrant(grantId, userId);
+    }
   }
 
   /**
