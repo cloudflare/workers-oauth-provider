@@ -94,23 +94,18 @@ export class MockKV {
     cursor?: string;
   }> {
     const { prefix, limit = 1000 } = options;
-    const allKeys: string[] = [];
 
-    // Collect all matching, non-expired keys
-    for (const key of this.storage.keys()) {
-      if (key.startsWith(prefix)) {
+    // Like Cloudflare KV: matching, non-expired keys in lexicographic order, and a cursor that
+    // continues after the last key returned, so keys deleted in between don't shift the next page.
+    const allKeys = [...this.storage.keys()]
+      .filter((key) => {
         const item = this.storage.get(key);
-        if (item && (!item.expiration || item.expiration >= this.now())) {
-          allKeys.push(key);
-        }
-      }
-    }
-
-    // Handle cursor-based pagination: cursor is the index to start from
-    const startIndex = options.cursor ? parseInt(options.cursor, 10) : 0;
-    const pageKeys = allKeys.slice(startIndex, startIndex + limit);
-    const nextIndex = startIndex + pageKeys.length;
-    const listComplete = nextIndex >= allKeys.length;
+        return key.startsWith(prefix) && item && (!item.expiration || item.expiration >= this.now());
+      })
+      .sort();
+    const pageKeys = allKeys.filter((key) => options.cursor === undefined || key > options.cursor).slice(0, limit);
+    const lastKey = pageKeys[pageKeys.length - 1];
+    const listComplete = lastKey === undefined || lastKey === allKeys[allKeys.length - 1];
 
     return {
       keys: pageKeys.map((name) => {
@@ -118,7 +113,7 @@ export class MockKV {
         return metadata === undefined ? { name } : { name, metadata };
       }),
       list_complete: listComplete,
-      cursor: listComplete ? undefined : String(nextIndex),
+      cursor: listComplete ? undefined : lastKey,
     };
   }
 

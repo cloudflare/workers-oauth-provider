@@ -13978,8 +13978,9 @@ describe('OAuthProvider', () => {
       expect(result1.grantsPurged).toBe(3);
       expect(result1.done).toBe(false);
 
-      // Second batch: purge remaining 2
-      const result2 = await mockEnv.OAUTH_PROVIDER!.purgeExpiredData({ batchSize: 3 });
+      // Second batch, resumed after the three it deleted: KV cursors continue after a key, so the
+      // deletions don't shift the remaining two out of reach.
+      const result2 = await mockEnv.OAUTH_PROVIDER!.purgeExpiredData({ batchSize: 3, cursor: result1.cursor });
       expect(result2.grantsPurged).toBe(2);
       expect(result2.done).toBe(true);
 
@@ -15970,19 +15971,20 @@ describe('user IDs cannot contain ":"', () => {
     expect((await env.OAUTH_KV.list({ prefix: 'grant:' })).keys).toHaveLength(0);
   });
 
-  it("keeps a legacy grant for user a:b out of user a's list and revocation", async () => {
+  it("keeps another user's legacy grant out of user a's list and revocation", async () => {
     const oauth = await helpers();
     const client = await oauth.createClient({
       redirectUris: ['https://client.example/cb'],
       tokenEndpointAuthMethod: 'none',
     });
-    // A grant stored before this rule, for user `a:b`, whose key `grant:a:b:…` starts with `grant:a:`.
+    // A grant stored before this rule, for user `a:!`, whose key starts with `grant:a:` and, since `!`
+    // sorts before every grant ID character, is listed ahead of a's own grants.
     await env.OAUTH_KV.put(
-      'grant:a:b:legacygrant00001',
+      'grant:a:!:legacygrant00001',
       JSON.stringify({
         id: 'legacygrant00001',
         clientId: client.clientId,
-        userId: 'a:b',
+        userId: 'a:!',
         scope: [],
         metadata: { label: 'someone else' },
         createdAt: 1,
@@ -15991,7 +15993,7 @@ describe('user IDs cannot contain ":"', () => {
     );
     expect((await oauth.listUserGrants('a')).items).toEqual([]);
 
-    // Completing an authorization for `a` revokes a's earlier grants for the client, not a:b's.
+    // Completing an authorization for `a` revokes a's earlier grants for the client, not a:!'s.
     const request = await oauth.parseAuthRequest(
       new Request(
         `https://example.com/authorize?response_type=code&client_id=${client.clientId}` +
@@ -16000,7 +16002,7 @@ describe('user IDs cannot contain ":"', () => {
       )
     );
     await oauth.completeAuthorization({ request, userId: 'a', metadata: {}, scope: [], props: {} });
-    expect(await env.OAUTH_KV.get('grant:a:b:legacygrant00001')).not.toBeNull();
+    expect(await env.OAUTH_KV.get('grant:a:!:legacygrant00001')).not.toBeNull();
     expect((await oauth.listUserGrants('a')).items).toHaveLength(1);
 
     // A page the legacy key fills entirely doesn't end the listing early: a's grant still comes back.
