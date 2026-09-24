@@ -91,7 +91,7 @@ Completing a new authorization replaces the user and client's earlier grant _for
 None of these require changes to a migrated 0.x deployment:
 
 - **Role classes** — `OAuthAuthorizationServer` (one AS, many resources) and `OAuthResourceServer` (host a resource in the AS Worker or its own, validating over a Service Binding). See [resource-servers.md](resource-servers.md).
-- **`ctx.auth` and `insufficientScope()`** — handlers see the verified token facts beside `ctx.props` and answer scope shortfalls with the MCP `403` challenge. See the README's scopes section.
+- **`ctx.auth` and `insufficientScope()`** — handlers see the verified token facts beside `ctx.props` and answer scope shortfalls with the MCP `403` challenge. See [Scopes and step-up authorization](authorization-server.md#scopes-and-step-up-authorization).
 - **`onError.internal`** — every library error carries a stable `{ category, reason }` for logs and alerting; the wire stays generic.
 - **`refreshTokenIdleTTL`** — opt-in sliding refresh-token expiry.
 - Dynamically registered clients in active use renew automatically; grant listing and revocation are KV-bounded.

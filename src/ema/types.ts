@@ -268,7 +268,7 @@ export interface EmaOptions<Env = Cloudflare.Env> {
    * Set to `true` to also accept public clients on this grant — for example
    * clients registered via a Client ID Metadata Document (CIMD), which are
    * always public (`none`) and therefore cannot present a client secret. The
-   * security trade-off is documented in the README: the trust then rests on
+   * security trade-off is documented in docs/advanced-configuration.md: the trust then rests on
    * the IdP-issued, signature-verified, short-lived, single-use ID-JAG
    * assertion (audience- and client-bound), together with the provider's
    * configured resource pinning, rather than on a separately presented client
