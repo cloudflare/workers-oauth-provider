@@ -263,13 +263,16 @@ export default {
     return provider.fetch(request, env, ctx);
   },
   async scheduled(_event, env) {
-    const result = await provider.purgeExpiredData(env, { batchSize: 100 });
-    console.log(result);
+    // Each run checks up to batchSize grants, then tokens, and returns where it stopped.
+    const cursor = (await env.OAUTH_KV.get('purge-cursor')) ?? undefined;
+    const result = await provider.purgeExpiredData(env, { batchSize: 100, cursor });
+    if (result.cursor) await env.OAUTH_KV.put('purge-cursor', result.cursor);
+    else await env.OAUTH_KV.delete('purge-cursor'); // done: the next run starts a new sweep
   },
 };
 ```
 
-The default batch size is 50. `result.done` reports whether both key spaces were scanned completely during that invocation.
+The default batch size is 50. Pass each result's `cursor` to the next invocation: without it, every run starts again from the first `batchSize` grants and never reaches the rest. `result.done` is true, with no `cursor`, once the sweep has covered both key spaces.
 
 Deleting a client through `OAuthHelpers.deleteClient()` also revokes its grants and associated tokens across users.
 

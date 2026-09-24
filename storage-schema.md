@@ -312,4 +312,4 @@ The browser holds a matching `__Host-` binding cookie per transaction, named `{p
 - Monitor KV usage metrics to ensure you stay within Cloudflare's limits for your plan.
 - The design uses KV's `list()` capability with key prefixes to efficiently query related data like all grants for a user, eliminating the need for separate list indexes.
 - When a grant is revoked via `revokeGrant()`, associated tokens are immediately deleted. When a client is deleted via `deleteClient()`, all grants and tokens for that client are also deleted.
-- The `purgeExpiredData()` method provides defense-in-depth garbage collection for orphaned grants and tokens. It is designed to be called from a scheduled handler (Cron Trigger).
+- The `purgeExpiredData()` method provides defense-in-depth garbage collection for orphaned grants and tokens. It is designed to be called from a scheduled handler (Cron Trigger); the caller persists the returned `cursor` between runs, for example under a key such as `purge-cursor`, which none of the provider's prefixes use.

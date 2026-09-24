@@ -13987,6 +13987,50 @@ describe('OAuthProvider', () => {
       expect(grantsAfter.keys.length).toBe(0);
     });
 
+    it('resumes from the cursor, so live grants ahead of an orphan never stall the sweep', async () => {
+      await initHelpers();
+      const live = await registerClient();
+      for (let i = 0; i < 5; i++) await authorizeClient(live.clientId, live.clientSecret, `live-${i}`);
+      const doomed = await registerClient();
+      await authorizeClient(doomed.clientId, doomed.clientSecret, 'orphan-user');
+      await mockEnv.OAUTH_KV.delete(`client:${doomed.clientId}`);
+      const now = Math.floor(Date.now() / 1000);
+      await mockEnv.OAUTH_KV.put(
+        'token:ghost-user:ghost-grant:ghost-token',
+        JSON.stringify({
+          id: 'ghost-token',
+          grantId: 'ghost-grant',
+          userId: 'ghost-user',
+          createdAt: now,
+          expiresAt: now + 3600,
+          wrappedEncryptionKey: 'key',
+          scope: [],
+          grant: { clientId: 'gone', scope: [], encryptedProps: 'data' },
+        })
+      );
+
+      // Without a cursor every run re-checked the same first three grants and never reached the rest.
+      let cursor: string | undefined;
+      const runs = [];
+      do {
+        const result = await mockEnv.OAUTH_PROVIDER!.purgeExpiredData({ batchSize: 3, cursor });
+        runs.push(result);
+        cursor = result.cursor;
+        expect(result.done).toBe(cursor === undefined);
+      } while (cursor !== undefined && runs.length < 10);
+
+      expect(runs[runs.length - 1].done).toBe(true);
+      expect(runs.reduce((sum, run) => sum + run.grantsPurged, 0)).toBe(1);
+      expect(runs.reduce((sum, run) => sum + run.tokensPurged, 0)).toBeGreaterThanOrEqual(1);
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'grant:orphan-user:' })).keys).toHaveLength(0);
+      expect(await mockEnv.OAUTH_KV.get('token:ghost-user:ghost-grant:ghost-token')).toBeNull();
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'grant:live-' })).keys).toHaveLength(5);
+
+      await expect(mockEnv.OAUTH_PROVIDER!.purgeExpiredData({ cursor: 'somewhere' })).rejects.toThrow(
+        'Invalid purgeExpiredData cursor'
+      );
+    });
+
     it('should purge orphaned tokens whose grant no longer exists', async () => {
       await initHelpers();
 
