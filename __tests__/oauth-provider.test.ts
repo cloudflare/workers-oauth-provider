@@ -2361,8 +2361,7 @@ describe('OAuthProvider', () => {
         'https://client.example.com:8080/callback',
         'http://localhost:3000/callback',
         'http://127.0.0.1:8080/callback',
-        'myapp://callback',
-        'com.example.app://oauth/callback',
+        'http://[::1]:8080/callback',
       ];
 
       legitimateUris.forEach((uri) => {
@@ -15599,5 +15598,103 @@ describe('onError.internal coverage across generic error paths', () => {
       ctx
     );
     expect(last()).toEqual({ category: 'upstream-idp', reason: 'refresh_rejected' });
+  });
+});
+
+describe('redirect URI policy: https, or http on a loopback host', () => {
+  let env: ReturnType<typeof createMockEnv>;
+  let ctx: MockExecutionContext;
+  beforeEach(() => {
+    env = createMockEnv();
+    ctx = new MockExecutionContext();
+  });
+  afterEach(() => env.OAUTH_KV.clear());
+
+  function createProvider(overrides: Record<string, unknown> = {}) {
+    return new OAuthProvider({
+      apiRoute: ['/api/'],
+      apiHandler: TestApiHandler,
+      defaultHandler: testDefaultHandler,
+      authorizeEndpoint: '/authorize',
+      tokenEndpoint: '/oauth/token',
+      clientRegistrationEndpoint: '/oauth/register',
+      ...overrides,
+    });
+  }
+  const register = (provider: ReturnType<typeof createProvider>, redirectUri: string) =>
+    provider.fetch(
+      createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify({ redirect_uris: [redirectUri], client_name: 'c', token_endpoint_auth_method: 'none' })
+      ),
+      env,
+      ctx
+    );
+  const helpers = async (provider: ReturnType<typeof createProvider>) => {
+    await provider.fetch(createMockRequest('https://example.com/'), env, ctx);
+    return env.OAUTH_PROVIDER!;
+  };
+
+  it.each([
+    ['remote http', 'http://client.example.com/callback'],
+    ['a private-use scheme', 'myapp://callback'],
+    ['a reverse-domain private-use scheme', 'com.example.app:/oauth/callback'],
+    ['userinfo', 'https://user@client.example.com/callback'],
+    ['a fragment', 'https://client.example.com/callback#frag'],
+  ])('refuses %s at registration, createClient and updateClient', async (_label, redirectUri) => {
+    const provider = createProvider();
+    const response = await register(provider, redirectUri);
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({ error: 'invalid_client_metadata' });
+
+    const oauth = await helpers(provider);
+    await expect(
+      oauth.createClient({ redirectUris: [redirectUri], tokenEndpointAuthMethod: 'none' })
+    ).rejects.toThrow();
+    const client = await oauth.createClient({
+      redirectUris: ['https://client.example.com/callback'],
+      tokenEndpointAuthMethod: 'none',
+    });
+    // updateClient validated nothing before this policy.
+    await expect(oauth.updateClient(client.clientId, { redirectUris: [redirectUri] })).rejects.toThrow();
+    expect((await oauth.lookupClient(client.clientId))!.redirectUris).toEqual(['https://client.example.com/callback']);
+  });
+
+  it('holds clients registered before the policy to it at authorization', async () => {
+    const provider = createProvider();
+    // A 0.x-era client record with a remote http redirect, written straight to storage.
+    await env.OAUTH_KV.put(
+      'client:legacy',
+      JSON.stringify({
+        clientId: 'legacy',
+        redirectUris: ['http://client.example.com/callback'],
+        tokenEndpointAuthMethod: 'none',
+        grantTypes: ['authorization_code', 'refresh_token'],
+        responseTypes: ['code'],
+      })
+    );
+    const oauth = await helpers(provider);
+    const error = await oauth
+      .parseAuthRequest(
+        new Request(
+          'https://example.com/authorize?response_type=code&client_id=legacy' +
+            `&redirect_uri=${encodeURIComponent('http://client.example.com/callback')}` +
+            '&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256'
+        )
+      )
+      .catch((thrown: unknown) => thrown);
+    // Rendered locally: never redirect to a URI the policy rejects.
+    expect(error).toMatchObject({ name: 'AuthorizationError', code: 'invalid_request', redirectUri: undefined });
+  });
+
+  it('accepts private-use schemes for native apps only with allowPrivateUseRedirectUris, never remote http', async () => {
+    const provider = createProvider({ allowPrivateUseRedirectUris: true });
+    for (const redirectUri of ['myapp://callback', 'com.example.app:/oauth/callback']) {
+      expect((await register(provider, redirectUri)).status).toBe(201);
+    }
+    expect((await register(provider, 'http://client.example.com/callback')).status).toBe(400);
+    expect((await register(provider, 'javascript:alert(1)')).status).toBe(400);
   });
 });

@@ -1,3 +1,4 @@
+import { isLoopbackHostname } from './oauth-resource';
 import {
   negotiateCimdClientCapabilities,
   negotiateDynamicClientRegistrationCapabilities,
@@ -215,7 +216,7 @@ function pickDisplayMetadata(metadata: ParsedOAuthClientMetadata): OAuthClientDi
  * Validates that a redirect URI has a scheme and does not use a dangerous
  * pseudo-scheme or contain control characters.
  */
-export function validateRedirectUriScheme(redirectUri: string): void {
+export function validateRedirectUri(redirectUri: string, server: OAuthServerCapabilities): void {
   const dangerousSchemes = ['javascript:', 'data:', 'vbscript:', 'file:', 'mailto:', 'blob:'];
   const normalized = redirectUri.trim();
 
@@ -231,13 +232,33 @@ export function validateRedirectUriScheme(redirectUri: string): void {
 
   const scheme = normalized.slice(0, colonIndex + 1).toLowerCase();
   if (dangerousSchemes.includes(scheme)) throw new Error('Invalid redirect URI');
+
+  let url: URL;
+  try {
+    url = new URL(normalized);
+  } catch {
+    throw new Error('Invalid redirect URI');
+  }
+  // RFC 6749 §3.1.2: no fragment. Userinfo only disguises where the code goes.
+  if (url.hash || url.username || url.password) throw new Error('Invalid redirect URI');
+
+  // MCP and OAuth 2.1: https, or http only on a loopback host (RFC 8252 §7.3). Remote http is never
+  // acceptable; private-use schemes (RFC 8252 §7.1) only when the server opts in for native apps.
+  if (url.protocol === 'https:') return;
+  if (url.protocol === 'http:') {
+    if (isLoopbackHostname(url.hostname)) return;
+    throw new Error('Redirect URI must use https, or http on a loopback host');
+  }
+  if (!server.allowPrivateUseRedirectUris) {
+    throw new Error('Redirect URI must use https, or http on a loopback host');
+  }
 }
 
-function requireValidRedirectUris(redirectUris: string[] | undefined): string[] {
+function requireValidRedirectUris(redirectUris: string[] | undefined, server: OAuthServerCapabilities): string[] {
   if (!redirectUris || redirectUris.length === 0) {
     throw new Error('redirect_uris is required and must not be empty');
   }
-  for (const redirectUri of redirectUris) validateRedirectUriScheme(redirectUri);
+  for (const redirectUri of redirectUris) validateRedirectUri(redirectUri, server);
   return redirectUris;
 }
 
@@ -260,7 +281,7 @@ export function resolveDynamicClientRegistrationMetadata(
 
   return {
     ...pickDisplayMetadata(metadata),
-    redirectUris: requireValidRedirectUris(metadata.redirectUris),
+    redirectUris: requireValidRedirectUris(metadata.redirectUris, server),
     ...capabilities,
     authMethodExplicit:
       metadata.tokenEndpointAuthMethod !== undefined || metadata.tokenEndpointAuthMethodsSupported !== undefined,
@@ -355,7 +376,7 @@ function resolveClientIdMetadataDocument(
     throw new Error(`client_id "${metadata.clientId}" does not match metadata URL "${metadataUrl}"`);
   }
   if (!metadata.clientName?.trim()) throw new Error('client_name is required and must not be empty');
-  const redirectUris = requireValidRedirectUris(metadata.redirectUris);
+  const redirectUris = requireValidRedirectUris(metadata.redirectUris, server);
 
   if ('client_secret' in raw || 'client_secret_expires_at' in raw) {
     throw new Error('CIMD documents must not contain client secrets');

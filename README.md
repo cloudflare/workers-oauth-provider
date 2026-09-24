@@ -333,7 +333,7 @@ CIMD validation follows [draft-ietf-oauth-client-id-metadata-document-00](https:
 
 - An HTTPS Client Identifier URL with a path component and no userinfo, fragment, or dot path segments.
 - A document `client_id` exactly matching its URL.
-- Non-empty `client_name` and `redirect_uris` fields, as MCP requires, with unsafe redirect schemes rejected at ingestion.
+- Non-empty `client_name` and `redirect_uris` fields, as MCP requires. Redirect URIs must use `https`, or `http` on a loopback host (`localhost`, `127.0.0.0/8`, `::1`), with no userinfo or fragment. The same rule applies to CIMD documents, `createClient()`, `updateClient()`, and every authorization request, so older clients are held to it too. Native apps using RFC 8252 private-use schemes (`com.example.app:/cb`) need `allowPrivateUseRedirectUris: true`; remote `http` is never accepted.
 - Exact authorization-request redirect URI validation, with RFC 8252 loopback port handling.
 - A 5 KB response size limit and a 10 second timeout covering both headers and body.
 - Valid UTF-8 JSON object syntax and safe URI schemes for client metadata fields.
@@ -480,6 +480,7 @@ The existing `OAuthProvider` combined configuration uses these options:
 | `scopesSupported`                  | Publish authorization server scopes                                         | Omitted                                  |
 | `resourceMetadata.resource`        | Canonical HTTPS resource and token audience                                 | Required                                 |
 | `clientIdMetadataDocumentEnabled`  | Enable CIMD lookup and advertisement                                        | `false`                                  |
+| `allowPrivateUseRedirectUris`      | Accept RFC 8252 private-use scheme redirect URIs for native apps            | `false`                                  |
 | `cookiePrefix`                     | Prefix for the consent and upstream helpers' cookies (must be `__Host-…`)   | `__Host-oauth-`                          |
 | `allowPlainPKCE`                   | Permit the legacy plain PKCE method                                         | `false`                                  |
 | `allowImplicitFlow`                | Enable implicit token responses                                             | `false`                                  |

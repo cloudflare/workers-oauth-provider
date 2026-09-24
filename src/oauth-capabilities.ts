@@ -66,6 +66,8 @@ export interface OAuthServerCapabilities {
   readonly responseTypes: readonly string[];
   readonly tokenEndpointAuthMethods: readonly string[];
   readonly codeChallengeMethods: readonly PkceCodeChallengeMethod[];
+  /** Accept RFC 8252 private-use URI scheme redirects (native apps), beyond https and loopback http. */
+  readonly allowPrivateUseRedirectUris: boolean;
 }
 
 export interface ClientCapabilities {
@@ -87,6 +89,7 @@ export function buildOAuthServerCapabilities(options: {
   allowPlainPKCE: boolean;
   allowTokenExchangeGrant: boolean;
   enterpriseManagedAuthorization: boolean;
+  allowPrivateUseRedirectUris: boolean;
 }): OAuthServerCapabilities {
   return {
     grantTypes: [
@@ -99,6 +102,7 @@ export function buildOAuthServerCapabilities(options: {
     responseTypes: options.allowImplicitFlow ? ['code', 'token'] : ['code'],
     tokenEndpointAuthMethods: ['client_secret_basic', 'client_secret_post', 'none'],
     codeChallengeMethods: options.allowPlainPKCE ? ['plain', 'S256'] : ['S256'],
+    allowPrivateUseRedirectUris: options.allowPrivateUseRedirectUris,
   };
 }
 
