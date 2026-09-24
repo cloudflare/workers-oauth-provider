@@ -7,7 +7,10 @@
  * Adds CORS headers for a browser client. The request's `Origin` is reflected: bearer tokens are
  * not ambient credentials, so any origin may present one it holds. Browser OAuth and MCP clients
  * need `WWW-Authenticate` (discovery, step-up) and `Retry-After` (backoff) exposed. Headers the
- * response already carries are kept, so an API handler can narrow its own CORS policy.
+ * response already carries are kept, so an API handler can narrow who may read its responses.
+ * Preflights (`OPTIONS`) are answered by the hosts before any handler runs and stay permissive, so
+ * an MCP client's preflight always succeeds; the browser enforces the handler's policy on the actual
+ * response, and sending the request carries no ambient credential to abuse.
  */
 export function withCorsHeaders(response: Response, request: Request): Response {
   const origin = request.headers.get('Origin');
