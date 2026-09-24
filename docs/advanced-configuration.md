@@ -6,6 +6,8 @@ This guide covers features that are useful for proxying another authorization sy
 
 `tokenExchangeCallback` runs during authorization code and refresh token exchanges. It is useful when the Worker also acts as an OAuth client to an upstream service.
 
+The callback receives the request's `env`, so it can reach secrets and bindings (an upstream client secret, say) while the provider itself is built once at module scope.
+
 ```ts
 new OAuthProvider({
   // Other options...
@@ -26,7 +28,7 @@ new OAuthProvider({
     }
 
     if (options.grantType === 'refresh_token') {
-      const upstream = await refreshUpstream(options.props.upstreamRefreshToken);
+      const upstream = await refreshUpstream(options.props.upstreamRefreshToken, options.env.UPSTREAM_CLIENT_SECRET);
       return {
         accessTokenProps: {
           ...options.props,
