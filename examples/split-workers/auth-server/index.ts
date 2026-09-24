@@ -30,16 +30,9 @@ async function authorize(request: Request, env: Env): Promise<Response> {
     oauthRequest = await oauth.parseAuthRequest(request);
   } catch (error) {
     if (!(error instanceof AuthorizationError)) throw error;
-    if (!error.redirectUri) {
-      // Unknown clients and invalid redirects must be rendered locally.
-      return new Response(error.description, { status: 400 });
-    }
-    const redirect = new URL(error.redirectUri);
-    redirect.searchParams.set('error', error.code);
-    redirect.searchParams.set('error_description', error.description);
-    if (error.state) redirect.searchParams.set('state', error.state);
-    if (error.issuer) redirect.searchParams.set('iss', error.issuer);
-    return Response.redirect(redirect.href, 302);
+    // redirectTo is set only once the client and redirect URI are validated; otherwise render locally.
+    if (error.redirectTo) return Response.redirect(error.redirectTo, 302);
+    return new Response(error.description, { status: 400 });
   }
 
   const client = await oauth.lookupClient(oauthRequest.clientId);
