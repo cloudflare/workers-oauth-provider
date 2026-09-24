@@ -190,7 +190,7 @@ Return a `Response` to replace the default response. Return nothing to use the p
 
 ### The internal reason
 
-Every error the library originates carries `internal: { category, reason, detail? }` — the exact check that failed, which the wire response deliberately does not reveal (RFC 6749 §5.2). It exists only on the path to `onError` and is never sent to the client, so `error_description` can stay generic while logs and alerting key on stable slugs instead of matching text:
+Every OAuth error response the library builds — everything `onError` observes — carries `internal: { category, reason, detail? }`: the exact check that failed, which the wire response deliberately does not reveal (RFC 6749 §5.2). Bare non-OAuth responses (the credential-less `401` challenge, `404`/`405` on metadata URLs) carry no OAuth error and do not run `onError`. It exists only on the path to `onError` and is never sent to the client, so `error_description` can stay generic while logs and alerting key on stable slugs instead of matching text:
 
 ```ts
 onError({ code, internal }) {

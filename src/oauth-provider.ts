@@ -3881,7 +3881,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // impersonation is policy, never the default).
     const crossClientExchange = grantData.clientId !== clientInfo.clientId;
     const crossClientRejection = () =>
-      new OAuthError('invalid_request', { description: 'The subject token was issued to a different client' });
+      new OAuthError('invalid_request', {
+        description: 'The subject token was issued to a different client',
+        internal: { category: 'token-exchange-grant', reason: 'cross_client_subject_token' },
+      });
     if (crossClientExchange && !this.options.tokenExchangeCallback) {
       throw crossClientRejection();
     }

@@ -15435,15 +15435,6 @@ describe('onError.internal coverage across generic error paths', () => {
     await redeem(`grant_type=refresh_token&refresh_token=${userId}:${grantId}:wrong&${credentials}`);
     expect(last()).toEqual({ category: 'refresh-token-grant', reason: 'refresh_token_mismatch' });
 
-    // Replaying the consumed code is tagged, answered generically, and revokes the grant
-    // (OAuth 2.1 code-replay defense) — so this row runs after the refresh rows above.
-    const replay = await redeem(
-      `grant_type=authorization_code&code=${code}&redirect_uri=${encodeURIComponent(REDIRECT)}&${credentials}`
-    );
-    expect(last()).toEqual({ category: 'authorization-code-grant', reason: 'code_replayed' });
-    const replayBody = await replay.json<any>();
-    expect(replayBody).toEqual({ error: 'invalid_grant', error_description: 'Authorization code already used' });
-
     await redeem(`grant_type=${encodeURIComponent('urn:ietf:params:oauth:grant-type:token-exchange')}&${credentials}`);
     expect(last()).toEqual({ category: 'token-exchange-grant', reason: 'subject_token_missing' });
 
@@ -15465,6 +15456,40 @@ describe('onError.internal coverage across generic error paths', () => {
         `&client_id=${plainClient.client_id}&client_secret=${plainClient.client_secret}`
     );
     expect(last()).toEqual({ category: 'token-endpoint-request', reason: 'grant_type_not_registered' });
+
+    // Another exchange-capable client presenting client A's token: the library's own
+    // rejection, not a callback's, and tagged as such (no tokenExchangeCallback is configured).
+    const clientB = await provider.fetch(
+      createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify({
+          redirect_uris: [REDIRECT],
+          token_endpoint_auth_method: 'client_secret_post',
+          grant_types: ['authorization_code', 'urn:ietf:params:oauth:grant-type:token-exchange'],
+        })
+      ),
+      env,
+      ctx
+    );
+    const b = await clientB.json<any>();
+    await redeem(
+      `grant_type=${encodeURIComponent('urn:ietf:params:oauth:grant-type:token-exchange')}` +
+        `&subject_token=${tokens.access_token}` +
+        `&subject_token_type=${encodeURIComponent('urn:ietf:params:oauth:token-type:access_token')}` +
+        `&client_id=${b.client_id}&client_secret=${b.client_secret}`
+    );
+    expect(last()).toEqual({ category: 'token-exchange-grant', reason: 'cross_client_subject_token' });
+
+    // Replaying the consumed code is tagged, answered generically, and revokes the grant
+    // (OAuth 2.1 code-replay defense) — so this row runs after the refresh rows above.
+    const replay = await redeem(
+      `grant_type=authorization_code&code=${code}&redirect_uri=${encodeURIComponent(REDIRECT)}&${credentials}`
+    );
+    expect(last()).toEqual({ category: 'authorization-code-grant', reason: 'code_replayed' });
+    const replayBody = await replay.json<any>();
+    expect(replayBody).toEqual({ error: 'invalid_grant', error_description: 'Authorization code already used' });
 
     // EMA is not configured, so jwt-bearer is not a supported grant; the wire says only that.
     const ema = await redeem(
