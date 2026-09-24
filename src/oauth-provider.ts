@@ -6514,7 +6514,7 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
     }
 
     const withRedirect = (error: AuthorizationError): never => {
-      throw withAuthorizationRedirect(error, redirectUri, state || undefined, issuer);
+      throw withAuthorizationRedirect(error, redirectUri, state || undefined, issuer, responseType);
     };
 
     // Resource, response type, and PKCE errors are redirectable only after the

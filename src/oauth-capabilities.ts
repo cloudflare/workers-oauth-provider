@@ -19,6 +19,8 @@ export interface AuthorizationErrorOptions {
   state?: string;
   /** Authorization server issuer for RFC 9207 error responses. */
   issuer?: string;
+  /** The request's `response_type`: `token` (implicit flow) carries errors in the fragment. */
+  responseType?: string;
 }
 
 /**
@@ -34,17 +36,27 @@ export interface AuthorizationErrorOptions {
  * ```
  */
 export function authorizationErrorRedirect(
-  request: { redirectUri: string; state?: string; issuer?: string },
+  request: { redirectUri: string; state?: string; issuer?: string; responseType?: string },
   code: AuthorizationErrorCode,
   description?: string
 ): string {
   const redirect = new URL(request.redirectUri);
-  redirect.searchParams.set('error', code);
-  if (description) redirect.searchParams.set('error_description', description);
-  if (request.state) redirect.searchParams.set('state', request.state);
-  if (request.issuer) redirect.searchParams.set('iss', request.issuer);
+  // A registered redirect URI may carry its own query; never let a stale value stand in for ours.
+  for (const key of ERROR_RESPONSE_PARAMETERS) redirect.searchParams.delete(key);
+  const params = new URLSearchParams({ error: code });
+  if (description) params.set('error_description', description);
+  if (request.state) params.set('state', request.state);
+  if (request.issuer) params.set('iss', request.issuer);
+  if (request.responseType === 'token') {
+    // RFC 6749 §4.2.2.1: implicit-flow errors travel in the fragment, where those clients read them.
+    redirect.hash = params.toString();
+  } else {
+    for (const [key, value] of params) redirect.searchParams.set(key, value);
+  }
   return redirect.href;
 }
+
+const ERROR_RESPONSE_PARAMETERS = ['error', 'error_description', 'error_uri', 'state', 'iss'];
 
 /**
  * Expected authorization-request validation failure. Absence of `redirectUri`
@@ -70,13 +82,25 @@ export class AuthorizationError extends Error {
     this.redirectUri = options.redirectUri;
     this.state = options.state;
     this.issuer = options.issuer;
-    this.redirectTo = options.redirectUri
-      ? authorizationErrorRedirect(
-          { redirectUri: options.redirectUri, state: options.state, issuer: options.issuer },
-          code,
-          options.description
-        )
-      : undefined;
+    this.redirectTo = options.redirectUri ? safeErrorRedirect(code, options) : undefined;
+  }
+}
+
+/** The error redirect, or undefined when the registered URI can't be parsed: render locally then. */
+function safeErrorRedirect(code: AuthorizationErrorCode, options: AuthorizationErrorOptions): string | undefined {
+  try {
+    return authorizationErrorRedirect(
+      {
+        redirectUri: options.redirectUri!,
+        state: options.state,
+        issuer: options.issuer,
+        responseType: options.responseType,
+      },
+      code,
+      options.description
+    );
+  } catch {
+    return undefined;
   }
 }
 
@@ -85,13 +109,15 @@ export function withAuthorizationRedirect(
   error: AuthorizationError,
   redirectUri: string,
   state: string | undefined,
-  issuer: string
+  issuer: string,
+  responseType?: string
 ): AuthorizationError {
   return new AuthorizationError(error.code, {
     description: error.description,
     redirectUri,
     state,
     issuer,
+    responseType,
   });
 }
 

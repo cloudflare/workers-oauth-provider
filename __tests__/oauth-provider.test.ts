@@ -1702,6 +1702,40 @@ describe('OAuthProvider', () => {
       expect(Object.fromEntries(minimal.searchParams)).toEqual({ error: 'access_denied' });
     });
 
+    it('drops stale error parameters, uses the fragment for the implicit flow, and stays local for an unparseable URI', () => {
+      // A registered redirect URI's own query can't stand in for the error response's parameters.
+      const stale = new URL(
+        authorizationErrorRedirect(
+          { redirectUri: 'https://client.example/cb?keep=1&state=old&iss=https://evil&error_description=old' },
+          'access_denied'
+        )
+      );
+      expect(Object.fromEntries(stale.searchParams)).toEqual({ keep: '1', error: 'access_denied' });
+
+      // RFC 6749 §4.2.2.1: implicit-flow errors travel in the fragment.
+      const implicit = new URL(
+        authorizationErrorRedirect(
+          {
+            redirectUri: 'https://client.example/cb',
+            state: 's',
+            issuer: 'https://example.com',
+            responseType: 'token',
+          },
+          'access_denied'
+        )
+      );
+      expect(implicit.search).toBe('');
+      expect(Object.fromEntries(new URLSearchParams(implicit.hash.slice(1)))).toEqual({
+        error: 'access_denied',
+        state: 's',
+        iss: 'https://example.com',
+      });
+
+      // A registered URI that can't be parsed leaves no redirect instead of throwing: render locally.
+      const error = new AuthorizationError('invalid_request', { description: 'x', redirectUri: 'http://[bad' });
+      expect(error.redirectTo).toBeUndefined();
+    });
+
     it('keeps unknown clients and invalid redirects local', async () => {
       const unknownClient = createMockRequest(
         `https://example.com/authorize?response_type=code&client_id=unknown` +
