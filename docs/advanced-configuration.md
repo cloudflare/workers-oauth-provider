@@ -188,9 +188,37 @@ new OAuthProvider({
 
 Return a `Response` to replace the default response. Return nothing to use the provider's RFC-formatted response.
 
+### The internal reason
+
+Every OAuth error response the library builds — everything `onError` observes — carries `internal: { category, reason, detail? }`: the exact check that failed, which the wire response deliberately does not reveal (RFC 6749 §5.2). Bare non-OAuth responses (the credential-less `401` challenge, `404`/`405` on metadata URLs) carry no OAuth error and do not run `onError`. It exists only on the path to `onError` and is never sent to the client, so `error_description` can stay generic while logs and alerting key on stable slugs instead of matching text:
+
+```ts
+onError({ code, internal }) {
+  metrics.increment(`oauth.${internal.category}.${internal.reason}`);
+},
+```
+
+`category` names the subsystem (kebab-case), `reason` the failed check (snake_case); both are stable across versions — treat additions like new enum members. `detail`, when present, carries structured context such as the caught error, a CIMD fetch diagnosis, or the offending parameter name; it never carries a secret.
+
+| Category                           | Examples of `reason`                                                                                |
+| ---------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `token-endpoint-request`           | `method_not_allowed`, `repeated_parameter`, `grant_type_not_supported`, `grant_type_not_registered` |
+| `client-authentication`            | `client_not_found`, `client_secret_mismatch`, `multiple_authentication_methods`                     |
+| `client-id-metadata-document`      | `metadata_resolution_failed` and the other typed CIMD reasons                                       |
+| `authorization-code-grant`         | `code_replayed`, `code_verifier_mismatch`, `redirect_uri_mismatch`, `grant_not_found`               |
+| `refresh-token-grant`              | `refresh_token_mismatch`, `refresh_token_expired`, `client_mismatch`, `grant_not_found`             |
+| `token-exchange-grant`             | `subject_token_invalid`, `subject_token_near_expiry`, `requested_ttl_too_short`                     |
+| `enterprise-managed-authorization` | the typed EMA validator reasons (`signature_failed`, `replayed`, `aud_mismatch`, …)                 |
+| `resource-indicator`               | `resource_not_configured`, `resource_grant_mismatch`, `legacy_grant_unbound`                        |
+| `token-issuance`                   | `kv_rate_limited`, `requested_ttl_too_short`                                                        |
+| `token-revocation`                 | `token_missing`                                                                                     |
+| `client-registration`              | `json_malformed`, `metadata_invalid`, `callback_denied`, `payload_too_large`                        |
+| `protected-resource`               | `token_not_found`, `token_expired`, `audience_mismatch`, `resolver_rejected`                        |
+| `token-exchange-callback`          | `callback_error` — an `OAuthError` thrown by a deployer callback without its own `internal`         |
+
 `OAuthError(code, options)` supports token-endpoint errors from `tokenExchangeCallback`. `ExternalTokenError(code, options)` supports protected-resource errors from `resolveExternalToken`, including `requiredScopes` for an `insufficient_scope` challenge.
 
-Both classes accept a public `description`, `statusCode`, and response `headers`. Only the exported class intended for that callback boundary is converted. Other errors remain unexpected failures.
+Both classes accept a public `description`, `statusCode`, and response `headers`. Only the exported class intended for that callback boundary is converted. Other errors remain unexpected failures. An `OAuthError` may also set `options.internal` to give `onError` its own category and reason; without one it arrives as `{ category: 'token-exchange-callback', reason: 'callback_error', detail: error }`.
 
 ## Token and client lifetimes
 

@@ -594,10 +594,10 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
    *
    * If the function returns a Response, that will be used in place of the OAuthProvider's default one.
    *
-   * `internal` (when present) carries a tagged, server-side-only reason that the library
-   * deliberately did NOT put on the wire — used for richer diagnostics where the public
-   * response must stay generic (e.g. JWT validation failures on the EMA path). Backwards
-   * compatible: existing callbacks ignoring this field continue to work unchanged.
+   * `internal` carries the stable, server-side-only reason for the error — often more
+   * specific than what the wire deliberately reveals (RFC 6749 §5.2), e.g. which refresh-token
+   * check failed or which EMA validation fired. It is never placed on the wire. See
+   * {@link OAuthErrorInternal}.
    *
    * `request` (when present) is the HTTP request that produced the error response, so the
    * callback can correlate the error with per-request state such as request-keyed telemetry.
@@ -609,7 +609,7 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
     description: string;
     status: number;
     headers: Record<string, string>;
-    internal?: { category: string; reason: string; detail?: unknown };
+    internal: OAuthErrorInternal;
     request?: Request;
   }) => Response | void;
 
@@ -2503,7 +2503,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   private createInvalidClientResponse(
     description: string,
     basicAuthenticationAttempted: boolean,
-    internal?: { category: string; reason: string; detail?: unknown },
+    internal: OAuthErrorInternal,
     request?: Request
   ): Response {
     return this.createErrorResponse(
@@ -2536,11 +2536,15 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   > {
     // Only accept POST requests
     if (request.method !== 'POST') {
-      return this.createErrorResponse('invalid_request', {
-        description: 'Method not allowed',
-        statusCode: 405,
-        headers: { Allow: 'POST, OPTIONS' },
-      });
+      return this.createErrorResponse(
+        'invalid_request',
+        {
+          description: 'Method not allowed',
+          statusCode: 405,
+          headers: { Allow: 'POST, OPTIONS' },
+        },
+        { category: 'token-endpoint-request', reason: 'method_not_allowed' }
+      );
     }
 
     const contentType = request.headers.get('Content-Type') || '';
@@ -2553,10 +2557,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // which then cause request.formData() to throw and crash the worker.
     const mediaType = contentType.split(';')[0].trim().toLowerCase();
     if (mediaType !== 'application/x-www-form-urlencoded') {
-      return this.createErrorResponse('invalid_request', {
-        description: 'Content-Type must be application/x-www-form-urlencoded',
-        statusCode: 400,
-      });
+      return this.createErrorResponse(
+        'invalid_request',
+        {
+          description: 'Content-Type must be application/x-www-form-urlencoded',
+          statusCode: 400,
+        },
+        { category: 'token-endpoint-request', reason: 'unsupported_content_type' }
+      );
     }
 
     // Process application/x-www-form-urlencoded. Parsing can still throw if the body is
@@ -2565,10 +2573,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     try {
       formData = await request.formData();
     } catch {
-      return this.createErrorResponse('invalid_request', {
-        description: 'Request body must be valid application/x-www-form-urlencoded data',
-        statusCode: 400,
-      });
+      return this.createErrorResponse(
+        'invalid_request',
+        {
+          description: 'Request body must be valid application/x-www-form-urlencoded data',
+          statusCode: 400,
+        },
+        { category: 'token-endpoint-request', reason: 'malformed_request_body' }
+      );
     }
     const processedKeys = new Set<string>();
     for (const [key, value] of formData.entries()) {
@@ -2580,10 +2592,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       // RFC 8707: resource parameter can appear multiple times
       const allValues = formData.getAll(key);
       if (key !== 'resource' && allValues.length > 1) {
-        return this.createErrorResponse('invalid_request', {
-          description: `Request parameter "${key}" must not be repeated`,
-          statusCode: 400,
-        });
+        return this.createErrorResponse(
+          'invalid_request',
+          {
+            description: `Request parameter "${key}" must not be repeated`,
+            statusCode: 400,
+          },
+          { category: 'token-endpoint-request', reason: 'repeated_parameter', detail: { parameter: key } }
+        );
       }
 
       body[key] = allValues.length > 1 ? allValues : value;
@@ -2597,16 +2613,21 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     if (basicAuthenticationAttempted) {
       if (formData.has('client_id') || formData.has('client_secret')) {
-        return this.createErrorResponse('invalid_request', {
-          description: 'Client must not use multiple authentication methods',
-          statusCode: 400,
-        });
+        return this.createErrorResponse(
+          'invalid_request',
+          {
+            description: 'Client must not use multiple authentication methods',
+            statusCode: 400,
+          },
+          { category: 'client-authentication', reason: 'multiple_authentication_methods' }
+        );
       }
 
       if (basicAuthorization.kind === 'malformed') {
         return this.createInvalidClientResponse(
           'Client authentication failed: invalid Basic credentials',
-          basicAuthenticationAttempted
+          basicAuthenticationAttempted,
+          { category: 'client-authentication', reason: 'malformed_basic_credentials' }
         );
       }
 
@@ -2618,7 +2639,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     if (!clientId) {
-      return this.createInvalidClientResponse('Client ID is required', basicAuthenticationAttempted);
+      return this.createInvalidClientResponse('Client ID is required', basicAuthenticationAttempted, {
+        category: 'client-authentication',
+        reason: 'client_id_missing',
+      });
     }
 
     // Verify client exists
@@ -2646,7 +2670,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       throw error;
     }
     if (!clientInfo) {
-      return this.createInvalidClientResponse('Client not found', basicAuthenticationAttempted);
+      return this.createInvalidClientResponse('Client not found', basicAuthenticationAttempted, {
+        category: 'client-authentication',
+        reason: 'client_not_found',
+      });
     }
 
     // RFC 7591 methods identify the credential transport. Check form-parameter
@@ -2680,7 +2707,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       if (!clientSecret) {
         return this.createInvalidClientResponse(
           'Client authentication failed: missing client_secret',
-          basicAuthenticationAttempted
+          basicAuthenticationAttempted,
+          { category: 'client-authentication', reason: 'client_secret_missing' }
         );
       }
 
@@ -2688,7 +2716,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       if (!clientInfo.clientSecret) {
         return this.createInvalidClientResponse(
           'Client authentication failed: client has no registered secret',
-          basicAuthenticationAttempted
+          basicAuthenticationAttempted,
+          { category: 'client-authentication', reason: 'client_secret_not_registered' }
         );
       }
 
@@ -2696,7 +2725,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       if (providedSecretHash !== clientInfo.clientSecret) {
         return this.createInvalidClientResponse(
           'Client authentication failed: invalid client_secret',
-          basicAuthenticationAttempted
+          basicAuthenticationAttempted,
+          { category: 'client-authentication', reason: 'client_secret_mismatch' }
         );
       }
     }
@@ -2952,7 +2982,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         (grantType === GrantType.JWT_BEARER && !!this.options.enterpriseManagedAuthorization);
 
       if (!supportedGrant) {
-        return this.createErrorResponse('unsupported_grant_type', { description: 'Grant type not supported' });
+        return this.createErrorResponse(
+          'unsupported_grant_type',
+          { description: 'Grant type not supported' },
+          { category: 'token-endpoint-request', reason: 'grant_type_not_supported' }
+        );
       }
 
       // RFC 7591 §2 and RFC 6749 §10.6: a client may use only the grant types it registered.
@@ -2965,9 +2999,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
           registered.includes(grantType) ||
           (grantType === GrantType.REFRESH_TOKEN && registered.includes(GrantType.AUTHORIZATION_CODE));
         if (!permitted) {
-          return this.createErrorResponse('unauthorized_client', {
-            description: 'The client is not registered for this grant type',
-          });
+          return this.createErrorResponse(
+            'unauthorized_client',
+            {
+              description: 'The client is not registered for this grant type',
+            },
+            { category: 'token-endpoint-request', reason: 'grant_type_not_registered' }
+          );
         }
       }
 
@@ -3003,7 +3041,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    */
   private createOAuthErrorResponse(error: unknown): Response | undefined {
     if (!(error instanceof OAuthError)) return undefined;
-    return this.createErrorResponse(error.code, error.options);
+    return this.createErrorResponse(
+      error.code,
+      error.options,
+      // The library attaches `internal` to its own throws; an OAuthError without one came
+      // from a deployer callback (`tokenExchangeCallback` is the documented thrower).
+      error.options.internal ?? { category: 'token-exchange-callback', reason: 'callback_error', detail: error }
+    );
   }
 
   /**
@@ -3044,11 +3088,15 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       };
     }
 
-    return this.createErrorResponse(error.code, {
-      description: error.description,
-      statusCode: error.statusCode,
-      headers: challengeHeaders ?? headers,
-    });
+    return this.createErrorResponse(
+      error.code,
+      {
+        description: error.description,
+        statusCode: error.statusCode,
+        headers: challengeHeaders ?? headers,
+      },
+      { category: 'protected-resource', reason: 'resolver_rejected', detail: error }
+    );
   }
 
   /**
@@ -3069,13 +3117,21 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const codeVerifier = body.code_verifier;
 
     if (!code) {
-      return this.createErrorResponse('invalid_request', { description: 'Authorization code is required' });
+      return this.createErrorResponse(
+        'invalid_request',
+        { description: 'Authorization code is required' },
+        { category: 'authorization-code-grant', reason: 'code_missing' }
+      );
     }
 
     // Parse the authorization code to extract user ID and grant ID
     const codeParts = code.split(':');
     if (codeParts.length !== 3) {
-      return this.createErrorResponse('invalid_grant', { description: 'Invalid authorization code format' });
+      return this.createErrorResponse(
+        'invalid_grant',
+        { description: 'Invalid authorization code format' },
+        { category: 'authorization-code-grant', reason: 'code_malformed' }
+      );
     }
 
     const [userId, grantId, _] = codeParts;
@@ -3085,9 +3141,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const grantData: Grant | null = await env.OAUTH_KV.get(grantKey, { type: 'json' });
 
     if (!grantData) {
-      return this.createErrorResponse('invalid_grant', {
-        description: 'Grant not found or authorization code expired',
-      });
+      return this.createErrorResponse(
+        'invalid_grant',
+        {
+          description: 'Grant not found or authorization code expired',
+        },
+        { category: 'authorization-code-grant', reason: 'grant_not_found' }
+      );
     }
 
     // Verify the authorization code by comparing its hash to the one in the grant.
@@ -3095,12 +3155,20 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // not match the one issued for this grant has no effect on the grant.
     const codeHash = await hashSecret(code);
     if (!grantData.authCodeId || codeHash !== grantData.authCodeId) {
-      return this.createErrorResponse('invalid_grant', { description: 'Invalid authorization code' });
+      return this.createErrorResponse(
+        'invalid_grant',
+        { description: 'Invalid authorization code' },
+        { category: 'authorization-code-grant', reason: 'code_mismatch' }
+      );
     }
 
     // Verify client ID matches before taking any action on the grant
     if (grantData.clientId !== clientInfo.clientId) {
-      return this.createErrorResponse('invalid_grant', { description: 'Client ID mismatch' });
+      return this.createErrorResponse(
+        'invalid_grant',
+        { description: 'Client ID mismatch' },
+        { category: 'authorization-code-grant', reason: 'client_mismatch' }
+      );
     }
 
     // If the authorization code has already been exchanged (the wrapped key has
@@ -3113,7 +3181,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       } catch {
         // Best-effort revocation — always return invalid_grant per RFC 6749 §10.5
       }
-      return this.createErrorResponse('invalid_grant', { description: 'Authorization code already used' });
+      return this.createErrorResponse(
+        'invalid_grant',
+        { description: 'Authorization code already used' },
+        { category: 'authorization-code-grant', reason: 'code_replayed' }
+      );
     }
 
     // Validate the stored method before deciding whether PKCE is active. Older
@@ -3125,9 +3197,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         ? validatePkceCodeChallengeMethod(this.serverCapabilities, grantData.codeChallengeMethod)
         : normalizePkceCodeChallengeMethod(grantData.codeChallengeMethod);
     } catch (error) {
-      return this.createErrorResponse('invalid_grant', {
-        description: error instanceof Error ? error.message : 'Invalid PKCE code_challenge_method',
-      });
+      return this.createErrorResponse(
+        'invalid_grant',
+        {
+          description: error instanceof Error ? error.message : 'Invalid PKCE code_challenge_method',
+        },
+        { category: 'authorization-code-grant', reason: 'pkce_method_invalid', detail: error }
+      );
     }
 
     // Check if PKCE is being used
@@ -3135,36 +3211,56 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // OAuth 2.1 requires redirect_uri parameter unless PKCE is used
     if (!redirectUri && !isPkceEnabled) {
-      return this.createErrorResponse('invalid_request', {
-        description: 'redirect_uri is required when not using PKCE',
-      });
+      return this.createErrorResponse(
+        'invalid_request',
+        {
+          description: 'redirect_uri is required when not using PKCE',
+        },
+        { category: 'authorization-code-grant', reason: 'redirect_uri_missing' }
+      );
     }
 
     // Verify redirect URI if provided
     if (redirectUri && !isValidRedirectUri(redirectUri, clientInfo.redirectUris)) {
-      return this.createErrorResponse('invalid_grant', { description: 'Invalid redirect URI' });
+      return this.createErrorResponse(
+        'invalid_grant',
+        { description: 'Invalid redirect URI' },
+        { category: 'authorization-code-grant', reason: 'redirect_uri_invalid' }
+      );
     }
 
     // OAuth 2.1 §4.1.3: a redirect_uri on the token request must be identical to the one
     // the authorization request used. Grants written before the redirect URI was recorded
     // keep only the registered-list check above.
     if (redirectUri && grantData.redirectUri !== undefined && redirectUri !== grantData.redirectUri) {
-      return this.createErrorResponse('invalid_grant', {
-        description: 'redirect_uri does not match the authorization request',
-      });
+      return this.createErrorResponse(
+        'invalid_grant',
+        {
+          description: 'redirect_uri does not match the authorization request',
+        },
+        { category: 'authorization-code-grant', reason: 'redirect_uri_mismatch' }
+      );
     }
 
     // Reject if code_verifier is provided but PKCE wasn't used in authorization
     if (!isPkceEnabled && codeVerifier) {
-      return this.createErrorResponse('invalid_request', {
-        description: 'code_verifier provided for a flow that did not use PKCE',
-      });
+      return this.createErrorResponse(
+        'invalid_request',
+        {
+          description: 'code_verifier provided for a flow that did not use PKCE',
+        },
+        { category: 'authorization-code-grant', reason: 'unexpected_code_verifier' }
+      );
     }
 
     // Verify PKCE code_verifier if code_challenge was provided during authorization
     if (isPkceEnabled) {
       if (!codeVerifier) {
-        return this.createErrorResponse('invalid_request', { description: 'code_verifier is required for PKCE' });
+        return this.createErrorResponse(
+          'invalid_request',
+          { description: 'code_verifier is required for PKCE' },
+          { category: 'authorization-code-grant', reason: 'code_verifier_missing' }
+        );
       }
 
       // Verify the code verifier against the stored code challenge.
@@ -3182,7 +3278,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       }
 
       if (calculatedChallenge !== grantData.codeChallenge) {
-        return this.createErrorResponse('invalid_grant', { description: 'Invalid PKCE code_verifier' });
+        return this.createErrorResponse(
+          'invalid_grant',
+          { description: 'Invalid PKCE code_verifier' },
+          { category: 'authorization-code-grant', reason: 'code_verifier_mismatch' }
+        );
       }
     }
 
@@ -3259,9 +3359,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
         // A new grant's lifetime is `refreshTokenTTL`; the idle lifetime only applies to a refresh.
         if (callbackResult.refreshTokenIdleTTL !== undefined) {
-          return this.createErrorResponse('invalid_request', {
-            description: 'refreshTokenIdleTTL is only honored during refresh token exchange',
-          });
+          return this.createErrorResponse(
+            'invalid_request',
+            {
+              description: 'refreshTokenIdleTTL is only honored during refresh token exchange',
+            },
+            { category: 'authorization-code-grant', reason: 'refresh_token_idle_ttl_wrong_grant' }
+          );
         }
 
         // If accessTokenScope was specified, use it for this token
@@ -3290,9 +3394,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Reject callback-provided TTLs before consuming the authorization code,
     // backfilling its grant resource, or writing any grant/token state.
     if (!isValidAccessTokenTTL(accessTokenTTL)) {
-      return this.createErrorResponse('invalid_request', {
-        description: 'Requested token lifetime must be at least 60 seconds',
-      });
+      return this.createErrorResponse(
+        'invalid_request',
+        {
+          description: 'Requested token lifetime must be at least 60 seconds',
+        },
+        { category: 'authorization-code-grant', reason: 'requested_ttl_too_short' }
+      );
     }
 
     // Calculate the access token expiration time (after callback might have updated TTL)
@@ -3381,13 +3489,21 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const refreshToken = body.refresh_token;
 
     if (!refreshToken) {
-      return this.createErrorResponse('invalid_request', { description: 'Refresh token is required' });
+      return this.createErrorResponse(
+        'invalid_request',
+        { description: 'Refresh token is required' },
+        { category: 'refresh-token-grant', reason: 'refresh_token_missing' }
+      );
     }
 
     // Parse the token to extract user ID and grant ID
     const tokenParts = refreshToken.split(':');
     if (tokenParts.length !== 3) {
-      return this.createErrorResponse('invalid_grant', { description: 'Invalid token format' });
+      return this.createErrorResponse(
+        'invalid_grant',
+        { description: 'Invalid token format' },
+        { category: 'refresh-token-grant', reason: 'refresh_token_malformed' }
+      );
     }
 
     const [userId, grantId, _] = tokenParts;
@@ -3400,7 +3516,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const grantData: Grant | null = await env.OAUTH_KV.get(grantKey, { type: 'json' });
 
     if (!grantData) {
-      return this.createErrorResponse('invalid_grant', { description: 'Grant not found' });
+      return this.createErrorResponse(
+        'invalid_grant',
+        { description: 'Grant not found' },
+        { category: 'refresh-token-grant', reason: 'grant_not_found' }
+      );
     }
 
     // Check if the provided token matches either the current or previous refresh token
@@ -3408,12 +3528,20 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const isPreviousToken = grantData.previousRefreshTokenId === providedTokenHash;
 
     if (!isCurrentToken && !isPreviousToken) {
-      return this.createErrorResponse('invalid_grant', { description: 'Invalid refresh token' });
+      return this.createErrorResponse(
+        'invalid_grant',
+        { description: 'Invalid refresh token' },
+        { category: 'refresh-token-grant', reason: 'refresh_token_mismatch' }
+      );
     }
 
     // Verify client ID matches
     if (grantData.clientId !== clientInfo.clientId) {
-      return this.createErrorResponse('invalid_grant', { description: 'Client ID mismatch' });
+      return this.createErrorResponse(
+        'invalid_grant',
+        { description: 'Client ID mismatch' },
+        { category: 'refresh-token-grant', reason: 'client_mismatch' }
+      );
     }
 
     // Check if the refresh token has expired.
@@ -3425,7 +3553,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     if (grantData.expiresAt !== undefined) {
       const now = Math.floor(Date.now() / 1000);
       if (grantData.expiresAt - now < KV_MIN_EXPIRATION_TTL_SECONDS) {
-        return this.createErrorResponse('invalid_grant', { description: 'Refresh token has expired' });
+        return this.createErrorResponse(
+          'invalid_grant',
+          { description: 'Refresh token has expired' },
+          { category: 'refresh-token-grant', reason: 'refresh_token_expired' }
+        );
       }
     }
 
@@ -3515,18 +3647,26 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
         // refreshTokenTTL changes are not supported during refresh token exchange
         if ('refreshTokenTTL' in callbackResult) {
-          return this.createErrorResponse('invalid_request', {
-            description: 'refreshTokenTTL cannot be changed during refresh token exchange',
-          });
+          return this.createErrorResponse(
+            'invalid_request',
+            {
+              description: 'refreshTokenTTL cannot be changed during refresh token exchange',
+            },
+            { category: 'refresh-token-grant', reason: 'refresh_token_ttl_immutable' }
+          );
         }
 
         // The callback may set this refresh's idle lifetime, typically to match an upstream
         // refresh token it has just rotated.
         if (callbackResult.refreshTokenIdleTTL !== undefined) {
           if (!isValidAccessTokenTTL(callbackResult.refreshTokenIdleTTL)) {
-            return this.createErrorResponse('invalid_request', {
-              description: `refreshTokenIdleTTL must be an integer of at least ${KV_MIN_EXPIRATION_TTL_SECONDS} seconds`,
-            });
+            return this.createErrorResponse(
+              'invalid_request',
+              {
+                description: `refreshTokenIdleTTL must be an integer of at least ${KV_MIN_EXPIRATION_TTL_SECONDS} seconds`,
+              },
+              { category: 'refresh-token-grant', reason: 'refresh_token_idle_ttl_invalid' }
+            );
           }
           refreshTokenIdleTTL = callbackResult.refreshTokenIdleTTL;
         }
@@ -3575,7 +3715,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // expired here so we return a clean invalid_grant rather than an uncaught 500. No grant
     // mutation or token write has happened yet, so returning now leaves no partial state.
     if (grantData.expiresAt !== undefined && grantData.expiresAt - now < KV_MIN_EXPIRATION_TTL_SECONDS) {
-      return this.createErrorResponse('invalid_grant', { description: 'Refresh token has expired' });
+      return this.createErrorResponse(
+        'invalid_grant',
+        { description: 'Refresh token has expired' },
+        { category: 'refresh-token-grant', reason: 'refresh_token_expired' }
+      );
     }
 
     // Sliding expiry. This runs after the re-check above, so a grant that expired while the
@@ -3601,9 +3745,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // only way to land here is a tokenExchangeCallback returning an `accessTokenTTL` below
     // the minimum. Reject before rotating/saving the grant rather than crashing on the write.
     if (!isValidAccessTokenTTL(accessTokenTTL)) {
-      return this.createErrorResponse('invalid_request', {
-        description: 'Requested token lifetime must be at least 60 seconds',
-      });
+      return this.createErrorResponse(
+        'invalid_request',
+        {
+          description: 'Requested token lifetime must be at least 60 seconds',
+        },
+        { category: 'refresh-token-grant', reason: 'requested_ttl_too_short' }
+      );
     }
 
     const accessTokenExpiresAt = now + accessTokenTTL;
@@ -3712,14 +3860,20 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // RFC 8693 §2.2.2: an invalid or unacceptable subject token is `invalid_request`.
     const tokenSummary = await this.unwrapToken(subjectToken, env);
     if (!tokenSummary) {
-      throw new OAuthError('invalid_request', { description: 'Invalid or expired subject token' });
+      throw new OAuthError('invalid_request', {
+        description: 'Invalid or expired subject token',
+        internal: { category: 'token-exchange-grant', reason: 'subject_token_invalid' },
+      });
     }
 
     // Get the grant to access resource information
     const grantKey = `grant:${tokenSummary.userId}:${tokenSummary.grantId}`;
     const grantData: Grant | null = await env.OAUTH_KV.get(grantKey, { type: 'json' });
     if (!grantData) {
-      throw new OAuthError('invalid_request', { description: 'Grant not found' });
+      throw new OAuthError('invalid_request', {
+        description: 'Grant not found',
+        internal: { category: 'token-exchange-grant', reason: 'grant_not_found' },
+      });
     }
 
     // A token is exchanged by the client it was issued to unless the deployment's
@@ -3727,7 +3881,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // impersonation is policy, never the default).
     const crossClientExchange = grantData.clientId !== clientInfo.clientId;
     const crossClientRejection = () =>
-      new OAuthError('invalid_request', { description: 'The subject token was issued to a different client' });
+      new OAuthError('invalid_request', {
+        description: 'The subject token was issued to a different client',
+        internal: { category: 'token-exchange-grant', reason: 'cross_client_subject_token' },
+      });
     if (crossClientExchange && !this.options.tokenExchangeCallback) {
       throw crossClientRejection();
     }
@@ -3748,6 +3905,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     if (subjectTokenRemainingLifetime < KV_MIN_EXPIRATION_TTL_SECONDS) {
       throw new OAuthError('invalid_request', {
         description: 'Subject token is too close to expiry to exchange',
+        internal: { category: 'token-exchange-grant', reason: 'subject_token_near_expiry' },
       });
     }
 
@@ -3756,7 +3914,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // If expiresIn is provided, use it but clamp to subject token's remaining lifetime
     if (expiresIn !== undefined) {
       if (expiresIn <= 0) {
-        throw new OAuthError('invalid_request', { description: 'Invalid expires_in parameter' });
+        throw new OAuthError('invalid_request', {
+          description: 'Invalid expires_in parameter',
+          internal: { category: 'token-exchange-grant', reason: 'expires_in_invalid' },
+        });
       }
       accessTokenTTL = Math.min(expiresIn, subjectTokenRemainingLifetime);
     } else {
@@ -3771,7 +3932,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     );
 
     if (!subjectTokenData) {
-      throw new OAuthError('invalid_request', { description: 'Subject token data not found' });
+      throw new OAuthError('invalid_request', {
+        description: 'Subject token data not found',
+        internal: { category: 'token-exchange-grant', reason: 'subject_token_data_missing' },
+      });
     }
 
     // Unwrap the encryption key from the subject token
@@ -3825,6 +3989,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         if (callbackResult.refreshTokenIdleTTL !== undefined) {
           throw new OAuthError('invalid_request', {
             description: 'refreshTokenIdleTTL is only honored during refresh token exchange',
+            internal: { category: 'token-exchange-grant', reason: 'refresh_token_idle_ttl_wrong_grant' },
           });
         }
 
@@ -3849,6 +4014,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     if (!isValidAccessTokenTTL(accessTokenTTL)) {
       throw new OAuthError('invalid_request', {
         description: 'Requested token lifetime must be at least 60 seconds',
+        internal: { category: 'token-exchange-grant', reason: 'requested_ttl_too_short' },
       });
     }
 
@@ -3895,25 +4061,41 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Validate required parameters
     if (!subjectToken) {
-      return this.createErrorResponse('invalid_request', { description: 'subject_token is required' });
+      return this.createErrorResponse(
+        'invalid_request',
+        { description: 'subject_token is required' },
+        { category: 'token-exchange-grant', reason: 'subject_token_missing' }
+      );
     }
 
     if (!subjectTokenType) {
-      return this.createErrorResponse('invalid_request', { description: 'subject_token_type is required' });
+      return this.createErrorResponse(
+        'invalid_request',
+        { description: 'subject_token_type is required' },
+        { category: 'token-exchange-grant', reason: 'subject_token_type_missing' }
+      );
     }
 
     // Only support access token as subject token type
     if (subjectTokenType !== 'urn:ietf:params:oauth:token-type:access_token') {
-      return this.createErrorResponse('invalid_request', {
-        description: 'Only access_token subject_token_type is supported',
-      });
+      return this.createErrorResponse(
+        'invalid_request',
+        {
+          description: 'Only access_token subject_token_type is supported',
+        },
+        { category: 'token-exchange-grant', reason: 'subject_token_type_unsupported' }
+      );
     }
 
     // Only support access token as requested token type
     if (requestedTokenType !== 'urn:ietf:params:oauth:token-type:access_token') {
-      return this.createErrorResponse('invalid_request', {
-        description: 'Only access_token requested_token_type is supported',
-      });
+      return this.createErrorResponse(
+        'invalid_request',
+        {
+          description: 'Only access_token requested_token_type is supported',
+        },
+        { category: 'token-exchange-grant', reason: 'requested_token_type_unsupported' }
+      );
     }
 
     // Parse requested scopes
@@ -3924,7 +4106,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       } else if (Array.isArray(requestedScope)) {
         requestedScopes = requestedScope;
       } else {
-        return this.createErrorResponse('invalid_request', { description: 'Invalid scope parameter format' });
+        return this.createErrorResponse(
+          'invalid_request',
+          { description: 'Invalid scope parameter format' },
+          { category: 'token-exchange-grant', reason: 'scope_malformed' }
+        );
       }
     }
 
@@ -3933,7 +4119,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     if (body.expires_in !== undefined) {
       const requestedTTL = parseInt(body.expires_in, 10);
       if (isNaN(requestedTTL) || requestedTTL <= 0) {
-        return this.createErrorResponse('invalid_request', { description: 'Invalid expires_in parameter' });
+        return this.createErrorResponse(
+          'invalid_request',
+          { description: 'Invalid expires_in parameter' },
+          { category: 'token-exchange-grant', reason: 'expires_in_invalid' }
+        );
       }
       expiresIn = requestedTTL;
     }
@@ -3981,7 +4171,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   ): Promise<Response> {
     const enterpriseOptions = this.options.enterpriseManagedAuthorization;
     if (!enterpriseOptions) {
-      return this.createErrorResponse('unsupported_grant_type', { description: 'Grant type not supported' });
+      return this.createErrorResponse(
+        'unsupported_grant_type',
+        { description: 'Grant type not supported' },
+        { category: 'enterprise-managed-authorization', reason: 'grant_disabled' }
+      );
     }
 
     // By default the EMA grant requires client authentication (per the MCP
@@ -3991,10 +4185,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // case trust rests on the signature-verified, short-lived, single-use
     // ID-JAG assertion rather than on a separately presented client secret.
     if (clientInfo.tokenEndpointAuthMethod === 'none' && !enterpriseOptions.allowPublicClients) {
-      return this.createErrorResponse('invalid_client', {
-        description: 'Enterprise-managed authorization requires client authentication',
-        statusCode: 401,
-      });
+      return this.createErrorResponse(
+        'invalid_client',
+        {
+          description: 'Enterprise-managed authorization requires client authentication',
+          statusCode: 401,
+        },
+        { category: 'enterprise-managed-authorization', reason: 'client_authentication_required' }
+      );
     }
 
     const result = await this.runEmaPipeline({ body, clientInfo, env, requestUrl, request, enterpriseOptions });
@@ -4270,7 +4468,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const tokenTypeHint = body.token_type_hint;
 
     if (!token) {
-      return this.createErrorResponse('invalid_request', { description: 'Token parameter is required' });
+      return this.createErrorResponse(
+        'invalid_request',
+        { description: 'Token parameter is required' },
+        { category: 'token-revocation', reason: 'token_missing' }
+      );
     }
     const tokenParts = token.split(':');
     if (tokenParts.length !== 3) {
@@ -4368,29 +4570,41 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    */
   private async handleClientRegistration(request: Request, env: Env & ProviderEnv): Promise<Response> {
     if (!this.options.clientRegistrationEndpoint) {
-      return this.createErrorResponse('not_implemented', {
-        description: 'Client registration is not enabled',
-        statusCode: 501,
-      });
+      return this.createErrorResponse(
+        'not_implemented',
+        {
+          description: 'Client registration is not enabled',
+          statusCode: 501,
+        },
+        { category: 'client-registration', reason: 'registration_disabled' }
+      );
     }
 
     // Check method
     if (request.method !== 'POST') {
-      return this.createErrorResponse('invalid_request', {
-        description: 'Method not allowed',
-        statusCode: 405,
-        headers: { Allow: 'POST, OPTIONS' },
-      });
+      return this.createErrorResponse(
+        'invalid_request',
+        {
+          description: 'Method not allowed',
+          statusCode: 405,
+          headers: { Allow: 'POST, OPTIONS' },
+        },
+        { category: 'client-registration', reason: 'method_not_allowed' }
+      );
     }
 
     // Check content length to ensure it's not too large (1 MiB limit)
     const contentLength = parseInt(request.headers.get('Content-Length') || '0', 10);
     if (contentLength > 1048576) {
       // 1 MiB = 1048576 bytes
-      return this.createErrorResponse('invalid_request', {
-        description: 'Request payload too large, must be under 1 MiB',
-        statusCode: 413,
-      });
+      return this.createErrorResponse(
+        'invalid_request',
+        {
+          description: 'Request payload too large, must be under 1 MiB',
+          statusCode: 413,
+        },
+        { category: 'client-registration', reason: 'declared_payload_too_large' }
+      );
     }
 
     // Clone before reading the body so a downstream clientRegistrationCallback
@@ -4405,14 +4619,22 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       const text = await request.text();
       if (text.length > 1048576) {
         // Double-check text length
-        return this.createErrorResponse('invalid_request', {
-          description: 'Request payload too large, must be under 1 MiB',
-          statusCode: 413,
-        });
+        return this.createErrorResponse(
+          'invalid_request',
+          {
+            description: 'Request payload too large, must be under 1 MiB',
+            statusCode: 413,
+          },
+          { category: 'client-registration', reason: 'payload_too_large' }
+        );
       }
       parsedJson = JSON.parse(text);
     } catch {
-      return this.createErrorResponse('invalid_request', { description: 'Invalid JSON payload', statusCode: 400 });
+      return this.createErrorResponse(
+        'invalid_request',
+        { description: 'Invalid JSON payload', statusCode: 400 },
+        { category: 'client-registration', reason: 'json_malformed' }
+      );
     }
 
     let clientMetadata: Record<string, unknown>;
@@ -4421,17 +4643,25 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       clientMetadata = requireJsonObject(parsedJson);
       metadata = resolveDynamicClientRegistrationMetadata(clientMetadata, this.serverCapabilities);
     } catch (error) {
-      return this.createErrorResponse('invalid_client_metadata', {
-        description: error instanceof Error ? error.message : 'Invalid client metadata',
-      });
+      return this.createErrorResponse(
+        'invalid_client_metadata',
+        {
+          description: error instanceof Error ? error.message : 'Invalid client metadata',
+        },
+        { category: 'client-registration', reason: 'metadata_invalid', detail: error }
+      );
     }
 
     const authMethod = metadata.tokenEndpointAuthMethod;
     const isPublicClient = authMethod === 'none';
     if (isPublicClient && this.options.disallowPublicClientRegistration) {
-      return this.createErrorResponse('invalid_client_metadata', {
-        description: 'Public client registration is not allowed',
-      });
+      return this.createErrorResponse(
+        'invalid_client_metadata',
+        {
+          description: 'Public client registration is not allowed',
+        },
+        { category: 'client-registration', reason: 'public_client_forbidden' }
+      );
     }
 
     const clientId = generateRandomString(16);
@@ -4472,20 +4702,28 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
           this.options.clientRegistrationCallback({ clientMetadata, request: callbackRequest })
         );
       } catch (error) {
-        return this.createErrorResponse('server_error', {
-          description: error instanceof Error ? error.message : 'Client registration callback failed',
-          statusCode: 500,
-        });
+        return this.createErrorResponse(
+          'server_error',
+          {
+            description: error instanceof Error ? error.message : 'Client registration callback failed',
+            statusCode: 500,
+          },
+          { category: 'client-registration', reason: 'callback_failed', detail: error }
+        );
       }
 
       if (callbackResult !== undefined) {
         // Default to RFC 7591 §3.2.2 — `invalid_client_metadata` / 400. Callbacks
         // rejecting for non-metadata reasons (missing IAT, policy denial) should
         // override `code` / `status` explicitly.
-        return this.createErrorResponse(callbackResult.code || 'invalid_client_metadata', {
-          description: callbackResult.description || 'Client registration denied',
-          statusCode: callbackResult.status ?? 400,
-        });
+        return this.createErrorResponse(
+          callbackResult.code || 'invalid_client_metadata',
+          {
+            description: callbackResult.description || 'Client registration denied',
+            statusCode: callbackResult.status ?? 400,
+          },
+          { category: 'client-registration', reason: 'callback_denied', detail: callbackResult }
+        );
       }
     }
 
@@ -4592,38 +4830,50 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // No internal token found in KV and no external token validator provided
     if (!tokenData && !externalTokenResolver) {
-      return this.createErrorResponse('invalid_token', {
-        description: 'Invalid access token',
-        statusCode: 401,
-        headers: {
-          'WWW-Authenticate': challenge('invalid_token'),
+      return this.createErrorResponse(
+        'invalid_token',
+        {
+          description: 'Invalid access token',
+          statusCode: 401,
+          headers: {
+            'WWW-Authenticate': challenge('invalid_token'),
+          },
         },
-      });
+        { category: 'protected-resource', reason: 'token_not_found' }
+      );
     }
 
     // Internal token data was found in KV, so we check for expiration and set the context props
     if (tokenData) {
       const tokenAudience = this.resolveStoredTokenAudience(tokenData.audience);
       if (!isExactResource(tokenAudience, configuredResource)) {
-        return this.createErrorResponse('invalid_token', {
-          description: 'Access token is not bound to the configured resource',
-          statusCode: 401,
-          headers: {
-            'WWW-Authenticate': challenge('invalid_token'),
+        return this.createErrorResponse(
+          'invalid_token',
+          {
+            description: 'Access token is not bound to the configured resource',
+            statusCode: 401,
+            headers: {
+              'WWW-Authenticate': challenge('invalid_token'),
+            },
           },
-        });
+          { category: 'protected-resource', reason: 'token_audience_unbound' }
+        );
       }
 
       // Check if token is expired (should be auto-deleted by KV TTL, but double-check)
       const now = Math.floor(Date.now() / 1000);
       if (tokenData.expiresAt < now) {
-        return this.createErrorResponse('invalid_token', {
-          description: 'Access token expired',
-          statusCode: 401,
-          headers: {
-            'WWW-Authenticate': challenge('invalid_token'),
+        return this.createErrorResponse(
+          'invalid_token',
+          {
+            description: 'Access token expired',
+            statusCode: 401,
+            headers: {
+              'WWW-Authenticate': challenge('invalid_token'),
+            },
           },
-        });
+          { category: 'protected-resource', reason: 'token_expired' }
+        );
       }
 
       // Validate audience according to RFC 7519 Section 4.1.3
@@ -4637,13 +4887,17 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         // Check if any audience matches (RFC 3986: case-insensitive hostname comparison)
         const matches = audiences.some((aud) => audienceMatches(resourceServer, aud));
         if (!matches) {
-          return this.createErrorResponse('invalid_token', {
-            description: 'Token audience does not match resource server',
-            statusCode: 401,
-            headers: {
-              'WWW-Authenticate': challenge('invalid_token', 'Invalid audience'),
+          return this.createErrorResponse(
+            'invalid_token',
+            {
+              description: 'Token audience does not match resource server',
+              statusCode: 401,
+              headers: {
+                'WWW-Authenticate': challenge('invalid_token', 'Invalid audience'),
+              },
             },
-          });
+            { category: 'protected-resource', reason: 'audience_mismatch' }
+          );
         }
       }
 
@@ -4678,25 +4932,33 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
       // Failed external validation
       if (!ext) {
-        return this.createErrorResponse('invalid_token', {
-          description: 'Invalid access token',
-          statusCode: 401,
-          headers: {
-            'WWW-Authenticate': challenge('invalid_token'),
+        return this.createErrorResponse(
+          'invalid_token',
+          {
+            description: 'Invalid access token',
+            statusCode: 401,
+            headers: {
+              'WWW-Authenticate': challenge('invalid_token'),
+            },
           },
-        });
+          { category: 'protected-resource', reason: 'external_token_rejected' }
+        );
       }
 
       // The resolver contract is one string; a stored 0.x array is tolerated only for
       // the provider's own token records.
       if (typeof ext.audience !== 'string' || !isExactResource(ext.audience, configuredResource)) {
-        return this.createErrorResponse('invalid_token', {
-          description: 'External access token is not bound to the configured resource',
-          statusCode: 401,
-          headers: {
-            'WWW-Authenticate': challenge('invalid_token'),
+        return this.createErrorResponse(
+          'invalid_token',
+          {
+            description: 'External access token is not bound to the configured resource',
+            statusCode: 401,
+            headers: {
+              'WWW-Authenticate': challenge('invalid_token'),
+            },
           },
-        });
+          { category: 'protected-resource', reason: 'external_audience_unbound' }
+        );
       }
 
       // Validate that tokens were issued specifically for them
@@ -4708,13 +4970,17 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         // Check if any audience matches (RFC 3986: case-insensitive hostname comparison)
         const matches = audiences.some((aud) => audienceMatches(resourceServer, aud));
         if (!matches) {
-          return this.createErrorResponse('invalid_token', {
-            description: 'Token audience does not match resource server',
-            statusCode: 401,
-            headers: {
-              'WWW-Authenticate': challenge('invalid_token', 'Invalid audience'),
+          return this.createErrorResponse(
+            'invalid_token',
+            {
+              description: 'Token audience does not match resource server',
+              statusCode: 401,
+              headers: {
+                'WWW-Authenticate': challenge('invalid_token', 'Invalid audience'),
+              },
             },
-          });
+            { category: 'protected-resource', reason: 'external_audience_mismatch' }
+          );
         }
       }
 
@@ -4788,6 +5054,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       description: 'Token issuance is temporarily unavailable; retry shortly',
       statusCode: 429,
       headers: { 'Retry-After': '30' },
+      internal: { category: 'token-issuance', reason: 'kv_rate_limited', detail: error },
     });
   }
 
@@ -4951,7 +5218,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       return this.resolveAuthorizationRequestResource(requestedResource);
     } catch (error) {
       if (error instanceof AuthorizationError) {
-        throw new OAuthError('invalid_target', { description: error.description });
+        throw new OAuthError('invalid_target', {
+          description: error.description,
+          internal: { category: 'resource-indicator', reason: 'resource_invalid', detail: error },
+        });
       }
       throw error;
     }
@@ -4963,6 +5233,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     if (!this.findConfiguredResource(requestedResource)) {
       throw new OAuthError('invalid_target', {
         description: 'The resource parameter must name exactly one configured protected resource',
+        internal: { category: 'resource-indicator', reason: 'resource_not_configured' },
       });
     }
   }
@@ -4976,6 +5247,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     if (!subjectAudience) {
       throw new OAuthError('invalid_target', {
         description: 'Subject token is not bound to a configured resource',
+        internal: { category: 'resource-indicator', reason: 'subject_token_audience_unbound' },
       });
     }
 
@@ -4984,6 +5256,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     if (resourceWasProvided && (!requestedAudience || requestedAudience !== subjectAudience)) {
       throw new OAuthError('invalid_target', {
         description: 'The requested resource must exactly match the subject token audience',
+        internal: { category: 'resource-indicator', reason: 'resource_subject_token_mismatch' },
       });
     }
     return subjectAudience;
@@ -5011,12 +5284,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       // discard their tokens and re-authorize, where `invalid_target` would make them fail.
       throw new OAuthError('invalid_grant', {
         description: 'The authorization grant is not bound to a configured resource',
+        internal: { category: 'resource-indicator', reason: 'grant_audience_unbound' },
       });
     }
     if (canonicalGrantResource) {
       if (resourceWasProvided && canonicalRequestedResource !== canonicalGrantResource) {
         throw new OAuthError('invalid_target', {
           description: 'The requested resource does not match the authorization grant',
+          internal: { category: 'resource-indicator', reason: 'resource_grant_mismatch' },
         });
       }
       return {
@@ -5029,11 +5304,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     if (!legacyGrantResource) {
       throw new OAuthError('invalid_grant', {
         description: 'This legacy authorization grant has no resource binding and must be reauthorized',
+        internal: { category: 'resource-indicator', reason: 'legacy_grant_unbound' },
       });
     }
     if (resourceWasProvided && canonicalRequestedResource !== legacyGrantResource) {
       throw new OAuthError('invalid_target', {
         description: 'The requested resource does not match the server legacy-grant migration policy',
+        internal: { category: 'resource-indicator', reason: 'legacy_grant_resource_mismatch' },
       });
     }
     return {
@@ -5057,6 +5334,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     if (!isValidAccessTokenTTL(expiresIn)) {
       throw new OAuthError('invalid_request', {
         description: 'Requested token lifetime must be at least 60 seconds',
+        internal: { category: 'token-issuance', reason: 'requested_ttl_too_short' },
       });
     }
 
@@ -5218,7 +5496,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   private createErrorResponse(
     code: string,
     options: OAuthErrorOptions,
-    internal?: { category: string; reason: string; detail?: unknown },
+    internal: OAuthErrorInternal,
     request?: Request
   ): Response {
     const { description } = options;
@@ -5234,7 +5512,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       description,
       status: responseStatus,
       headers: responseHeaders,
-      ...(internal ? { internal } : {}),
+      internal,
       ...(request ? { request } : {}),
     });
     const body = JSON.stringify({
@@ -5261,6 +5539,26 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
  * Error class for OAuth operations
  * Carries OAuth error code and description for proper error responses
  */
+
+/**
+ * The internal reason behind an error response, forwarded to the `onError` hook and never
+ * placed on the wire. `category` is a stable kebab-case subsystem (`client-authentication`,
+ * `authorization-code-grant`, `refresh-token-grant`, `token-exchange-grant`,
+ * `token-endpoint-request`, `token-revocation`, `token-issuance`, `resource-indicator`,
+ * `client-registration`, `client-id-metadata-document`, `protected-resource`,
+ * `enterprise-managed-authorization`, `token-exchange-callback`); `reason` is a stable
+ * snake_case slug naming the exact check that failed. Treat both like enum members in semver.
+ * `detail` may carry structured context such as a caught error; it is never a secret.
+ */
+export interface OAuthErrorInternal {
+  /** Stable kebab-case subsystem that produced the error. */
+  category: string;
+  /** Stable snake_case slug naming the failed check, often more specific than the wire description. */
+  reason: string;
+  /** Optional structured context, e.g. the caught error or the offending parameter. */
+  detail?: unknown;
+}
+
 /**
  * Options accepted by the {@link OAuthError} constructor.
  */
@@ -5284,6 +5582,14 @@ export interface OAuthErrorOptions {
    * number of seconds or an HTTP-date.
    */
   headers?: Record<string, string>;
+
+  /**
+   * Internal reason forwarded to the `onError` hook and never sent on the wire. The library
+   * sets it on every error it originates; a `tokenExchangeCallback` may set its own. An
+   * `OAuthError` thrown without one reaches `onError` as
+   * `{ category: 'token-exchange-callback', reason: 'callback_error', detail: error }`.
+   */
+  internal?: OAuthErrorInternal;
 }
 
 /**

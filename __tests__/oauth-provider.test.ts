@@ -15263,3 +15263,276 @@ describe('request URL audience check on the combined provider', () => {
     expect(response.headers.get('WWW-Authenticate')).toContain('error="invalid_token"');
   });
 });
+
+describe('onError.internal coverage across generic error paths', () => {
+  type OnErrorInput = Parameters<NonNullable<ConstructorParameters<typeof OAuthProvider>[0]['onError']>>[0];
+
+  let env: ReturnType<typeof createMockEnv>;
+  let ctx: MockExecutionContext;
+  let captured: OnErrorInput[];
+
+  beforeEach(() => {
+    env = createMockEnv();
+    ctx = new MockExecutionContext();
+    captured = [];
+  });
+  afterEach(() => env.OAUTH_KV.clear());
+
+  const last = () => captured[captured.length - 1].internal;
+  const REDIRECT = 'https://client.example.com/cb';
+
+  const form = (body: string, headers: Record<string, string> = {}) =>
+    createMockRequest(
+      'https://example.com/oauth/token',
+      'POST',
+      { 'Content-Type': 'application/x-www-form-urlencoded', ...headers },
+      body
+    );
+
+  function createProvider(overrides: Record<string, unknown> = {}) {
+    return new OAuthProvider({
+      apiRoute: ['/api/'],
+      apiHandler: TestApiHandler,
+      defaultHandler: testDefaultHandler,
+      authorizeEndpoint: '/authorize',
+      tokenEndpoint: '/oauth/token',
+      clientRegistrationEndpoint: '/oauth/register',
+      scopesSupported: ['read', 'write'],
+      allowTokenExchangeGrant: true,
+      onError: (error) => {
+        captured.push(error);
+      },
+      ...overrides,
+    });
+  }
+
+  /** Register a confidential client and complete authorization, returning a fresh code. */
+  async function authorizationCode(provider: ReturnType<typeof createProvider>) {
+    const register = await provider.fetch(
+      createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify({
+          redirect_uris: [REDIRECT],
+          token_endpoint_auth_method: 'client_secret_post',
+          grant_types: ['authorization_code', 'refresh_token', 'urn:ietf:params:oauth:grant-type:token-exchange'],
+        })
+      ),
+      env,
+      ctx
+    );
+    const client = await register.json<any>();
+    const authorize = await provider.fetch(
+      createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${client.client_id}` +
+          `&redirect_uri=${encodeURIComponent(REDIRECT)}&scope=read&state=s`
+      ),
+      env,
+      ctx
+    );
+    const code = new URL(authorize.headers.get('Location')!).searchParams.get('code')!;
+    const credentials = `client_id=${client.client_id}&client_secret=${client.client_secret}`;
+    return { code, credentials };
+  }
+
+  it.each([
+    [
+      'a GET to the token endpoint',
+      () => createMockRequest('https://example.com/oauth/token', 'GET'),
+      { category: 'token-endpoint-request', reason: 'method_not_allowed' },
+    ],
+    [
+      'a JSON token request',
+      () => createMockRequest('https://example.com/oauth/token', 'POST', { 'Content-Type': 'application/json' }, '{}'),
+      { category: 'token-endpoint-request', reason: 'unsupported_content_type' },
+    ],
+    [
+      'a repeated parameter',
+      () => form('grant_type=authorization_code&grant_type=refresh_token'),
+      { category: 'token-endpoint-request', reason: 'repeated_parameter', detail: { parameter: 'grant_type' } },
+    ],
+    [
+      'Basic credentials alongside body credentials',
+      () => form('client_id=someone', { Authorization: `Basic ${btoa('someone:secret')}` }),
+      { category: 'client-authentication', reason: 'multiple_authentication_methods' },
+    ],
+    [
+      'a missing client_id',
+      () => form('grant_type=authorization_code'),
+      { category: 'client-authentication', reason: 'client_id_missing' },
+    ],
+    [
+      'an unknown client',
+      () => form('grant_type=authorization_code&client_id=nope&client_secret=x'),
+      { category: 'client-authentication', reason: 'client_not_found' },
+    ],
+    [
+      'a bearer token that does not exist',
+      () => createMockRequest('https://example.com/api/x', 'GET', { Authorization: 'Bearer u:g:secret' }),
+      { category: 'protected-resource', reason: 'token_not_found' },
+    ],
+    [
+      'a GET to the registration endpoint',
+      () => createMockRequest('https://example.com/oauth/register', 'GET'),
+      { category: 'client-registration', reason: 'method_not_allowed' },
+    ],
+    [
+      'malformed registration JSON',
+      () =>
+        createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          '{nope'
+        ),
+      { category: 'client-registration', reason: 'json_malformed' },
+    ],
+  ] as const)('tags %s for onError without touching the wire', async (_label, request, internal) => {
+    const provider = createProvider();
+    const response = await provider.fetch(request(), env, ctx);
+
+    expect(response.ok).toBe(false);
+    expect(last()).toEqual(internal);
+    // The reason is a server-side slug, never part of the client-visible response.
+    expect(await response.clone().text()).not.toContain(internal.reason);
+  });
+
+  it('names the exact failed check per grant flow while the wire stays generic', async () => {
+    const provider = createProvider();
+    const { code, credentials } = await authorizationCode(provider);
+    const redeem = (body: string) => provider.fetch(form(body), env, ctx);
+
+    await redeem(`grant_type=authorization_code&${credentials}`);
+    expect(last()).toEqual({ category: 'authorization-code-grant', reason: 'code_missing' });
+
+    await redeem(`grant_type=password&${credentials}`);
+    expect(last()).toEqual({ category: 'token-endpoint-request', reason: 'grant_type_not_supported' });
+
+    // RFC 8707: a resource the server does not host. Audience resolution runs before the
+    // code is consumed, so the same code stays redeemable below.
+    await redeem(
+      `grant_type=authorization_code&code=${code}&redirect_uri=${encodeURIComponent(REDIRECT)}` +
+        `&resource=${encodeURIComponent('https://other.example/api')}&${credentials}`
+    );
+    expect(last()).toEqual({ category: 'resource-indicator', reason: 'resource_not_configured' });
+
+    const issued = await redeem(
+      `grant_type=authorization_code&code=${code}&redirect_uri=${encodeURIComponent(REDIRECT)}&${credentials}`
+    );
+    expect(issued.status).toBe(200);
+    const tokens = await issued.json<any>();
+
+    await redeem(`grant_type=refresh_token&refresh_token=garbage&${credentials}`);
+    expect(last()).toEqual({ category: 'refresh-token-grant', reason: 'refresh_token_malformed' });
+
+    await redeem(`grant_type=refresh_token&refresh_token=user:grant:wrong&${credentials}`);
+    expect(last()).toEqual({ category: 'refresh-token-grant', reason: 'grant_not_found' });
+
+    // A real grant presented with the wrong token half: distinguishable from a missing grant
+    // internally, identical invalid_grant on the wire.
+    const [userId, grantId] = (tokens.refresh_token as string).split(':');
+    await redeem(`grant_type=refresh_token&refresh_token=${userId}:${grantId}:wrong&${credentials}`);
+    expect(last()).toEqual({ category: 'refresh-token-grant', reason: 'refresh_token_mismatch' });
+
+    await redeem(`grant_type=${encodeURIComponent('urn:ietf:params:oauth:grant-type:token-exchange')}&${credentials}`);
+    expect(last()).toEqual({ category: 'token-exchange-grant', reason: 'subject_token_missing' });
+
+    // The same grant type from a client that did not register it: a server capability miss
+    // and a client registration miss are different internal reasons behind similar wires.
+    const plain = await provider.fetch(
+      createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify({ redirect_uris: [REDIRECT], token_endpoint_auth_method: 'client_secret_post' })
+      ),
+      env,
+      ctx
+    );
+    const plainClient = await plain.json<any>();
+    await redeem(
+      `grant_type=${encodeURIComponent('urn:ietf:params:oauth:grant-type:token-exchange')}` +
+        `&client_id=${plainClient.client_id}&client_secret=${plainClient.client_secret}`
+    );
+    expect(last()).toEqual({ category: 'token-endpoint-request', reason: 'grant_type_not_registered' });
+
+    // Another exchange-capable client presenting client A's token: the library's own
+    // rejection, not a callback's, and tagged as such (no tokenExchangeCallback is configured).
+    const clientB = await provider.fetch(
+      createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify({
+          redirect_uris: [REDIRECT],
+          token_endpoint_auth_method: 'client_secret_post',
+          grant_types: ['authorization_code', 'urn:ietf:params:oauth:grant-type:token-exchange'],
+        })
+      ),
+      env,
+      ctx
+    );
+    const b = await clientB.json<any>();
+    await redeem(
+      `grant_type=${encodeURIComponent('urn:ietf:params:oauth:grant-type:token-exchange')}` +
+        `&subject_token=${tokens.access_token}` +
+        `&subject_token_type=${encodeURIComponent('urn:ietf:params:oauth:token-type:access_token')}` +
+        `&client_id=${b.client_id}&client_secret=${b.client_secret}`
+    );
+    expect(last()).toEqual({ category: 'token-exchange-grant', reason: 'cross_client_subject_token' });
+
+    // Replaying the consumed code is tagged, answered generically, and revokes the grant
+    // (OAuth 2.1 code-replay defense) — so this row runs after the refresh rows above.
+    const replay = await redeem(
+      `grant_type=authorization_code&code=${code}&redirect_uri=${encodeURIComponent(REDIRECT)}&${credentials}`
+    );
+    expect(last()).toEqual({ category: 'authorization-code-grant', reason: 'code_replayed' });
+    const replayBody = await replay.json<any>();
+    expect(replayBody).toEqual({ error: 'invalid_grant', error_description: 'Authorization code already used' });
+
+    // EMA is not configured, so jwt-bearer is not a supported grant; the wire says only that.
+    const ema = await redeem(
+      `grant_type=${encodeURIComponent('urn:ietf:params:oauth:grant-type:jwt-bearer')}&${credentials}`
+    );
+    expect(last()).toEqual({ category: 'token-endpoint-request', reason: 'grant_type_not_supported' });
+    expect(await ema.json<any>()).toMatchObject({ error: 'unsupported_grant_type' });
+  });
+
+  it('wraps a callback OAuthError as callback_error and passes a callback-supplied internal through', async () => {
+    const throwing = createProvider({
+      tokenExchangeCallback: () => {
+        throw new OAuthError('invalid_grant', { description: 'upstream says no' });
+      },
+    });
+    const first = await authorizationCode(throwing);
+    const denied = await throwing.fetch(
+      form(
+        `grant_type=authorization_code&code=${first.code}&redirect_uri=${encodeURIComponent(REDIRECT)}&${first.credentials}`
+      ),
+      env,
+      ctx
+    );
+    expect(await denied.json<any>()).toEqual({ error: 'invalid_grant', error_description: 'upstream says no' });
+    expect(last()).toMatchObject({ category: 'token-exchange-callback', reason: 'callback_error' });
+    expect(last().detail).toBeInstanceOf(OAuthError);
+
+    const tagged = createProvider({
+      tokenExchangeCallback: () => {
+        throw new OAuthError('invalid_grant', {
+          description: 'upstream says no',
+          internal: { category: 'upstream-idp', reason: 'refresh_rejected' },
+        });
+      },
+    });
+    const second = await authorizationCode(tagged);
+    await tagged.fetch(
+      form(
+        `grant_type=authorization_code&code=${second.code}&redirect_uri=${encodeURIComponent(REDIRECT)}&${second.credentials}`
+      ),
+      env,
+      ctx
+    );
+    expect(last()).toEqual({ category: 'upstream-idp', reason: 'refresh_rejected' });
+  });
+});
