@@ -6843,7 +6843,11 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
     }
 
     // Preserve TTL for DCR clients: re-apply clientRegistrationTTL if configured
-    await this.provider.putRegisteredClient(this.env, updatedClient, Math.floor(Date.now() / 1000));
+    if (client.registrationExpiresAt === undefined) {
+      await this.env.OAUTH_KV.put(`client:${updatedClient.clientId}`, JSON.stringify(updatedClient));
+    } else {
+      await this.provider.putRegisteredClient(this.env, updatedClient, Math.floor(Date.now() / 1000));
+    }
 
     // Create a response object
     const response = toPublicClientInfo(updatedClient);

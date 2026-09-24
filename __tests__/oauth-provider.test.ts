@@ -13348,6 +13348,20 @@ describe('OAuthProvider', () => {
       expect(updated.clientName).toBe('Renamed');
       expect(updated.registrationExpiresAt).toBeGreaterThanOrEqual(nowSeconds() + NINETY_DAYS - 5);
     });
+
+    it('keeps a createClient() client permanent when updateClient() rewrites it', async () => {
+      const provider = makeProvider();
+      await provider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
+      const client = await mockEnv.OAUTH_PROVIDER!.createClient({ redirectUris: [REDIRECT_URI] });
+
+      await mockEnv.OAUTH_PROVIDER!.updateClient(client.clientId, { clientName: 'Renamed' });
+      const updated = await readClient(client.clientId);
+      expect(updated.clientName).toBe('Renamed');
+      expect(updated).not.toHaveProperty('registrationExpiresAt');
+
+      mockEnv.OAUTH_KV.advanceTime((NINETY_DAYS + 1) * 1000);
+      expect(await readClient(client.clientId)).not.toBeNull();
+    });
   });
 
   describe('deleteClient cascading to grants', () => {
