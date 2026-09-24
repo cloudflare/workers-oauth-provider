@@ -1,0 +1,31 @@
+.changeset/consent-and-upstream-sign-in.md
+  s_1b1f3dce47e01c::t_dcf40088dd6db4 7,13
+README.md
+  s_1b1f3dce47e01c::t_9eabcfcac38a0a 274-275,512
+__tests__/oauth-consent.test.ts
+  s_1b1f3dce47e01c::t_8a82b06df7da08 148-185
+docs/consent-page.md
+  s_1b1f3dce47e01c::t_88775c1f3f4da7 1-137
+docs/upstream-sign-in.md
+  s_1b1f3dce47e01c::t_a19323d31dcbb1 47-62,73
+src/oauth-consent.ts
+  s_1b1f3dce47e01c::t_c0b982dd598aa6 43-50,169-191
+src/oauth-provider.ts
+  s_1b1f3dce47e01c::t_2edba141b6e803 62,71,816-823,7098-7101
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "cc6417adcb249099c226f646bb7c909172ec4426",
+  "prompts": {},
+  "sessions": {
+    "s_1b1f3dce47e01c": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a0b3b8-09e5-75fe-ad90-bf9d48da5b83",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Matt Carey <mcarey@cloudflare.com>"
+    }
+  }
+}
