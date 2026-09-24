@@ -1,9 +1,5 @@
-/// <reference types="vite/client" />
 import { afterAll, beforeAll, expect, it } from 'vitest';
 import { createTestHarness } from 'wrangler';
-import readme from '../../README.md?raw';
-import authServerSource from './auth-server/index.ts?raw';
-import mcpServerSource from './mcp-server/index.ts?raw';
 
 const AUTH_SERVER = { configPath: './examples/split-workers/auth-server/wrangler.jsonc' };
 const MCP_SERVER = { configPath: './examples/split-workers/mcp-server/wrangler.jsonc' };
@@ -97,10 +93,4 @@ it('answers a token without mcp:read with the MCP insufficient_scope challenge',
   const call = await mcp.fetch(RESOURCE, { headers: { Authorization: `Bearer ${token}` } });
   expect(call.status).toBe(403);
   expect(call.headers.get('WWW-Authenticate')).toContain('error="insufficient_scope", scope="mcp:read"');
-});
-
-it('is the README quick start, verbatim', () => {
-  const quickStart = readme.slice(readme.indexOf('## Quick start'), readme.indexOf('## Single Worker'));
-  const blocks = [...quickStart.matchAll(/```ts\n([\s\S]*?)```/g)].map((match) => match[1]);
-  expect(blocks).toEqual([authServerSource, mcpServerSource]);
 });

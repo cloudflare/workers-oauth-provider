@@ -3,6 +3,8 @@
   "name": "mcp-server",
   "main": "index.ts",
   "compatibility_date": "2026-07-29",
+  // Reachable only on its custom domain, which matches the configured issuer or resource.
+  "workers_dev": false,
   "routes": [{ "pattern": "mcp.example.com", "custom_domain": true }],
   // Tokens are validated by calling the auth-server Worker's validateToken() over this binding.
   "services": [{ "binding": "AUTH_SERVER", "service": "auth-server" }],

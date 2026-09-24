@@ -1,6 +1,6 @@
 # Advanced configuration
 
-This guide covers features that are useful for proxying another authorization system, changing token data during exchange, or operating the provider over time. Start with the main [README](../README.md) for MCP discovery, client registration, and a minimal Worker.
+This guide covers features that are useful for proxying another authorization system, changing token data during exchange, or operating the provider over time. Start with the [README](../README.md) for a minimal deployment, [MCP authorization discovery](mcp-discovery.md), and the [authorization server reference](authorization-server.md) for client registration.
 
 ## Token exchange callback
 
