@@ -88,8 +88,6 @@ export type {
   EmaTrustedIssuerResolverInput,
 } from './ema/types';
 export type { EmaValidationError } from './ema/result';
-export { isValidOAuthScopeToken } from './oauth-capabilities';
-export { resourceMatches, validateResourceUri } from './oauth-resource';
 
 const PROTECTED_RESOURCE_WELL_KNOWN_PREFIX = '/.well-known/oauth-protected-resource';
 const NO_CACHE_HEADERS = { 'Cache-Control': 'no-store', Pragma: 'no-cache' } as const;
@@ -6270,58 +6268,6 @@ function isValidRedirectUri(requestUri: string, registeredUris: string[]): boole
  */
 function base64UrlEncode(str: string): string {
   return btoa(str).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
-}
-
-/**
- * Decodes a base64url-encoded string to bytes.
- */
-export function base64UrlToBytes(base64Url: string): Uint8Array {
-  const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
-  const padded = base64.padEnd(base64.length + ((4 - (base64.length % 4)) % 4), '=');
-  const binaryString = atob(padded);
-  const bytes = new Uint8Array(binaryString.length);
-  for (let i = 0; i < binaryString.length; i++) {
-    bytes[i] = binaryString.charCodeAt(i);
-  }
-  return bytes;
-}
-
-/**
- * Parses a base64url-encoded JWT JSON part into an object.
- */
-export function parseJwtJsonPart(encoded: string): Record<string, unknown> {
-  try {
-    const json = new TextDecoder().decode(base64UrlToBytes(encoded));
-    const parsed = JSON.parse(json);
-    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-      throw new Error('JWT part must be an object');
-    }
-    return parsed as Record<string, unknown>;
-  } catch {
-    throw new Error('Malformed JWT part');
-  }
-}
-
-/**
- * Gets WebCrypto import and verify parameters for supported JOSE algorithms.
- */
-export function getJwtCryptoAlgorithms(alg: string): {
-  importAlgorithm: Parameters<SubtleCrypto['importKey']>[2];
-  verifyAlgorithm: Parameters<SubtleCrypto['verify']>[0];
-} {
-  if (alg === 'RS256') {
-    const algorithm = { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' };
-    return { importAlgorithm: algorithm, verifyAlgorithm: algorithm };
-  }
-
-  if (alg === 'ES256') {
-    return {
-      importAlgorithm: { name: 'ECDSA', namedCurve: 'P-256' },
-      verifyAlgorithm: { name: 'ECDSA', hash: 'SHA-256' },
-    };
-  }
-
-  throw new Error(`Unsupported JWT alg: ${alg}`);
 }
 
 /**

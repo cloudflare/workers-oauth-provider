@@ -5,7 +5,6 @@
  * WebCrypto call. Both operate over an already-fetched JWKS.
  */
 
-import { getJwtCryptoAlgorithms } from '../oauth-provider';
 import { type EmaSupportedAlg } from './constants';
 import { err, ok, type EmaValidationError, type Result } from './result';
 import type { JsonWebKeySet, OAuthJsonWebKey } from './types';
@@ -75,4 +74,26 @@ export async function verifyIdJagSignature(input: VerifyInput): Promise<boolean>
   } catch {
     return false;
   }
+}
+
+/**
+ * Gets WebCrypto import and verify parameters for supported JOSE algorithms.
+ */
+function getJwtCryptoAlgorithms(alg: string): {
+  importAlgorithm: Parameters<SubtleCrypto['importKey']>[2];
+  verifyAlgorithm: Parameters<SubtleCrypto['verify']>[0];
+} {
+  if (alg === 'RS256') {
+    const algorithm = { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' };
+    return { importAlgorithm: algorithm, verifyAlgorithm: algorithm };
+  }
+
+  if (alg === 'ES256') {
+    return {
+      importAlgorithm: { name: 'ECDSA', namedCurve: 'P-256' },
+      verifyAlgorithm: { name: 'ECDSA', hash: 'SHA-256' },
+    };
+  }
+
+  throw new Error(`Unsupported JWT alg: ${alg}`);
 }

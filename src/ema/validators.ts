@@ -10,7 +10,7 @@
  */
 
 import type { ClientInfo } from '../oauth-provider';
-import { isValidOAuthScopeToken } from '../oauth-provider';
+import { isValidOAuthScopeToken } from '../oauth-capabilities';
 import { resourceMatches, validateResourceUri } from '../oauth-resource';
 import { EMA_DEFAULT_JWT_ALGORITHM, EMA_SUPPORTED_JWT_ALGORITHMS, type EmaSupportedAlg } from './constants';
 import { err, ok, type EmaValidationError, type Result } from './result';
