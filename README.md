@@ -31,7 +31,7 @@ export default class AuthServer extends WorkerEntrypoint<Env> {
   fetch(request: Request) {
     // /authorize is yours: parseAuthRequest(), sign the user in and ask for consent, completeAuthorization().
     if (new URL(request.url).pathname === '/authorize') return authorize(request, this.env);
-    return authorizationServer.fetch(request, this.env, this.ctx); // discovery, token, revocation, registration
+    return authorizationServer.fetch(request, this.env, this.ctx); // discovery, token, revocation
   }
 
   // Resource servers call this over their Service Binding.

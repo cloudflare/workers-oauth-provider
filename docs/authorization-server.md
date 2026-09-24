@@ -4,7 +4,7 @@ The authorization endpoint, client registration, tokens, resources, scopes, stor
 
 ## Authorization endpoint
 
-Your `authorizeEndpoint` belongs to the application's `defaultHandler` because user authentication and consent are application-specific. The provider is not an identity provider.
+Your `authorizeEndpoint` is application code, because user authentication and consent are application-specific. With split roles it is the `/authorize` route in your authorization server's `fetch`, using `authorizationServer.getOAuthApi(env)`; with `OAuthProvider` it lives in `defaultHandler`, using `env.OAUTH_PROVIDER`. The helpers are the same. The provider is not an identity provider.
 
 A typical flow has three steps:
 
