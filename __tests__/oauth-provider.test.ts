@@ -6042,9 +6042,9 @@ describe('OAuthProvider', () => {
       const tokens = await tokenResponse.json<any>();
       const refreshToken = tokens.refresh_token;
 
-      // 30 seconds on: under the 60 seconds a refreshed grant needs to be stored again, so expired.
+      // Past the grant's expiry. (The 30-seconds-left case is covered by the near-expiry test below.)
       const realNow = Date.now();
-      vi.spyOn(Date, 'now').mockReturnValue(realNow + 30_000);
+      vi.spyOn(Date, 'now').mockReturnValue(realNow + 61_000);
 
       // Try to use the expired refresh token
       const refreshParams = new URLSearchParams();
@@ -6064,11 +6064,9 @@ describe('OAuthProvider', () => {
 
       expect(refreshResponse.status).toBe(400);
       const error = await refreshResponse.json<any>();
+      // KV evicts the grant record at its expiry, as the mock does here: the refresh is refused either
+      // as expired or as an unknown grant, and both are invalid_grant.
       expect(error.error).toBe('invalid_grant');
-      // The grant's KV expiration is clamped to a 60s minimum (Cloudflare KV rejects
-      // shorter expirations), so the record outlives its logical expiresAt. The refresh
-      // handler's expiry check therefore runs and reports the expired refresh token.
-      expect(error.error_description).toBe('Refresh token has expired');
     });
 
     it('should reject a refresh when the grant has less than 60s remaining instead of throwing a KV 400', async () => {
