@@ -2,7 +2,7 @@
 '@cloudflare/workers-oauth-provider': major
 ---
 
-Split the authorization server and resource server roles, and bind every token to one canonical resource.
+Split the authorization server and resource server roles, and bind every token to one canonical resource. Migration guide: [docs/migration-1.0.md](https://github.com/cloudflare/workers-oauth-provider/blob/main/docs/migration-1.0.md) — for most 0.x deployments the diff is adding `resourceMetadata: { resource }`.
 
 - `OAuthAuthorizationServer` declares its `resources` at construction and validates its access tokens for any of them with `validateToken(resource, token, env)`. Metadata advertises the registry as RFC 9728 `protected_resources`. Every resource is hosted by `OAuthResourceServer`, in the same Worker or another: its `validateToken` option returns the validator for a request, the host calls it with its own canonical resource and the bearer token, and the two topologies differ only in what that points at, `(env) => (resource, token) => authorizationServer.validateToken(resource, token, env)` locally or `(env) => env.AUTH_SERVER.validateToken` over a Service Binding to a `WorkerEntrypoint` (`AuthorizationServerBinding` types it). `resolveExternalToken` stays on the combined `OAuthProvider` only; a role-based resource that must accept another issuer's tokens does so in its own `validateToken`.
 - `OAuthResourceServer` publishes RFC 9728 metadata (a cache-busting query does not hide it; a resource's own query must be present), issues Bearer challenges, and enforces audience and expiry on whatever the validator returns.

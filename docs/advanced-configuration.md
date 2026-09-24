@@ -99,6 +99,8 @@ tokenExchangeCallback: (options) => {
 
 ## Enterprise-managed authorization
 
+**Experimental.** The [MCP Enterprise-Managed Authorization extension](https://modelcontextprotocol.io/extensions/auth/enterprise-managed-authorization) is itself young, so the `enterpriseManagedAuthorization` option and its exported types (`EmaValidationError`, trust-policy shapes) are exempt from 1.x semver: they may change in a minor release, with the change documented in the changelog. Everything else on this page is stable API.
+
 The token endpoint accepts a validated ID-JAG assertion using the JWT bearer grant and returns an opaque, resource-bound access token.
 
 ```ts
