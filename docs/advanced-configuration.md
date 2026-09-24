@@ -6,6 +6,8 @@ This guide covers features that are useful for proxying another authorization sy
 
 `tokenExchangeCallback` runs during authorization code and refresh token exchanges. It is useful when the Worker also acts as an OAuth client to an upstream service.
 
+The callback receives the request's `env`, so it can reach secrets and bindings (an upstream client secret, say) while the provider itself is built once at module scope.
+
 ```ts
 new OAuthProvider({
   // Other options...
@@ -26,7 +28,7 @@ new OAuthProvider({
     }
 
     if (options.grantType === 'refresh_token') {
-      const upstream = await refreshUpstream(options.props.upstreamRefreshToken);
+      const upstream = await refreshUpstream(options.props.upstreamRefreshToken, options.env.UPSTREAM_CLIENT_SECRET);
       return {
         accessTokenProps: {
           ...options.props,
@@ -294,7 +296,7 @@ Use either `apiHandlers` or `apiRoute` plus `apiHandler`, not both. Routes can b
 
 ## External token resolution
 
-`resolveExternalToken` accepts a bearer credential that was not issued or stored by this provider. It runs only after the internal token lookup fails. The credential can be an external OAuth access token, opaque API key, or personal access token (PAT).
+`resolveExternalToken` accepts a bearer credential that was not issued or stored by this provider. It runs only after the internal token lookup fails, and never for a token in this provider's own `userId:grantId:secret` format: an expired or revoked token we issued is answered `invalid_token` directly, so it is never forwarded to an external validator. The credential can be an external OAuth access token, opaque API key, or personal access token (PAT).
 
 ### MCP compatibility warning
 
