@@ -15867,3 +15867,78 @@ describe('redirect URI policy: https, or http on a loopback host', () => {
     expect((await register(provider, 'javascript:alert(1)')).status).toBe(400);
   });
 });
+
+describe('user IDs cannot contain ":"', () => {
+  let env: ReturnType<typeof createMockEnv>;
+  let ctx: MockExecutionContext;
+  beforeEach(() => {
+    env = createMockEnv();
+    ctx = new MockExecutionContext();
+  });
+  afterEach(() => env.OAUTH_KV.clear());
+
+  async function helpers() {
+    const provider = new OAuthProvider({
+      apiRoute: ['/api/'],
+      apiHandler: TestApiHandler,
+      defaultHandler: testDefaultHandler,
+      authorizeEndpoint: '/authorize',
+      tokenEndpoint: '/oauth/token',
+    });
+    await provider.fetch(createMockRequest('https://example.com/'), env, ctx);
+    return env.OAUTH_PROVIDER!;
+  }
+
+  it('refuses to issue for one: its tokens could never be validated', async () => {
+    const oauth = await helpers();
+    const client = await oauth.createClient({
+      redirectUris: ['https://client.example/cb'],
+      tokenEndpointAuthMethod: 'none',
+    });
+    const request = await oauth.parseAuthRequest(
+      new Request(
+        `https://example.com/authorize?response_type=code&client_id=${client.clientId}` +
+          `&redirect_uri=${encodeURIComponent('https://client.example/cb')}` +
+          '&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256'
+      )
+    );
+    await expect(
+      oauth.completeAuthorization({ request, userId: 'tenant:user-7', metadata: {}, scope: [], props: {} })
+    ).rejects.toThrow('userId must be a non-empty string without ":"');
+    expect((await env.OAUTH_KV.list({ prefix: 'grant:' })).keys).toHaveLength(0);
+  });
+
+  it("keeps a legacy grant for user a:b out of user a's list and revocation", async () => {
+    const oauth = await helpers();
+    const client = await oauth.createClient({
+      redirectUris: ['https://client.example/cb'],
+      tokenEndpointAuthMethod: 'none',
+    });
+    // A grant stored before this rule, for user `a:b`, whose key `grant:a:b:…` starts with `grant:a:`.
+    await env.OAUTH_KV.put(
+      'grant:a:b:legacygrant00001',
+      JSON.stringify({
+        id: 'legacygrant00001',
+        clientId: client.clientId,
+        userId: 'a:b',
+        scope: [],
+        metadata: { label: 'someone else' },
+        createdAt: 1,
+      }),
+      { metadata: { clientId: client.clientId, resource: TEST_RESOURCE, redirectUri: 'https://client.example/cb' } }
+    );
+    expect((await oauth.listUserGrants('a')).items).toEqual([]);
+
+    // Completing an authorization for `a` revokes a's earlier grants for the client, not a:b's.
+    const request = await oauth.parseAuthRequest(
+      new Request(
+        `https://example.com/authorize?response_type=code&client_id=${client.clientId}` +
+          `&redirect_uri=${encodeURIComponent('https://client.example/cb')}` +
+          '&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256'
+      )
+    );
+    await oauth.completeAuthorization({ request, userId: 'a', metadata: {}, scope: [], props: {} });
+    expect(await env.OAUTH_KV.get('grant:a:b:legacygrant00001')).not.toBeNull();
+    expect((await oauth.listUserGrants('a')).items).toHaveLength(1);
+  });
+});

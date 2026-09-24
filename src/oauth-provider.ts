@@ -6602,6 +6602,12 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
     if (!clientId || !redirectUri) {
       throw new Error('Client ID and Redirect URI are required in the authorization request.');
     }
+    // `:` separates the parts of issued tokens and grant keys (`userId:grantId:secret`,
+    // `grant:{userId}:{grantId}`). A user ID containing it yields tokens that can never be
+    // validated, and grant keys that another user's `grant:{userId}:` prefix would match.
+    if (typeof options.userId !== 'string' || options.userId.length === 0 || options.userId.includes(':')) {
+      throw new TypeError('userId must be a non-empty string without ":"');
+    }
 
     // Re-validate the redirectUri to prevent open redirect vulnerabilities
     const clientInfo = await this.lookupClient(clientId);
@@ -6827,6 +6833,8 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
       const page = await this.env.OAUTH_KV.list<unknown>({ prefix, limit: MAX_KV_LIST_LIMIT, cursor });
       const toRead: string[] = [];
       for (const key of page.keys) {
+        // `grant:a:` also matches a legacy `grant:a:b:{grantId}` belonging to user `a:b`.
+        if (key.name.slice(prefix.length).includes(':')) continue;
         if (isGrantKeyMetadata(key.metadata)) {
           if (matches(key.metadata)) found.push(key.name.slice(prefix.length));
         } else {
@@ -7085,10 +7093,14 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
 
     // Use the KV list() function to get grant keys with pagination
     const response = await this.env.OAUTH_KV.list(listOptions);
+    // `grant:a:` also matches a legacy `grant:a:b:{grantId}` belonging to user `a:b`: never list it.
+    const ownKeys = response.keys.filter(
+      (key: { name: string }) => !key.name.slice(listOptions.prefix.length).includes(':')
+    );
 
     // Fetch all grants in parallel and convert to grant summaries
     const grantSummaries: GrantSummary[] = [];
-    const promises = response.keys.map(async (key: { name: string }) => {
+    const promises = ownKeys.map(async (key: { name: string }) => {
       const grantData: Grant | null = await this.env.OAUTH_KV.get(key.name, { type: 'json' });
       if (grantData) {
         // Create a summary with only the public fields
