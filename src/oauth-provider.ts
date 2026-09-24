@@ -13,6 +13,7 @@ import {
   withAuthorizationRedirect,
   type OAuthServerCapabilities,
 } from './oauth-capabilities';
+import { baselineResourceScopes, withCorsHeaders } from './oauth-http';
 import {
   fetchClientIdMetadataDocument,
   isClientIdMetadataDocumentUrl,
@@ -2344,7 +2345,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         (this.options.clientRegistrationEndpoint && this.isClientRegistrationEndpoint(url))
       ) {
         // Create an empty 204 No Content response with CORS headers
-        return this.addCorsHeaders(
+        return withCorsHeaders(
           new Response(null, {
             status: 204,
             headers: { 'Content-Length': '0' },
@@ -2359,7 +2360,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Handle .well-known/oauth-authorization-server
     if (this.isAuthorizationServerMetadataRequest(url)) {
       if (request.method !== 'GET' && request.method !== 'HEAD') {
-        return this.addCorsHeaders(
+        return withCorsHeaders(
           new Response(null, {
             status: 405,
             headers: { Allow: 'GET, HEAD, OPTIONS' },
@@ -2368,7 +2369,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         );
       }
       const response = await this.handleMetadataDiscovery(url);
-      return this.addCorsHeaders(withoutBodyForHead(request, response), request);
+      return withCorsHeaders(withoutBodyForHead(request, response), request);
     }
 
     // Handle .well-known/oauth-protected-resource (RFC 9728). A document at
@@ -2376,10 +2377,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // it, so reserve the namespace and return 404 for noncanonical variants.
     if (servesProtectedResources && this.isProtectedResourceMetadataPath(url)) {
       if (!metadataResourceServer) {
-        return this.addCorsHeaders(new Response(null, { status: 404 }), request);
+        return withCorsHeaders(new Response(null, { status: 404 }), request);
       }
       if (request.method !== 'GET' && request.method !== 'HEAD') {
-        return this.addCorsHeaders(
+        return withCorsHeaders(
           new Response(null, {
             status: 405,
             headers: { Allow: 'GET, HEAD, OPTIONS' },
@@ -2388,7 +2389,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         );
       }
       const response = this.handleProtectedResourceMetadata(url, metadataResourceServer);
-      return this.addCorsHeaders(withoutBodyForHead(request, response), request);
+      return withCorsHeaders(withoutBodyForHead(request, response), request);
     }
 
     // Handle token endpoint (including revocation)
@@ -2397,7 +2398,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
       // If parsing failed, return the error response
       if (parsed instanceof Response) {
-        return this.addCorsHeaders(parsed, request);
+        return withCorsHeaders(parsed, request);
       }
 
       let response: Response;
@@ -2412,19 +2413,19 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         await this.renewClientRegistrationIfDue(env, parsed.clientInfo, Math.floor(Date.now() / 1000));
       }
 
-      return this.addCorsHeaders(response, request);
+      return withCorsHeaders(response, request);
     }
 
     // Handle client registration endpoint
     if (this.options.clientRegistrationEndpoint && this.isClientRegistrationEndpoint(url)) {
       const response = await this.handleClientRegistration(request, env);
-      return this.addCorsHeaders(response, request);
+      return withCorsHeaders(response, request);
     }
 
     // Check if it's an API request
     if (apiRoute) {
       const response = await this.handleApiRequest(request, env, ctx, apiRoute);
-      return this.addCorsHeaders(response, request);
+      return withCorsHeaders(response, request);
     }
 
     if (typeof role === 'object') {
@@ -2947,50 +2948,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   }
 
   /**
-   * Adds CORS headers to a response
-   * @param response - The response to add CORS headers to
-   * @param request - The original request
-   * @returns A new Response with CORS headers added
-   */
-  private addCorsHeaders(response: Response, request: Request): Response {
-    // Get the Origin header from the request
-    const origin = request.headers.get('Origin');
-
-    // If there's no Origin header, return the original response
-    if (!origin) {
-      return response;
-    }
-
-    // Create a new response that copies all properties from the original response
-    // This makes the response mutable so we can modify its headers
-    const newResponse = new Response(response.body, response);
-
-    // Add CORS headers
-    newResponse.headers.set('Access-Control-Allow-Origin', origin);
-    newResponse.headers.set('Access-Control-Allow-Methods', '*');
-    // Include Authorization explicitly since it's not included in * for security reasons
-    newResponse.headers.set('Access-Control-Allow-Headers', 'Authorization, *');
-    appendHeaderValue(newResponse.headers, 'Vary', 'Origin');
-
-    // Browser-based OAuth/MCP clients need these non-safelisted response
-    // headers for authorization discovery, step-up challenges, and backoff.
-    // Preserve any headers the API handler already chose to expose.
-    const exposedHeaders = (newResponse.headers.get('Access-Control-Expose-Headers') ?? '')
-      .split(',')
-      .map((name) => name.trim())
-      .filter(Boolean);
-    for (const requiredHeader of ['WWW-Authenticate', 'Retry-After']) {
-      if (!exposedHeaders.some((name) => name.toLowerCase() === requiredHeader.toLowerCase())) {
-        exposedHeaders.push(requiredHeader);
-      }
-    }
-    newResponse.headers.set('Access-Control-Expose-Headers', exposedHeaders.join(', '));
-    newResponse.headers.set('Access-Control-Max-Age', '86400'); // 24 hours
-
-    return newResponse;
-  }
-
-  /**
    * Handles the OAuth metadata discovery endpoint
    * Implements RFC 8414 for OAuth Server Metadata
    * @param requestUrl - The URL of the incoming request
@@ -3064,7 +3021,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
   /** Deduplicate resource-facing scopes and remove authorization-server-only capabilities. */
   private normalizeProtectedResourceScopes(scopes: string[]): string[] {
-    return [...new Set(scopes)].filter((scope) => scope !== 'offline_access');
+    return baselineResourceScopes(scopes);
   }
 
   /**
@@ -6126,15 +6083,6 @@ function audienceMatches(resourceServerUrl: string, audienceValue: string): bool
   } catch {
     return false;
   }
-}
-
-function appendHeaderValue(headers: Headers, name: string, value: string): void {
-  const values = (headers.get(name) ?? '')
-    .split(',')
-    .map((item) => item.trim())
-    .filter(Boolean);
-  if (!values.some((item) => item.toLowerCase() === value.toLowerCase())) values.push(value);
-  headers.set(name, values.join(', '));
 }
 
 /** Whether a request or audience names one canonical configured resource. */

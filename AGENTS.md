@@ -37,6 +37,7 @@ workers-oauth-provider/
 │   ├── oauth-provider.ts      # Core provider implementation
 │   ├── oauth-capabilities.ts  # Pure server/client metadata capability policy
 │   ├── oauth-client-metadata.ts # Typed DCR parsing and CIMD resolution pipeline
+│   ├── oauth-http.ts          # CORS and scope helpers shared by both hosts
 │   ├── oauth-consent.ts       # Consent and upstream sign-in transactions (MCP confused-deputy MUSTs)
 │   └── ema/                   # Enterprise-Managed Authorization pipeline
 ├── __tests__/
