@@ -11,7 +11,6 @@ import {
   validateAuthorizationServerScopes,
   withAuthorizationRedirect,
   type OAuthServerCapabilities,
-  type PkceCodeChallengeMethod,
 } from './oauth-capabilities';
 import {
   fetchClientIdMetadataDocument,
@@ -537,13 +536,6 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
    * `resourceMetadata.scopes_supported` separately for protected resource requirements.
    */
   scopesSupported?: string[];
-
-  /**
-   * Controls whether the legacy plain PKCE method is allowed.
-   * Defaults to false so PKCE challenges use S256 exclusively.
-   * Set to true only for compatibility with clients that cannot use S256.
-   */
-  allowPlainPKCE?: boolean;
 
   /**
    * Controls whether OAuth 2.0 Token Exchange (RFC 8693) is allowed.
@@ -1970,6 +1962,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         `refreshTokenIdleTTL must be an integer of at least ${KV_MIN_EXPIRATION_TTL_SECONDS} seconds (Cloudflare KV's minimum expiration window).`
       );
     }
+    if ((this.options as { allowPlainPKCE?: unknown }).allowPlainPKCE) {
+      throw new TypeError('allowPlainPKCE has been removed: MCP and OAuth 2.1 clients use S256 PKCE.');
+    }
     // Removed in 1.2: OAuth 2.1 dropped the implicit grant and MCP requires the code flow with PKCE.
     // Say so rather than silently ignoring it, which would look like implicit clients broke at random.
     if ((this.options as { allowImplicitFlow?: unknown }).allowImplicitFlow) {
@@ -1993,7 +1988,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     this.serverCapabilities = buildOAuthServerCapabilities({
-      allowPlainPKCE: this.options.allowPlainPKCE === true,
       allowTokenExchangeGrant: !!this.options.allowTokenExchangeGrant,
       enterpriseManagedAuthorization: !!this.options.enterpriseManagedAuthorization,
       allowPrivateUseRedirectUris: this.options.allowPrivateUseRedirectUris === true,
@@ -3352,14 +3346,15 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       );
     }
 
-    // Validate the stored method before deciding whether PKCE is active. Older
-    // versions could persist unknown methods; those grants must not fall back
-    // to the non-PKCE path or be interpreted as plain.
-    let codeChallengeMethod: PkceCodeChallengeMethod;
+    // Validate the stored method before deciding whether PKCE is active. Only S256 passes: older
+    // versions could persist plain or unknown methods, and those grants must not fall back to the
+    // non-PKCE path or be compared as plain.
     try {
-      codeChallengeMethod = grantData.codeChallenge
-        ? validatePkceCodeChallengeMethod(this.serverCapabilities, grantData.codeChallengeMethod)
-        : normalizePkceCodeChallengeMethod(grantData.codeChallengeMethod);
+      if (grantData.codeChallenge) {
+        validatePkceCodeChallengeMethod(this.serverCapabilities, grantData.codeChallengeMethod);
+      } else {
+        normalizePkceCodeChallengeMethod(grantData.codeChallengeMethod);
+      }
     } catch (error) {
       return this.createErrorResponse(
         'invalid_grant',
@@ -3427,19 +3422,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         );
       }
 
-      // Verify the code verifier against the stored code challenge.
-      let calculatedChallenge: string;
-      if (codeChallengeMethod === 'S256') {
-        // SHA-256 transformation for S256 method
-        const encoder = new TextEncoder();
-        const data = encoder.encode(codeVerifier);
-        const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-        const hashArray = Array.from(new Uint8Array(hashBuffer));
-        calculatedChallenge = base64UrlEncode(String.fromCharCode(...hashArray));
-      } else {
-        // Plain method, direct comparison
-        calculatedChallenge = codeVerifier;
-      }
+      // Verify the code verifier against the stored S256 code challenge.
+      const hashBuffer = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(codeVerifier));
+      const calculatedChallenge = base64UrlEncode(String.fromCharCode(...new Uint8Array(hashBuffer)));
 
       if (calculatedChallenge !== grantData.codeChallenge) {
         return this.createErrorResponse(

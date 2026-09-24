@@ -137,7 +137,6 @@ export interface ClientMetadataCapabilities {
 }
 
 export function buildOAuthServerCapabilities(options: {
-  allowPlainPKCE: boolean;
   allowTokenExchangeGrant: boolean;
   enterpriseManagedAuthorization: boolean;
   allowPrivateUseRedirectUris: boolean;
@@ -151,7 +150,7 @@ export function buildOAuthServerCapabilities(options: {
     ],
     responseTypes: ['code'],
     tokenEndpointAuthMethods: ['client_secret_basic', 'client_secret_post', 'none'],
-    codeChallengeMethods: options.allowPlainPKCE ? ['plain', 'S256'] : ['S256'],
+    codeChallengeMethods: ['S256'],
     allowPrivateUseRedirectUris: options.allowPrivateUseRedirectUris,
   };
 }

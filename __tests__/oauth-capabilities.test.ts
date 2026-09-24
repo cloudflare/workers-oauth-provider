@@ -13,14 +13,6 @@ import {
 } from '../src/oauth-capabilities';
 
 const defaults = buildOAuthServerCapabilities({
-  allowPlainPKCE: false,
-  allowTokenExchangeGrant: false,
-  enterpriseManagedAuthorization: false,
-  allowPrivateUseRedirectUris: false,
-});
-
-const withPlainPkce = buildOAuthServerCapabilities({
-  allowPlainPKCE: true,
   allowTokenExchangeGrant: false,
   enterpriseManagedAuthorization: false,
   allowPrivateUseRedirectUris: false,
@@ -29,7 +21,6 @@ const withPlainPkce = buildOAuthServerCapabilities({
 describe('OAuth server capabilities', () => {
   it('derives advertised capabilities from enabled provider features', () => {
     const enabled = buildOAuthServerCapabilities({
-      allowPlainPKCE: true,
       allowTokenExchangeGrant: true,
       enterpriseManagedAuthorization: true,
       allowPrivateUseRedirectUris: false,
@@ -49,7 +40,7 @@ describe('OAuth server capabilities', () => {
       'urn:ietf:params:oauth:grant-type:jwt-bearer',
     ]);
     expect(enabled.responseTypes).toEqual(['code']);
-    expect(enabled.codeChallengeMethods).toEqual(['plain', 'S256']);
+    expect(enabled.codeChallengeMethods).toEqual(['S256']);
   });
 
   it.each([
@@ -121,7 +112,6 @@ describe('OAuth server capabilities', () => {
 
   it('retains JWT bearer when enterprise-managed authorization is enabled', () => {
     const withEnterpriseManagedAuthorization = buildOAuthServerCapabilities({
-      allowPlainPKCE: false,
       allowTokenExchangeGrant: false,
       enterpriseManagedAuthorization: true,
       allowPrivateUseRedirectUris: false,
@@ -247,27 +237,11 @@ describe('PKCE capabilities', () => {
     ).toThrow('plain PKCE method is not allowed');
   });
 
-  it.each([
-    ['S256-only', defaults],
-    ['plain-compatible', withPlainPkce],
-  ])('accepts S256 under the %s policy', (_label, server) => {
+  it('accepts S256', () => {
     expect(() =>
       validateAuthorizationPkce(
-        server,
+        defaults,
         { responseType: 'code', codeChallenge: 's256-challenge', codeChallengeMethod: 'S256' },
-        { tokenEndpointAuthMethod: 'client_secret_basic' }
-      )
-    ).not.toThrow();
-  });
-
-  it.each([
-    ['an explicit plain method', { codeChallenge: 'legacy-verifier', codeChallengeMethod: 'plain' }],
-    ['an omitted method', { codeChallenge: 'legacy-verifier' }],
-  ])('accepts legacy plain PKCE with %s only when advertised', (_label, request) => {
-    expect(() =>
-      validateAuthorizationPkce(
-        withPlainPkce,
-        { responseType: 'code', ...request },
         { tokenEndpointAuthMethod: 'client_secret_basic' }
       )
     ).not.toThrow();
