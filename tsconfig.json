@@ -9,8 +9,11 @@
     "esModuleInterop": true,
     "strict": true,
     "skipLibCheck": true,
-    "noEmit": true
+    "noEmit": true,
+    "paths": {
+      "@cloudflare/workers-oauth-provider": ["./src/oauth-provider.ts"]
+    }
   },
-  "include": ["src/**/*.ts", "__tests__/**/*.ts", "conformance/**/*.ts"],
+  "include": ["src/**/*.ts", "__tests__/**/*.ts", "conformance/**/*.ts", "examples/**/*.ts"],
   "exclude": ["node_modules", "dist"]
 }

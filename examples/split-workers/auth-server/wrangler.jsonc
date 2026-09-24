@@ -1,0 +1,12 @@
+{
+  "$schema": "../../../node_modules/wrangler/config-schema.json",
+  "name": "auth-server",
+  "main": "index.ts",
+  "compatibility_date": "2026-07-29",
+  // Client ID Metadata Documents fetch client-supplied URLs; this blocks private addresses.
+  "compatibility_flags": ["global_fetch_strictly_public"],
+  "routes": [{ "pattern": "auth.example.com", "custom_domain": true }],
+  "kv_namespaces": [{ "binding": "OAUTH_KV", "id": "<your KV namespace id>" }],
+  // Builds against this repository's source. Delete this in your own project.
+  "alias": { "@cloudflare/workers-oauth-provider": "../../../src/oauth-provider.ts" },
+}

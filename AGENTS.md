@@ -45,6 +45,8 @@ workers-oauth-provider/
 │   ├── setup.ts               # Vitest setup and mocking
 │   └── mocks/
 │       └── cloudflare-workers.ts
+├── examples/                  # Runnable Workers, typechecked and e2e-tested in workerd
+│   └── split-workers/         # README quick start verbatim; e2e.test.ts fails if they drift
 ├── conformance/               # Black-box MCP authorization conformance matrix
 │   ├── README.md              # Scope, revision coverage, and traceability
 │   ├── shared.ts              # Typed Worker RPC contract and fixture constants
@@ -158,6 +160,8 @@ npm run test:watch         # Watch mode
 **Main integration test:** `__tests__/oauth-provider.test.ts`
 
 **MCP authorization conformance:** `conformance/` contains black-box tests for every dated authorization revision represented by the official MCP conformance timeline. Wrangler's `createTestHarness()` runs a real Worker in Workerd with a local KV binding; tests exercise public `OAuthProvider` and `OAuthHelpers` interfaces and include requirement traceability in `conformance/README.md`.
+
+**Examples:** `examples/` Workers import `@cloudflare/workers-oauth-provider`, which `tsconfig.json` `paths` and each `wrangler.jsonc` `alias` map to `src/`, so they are built from source and need no package.json of their own. When you change the README quick start, change `examples/split-workers/` to match, or the test fails.
 
 **Mock implementations:**
 
