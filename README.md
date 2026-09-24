@@ -72,16 +72,9 @@ async function authorize(request: Request, env: Env): Promise<Response> {
     oauthRequest = await oauth.parseAuthRequest(request);
   } catch (error) {
     if (!(error instanceof AuthorizationError)) throw error;
-    if (!error.redirectUri) {
-      // Unknown clients and invalid redirects must be rendered locally.
-      return new Response(error.description, { status: 400 });
-    }
-    const redirect = new URL(error.redirectUri);
-    redirect.searchParams.set('error', error.code);
-    redirect.searchParams.set('error_description', error.description);
-    if (error.state) redirect.searchParams.set('state', error.state);
-    if (error.issuer) redirect.searchParams.set('iss', error.issuer);
-    return Response.redirect(redirect.href, 302);
+    // redirectTo is set only once the client and redirect URI are validated; otherwise render locally.
+    if (error.redirectTo) return Response.redirect(error.redirectTo, 302);
+    return new Response(error.description, { status: 400 });
   }
 
   const client = await oauth.lookupClient(oauthRequest.clientId);
@@ -287,15 +280,12 @@ For users with many grants, `revokeExistingGrantsBatchSize` controls the KV page
 
 RFC 9207 issuer identification is always enabled. Authorization server metadata advertises `authorization_response_iss_parameter_supported: true`, and successful authorization responses include `iss` automatically.
 
-`parseAuthRequest()` returns the expected `issuer`. If the application creates a terminal OAuth error redirect, include that value:
+Error redirects carry it too. `AuthorizationError.redirectTo` is ready-made for `parseAuthRequest()` failures, and `authorizationErrorRedirect()` builds one for an error your application decides on, from a request the library validated:
 
 ```ts
 const oauthRequest = await env.OAUTH_PROVIDER.parseAuthRequest(request);
-const redirect = new URL(oauthRequest.redirectUri);
-redirect.searchParams.set('error', 'access_denied');
-redirect.searchParams.set('state', oauthRequest.state);
-if (oauthRequest.issuer) redirect.searchParams.set('iss', oauthRequest.issuer);
-return Response.redirect(redirect.toString(), 302);
+// …the user declined:
+return Response.redirect(authorizationErrorRedirect(oauthRequest, 'access_denied'), 302);
 ```
 
 Intermediate identity-provider redirects and local HTML error pages do not need the OAuth `iss` parameter.

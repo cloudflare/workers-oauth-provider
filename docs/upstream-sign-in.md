@@ -52,13 +52,8 @@ If the third party sends the user back with an error (they declined there, or it
 
 ```ts
 const { request: original, headers } = await oauth.finishUpstream(req);
-const error = new URL(req.url).searchParams.get('error');
-if (error) {
-  const redirect = new URL(original.redirectUri);
-  redirect.searchParams.set('error', 'access_denied');
-  redirect.searchParams.set('state', original.state);
-  if (original.issuer) redirect.searchParams.set('iss', original.issuer);
-  headers.set('Location', redirect.href);
+if (new URL(req.url).searchParams.get('error')) {
+  headers.set('Location', authorizationErrorRedirect(original, 'access_denied')); // state and iss included
   return new Response(null, { status: 302, headers });
 }
 ```

@@ -22,6 +22,31 @@ export interface AuthorizationErrorOptions {
 }
 
 /**
+ * The OAuth error redirect back to a client (RFC 6749 §4.1.2.1): `error`, an optional
+ * `error_description`, the client's `state`, and `iss` (RFC 9207). Pass only a request the
+ * library validated, from `parseAuthRequest()`, `finishUpstream()` or `approveConsent()`,
+ * never one rebuilt from user input.
+ *
+ * ```ts
+ * if (new URL(req.url).searchParams.get('error')) {
+ *   return Response.redirect(authorizationErrorRedirect(original, 'access_denied'), 302);
+ * }
+ * ```
+ */
+export function authorizationErrorRedirect(
+  request: { redirectUri: string; state?: string; issuer?: string },
+  code: AuthorizationErrorCode,
+  description?: string
+): string {
+  const redirect = new URL(request.redirectUri);
+  redirect.searchParams.set('error', code);
+  if (description) redirect.searchParams.set('error_description', description);
+  if (request.state) redirect.searchParams.set('state', request.state);
+  if (request.issuer) redirect.searchParams.set('iss', request.issuer);
+  return redirect.href;
+}
+
+/**
  * Expected authorization-request validation failure. Absence of `redirectUri`
  * means a caller MUST render locally and MUST NOT redirect.
  */
@@ -31,6 +56,11 @@ export class AuthorizationError extends Error {
   public readonly redirectUri?: string;
   public readonly state?: string;
   public readonly issuer?: string;
+  /**
+   * The ready-made error redirect back to the client, set only when a redirect is safe
+   * (`redirectUri` was validated). Without it, render the error locally.
+   */
+  public readonly redirectTo?: string;
 
   constructor(code: AuthorizationErrorCode, options: AuthorizationErrorOptions) {
     super(options.description);
@@ -40,6 +70,13 @@ export class AuthorizationError extends Error {
     this.redirectUri = options.redirectUri;
     this.state = options.state;
     this.issuer = options.issuer;
+    this.redirectTo = options.redirectUri
+      ? authorizationErrorRedirect(
+          { redirectUri: options.redirectUri, state: options.state, issuer: options.issuer },
+          code,
+          options.description
+        )
+      : undefined;
   }
 }
 

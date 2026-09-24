@@ -101,13 +101,8 @@ A redirect back to the client is only safe once the client and its exact redirec
 try {
   // …the handlers above
 } catch (error) {
-  if (error instanceof AuthorizationError && error.redirectUri) {
-    const redirect = new URL(error.redirectUri);
-    redirect.searchParams.set('error', error.code);
-    redirect.searchParams.set('error_description', error.description);
-    if (error.state) redirect.searchParams.set('state', error.state);
-    if (error.issuer) redirect.searchParams.set('iss', error.issuer);
-    return Response.redirect(redirect.href, 302);
+  if (error instanceof AuthorizationError && error.redirectTo) {
+    return Response.redirect(error.redirectTo, 302); // error, error_description, state, iss
   }
   if (error instanceof AuthorizationError || error instanceof CimdFetchError) {
     const message = error instanceof AuthorizationError ? error.description : 'This app could not be verified.';

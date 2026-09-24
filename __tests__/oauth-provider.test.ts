@@ -1,6 +1,7 @@
 import { describe, it, expect, expectTypeOf, beforeEach, vi, afterEach } from 'vitest';
 import {
   AuthorizationError,
+  authorizationErrorRedirect,
   CimdFetchError,
   ExternalTokenError,
   OAuthError,
@@ -1656,15 +1657,49 @@ describe('OAuthProvider', () => {
           `&scope=read&state=state-123${responseType}`
       );
 
-      await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toMatchObject({
+      const error = (await oauthProvider
+        .fetch(authRequest, mockEnv, mockCtx)
+        .catch((thrown) => thrown)) as AuthorizationError;
+      expect(error).toMatchObject({
         name: 'AuthorizationError',
         code,
         redirectUri,
         state: 'state-123',
         issuer: 'https://example.com',
       });
+      // A ready error redirect back to the client: error, description, state and iss.
+      const redirect = new URL(error.redirectTo!);
+      expect(redirect.origin + redirect.pathname).toBe(redirectUri);
+      expect(Object.fromEntries(redirect.searchParams)).toEqual({
+        error: code,
+        error_description: error.description,
+        state: 'state-123',
+        iss: 'https://example.com',
+      });
       expect((await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys).toHaveLength(0);
       expect((await mockEnv.OAUTH_KV.list({ prefix: 'token:' })).keys).toHaveLength(0);
+    });
+
+    it('builds the error redirect for a validated request, omitting what the client did not send', () => {
+      const full = new URL(
+        authorizationErrorRedirect(
+          { redirectUri: 'https://client.example/cb?keep=1', state: 's', issuer: 'https://example.com' },
+          'access_denied',
+          'The user declined'
+        )
+      );
+      expect(full.searchParams.get('keep')).toBe('1');
+      expect(Object.fromEntries(full.searchParams)).toEqual({
+        keep: '1',
+        error: 'access_denied',
+        error_description: 'The user declined',
+        state: 's',
+        iss: 'https://example.com',
+      });
+      const minimal = new URL(
+        authorizationErrorRedirect({ redirectUri: 'https://client.example/cb' }, 'access_denied')
+      );
+      expect(Object.fromEntries(minimal.searchParams)).toEqual({ error: 'access_denied' });
     });
 
     it('keeps unknown clients and invalid redirects local', async () => {
@@ -1685,6 +1720,7 @@ describe('OAuthProvider', () => {
           expect(error).toBeInstanceOf(AuthorizationError);
           expect(error).toMatchObject({ name: 'AuthorizationError', code: 'invalid_request' });
           expect((error as AuthorizationError).redirectUri).toBeUndefined();
+          expect((error as AuthorizationError).redirectTo).toBeUndefined();
           expect((error as AuthorizationError).state).toBeUndefined();
         }
       }

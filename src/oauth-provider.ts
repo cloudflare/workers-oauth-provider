@@ -53,7 +53,7 @@ import {
   validateResourceUri,
 } from './oauth-resource';
 
-export { AuthorizationError } from './oauth-capabilities';
+export { AuthorizationError, authorizationErrorRedirect } from './oauth-capabilities';
 export type { AuthorizationErrorCode, AuthorizationErrorOptions } from './oauth-capabilities';
 export * from './oauth-resource-server';
 export type {
