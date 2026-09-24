@@ -1,0 +1,33 @@
+AGENTS.md
+  s_1b1f3dce47e01c::t_d2738828129aa5 47-48,163-164
+examples/split-workers/README.md
+  s_1b1f3dce47e01c::t_07bc802b2ea7f2 1-10
+examples/split-workers/auth-server/index.ts
+  s_1b1f3dce47e01c::t_13ba27cf9c45e8 1-72
+examples/split-workers/auth-server/wrangler.jsonc
+  s_1b1f3dce47e01c::t_ea3fa5ebe34c7a 1-12
+examples/split-workers/e2e.test.ts
+  s_1b1f3dce47e01c::t_47472640e51b9a 1-90
+examples/split-workers/mcp-server/index.ts
+  s_1b1f3dce47e01c::t_f7bf6d713a8860 1-26
+examples/split-workers/mcp-server/wrangler.jsonc
+  s_1b1f3dce47e01c::t_0fc9a534f5a6e2 1-11
+tsconfig.json
+  s_1b1f3dce47e01c::t_fb0a58ce17b7eb 12-15,17
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "87f932c2bf78575f77d0b60d2bd3dae7fccf5e47",
+  "prompts": {},
+  "sessions": {
+    "s_1b1f3dce47e01c": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a0b3b8-09e5-75fe-ad90-bf9d48da5b83",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Matt Carey <mcarey@cloudflare.com>"
+    }
+  }
+}
