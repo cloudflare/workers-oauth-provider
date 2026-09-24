@@ -184,6 +184,8 @@ Token records store metadata about issued access tokens, including denormalized 
 
 > **Audience safety:** Every access token issued by 1.0 carries exactly one registered canonical resource as its audience. Token exchange cannot change that audience. Persisted token types keep the field optional so old KV records can be decoded: a record with no audience is treated as bound to the server-selected migration resource (the sole resource, or `legacyGrantResource`) until it expires, a stored 0.x array is bound to the configured resource it contains, and a record whose audience belongs only to other resources is rejected. Refresh binds the grant and returns a replacement token with an explicit audience.
 
+> **Issued client:** `grant.clientId` on a token record is the client the token was issued to. That is the grant's client, except for a token from an allowed cross-client token exchange, which records the requesting client (RFC 8693); the token still lives under the subject's grant, so revoking that grant removes it.
+
 **TTL:** Access tokens typically have a 1 hour (3600 seconds) TTL by default
 
 ### Transactions
