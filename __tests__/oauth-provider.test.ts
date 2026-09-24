@@ -12417,7 +12417,8 @@ describe('OAuthProvider', () => {
         const before = await reAuthEnv.OAUTH_PROVIDER!.listUserGrants('user-1');
         expect(before.items.length).toBe(5);
 
-        // Phase 2: re-authorize; revoking walks every page of the user's grants.
+        // Phase 2: re-authorize; every earlier grant for this client is revoked. (Paging across KV list
+        // pages is covered by the 1,201-grant test above.)
         const smallBatchHandler = {
           async fetch(request: Request, env: any, _ctx: ExecutionContext) {
             const url = new URL(request.url);
@@ -12448,7 +12449,7 @@ describe('OAuthProvider', () => {
         const code = await authorizeAndGetCode(revokeProvider, reAuthEnv, reAuthCtx, clientId);
         await exchangeCodeForTokens(revokeProvider, reAuthEnv, reAuthCtx, code, clientId, clientSecret);
 
-        // Pagination walked every page — only the new grant remains.
+        // Only the new grant remains.
         const after = await reAuthEnv.OAUTH_PROVIDER!.listUserGrants('user-1');
         expect(after.items.length).toBe(1);
         expect(after.items[0].clientId).toBe(clientId);
