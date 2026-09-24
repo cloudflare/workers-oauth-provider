@@ -499,26 +499,26 @@ Deleting a client through `OAuthHelpers.deleteClient()` also revokes its grants 
 
 The existing `OAuthProvider` combined configuration uses these options:
 
-| Option                             | Purpose                                                  | Default                                  |
-| ---------------------------------- | -------------------------------------------------------- | ---------------------------------------- |
-| `apiRoute` and `apiHandler`        | Protect one or more route prefixes with one handler      | Use these or `apiHandlers`               |
-| `apiHandlers`                      | Map protected route prefixes to different handlers       | Use this or `apiRoute` plus `apiHandler` |
-| `defaultHandler`                   | Handle authorization UI and other unprotected routes     | Required                                 |
-| `authorizeEndpoint`                | Application-owned authorization and consent endpoint     | Required                                 |
-| `tokenEndpoint`                    | Provider-owned token and revocation endpoint             | Required                                 |
-| `clientRegistrationEndpoint`       | Enable RFC 7591 DCR                                      | Disabled                                 |
-| `scopesSupported`                  | Publish authorization server scopes                      | Omitted                                  |
-| `resourceMetadata.resource`        | Canonical HTTPS resource and token audience              | Required                                 |
-| `clientIdMetadataDocumentEnabled`  | Enable CIMD lookup and advertisement                     | `false`                                  |
-| `allowPlainPKCE`                   | Permit the legacy plain PKCE method                      | `false`                                  |
-| `allowImplicitFlow`                | Enable implicit token responses                          | `false`                                  |
-| `disallowPublicClientRegistration` | Reject public clients at DCR                             | `false`                                  |
-| `clientRegistrationCallback`       | Apply application policy before storing a DCR client     | None                                     |
-| `allowTokenExchangeGrant`          | Enable RFC 8693                                          | `false`                                  |
-| `tokenExchangeCallback`            | Update props, scopes, or lifetimes during token exchange | None                                     |
-| `resolveExternalToken`             | Validate external bearer credentials (advanced)          | None                                     |
-| `enterpriseManagedAuthorization`   | Enable experimental ID-JAG grant support                 | Disabled                                 |
-| `onError`                          | Observe or replace OAuth error responses                 | Logs a warning                           |
+| Option                             | Purpose                                                                     | Default                                  |
+| ---------------------------------- | --------------------------------------------------------------------------- | ---------------------------------------- |
+| `apiRoute` and `apiHandler`        | Protect one or more route prefixes with one handler                         | Use these or `apiHandlers`               |
+| `apiHandlers`                      | Map protected route prefixes to different handlers                          | Use this or `apiRoute` plus `apiHandler` |
+| `defaultHandler`                   | Handle authorization UI and other unprotected routes                        | Required                                 |
+| `authorizeEndpoint`                | Application-owned authorization and consent endpoint                        | Required                                 |
+| `tokenEndpoint`                    | Provider-owned token and revocation endpoint                                | Required                                 |
+| `clientRegistrationEndpoint`       | Enable RFC 7591 DCR                                                         | Disabled                                 |
+| `scopesSupported`                  | Publish authorization server scopes                                         | Omitted                                  |
+| `resourceMetadata.resource`        | Canonical HTTPS resource and token audience                                 | Required                                 |
+| `clientIdMetadataDocumentEnabled`  | Enable CIMD lookup and advertisement                                        | `false`                                  |
+| `allowPlainPKCE`                   | Permit the legacy plain PKCE method                                         | `false`                                  |
+| `allowImplicitFlow`                | Enable implicit token responses                                             | `false`                                  |
+| `disallowPublicClientRegistration` | Reject public clients at DCR                                                | `false`                                  |
+| `clientRegistrationCallback`       | Apply application policy before storing a DCR client                        | None                                     |
+| `allowTokenExchangeGrant`          | Enable RFC 8693                                                             | `false`                                  |
+| `tokenExchangeCallback`            | Update props, scopes, or lifetimes during token exchange                    | None                                     |
+| `resolveExternalToken`             | Validate external bearer credentials (advanced)                             | None                                     |
+| `enterpriseManagedAuthorization`   | Enable experimental ID-JAG grant support                                    | Disabled                                 |
+| `onError`                          | Observe or replace OAuth error responses; `internal` names the failed check | Logs a warning                           |
 
 The functional role API adds these surfaces without removing `OAuthProvider`:
 
