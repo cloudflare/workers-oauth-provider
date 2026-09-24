@@ -213,8 +213,12 @@ function pickDisplayMetadata(metadata: ParsedOAuthClientMetadata): OAuthClientDi
 }
 
 /**
- * Validates that a redirect URI has a scheme and does not use a dangerous
- * pseudo-scheme or contain control characters.
+ * Validates a redirect URI against the MCP / OAuth 2.1 redirect policy: `https`, or `http` on a
+ * loopback host (`localhost`, `127.0.0.0/8`, `::1`), with no userinfo and no fragment (not even an
+ * empty `#`). RFC 8252 private-use schemes are accepted only when the server enables
+ * `allowPrivateUseRedirectUris`; remote `http` never is. Control characters and dangerous schemes
+ * (`javascript:`, `data:` and the like) are always rejected.
+ * @throws Error describing why the redirect URI is not acceptable
  */
 export function validateRedirectUri(redirectUri: string, server: OAuthServerCapabilities): void {
   const dangerousSchemes = ['javascript:', 'data:', 'vbscript:', 'file:', 'mailto:', 'blob:'];
@@ -239,8 +243,9 @@ export function validateRedirectUri(redirectUri: string, server: OAuthServerCapa
   } catch {
     throw new Error('Invalid redirect URI');
   }
-  // RFC 6749 §3.1.2: no fragment. Userinfo only disguises where the code goes.
-  if (url.hash || url.username || url.password) throw new Error('Invalid redirect URI');
+  // RFC 6749 §3.1.2: no fragment, including an empty trailing `#` (which leaves url.hash empty).
+  // Userinfo only disguises where the code goes.
+  if (normalized.includes('#') || url.username || url.password) throw new Error('Invalid redirect URI');
 
   // MCP and OAuth 2.1: https, or http only on a loopback host (RFC 8252 §7.3). Remote http is never
   // acceptable; private-use schemes (RFC 8252 §7.1) only when the server opts in for native apps.

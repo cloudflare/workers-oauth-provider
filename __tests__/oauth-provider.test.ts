@@ -15643,6 +15643,7 @@ describe('redirect URI policy: https, or http on a loopback host', () => {
     ['a reverse-domain private-use scheme', 'com.example.app:/oauth/callback'],
     ['userinfo', 'https://user@client.example.com/callback'],
     ['a fragment', 'https://client.example.com/callback#frag'],
+    ['an empty fragment', 'https://client.example.com/callback#'],
   ])('refuses %s at registration, createClient and updateClient', async (_label, redirectUri) => {
     const provider = createProvider();
     const response = await register(provider, redirectUri);
