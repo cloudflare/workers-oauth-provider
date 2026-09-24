@@ -1,0 +1,363 @@
+/**
+ * Consent and upstream-state primitives for authorization servers that sign users in through a
+ * third-party OAuth provider (an MCP "proxy" server). They implement the protections the MCP
+ * 2026-07-28 security best practices require under Confused Deputy → Mitigation:
+ *
+ * - consent per client before any redirect to the third party, with CSRF protection and anti-framing
+ *   headers on the consent page;
+ * - remembered consent, chosen per call, in a signed `__Host-` cookie bound to the client, its redirect
+ *   URI and resource, reused only for a subset of the approved scopes;
+ * - a random `state` stored server-side only after consent, bound to the browser by a `__Host-` cookie,
+ *   single-use and short-lived.
+ *
+ * A transaction handle is 256 random bits. KV stores the record under the handle's SHA-256, and the
+ * binding cookie holds the same hash, so neither KV nor the cookie holds the handle itself. Single use
+ * is `get` then `delete`, which KV cannot make atomic: two concurrent requests from the same browser
+ * with the same handle could both pass. The cookie binding confines that to the browser that started
+ * the transaction.
+ */
+import { AuthorizationError } from './oauth-capabilities';
+import type { AuthRequest } from './oauth-provider';
+
+/** Remember an approval so the consent page can be skipped for requests it already covers. */
+export interface RememberConsentOptions {
+  /** HMAC key for the approvals cookie: at least 32 characters, from a Worker secret. */
+  secret: string;
+  /** How long an approval is remembered. Defaults to 30 days. */
+  maxAgeSeconds?: number;
+}
+
+/** A consent page to render: post `handle` back to {@link approveConsent}; send `headers` with the page. */
+export interface ConsentTransaction {
+  handle: string;
+  headers: Headers;
+}
+
+/** The approved authorization request, with the cookies to set on the next response. */
+export interface ApprovedConsent {
+  request: AuthRequest;
+  headers: Headers;
+}
+
+/** The `state` to send to the third-party provider, with the binding cookie to set on the redirect. */
+export interface UpstreamTransaction {
+  state: string;
+  headers: Headers;
+}
+
+/** The authorization request and data saved by `beginUpstream()`, recovered at the callback. */
+export interface ResumedUpstream<Data = unknown> {
+  request: AuthRequest;
+  data: Data;
+  headers: Headers;
+}
+
+const TRANSACTION_TTL_SECONDS = 600;
+/** Default for the provider's `cookiePrefix` option. */
+export const DEFAULT_COOKIE_PREFIX = '__Host-oauth-';
+const DEFAULT_REMEMBER_SECONDS = 30 * 24 * 60 * 60;
+const MIN_SECRET_LENGTH = 32;
+// Browsers cap a cookie near 4 KB; older approvals are dropped to stay under it.
+const MAX_APPROVALS_COOKIE_BYTES = 3800;
+
+type TransactionKind = 'consent' | 'upstream';
+interface TransactionRecord {
+  kind: TransactionKind;
+  request: AuthRequest;
+  data?: unknown;
+}
+interface Approval {
+  /** base64url SHA-256 of client ID, redirect URI and resource. */
+  k: string;
+  /** Approved scopes. */
+  s: string[];
+  /** Expiry, seconds since the epoch. */
+  e: number;
+}
+
+/** Cookie names derived from the provider's `cookiePrefix`. */
+export interface ConsentCookies {
+  consent: string;
+  upstream: string;
+  approvals: string;
+}
+
+/** Throws a `TypeError` unless the prefix keeps the `__Host-` guarantees the MCP best practices require. */
+export function consentCookies(prefix: string = DEFAULT_COOKIE_PREFIX): ConsentCookies {
+  if (typeof prefix !== 'string' || !prefix.startsWith('__Host-') || !/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(prefix)) {
+    throw new TypeError('cookiePrefix must start with "__Host-" and contain only cookie-name characters');
+  }
+  return { consent: `${prefix}consent`, upstream: `${prefix}upstream`, approvals: `${prefix}approvals` };
+}
+
+function validateRememberConsentOptions(options: RememberConsentOptions): void {
+  if (typeof options !== 'object' || options === null) {
+    throw new TypeError('remember must be an object with a secret');
+  }
+  if (typeof options.secret !== 'string' || options.secret.length < MIN_SECRET_LENGTH) {
+    throw new TypeError(`remember.secret must be a string of at least ${MIN_SECRET_LENGTH} characters`);
+  }
+  const maxAge = options.maxAgeSeconds;
+  if (maxAge !== undefined && (!Number.isInteger(maxAge) || maxAge <= 0)) {
+    throw new TypeError('remember.maxAgeSeconds must be a positive integer');
+  }
+}
+
+/** Start a consent transaction for an authorization request that must be shown to the user. */
+export async function beginConsent(
+  kv: KVNamespace,
+  cookies: ConsentCookies,
+  request: AuthRequest
+): Promise<ConsentTransaction> {
+  const { handle, hash } = await createTransaction(kv, { kind: 'consent', request });
+  const headers = new Headers({
+    'Set-Cookie': bindingCookie(cookies.consent, hash, TRANSACTION_TTL_SECONDS),
+    'Cache-Control': 'no-store',
+    // Clickjacking protection for the consent page (MUST).
+    'Content-Security-Policy': "frame-ancestors 'none'",
+    'X-Frame-Options': 'DENY',
+  });
+  return { handle, headers };
+}
+
+/**
+ * Consume a consent transaction the user approved. `scope`, when given, must be a subset of the
+ * requested scopes (it usually comes from the page's checkboxes, which the user controls).
+ * `remember` stores the approval in a signed cookie for `isConsentRemembered()`.
+ */
+export async function approveConsent(
+  kv: KVNamespace,
+  cookies: ConsentCookies,
+  request: Request,
+  handle: string,
+  options: { scope?: string[]; remember?: RememberConsentOptions } = {}
+): Promise<ApprovedConsent> {
+  if (options.remember !== undefined) validateRememberConsentOptions(options.remember);
+  const record = await consumeTransaction(kv, request, cookies.consent, handle, 'consent');
+  let approved = record.request;
+  if (options.scope !== undefined) {
+    const requested = new Set(approved.scope);
+    if (!Array.isArray(options.scope) || options.scope.some((scope) => !requested.has(scope))) {
+      throw new AuthorizationError('invalid_scope', {
+        description: 'Approved scopes must be a subset of those requested',
+      });
+    }
+    approved = { ...approved, scope: [...new Set(options.scope)] };
+  }
+  const headers = new Headers({ 'Cache-Control': 'no-store' });
+  headers.append('Set-Cookie', clearCookie(cookies.consent));
+  if (options.remember) {
+    headers.append('Set-Cookie', await rememberApproval(cookies, request, approved, options.remember));
+  }
+  return { request: approved, headers };
+}
+
+/** Whether a remembered approval covers this request: same client, redirect URI and resource, subset of scopes. */
+export async function isConsentRemembered(
+  cookies: ConsentCookies,
+  request: Request,
+  authRequest: AuthRequest,
+  remember: Pick<RememberConsentOptions, 'secret'>
+): Promise<boolean> {
+  validateRememberConsentOptions(remember);
+  const approvals = await readApprovals(cookies, request, remember.secret);
+  const key = await approvalKey(authRequest);
+  const now = Math.floor(Date.now() / 1000);
+  const approval = approvals.find((entry) => entry.k === key && entry.e > now);
+  if (!approval) return false;
+  const approvedScopes = new Set(approval.s);
+  return authRequest.scope.every((scope) => approvedScopes.has(scope));
+}
+
+/**
+ * Save an approved authorization request before redirecting to the third-party provider, and get
+ * the `state` to send it. Call only after consent. Pass `headers` to add the binding cookie to
+ * headers you are already sending, such as `approveConsent()`'s.
+ */
+export async function beginUpstream(
+  kv: KVNamespace,
+  cookies: ConsentCookies,
+  request: AuthRequest,
+  options: { data?: unknown; headers?: Headers } = {}
+): Promise<UpstreamTransaction> {
+  const { handle, hash } = await createTransaction(kv, { kind: 'upstream', request, data: options.data });
+  const headers = options.headers ?? new Headers();
+  headers.append('Set-Cookie', bindingCookie(cookies.upstream, hash, TRANSACTION_TTL_SECONDS));
+  headers.set('Cache-Control', 'no-store');
+  return { state: handle, headers };
+}
+
+/** Recover the authorization request at the third-party provider's callback, from its `state` parameter. */
+export async function finishUpstream<Data = unknown>(
+  kv: KVNamespace,
+  cookies: ConsentCookies,
+  request: Request
+): Promise<ResumedUpstream<Data>> {
+  const state = new URL(request.url).searchParams.get('state');
+  if (!state) {
+    throw new AuthorizationError('invalid_request', { description: 'Missing state parameter' });
+  }
+  const record = await consumeTransaction(kv, request, cookies.upstream, state, 'upstream');
+  const headers = new Headers({ 'Cache-Control': 'no-store' });
+  headers.append('Set-Cookie', clearCookie(cookies.upstream));
+  return { request: record.request, data: record.data as Data, headers };
+}
+
+async function createTransaction(
+  kv: KVNamespace,
+  record: TransactionRecord
+): Promise<{ handle: string; hash: string }> {
+  const handle = base64url(crypto.getRandomValues(new Uint8Array(32)));
+  const hash = await sha256Hex(handle);
+  await kv.put(`transaction:${hash}`, JSON.stringify(record), { expirationTtl: TRANSACTION_TTL_SECONDS });
+  return { handle, hash };
+}
+
+async function consumeTransaction(
+  kv: KVNamespace,
+  request: Request,
+  cookieName: string,
+  handle: string,
+  kind: TransactionKind
+): Promise<TransactionRecord> {
+  if (typeof handle !== 'string' || handle.length === 0) {
+    throw new AuthorizationError('invalid_request', { description: 'Missing transaction handle' });
+  }
+  const bound = readCookie(request, cookieName);
+  if (!bound) {
+    throw new AuthorizationError('invalid_request', {
+      description: 'This authorization was not started in this browser; start again',
+    });
+  }
+  const hash = await sha256Hex(handle);
+  if (!timingSafeEqual(hash, bound)) {
+    throw new AuthorizationError('invalid_request', {
+      description: 'This authorization belongs to a different browser session; start again',
+    });
+  }
+  const key = `transaction:${hash}`;
+  const stored = await kv.get<TransactionRecord>(key, { type: 'json' });
+  if (!stored || stored.kind !== kind) {
+    throw new AuthorizationError('invalid_request', {
+      description: 'This authorization expired or was already used; start again',
+    });
+  }
+  await kv.delete(key);
+  return stored;
+}
+
+async function rememberApproval(
+  cookies: ConsentCookies,
+  request: Request,
+  approved: AuthRequest,
+  remember: RememberConsentOptions
+): Promise<string> {
+  const maxAge = remember.maxAgeSeconds ?? DEFAULT_REMEMBER_SECONDS;
+  const now = Math.floor(Date.now() / 1000);
+  const key = await approvalKey(approved);
+  const approvals = (await readApprovals(cookies, request, remember.secret)).filter(
+    (entry) => entry.e > now && entry.k !== key
+  );
+  approvals.push({ k: key, s: approved.scope, e: now + maxAge });
+  let value = await signApprovals(approvals, remember.secret);
+  while (value.length > MAX_APPROVALS_COOKIE_BYTES && approvals.length > 1) {
+    approvals.shift();
+    value = await signApprovals(approvals, remember.secret);
+  }
+  return `${cookies.approvals}=${value}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=${maxAge}`;
+}
+
+async function readApprovals(cookies: ConsentCookies, request: Request, secret: string): Promise<Approval[]> {
+  const value = readCookie(request, cookies.approvals);
+  if (!value) return [];
+  const [payload, signature] = value.split('.');
+  if (!payload || !signature) return [];
+  const key = await hmacKey(secret);
+  let valid = false;
+  try {
+    valid = await crypto.subtle.verify('HMAC', key, fromBase64url(signature), new TextEncoder().encode(payload));
+  } catch {
+    return [];
+  }
+  if (!valid) return [];
+  try {
+    const parsed: unknown = JSON.parse(new TextDecoder().decode(fromBase64url(payload)));
+    return Array.isArray(parsed) ? parsed.filter(isApproval) : [];
+  } catch {
+    return [];
+  }
+}
+
+async function signApprovals(approvals: Approval[], secret: string): Promise<string> {
+  const payload = base64url(new TextEncoder().encode(JSON.stringify(approvals)));
+  const signature = await crypto.subtle.sign('HMAC', await hmacKey(secret), new TextEncoder().encode(payload));
+  return `${payload}.${base64url(new Uint8Array(signature))}`;
+}
+
+function isApproval(value: unknown): value is Approval {
+  if (!value || typeof value !== 'object') return false;
+  const entry = value as Record<string, unknown>;
+  return (
+    typeof entry.k === 'string' &&
+    typeof entry.e === 'number' &&
+    Array.isArray(entry.s) &&
+    entry.s.every((scope) => typeof scope === 'string')
+  );
+}
+
+/** Approval is bound to the client, where its tokens go, and which resource they are for. */
+async function approvalKey(request: AuthRequest): Promise<string> {
+  const material = JSON.stringify([request.clientId, request.redirectUri, request.resource ?? null]);
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(material));
+  return base64url(new Uint8Array(digest));
+}
+
+function hmacKey(secret: string): Promise<CryptoKey> {
+  return crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, [
+    'sign',
+    'verify',
+  ]);
+}
+
+function bindingCookie(name: string, value: string, maxAge: number): string {
+  return `${name}=${value}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=${maxAge}`;
+}
+
+function clearCookie(name: string): string {
+  return `${name}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0`;
+}
+
+function readCookie(request: Request, name: string): string | undefined {
+  const header = request.headers.get('Cookie');
+  if (!header) return undefined;
+  for (const part of header.split(';')) {
+    const separator = part.indexOf('=');
+    if (separator === -1) continue;
+    if (part.slice(0, separator).trim() === name) return part.slice(separator + 1).trim();
+  }
+  return undefined;
+}
+
+async function sha256Hex(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let difference = 0;
+  for (let index = 0; index < a.length; index++) difference |= a.charCodeAt(index) ^ b.charCodeAt(index);
+  return difference === 0;
+}
+
+function base64url(bytes: Uint8Array): string {
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function fromBase64url(value: string): Uint8Array {
+  const base64 = value.replace(/-/g, '+').replace(/_/g, '/');
+  const binary = atob(base64 + '='.repeat((4 - (base64.length % 4)) % 4));
+  return Uint8Array.from(binary, (char) => char.charCodeAt(0));
+}

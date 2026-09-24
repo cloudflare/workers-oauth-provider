@@ -419,6 +419,7 @@ The package also supports:
 - External API keys and bearer credentials through `resolveExternalToken` as an advanced compatibility feature.
 - Updating encrypted props, token scope, and token lifetimes with `tokenExchangeCallback`.
 - OAuth 2.0 Token Exchange when `allowTokenExchangeGrant` is enabled.
+- Signing users in through another OAuth provider (GitHub, Google, …) with per-client consent and browser-bound `state`. See [docs/upstream-sign-in.md](docs/upstream-sign-in.md).
 - Structured callback errors through the exported `OAuthError` and `ExternalTokenError` classes.
 - Custom error observation or responses through `onError`.
 - Experimental MCP Enterprise-Managed Authorization using ID-JAG assertions.
@@ -477,6 +478,7 @@ The existing `OAuthProvider` combined configuration uses these options:
 | `scopesSupported`                  | Publish authorization server scopes                                         | Omitted                                  |
 | `resourceMetadata.resource`        | Canonical HTTPS resource and token audience                                 | Required                                 |
 | `clientIdMetadataDocumentEnabled`  | Enable CIMD lookup and advertisement                                        | `false`                                  |
+| `cookiePrefix`                     | Prefix for the consent and upstream helpers' cookies (must be `__Host-…`)   | `__Host-oauth-`                          |
 | `allowPlainPKCE`                   | Permit the legacy plain PKCE method                                         | `false`                                  |
 | `allowImplicitFlow`                | Enable implicit token responses                                             | `false`                                  |
 | `disallowPublicClientRegistration` | Reject public clients at DCR                                                | `false`                                  |
@@ -505,6 +507,7 @@ Consult the exported `OAuthProviderOptions`, `OAuthAuthorizationServerOptions`, 
 Handlers receive `env.OAUTH_PROVIDER`, which implements `OAuthHelpers`. It can:
 
 - Parse authorization requests and complete authorization.
+- Run a consent page and a third-party sign-in redirect safely (`beginConsent()`, `approveConsent()`, `isConsentRemembered()`, `beginUpstream()`, `finishUpstream()`).
 - Look up, create, list, update, and delete clients.
 - List and revoke grants for a user.
 - Inspect internally issued tokens with `unwrapToken()`.
