@@ -1467,7 +1467,8 @@ describe('OAuthProvider', () => {
       expect(body.error_description).toBe('client_name is required by policy');
     });
 
-    it('should return 500 server_error when callback throws', async () => {
+    it('should return 500 server_error when callback throws, keeping its message out of the response', async () => {
+      const seen: unknown[] = [];
       const provider = new OAuthProvider({
         apiRoute: '/api/',
         apiHandler: TestApiHandler,
@@ -1477,6 +1478,9 @@ describe('OAuthProvider', () => {
         clientRegistrationEndpoint: '/oauth/register',
         clientRegistrationCallback: () => {
           throw new Error('upstream allowlist service unavailable');
+        },
+        onError: ({ internal }) => {
+          seen.push(internal.detail);
         },
       });
 
@@ -1498,11 +1502,41 @@ describe('OAuthProvider', () => {
       expect(response.status).toBe(500);
       const body = await response.json<any>();
       expect(body.error).toBe('server_error');
-      expect(body.error_description).toBe('upstream allowlist service unavailable');
+      // The message may be internal: the client gets a fixed description, onError gets the error.
+      expect(body.error_description).toBe('Client registration callback failed');
+      expect((seen[0] as Error).message).toBe('upstream allowlist service unavailable');
 
       // No client should have been stored
       const keys = await mockEnv.OAUTH_KV.list({ prefix: 'client:' });
       expect(keys.keys.length).toBe(0);
+    });
+
+    it('refuses a registration body over 1 MiB even without a Content-Length', async () => {
+      // A chunked body carries no Content-Length, so the declared-size check alone can't see it.
+      // Offer 10 MiB in 512 KiB chunks and count how many are pulled: reading must stop at the limit.
+      const chunk = new TextEncoder().encode(' '.repeat(512 * 1024));
+      let pulled = 0;
+      const body = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (pulled === 20) return controller.close();
+          pulled++;
+          controller.enqueue(chunk);
+        },
+      });
+      const request = new Request('https://example.com/oauth/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+        duplex: 'half',
+      } as RequestInit);
+      expect(request.headers.get('Content-Length')).toBeNull();
+
+      const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
+      expect(response.status).toBe(413);
+      expect(await response.json<any>()).toMatchObject({ error: 'invalid_request' });
+      // Three chunks pass the limit; the clone kept for the callback reads a little ahead. All 20 before.
+      expect(pulled).toBeLessThanOrEqual(6);
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'client:' })).keys).toHaveLength(0);
     });
 
     it('should expose request body to the callback (cloned before parsing)', async () => {

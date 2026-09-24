@@ -4773,9 +4773,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // invalid_client_metadata.
     let parsedJson: unknown;
     try {
-      const text = await request.text();
-      if (text.length > 1048576) {
-        // Double-check text length
+      // Content-Length is only a claim, and a chunked body has none: stop reading at the limit.
+      const text = await readTextWithLimit(request, 1048576);
+      if (text === undefined) {
         return this.createErrorResponse(
           'invalid_request',
           {
@@ -4873,7 +4873,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         return this.createErrorResponse(
           'server_error',
           {
-            description: error instanceof Error ? error.message : 'Client registration callback failed',
+            // The error itself goes to onError; its message may be internal, so it isn't sent to the client.
+            description: 'Client registration callback failed',
             statusCode: 500,
           },
           { category: 'client-registration', reason: 'callback_failed', detail: error }
@@ -5979,6 +5980,33 @@ function parsePurgeCursor(cursor: string | undefined): { phase: 'grants' | 'toke
 function grantsNoneOfTheRequestedScopes(requested: string | string[] | undefined, granted: string[]): boolean {
   const named = typeof requested === 'string' ? requested.split(' ').filter(Boolean) : (requested ?? []);
   return named.length > 0 && granted.length === 0;
+}
+
+/** Reads a request body as text, or returns undefined once it passes `maxBytes`. */
+async function readTextWithLimit(request: Request, maxBytes: number): Promise<string | undefined> {
+  const reader = request.body?.getReader();
+  if (!reader) return '';
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      // Not awaited: on a teed body (the handler keeps a clone for the registration callback),
+      // cancelling one branch settles only once the other is cancelled too.
+      reader.cancel().catch(() => undefined);
+      return undefined;
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes);
 }
 
 function isValidAccessTokenTTL(value: number): boolean {
