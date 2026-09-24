@@ -15550,7 +15550,7 @@ describe('onError.internal coverage across generic error paths', () => {
     expect(resolver).toHaveBeenCalledTimes(1);
   });
 
-  it('passes the Worker env to tokenExchangeCallback, on code exchange and refresh', async () => {
+  it('passes the Worker env to tokenExchangeCallback, on code exchange, refresh and token exchange', async () => {
     const seen: Array<{ grantType: string; env: unknown }> = [];
     const provider = createProvider({
       tokenExchangeCallback: ({ grantType, env: callbackEnv }: { grantType: string; env: unknown }) => {
@@ -15570,9 +15570,23 @@ describe('onError.internal coverage across generic error paths', () => {
       env,
       ctx
     );
+    const exchanged = await provider.fetch(
+      form(
+        `grant_type=${encodeURIComponent('urn:ietf:params:oauth:grant-type:token-exchange')}` +
+          `&subject_token=${tokens.access_token}` +
+          `&subject_token_type=${encodeURIComponent('urn:ietf:params:oauth:token-type:access_token')}&${credentials}`
+      ),
+      env,
+      ctx
+    );
+    expect(exchanged.status).toBe(200);
 
-    // The same env the Worker's fetch received: secrets and bindings, no per-request provider needed.
-    expect(seen.map(({ grantType }) => grantType)).toEqual(['authorization_code', 'refresh_token']);
+    // The same env the Worker's fetch received, on every grant: no per-request provider needed.
+    expect(seen.map(({ grantType }) => grantType)).toEqual([
+      'authorization_code',
+      'refresh_token',
+      'urn:ietf:params:oauth:grant-type:token-exchange',
+    ]);
     for (const call of seen) expect(call.env).toBe(env);
   });
 
