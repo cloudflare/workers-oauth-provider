@@ -8,7 +8,9 @@
   "license": "MIT",
   "sideEffects": false,
   "files": [
-    "dist"
+    "dist",
+    "docs",
+    "skills"
   ],
   "type": "module",
   "publishConfig": {

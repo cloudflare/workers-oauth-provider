@@ -424,6 +424,8 @@ Path-aware API validation uses path-boundary prefix matching. A canonical audien
 
 ### Upgrading to 1.0
 
+The step-by-step guide, including an "Am I affected" checklist and an agent skill (`skills/migrate-to-1.0/`), is [docs/migration-1.0.md](docs/migration-1.0.md). The compatibility rules it relies on:
+
 The existing combined `OAuthProvider` configuration has one `resourceMetadata.resource`. That sole resource automatically acts as both the omitted-authorization default and the migration destination for grants created before resource binding, so existing single-resource clients can continue without adding a `resource` parameter.
 
 For a multi-resource `OAuthAuthorizationServer`, `defaultResource` and `legacyGrantResource` solve different compatibility problems:
