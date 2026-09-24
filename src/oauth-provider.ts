@@ -251,7 +251,7 @@ export interface TokenExchangeCallbackResult {
 /**
  * Options for token exchange callback functions
  */
-export interface TokenExchangeCallbackOptions {
+export interface TokenExchangeCallbackOptions<Env = Cloudflare.Env> {
   /**
    * The type of grant being processed.
    */
@@ -302,6 +302,12 @@ export interface TokenExchangeCallbackOptions {
    * Application-specific properties currently associated with this grant
    */
   props: any;
+
+  /**
+   * The Worker's environment for this request, so the callback can reach secrets and bindings
+   * (an upstream provider's client secret, say) without the provider being rebuilt per request.
+   */
+  env: Env;
 }
 
 /**
@@ -588,7 +594,7 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
    * If the callback returns nothing or undefined for a props field, the original props will be used.
    */
   tokenExchangeCallback?: (
-    options: TokenExchangeCallbackOptions
+    options: TokenExchangeCallbackOptions<Env>
   ) => Promise<TokenExchangeCallbackResult | void> | TokenExchangeCallbackResult | void;
 
   /**
@@ -3129,11 +3135,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * revocation is logged and the callback's error still answers the request.
    */
   private async callTokenExchangeCallback(
-    options: TokenExchangeCallbackOptions,
+    options: Omit<TokenExchangeCallbackOptions<Env>, 'env'>,
     env: Env & ProviderEnv
   ): Promise<TokenExchangeCallbackResult | void> {
     try {
-      return await Promise.resolve(this.options.tokenExchangeCallback!(options));
+      return await Promise.resolve(this.options.tokenExchangeCallback!({ ...options, env }));
     } catch (error) {
       if (error instanceof OAuthError && error.code === 'invalid_grant') {
         try {
@@ -3426,7 +3432,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       let grantProps = decryptedProps;
       let accessTokenProps = decryptedProps;
 
-      const callbackOptions: TokenExchangeCallbackOptions = {
+      const callbackOptions: Omit<TokenExchangeCallbackOptions<Env>, 'env'> = {
         grantType: GrantType.AUTHORIZATION_CODE,
         clientId: clientInfo.clientId,
         subjectClientId: grantData.clientId,
@@ -3718,7 +3724,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       let grantProps = decryptedProps;
       let accessTokenProps = decryptedProps;
 
-      const callbackOptions: TokenExchangeCallbackOptions = {
+      const callbackOptions: Omit<TokenExchangeCallbackOptions<Env>, 'env'> = {
         grantType: GrantType.REFRESH_TOKEN,
         clientId: clientInfo.clientId,
         subjectClientId: grantData.clientId,
@@ -4059,7 +4065,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     if (this.options.tokenExchangeCallback) {
       const decryptedProps = await decryptProps(encryptionKey, subjectTokenData.grant.encryptedProps);
 
-      const callbackOptions: TokenExchangeCallbackOptions = {
+      const callbackOptions: Omit<TokenExchangeCallbackOptions<Env>, 'env'> = {
         grantType: GrantType.TOKEN_EXCHANGE,
         clientId: clientInfo.clientId,
         subjectClientId: grantData.clientId,

@@ -15550,6 +15550,32 @@ describe('onError.internal coverage across generic error paths', () => {
     expect(resolver).toHaveBeenCalledTimes(1);
   });
 
+  it('passes the Worker env to tokenExchangeCallback, on code exchange and refresh', async () => {
+    const seen: Array<{ grantType: string; env: unknown }> = [];
+    const provider = createProvider({
+      tokenExchangeCallback: ({ grantType, env: callbackEnv }: { grantType: string; env: unknown }) => {
+        seen.push({ grantType, env: callbackEnv });
+      },
+    });
+    const { code, credentials } = await authorizationCode(provider);
+    const tokens = await (
+      await provider.fetch(
+        form(`grant_type=authorization_code&code=${code}&redirect_uri=${encodeURIComponent(REDIRECT)}&${credentials}`),
+        env,
+        ctx
+      )
+    ).json<any>();
+    await provider.fetch(
+      form(`grant_type=refresh_token&refresh_token=${tokens.refresh_token}&${credentials}`),
+      env,
+      ctx
+    );
+
+    // The same env the Worker's fetch received: secrets and bindings, no per-request provider needed.
+    expect(seen.map(({ grantType }) => grantType)).toEqual(['authorization_code', 'refresh_token']);
+    for (const call of seen) expect(call.env).toBe(env);
+  });
+
   it('revokes the grant when tokenExchangeCallback throws invalid_grant, which can never recover', async () => {
     // A proxy server's upstream refresh token is dead for good: the grant goes too, so the client
     // re-authorizes instead of refreshing a grant that can never work again.
