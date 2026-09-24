@@ -271,6 +271,8 @@ A typical flow has three steps:
 2. Authenticate the user, show consent, and decide which scopes to grant.
 3. Call `completeAuthorization()` and redirect to its returned `redirectTo` URL.
 
+[docs/consent-page.md](docs/consent-page.md) shows a safe consent page (what it must display, escaping client metadata, Allow and Deny) and which errors to redirect back to the client and which to render.
+
 `parseAuthRequest()` throws an exported `AuthorizationError` for expected request validation failures. Its optional `redirectUri` is present only after the client and exact registered redirect URI have been validated. Without it, render the error locally and never redirect. With it, the application can safely construct an OAuth error redirect using the error's `code`, `description`, original `state`, and RFC 9207 `issuer`, as shown in the quick start.
 
 `completeAuthorization()` repeats response-type validation before writing a grant or revoking existing grants. Validation errors from reconstructed requests are also typed as `AuthorizationError`, but applications should not construct redirects from untrusted reconstructed values; the redirect context is attached only by `parseAuthRequest()`.
@@ -507,7 +509,7 @@ Consult the exported `OAuthProviderOptions`, `OAuthAuthorizationServerOptions`, 
 Handlers receive `env.OAUTH_PROVIDER`, which implements `OAuthHelpers`. It can:
 
 - Parse authorization requests and complete authorization.
-- Run a consent page and a third-party sign-in redirect safely (`beginConsent()`, `approveConsent()`, `isConsentRemembered()`, `beginUpstream()`, `finishUpstream()`).
+- Run a consent page and a third-party sign-in redirect safely (`beginConsent()`, `approveConsent()`, `denyConsent()`, `isConsentRemembered()`, `beginUpstream()`, `finishUpstream()`).
 - Look up, create, list, update, and delete clients.
 - List and revoke grants for a user.
 - Inspect internally issued tokens with `unwrapToken()`.

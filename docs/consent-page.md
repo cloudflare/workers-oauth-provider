@@ -1,0 +1,137 @@
+# Building a consent page
+
+Your `authorizeEndpoint` is your page: the library validates the request, and you sign the user in and ask whether this client may act for them. The consent helpers (`beginConsent()`, `approveConsent()`, `denyConsent()`, `isConsentRemembered()`) make that page safe to build. A server that signs users in through another provider also needs [upstream-sign-in.md](upstream-sign-in.md).
+
+## What the page must show
+
+From the MCP authorization spec and security best practices:
+
+- **The client's name**, and **the scopes** being granted.
+- **The redirect URI's hostname** (MUST): where the tokens will go.
+- **A warning when that hostname is `localhost`** (SHOULD). A CIMD client's name comes from its metadata document, but anyone can present that document and listen on a local port, so the name alone doesn't prove which app is asking.
+- **A CIMD client's domain**, prominently. Its `client_id` is a URL on a domain the client controls; a DCR client's name is self-asserted.
+- **No framing**, and a form that can't be forged: `beginConsent()` returns the headers and the browser-bound handle that do this.
+
+## Escape everything that came from the client
+
+`clientName`, `clientUri`, `logoUri` and the scope strings come from dynamic registration or a CIMD document, so an attacker chooses them. Rendered without escaping, they're script running on your authorization origin, next to your users' sessions.
+
+## A minimal page
+
+```ts
+import type { AuthRequest, ClientInfo } from '@cloudflare/workers-oauth-provider';
+
+const escape = (value: string) => value.replace(/[&<>"']/g, (char) => `&#${char.charCodeAt(0)};`);
+
+function consentPage(client: ClientInfo, request: AuthRequest, handle: string): string {
+  const name = escape(client.clientName ?? client.clientId);
+  const redirectHost = new URL(request.redirectUri).hostname;
+  const local = /^(localhost|127(\.\d{1,3}){3}|\[::1\])$/.test(redirectHost);
+  const origin = client.clientId.startsWith('https://')
+    ? `Published by <strong>${escape(new URL(client.clientId).hostname)}</strong>.`
+    : 'This app registered itself; its name is not verified.';
+  const scopes = request.scope
+    .map(
+      (scope) => `<label><input type="checkbox" name="scope" value="${escape(scope)}" checked> ${escape(scope)}</label>`
+    )
+    .join('<br>');
+  return `<!doctype html>
+<meta charset="utf-8">
+<title>Authorize ${name}</title>
+<h1>Allow ${name} to access your account?</h1>
+<p>${origin} Access will be sent to <strong>${escape(redirectHost)}</strong>.</p>
+${local ? '<p><strong>This sends access to an app on your computer.</strong> Continue only if you just started signing in from it.</p>' : ''}
+<form method="post">
+  <input type="hidden" name="handle" value="${escape(handle)}">
+  ${scopes}
+  <p><button name="decision" value="approve">Allow</button> <button name="decision" value="deny">Deny</button></p>
+</form>`;
+}
+```
+
+## Showing it, approving, declining
+
+```ts
+const oauth = authorizationServer.getOAuthApi(env); // or env.OAUTH_PROVIDER with OAuthProvider
+
+// GET /authorize (after signing the user in with your own session)
+const request = await oauth.parseAuthRequest(req);
+const client = await oauth.lookupClient(request.clientId);
+const consent = await oauth.beginConsent(request);
+consent.headers.set('Content-Type', 'text/html; charset=utf-8');
+return new Response(consentPage(client!, request, consent.handle), { headers: consent.headers });
+
+// POST /authorize
+const form = await req.formData();
+const handle = String(form.get('handle'));
+if (form.get('decision') !== 'approve') {
+  const denied = await oauth.denyConsent(req, handle); // redirect to the client: access_denied, state, iss
+  return new Response(null, { status: 302, headers: denied.headers });
+}
+const approved = await oauth.approveConsent(req, handle, { scope: form.getAll('scope').map(String) });
+const { redirectTo } = await oauth.completeAuthorization({
+  request: approved.request, // from storage, not from the form
+  userId: session.userId,
+  metadata: {},
+  scope: approved.request.scope,
+  props: { userId: session.userId },
+});
+approved.headers.set('Location', redirectTo);
+return new Response(null, { status: 302, headers: approved.headers });
+```
+
+The authorization request is kept server-side between the two requests; the form carries only the handle, which works once, for ten minutes, in the browser that opened the page. `scope` is what the user ticked: fewer or more than the client requested, each in `scopesSupported`.
+
+## Errors: redirect or render?
+
+A redirect back to the client is only safe once the client and its exact redirect URI are validated. Everything else is shown on your page.
+
+| Where it fails                                                                     | What to do                                                                                                        |
+| ---------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `parseAuthRequest()` throws `AuthorizationError` **with** `redirectUri`            | Redirect to it with `error`, `error_description`, `state` and `iss` from the error (see the quick start)          |
+| `parseAuthRequest()` throws `AuthorizationError` **without** `redirectUri`         | Render locally. Never redirect: the client or redirect URI isn't trusted                                          |
+| `parseAuthRequest()` / `lookupClient()` throw `CimdFetchError`                     | Render locally: the client's metadata document couldn't be fetched (`error.reason`, `error.detail` for your logs) |
+| `approveConsent()`, `denyConsent()`, `finishUpstream()` throw `AuthorizationError` | Render locally: the page expired, was used, or was opened in another browser. Offer to start again                |
+| The user clicks Deny                                                               | `denyConsent()`, then send its redirect                                                                           |
+| A third-party provider returns `error=` to your callback                           | `finishUpstream()`, then redirect to the client with `access_denied` ([upstream-sign-in.md](upstream-sign-in.md)) |
+| Token endpoint errors                                                              | The library answers them; observe them with `onError`                                                             |
+
+```ts
+try {
+  // …the handlers above
+} catch (error) {
+  if (error instanceof AuthorizationError && error.redirectUri) {
+    const redirect = new URL(error.redirectUri);
+    redirect.searchParams.set('error', error.code);
+    redirect.searchParams.set('error_description', error.description);
+    if (error.state) redirect.searchParams.set('state', error.state);
+    if (error.issuer) redirect.searchParams.set('iss', error.issuer);
+    return Response.redirect(redirect.href, 302);
+  }
+  if (error instanceof AuthorizationError || error instanceof CimdFetchError) {
+    const message = error instanceof AuthorizationError ? error.description : 'This app could not be verified.';
+    return new Response(escape(message), { status: 400, headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
+  }
+  throw error;
+}
+```
+
+## Remembering consent
+
+By default the page appears on every authorization, which also lets users re-authorize with different scopes. To skip it for clients a user already approved, pass `remember` when approving and check before showing the page:
+
+```ts
+const remember = { secret: env.CONSENT_SECRET }; // at least 32 characters, from a Worker secret
+
+if (await oauth.isConsentRemembered(req, request, remember)) {
+  // skip the page: complete the authorization (or start the third-party sign-in) directly
+}
+// …when approving:
+await oauth.approveConsent(req, handle, { scope, remember }); // maxAgeSeconds defaults to 30 days
+```
+
+Approvals live in a signed `__Host-` cookie, bound to the client ID, its redirect URI and the resource, and they cover only the scopes that were approved: asking for more brings the page back.
+
+## Cookie names
+
+The helpers set `__Host-oauth-consent`, `__Host-oauth-upstream` and `__Host-oauth-approvals`. Change the prefix with the `cookiePrefix` option if those collide with yours; it must start with `__Host-`.

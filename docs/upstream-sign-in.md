@@ -44,7 +44,22 @@ clear.set('Location', redirectTo);
 return new Response(null, { status: 302, headers: clear });
 ```
 
-The consent page must name the client, show the scopes and the `redirect_uri` its tokens will go to, and post `handle` back. Every helper that fails throws `AuthorizationError` without a `redirectUri`, so render it locally, the same as `parseAuthRequest()` failures.
+Build the consent page itself, and the Deny path (`denyConsent()`), as in [consent-page.md](consent-page.md), which also covers which errors to redirect and which to render. Every helper that fails throws `AuthorizationError` without a `redirectUri`: render it locally.
+
+If the third party sends the user back with an error (they declined there, or it failed), `finishUpstream()` still returns the original request, so answer the client with it:
+
+```ts
+const { request: original, headers } = await oauth.finishUpstream(req);
+const error = new URL(req.url).searchParams.get('error');
+if (error) {
+  const redirect = new URL(original.redirectUri);
+  redirect.searchParams.set('error', 'access_denied');
+  redirect.searchParams.set('state', original.state);
+  if (original.issuer) redirect.searchParams.set('iss', original.issuer);
+  headers.set('Location', redirect.href);
+  return new Response(null, { status: 302, headers });
+}
+```
 
 ## What the helpers guarantee
 
@@ -55,24 +70,7 @@ The consent page must name the client, show the scopes and the `redirect_uri` it
 
 ## Remembering consent
 
-By default the consent page appears on every authorization, which also lets users re-authorize with different scopes. To skip it for clients a user already approved, pass `remember` when approving and check before showing the page:
-
-```ts
-const remember = { secret: env.CONSENT_SECRET }; // at least 32 characters, from a Worker secret
-
-if (await oauth.isConsentRemembered(req, request, remember)) {
-  const { state, headers } = await oauth.beginUpstream(request, { data: { verifier } });
-  // …redirect to the third party
-}
-// …after the consent POST:
-await oauth.approveConsent(req, handle, { scope, remember }); // maxAgeSeconds defaults to 30 days
-```
-
-Approvals live in a signed `__Host-` cookie, bound to the client ID, its redirect URI and the resource, and they cover only the scopes that were approved: asking for more brings the page back.
-
-## Cookie names
-
-The helpers set `__Host-oauth-consent`, `__Host-oauth-upstream` and `__Host-oauth-approvals`. Change the prefix with the `cookiePrefix` option if those collide with yours; it must start with `__Host-`.
+Pass `remember` to `approveConsent()` and check `isConsentRemembered()` before showing the page; when it's remembered, go straight to `beginUpstream()`. See [consent-page.md](consent-page.md#remembering-consent), which also covers the cookie names.
 
 ## When the third party revokes access
 

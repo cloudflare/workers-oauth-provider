@@ -145,6 +145,44 @@ describe('consent transactions', () => {
     );
   });
 
+  it('declines back to the client with access_denied, its state and iss, once, from the browser that opened it', async () => {
+    const request = await parsedRequest();
+    const browser = new Browser();
+    const consent = await oauth.beginConsent(request);
+    browser.receive(consent.headers);
+
+    await expectLocalRejection(
+      oauth.denyConsent(new Browser().request(`${ISSUER}/authorize`), consent.handle),
+      'invalid_request',
+      /not started in this browser/
+    );
+
+    const denied = await oauth.denyConsent(browser.request(`${ISSUER}/authorize`), consent.handle, {
+      description: 'The user declined',
+    });
+    const redirect = new URL(denied.redirectTo);
+    expect(redirect.origin + redirect.pathname).toBe(REDIRECT_URI);
+    expect(Object.fromEntries(redirect.searchParams)).toEqual({
+      error: 'access_denied',
+      error_description: 'The user declined',
+      state: 'client-state',
+      iss: ISSUER,
+    });
+    expect(denied.headers.get('Location')).toBe(denied.redirectTo);
+    expect(denied.headers.getSetCookie()).toEqual([
+      '__Host-oauth-consent=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0',
+    ]);
+
+    // Declining uses the handle up: it can't be approved afterwards.
+    const after = new Browser();
+    after.receive(consent.headers);
+    await expectLocalRejection(
+      oauth.approveConsent(after.request(`${ISSUER}/authorize`), consent.handle),
+      'invalid_request',
+      /expired or was already used/
+    );
+  });
+
   it('lets the consent page choose any scope the server supports, like cloudflare/mcp, and nothing else', async () => {
     const request = await parsedRequest('read');
     const approve = async (scope: string[]) => {

@@ -59,6 +59,7 @@ export * from './oauth-resource-server';
 export type {
   ApprovedConsent,
   ConsentTransaction,
+  DeniedConsent,
   RememberConsentOptions,
   ResumedUpstream,
   UpstreamTransaction,
@@ -67,6 +68,7 @@ import * as consent from './oauth-consent';
 import type {
   ApprovedConsent,
   ConsentTransaction,
+  DeniedConsent,
   RememberConsentOptions,
   ResumedUpstream,
   UpstreamTransaction,
@@ -810,6 +812,14 @@ export interface OAuthHelpers {
     handle: string,
     options?: { scope?: string[]; remember?: RememberConsentOptions }
   ): Promise<ApprovedConsent>;
+
+  /**
+   * Decline the consent form: consumes the handle like `approveConsent()` and returns the redirect
+   * back to the client with `error=access_denied`, its `state` and `iss`. Send `headers` with the
+   * redirect (they include `Location`).
+   * @throws AuthorizationError when the handle is missing, unbound, expired, or already used
+   */
+  denyConsent(request: Request, handle: string, options?: { description?: string }): Promise<DeniedConsent>;
 
   /**
    * Save an approved request before redirecting to a third-party provider, and get the `state`
@@ -7083,6 +7093,10 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
       handle,
       options
     );
+  }
+
+  denyConsent(request: Request, handle: string, options?: { description?: string }): Promise<DeniedConsent> {
+    return consent.denyConsent(this.env.OAUTH_KV, this.provider.consentCookies, request, handle, options);
   }
 
   beginUpstream(

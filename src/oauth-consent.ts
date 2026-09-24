@@ -40,6 +40,14 @@ export interface ApprovedConsent {
   headers: Headers;
 }
 
+/** Where to send the browser after the user declined, with the cookies to set on that redirect. */
+export interface DeniedConsent {
+  request: AuthRequest;
+  /** The client's redirect URI with `error=access_denied`, its `state`, and `iss` (RFC 9207). */
+  redirectTo: string;
+  headers: Headers;
+}
+
 /** The `state` to send to the third-party provider, with the binding cookie to set on the redirect. */
 export interface UpstreamTransaction {
   state: string;
@@ -156,6 +164,29 @@ export async function approveConsent(
     headers.append('Set-Cookie', await rememberApproval(cookies, request, approved, options.remember));
   }
   return { request: approved, headers };
+}
+
+/**
+ * Consume a consent transaction the user declined, and build the OAuth error redirect back to the
+ * client: `error=access_denied`, the client's `state`, and `iss`. The redirect URI comes from the
+ * stored request, which `parseAuthRequest()` validated, never from the form.
+ */
+export async function denyConsent(
+  kv: KVNamespace,
+  cookies: ConsentCookies,
+  request: Request,
+  handle: string,
+  options: { description?: string } = {}
+): Promise<DeniedConsent> {
+  const record = await consumeTransaction(kv, request, cookies.consent, handle, 'consent');
+  const redirect = new URL(record.request.redirectUri);
+  redirect.searchParams.set('error', 'access_denied');
+  if (options.description) redirect.searchParams.set('error_description', options.description);
+  if (record.request.state) redirect.searchParams.set('state', record.request.state);
+  if (record.request.issuer) redirect.searchParams.set('iss', record.request.issuer);
+  const headers = new Headers({ 'Cache-Control': 'no-store', Location: redirect.href });
+  headers.append('Set-Cookie', clearCookie(cookies.consent));
+  return { request: record.request, redirectTo: redirect.href, headers };
 }
 
 /** Whether a remembered approval covers this request: same client, redirect URI and resource, subset of scopes. */
