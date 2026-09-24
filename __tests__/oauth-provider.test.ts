@@ -973,6 +973,58 @@ describe('OAuthProvider', () => {
       );
     }
 
+    it('disallowPublicClientRegistration registers a secret method when one is on offer and refuses none alone', async () => {
+      const provider = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        disallowPublicClientRegistration: true,
+      });
+      const register = (metadata: Record<string, unknown>) =>
+        provider.fetch(
+          createMockRequest(
+            'https://example.com/oauth/register',
+            'POST',
+            { 'Content-Type': 'application/json' },
+            JSON.stringify({ redirect_uris: ['https://client.example.com/callback'], ...metadata })
+          ),
+          mockEnv,
+          mockCtx
+        );
+
+      // Only `none`: refused.
+      const publicOnly = await register({ token_endpoint_auth_method: 'none' });
+      expect(publicOnly.status).toBe(400);
+      expect(await publicOnly.json<any>()).toMatchObject({ error: 'invalid_client_metadata' });
+
+      // Prefers `none` but also supports a secret method: registered with the secret method.
+      const either = await register({
+        token_endpoint_auth_method: 'none',
+        token_endpoint_auth_methods_supported: ['none', 'client_secret_basic'],
+      });
+      expect(either.status).toBe(201);
+      expect(await either.json<any>()).toMatchObject({
+        token_endpoint_auth_method: 'client_secret_basic',
+        client_secret: expect.any(String),
+      });
+
+      // Nothing said: the RFC 7591 default, a confidential client.
+      const defaults = await register({});
+      expect(defaults.status).toBe(201);
+      expect((await defaults.json<any>()).token_endpoint_auth_method).toBe('client_secret_basic');
+
+      // DCR only: administrative code can still create a public client.
+      await provider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
+      const admin = await mockEnv.OAUTH_PROVIDER!.createClient({
+        redirectUris: ['https://client.example.com/callback'],
+        tokenEndpointAuthMethod: 'none',
+      });
+      expect(admin.tokenEndpointAuthMethod).toBe('none');
+    });
+
     it('should register a new client', async () => {
       const clientData = {
         redirect_uris: ['https://client.example.com/callback'],

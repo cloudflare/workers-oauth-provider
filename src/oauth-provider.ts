@@ -4773,7 +4773,17 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     let metadata: ResolvedDynamicClientRegistrationMetadata;
     try {
       clientMetadata = requireJsonObject(parsedJson);
-      metadata = resolveDynamicClientRegistrationMetadata(clientMetadata, this.serverCapabilities);
+      // With public registration disallowed, `none` isn't on offer: a client that also supports a
+      // secret method is registered with one, and a client that supports only `none` is refused.
+      const capabilities = this.options.disallowPublicClientRegistration
+        ? {
+            ...this.serverCapabilities,
+            tokenEndpointAuthMethods: this.serverCapabilities.tokenEndpointAuthMethods.filter(
+              (method) => method !== 'none'
+            ),
+          }
+        : this.serverCapabilities;
+      metadata = resolveDynamicClientRegistrationMetadata(clientMetadata, capabilities);
     } catch (error) {
       return this.createErrorResponse(
         'invalid_client_metadata',
@@ -4786,15 +4796,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     const authMethod = metadata.tokenEndpointAuthMethod;
     const isPublicClient = authMethod === 'none';
-    if (isPublicClient && this.options.disallowPublicClientRegistration) {
-      return this.createErrorResponse(
-        'invalid_client_metadata',
-        {
-          description: 'Public client registration is not allowed',
-        },
-        { category: 'client-registration', reason: 'public_client_forbidden' }
-      );
-    }
 
     const clientId = generateRandomString(16);
     let clientSecret: string | undefined;
