@@ -3470,6 +3470,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Parse and validate scope parameter for downscoping (RFC 6749 Section 3.3)
     // The token request can include a scope parameter to request a subset of the granted scopes
     let tokenScopes: string[] = this.downscope(body.scope, grantData.scope);
+    if (grantsNoneOfTheRequestedScopes(body.scope, tokenScopes)) {
+      return this.createErrorResponse(
+        'invalid_scope',
+        { description: 'None of the requested scopes were granted' },
+        { category: 'authorization-code-grant', reason: 'scope_not_granted' }
+      );
+    }
 
     // Process token exchange callback if provided
     if (this.options.tokenExchangeCallback) {
@@ -3760,6 +3767,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Parse and validate scope parameter for downscoping (RFC 6749 Section 3.3)
     // The token request can include a scope parameter to request a subset of the granted scopes
     let tokenScopes = this.downscope(body.scope, grantData.scope);
+    if (grantsNoneOfTheRequestedScopes(body.scope, tokenScopes)) {
+      return this.createErrorResponse(
+        'invalid_scope',
+        { description: 'None of the requested scopes were granted' },
+        { category: 'refresh-token-grant', reason: 'scope_not_granted' }
+      );
+    }
 
     // Track whether grant props changed
     let grantPropsChanged = false;
@@ -4048,6 +4062,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // An exchanged token inherits the subject token's scopes unless a narrower subset is requested.
     let tokenScopes: string[] = this.downscope(requestedScopes, tokenSummary.scope);
+    if (grantsNoneOfTheRequestedScopes(requestedScopes, tokenScopes)) {
+      throw new OAuthError('invalid_scope', {
+        description: 'None of the requested scopes were granted',
+        internal: { category: 'token-exchange-grant', reason: 'scope_not_granted' },
+      });
+    }
 
     const newAudience = this.resolveTokenExchangeResource(requestedResource, tokenSummary.audience);
 
@@ -5954,6 +5974,15 @@ function parsePurgeCursor(cursor: string | undefined): { phase: 'grants' | 'toke
   }
   const kvCursor = cursor.slice(separator + 1);
   return kvCursor ? { phase, kvCursor } : { phase };
+}
+
+/**
+ * RFC 6749 §6: a token request may narrow the grant's scopes. One that names scopes but none the
+ * grant holds would otherwise get a token with no scope at all; it is `invalid_scope` instead.
+ */
+function grantsNoneOfTheRequestedScopes(requested: string | string[] | undefined, granted: string[]): boolean {
+  const named = typeof requested === 'string' ? requested.split(' ').filter(Boolean) : (requested ?? []);
+  return named.length > 0 && granted.length === 0;
 }
 
 function isValidAccessTokenTTL(value: number): boolean {
