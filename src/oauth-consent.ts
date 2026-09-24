@@ -57,7 +57,10 @@ export interface ConsentDescription {
   logoUri?: string;
   /** Where the tokens will be sent. */
   redirectUri: string;
-  /** The redirect URI's hostname, which the page MUST display. */
+  /**
+   * The redirect URI's hostname, which the page MUST display. A native app's private-use URI
+   * (`com.example.app:/callback`) has no host, so it's the whole URI instead.
+   */
   redirectHost: string;
   /**
    * The redirect goes to a local app (`localhost`, `127.0.0.0/8`, `::1`). The page SHOULD warn:
@@ -167,7 +170,7 @@ export function describeConsent(
   request: AuthRequest,
   isClientIdMetadataDocument: boolean
 ): ConsentDescription {
-  const redirectHost = new URL(request.redirectUri).hostname;
+  const redirectHost = new URL(request.redirectUri).hostname || request.redirectUri;
   return {
     clientId: request.clientId,
     clientName: client?.clientName || request.clientId,

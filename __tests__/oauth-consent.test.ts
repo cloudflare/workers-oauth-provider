@@ -494,5 +494,12 @@ describe('describeConsent', () => {
     });
     // The same URL-shaped ID without CIMD enabled is just an opaque registered ID.
     expect(describeConsent(client, request, false)).not.toHaveProperty('clientDomain');
+
+    // A native app's private-use redirect has no host: the page shows the whole URI.
+    const native = { ...request, redirectUri: 'com.example.app:/oauth/callback' };
+    expect(describeConsent(client, native, true)).toMatchObject({
+      redirectHost: 'com.example.app:/oauth/callback',
+      redirectIsLoopback: false,
+    });
   });
 });
