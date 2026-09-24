@@ -6,16 +6,19 @@
  * - consent per client before any redirect to the third party, with CSRF protection and anti-framing
  *   headers on the consent page;
  * - remembered consent, chosen per call, in a signed `__Host-` cookie bound to the client, its redirect
- *   URI and resource, reused only for a subset of the approved scopes;
+ *   URI and resource (and the user, when the caller knows them), reused only for a subset of the
+ *   approved scopes;
  * - the approved scopes chosen on the consent page, from any the server supports;
  * - a random `state` stored server-side only after consent, bound to the browser by a `__Host-` cookie,
  *   single-use and short-lived.
  *
- * A transaction handle is 256 random bits. KV stores the record under the handle's SHA-256, and the
- * binding cookie holds the same hash, so neither KV nor the cookie holds the handle itself. Single use
- * is `get` then `delete`, which KV cannot make atomic: two concurrent requests from the same browser
- * with the same handle could both pass. The cookie binding confines that to the browser that started
- * the transaction.
+ * A transaction handle is 256 random bits. KV stores the record under the handle's SHA-256, encrypted
+ * with a key derived from the handle, so KV alone reveals neither the request nor deployer data such as
+ * a PKCE verifier. Each transaction has its own binding cookie, named after its hash and holding the
+ * full hash, so several authorizations can be in flight in one browser (two tabs) without replacing each
+ * other. Single use is `get` then `delete`, which KV cannot make atomic: two concurrent requests from the
+ * same browser with the same handle could both pass; the cookie binding confines that to the browser
+ * that started the transaction.
  */
 import { AuthorizationError, isValidOAuthScopeToken } from './oauth-capabilities';
 import type { AuthRequest } from './oauth-provider';
@@ -26,6 +29,13 @@ export interface RememberConsentOptions {
   secret: string;
   /** How long an approval is remembered. Defaults to 30 days. */
   maxAgeSeconds?: number;
+  /**
+   * The signed-in user, when you know them before consent (your own sign-in). The approval is then
+   * bound to them as well, so another account on the same browser is asked again. Without it an
+   * approval belongs to the browser, which suits a proxy server that only learns the user from the
+   * third party after consent.
+   */
+  subject?: string;
 }
 
 /** A consent page to render: post `handle` back to {@link approveConsent}; send `headers` with the page. */
@@ -75,6 +85,12 @@ interface TransactionRecord {
   request: AuthRequest;
   data?: unknown;
 }
+/** A transaction whose binding and record checked out; `consume()` makes it single-use. */
+interface OpenTransaction {
+  record: TransactionRecord;
+  cookieName: string;
+  consume(): Promise<void>;
+}
 interface Approval {
   /** base64url SHA-256 of client ID, redirect URI and resource. */
   k: string;
@@ -110,6 +126,9 @@ function validateRememberConsentOptions(options: RememberConsentOptions): void {
   if (maxAge !== undefined && (!Number.isInteger(maxAge) || maxAge <= 0)) {
     throw new TypeError('remember.maxAgeSeconds must be a positive integer');
   }
+  if (options.subject !== undefined && (typeof options.subject !== 'string' || options.subject.length === 0)) {
+    throw new TypeError('remember.subject must be a non-empty string');
+  }
 }
 
 /** Start a consent transaction for an authorization request that must be shown to the user. */
@@ -120,7 +139,7 @@ export async function beginConsent(
 ): Promise<ConsentTransaction> {
   const { handle, hash } = await createTransaction(kv, { kind: 'consent', request });
   const headers = new Headers({
-    'Set-Cookie': bindingCookie(cookies.consent, hash, TRANSACTION_TTL_SECONDS),
+    'Set-Cookie': bindingCookie(transactionCookieName(cookies.consent, hash), hash, TRANSACTION_TTL_SECONDS),
     'Cache-Control': 'no-store',
     // Clickjacking protection for the consent page (MUST).
     'Content-Security-Policy': "frame-ancestors 'none'",
@@ -143,8 +162,8 @@ export async function approveConsent(
   options: { scope?: string[]; remember?: RememberConsentOptions } = {}
 ): Promise<ApprovedConsent> {
   if (options.remember !== undefined) validateRememberConsentOptions(options.remember);
-  const record = await consumeTransaction(kv, request, cookies.consent, handle, 'consent');
-  let approved = record.request;
+  const transaction = await openTransaction(kv, request, cookies.consent, handle, 'consent');
+  let approved = transaction.record.request;
   if (options.scope !== undefined) {
     // The checkboxes are the user's to edit, so every value is checked against what the server
     // supports; with no scopesSupported configured, any well-formed scope is the page's call.
@@ -158,8 +177,10 @@ export async function approveConsent(
     }
     approved = { ...approved, scope: [...new Set(options.scope)] };
   }
+  // Consumed only once the submission is valid, so a corrected resubmission of the same page works.
+  await transaction.consume();
   const headers = new Headers({ 'Cache-Control': 'no-store' });
-  headers.append('Set-Cookie', clearCookie(cookies.consent));
+  headers.append('Set-Cookie', clearCookie(transaction.cookieName));
   if (options.remember) {
     headers.append('Set-Cookie', await rememberApproval(cookies, request, approved, options.remember));
   }
@@ -178,14 +199,16 @@ export async function denyConsent(
   handle: string,
   options: { description?: string } = {}
 ): Promise<DeniedConsent> {
-  const record = await consumeTransaction(kv, request, cookies.consent, handle, 'consent');
+  const transaction = await openTransaction(kv, request, cookies.consent, handle, 'consent');
+  await transaction.consume();
+  const record = transaction.record;
   const redirect = new URL(record.request.redirectUri);
   redirect.searchParams.set('error', 'access_denied');
   if (options.description) redirect.searchParams.set('error_description', options.description);
   if (record.request.state) redirect.searchParams.set('state', record.request.state);
   if (record.request.issuer) redirect.searchParams.set('iss', record.request.issuer);
   const headers = new Headers({ 'Cache-Control': 'no-store', Location: redirect.href });
-  headers.append('Set-Cookie', clearCookie(cookies.consent));
+  headers.append('Set-Cookie', clearCookie(transaction.cookieName));
   return { request: record.request, redirectTo: redirect.href, headers };
 }
 
@@ -194,11 +217,11 @@ export async function isConsentRemembered(
   cookies: ConsentCookies,
   request: Request,
   authRequest: AuthRequest,
-  remember: Pick<RememberConsentOptions, 'secret'>
+  remember: Pick<RememberConsentOptions, 'secret' | 'subject'>
 ): Promise<boolean> {
   validateRememberConsentOptions(remember);
   const approvals = await readApprovals(cookies, request, remember.secret);
-  const key = await approvalKey(authRequest);
+  const key = await approvalKey(authRequest, remember.subject);
   const now = Math.floor(Date.now() / 1000);
   const approval = approvals.find((entry) => entry.k === key && entry.e > now);
   if (!approval) return false;
@@ -219,7 +242,10 @@ export async function beginUpstream(
 ): Promise<UpstreamTransaction> {
   const { handle, hash } = await createTransaction(kv, { kind: 'upstream', request, data: options.data });
   const headers = options.headers ?? new Headers();
-  headers.append('Set-Cookie', bindingCookie(cookies.upstream, hash, TRANSACTION_TTL_SECONDS));
+  headers.append(
+    'Set-Cookie',
+    bindingCookie(transactionCookieName(cookies.upstream, hash), hash, TRANSACTION_TTL_SECONDS)
+  );
   headers.set('Cache-Control', 'no-store');
   return { state: handle, headers };
 }
@@ -234,10 +260,11 @@ export async function finishUpstream<Data = unknown>(
   if (!state) {
     throw new AuthorizationError('invalid_request', { description: 'Missing state parameter' });
   }
-  const record = await consumeTransaction(kv, request, cookies.upstream, state, 'upstream');
+  const transaction = await openTransaction(kv, request, cookies.upstream, state, 'upstream');
+  await transaction.consume();
   const headers = new Headers({ 'Cache-Control': 'no-store' });
-  headers.append('Set-Cookie', clearCookie(cookies.upstream));
-  return { request: record.request, data: record.data as Data, headers };
+  headers.append('Set-Cookie', clearCookie(transaction.cookieName));
+  return { request: transaction.record.request, data: transaction.record.data as Data, headers };
 }
 
 async function createTransaction(
@@ -246,41 +273,72 @@ async function createTransaction(
 ): Promise<{ handle: string; hash: string }> {
   const handle = base64url(crypto.getRandomValues(new Uint8Array(32)));
   const hash = await sha256Hex(handle);
-  await kv.put(`transaction:${hash}`, JSON.stringify(record), { expirationTtl: TRANSACTION_TTL_SECONDS });
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const sealed = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv },
+    await transactionKey(handle),
+    new TextEncoder().encode(JSON.stringify(record))
+  );
+  await kv.put(`transaction:${hash}`, `${base64url(iv)}.${base64url(new Uint8Array(sealed))}`, {
+    expirationTtl: TRANSACTION_TTL_SECONDS,
+  });
   return { handle, hash };
 }
 
-async function consumeTransaction(
+async function openTransaction(
   kv: KVNamespace,
   request: Request,
-  cookieName: string,
+  cookieBase: string,
   handle: string,
   kind: TransactionKind
-): Promise<TransactionRecord> {
+): Promise<OpenTransaction> {
   if (typeof handle !== 'string' || handle.length === 0) {
     throw new AuthorizationError('invalid_request', { description: 'Missing transaction handle' });
   }
+  const hash = await sha256Hex(handle);
+  const cookieName = transactionCookieName(cookieBase, hash);
   const bound = readCookie(request, cookieName);
   if (!bound) {
     throw new AuthorizationError('invalid_request', {
       description: 'This authorization was not started in this browser; start again',
     });
   }
-  const hash = await sha256Hex(handle);
   if (!timingSafeEqual(hash, bound)) {
     throw new AuthorizationError('invalid_request', {
       description: 'This authorization belongs to a different browser session; start again',
     });
   }
   const key = `transaction:${hash}`;
-  const stored = await kv.get<TransactionRecord>(key, { type: 'json' });
-  if (!stored || stored.kind !== kind) {
-    throw new AuthorizationError('invalid_request', {
-      description: 'This authorization expired or was already used; start again',
-    });
+  const expired = new AuthorizationError('invalid_request', {
+    description: 'This authorization expired or was already used; start again',
+  });
+  const stored = await kv.get(key);
+  if (!stored) throw expired;
+  let record: TransactionRecord;
+  try {
+    const [iv, sealed] = stored.split('.');
+    const plain = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: fromBase64url(iv) },
+      await transactionKey(handle),
+      fromBase64url(sealed)
+    );
+    record = JSON.parse(new TextDecoder().decode(plain));
+  } catch {
+    throw expired;
   }
-  await kv.delete(key);
-  return stored;
+  if (record.kind !== kind) throw expired;
+  return { record, cookieName, consume: () => kv.delete(key) };
+}
+
+/** Only the holder of the handle can decrypt its record; KV keeps the hash, not the handle. */
+async function transactionKey(handle: string): Promise<CryptoKey> {
+  const material = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`oauth-transaction-key:${handle}`));
+  return crypto.subtle.importKey('raw', material, 'AES-GCM', false, ['encrypt', 'decrypt']);
+}
+
+/** One binding cookie per transaction, so concurrent authorizations in one browser don't collide. */
+function transactionCookieName(base: string, hash: string): string {
+  return `${base}-${hash.slice(0, 16)}`;
 }
 
 async function rememberApproval(
@@ -291,7 +349,7 @@ async function rememberApproval(
 ): Promise<string> {
   const maxAge = remember.maxAgeSeconds ?? DEFAULT_REMEMBER_SECONDS;
   const now = Math.floor(Date.now() / 1000);
-  const key = await approvalKey(approved);
+  const key = await approvalKey(approved, remember.subject);
   const approvals = (await readApprovals(cookies, request, remember.secret)).filter(
     (entry) => entry.e > now && entry.k !== key
   );
@@ -301,7 +359,9 @@ async function rememberApproval(
     approvals.shift();
     value = await signApprovals(approvals, remember.secret);
   }
-  return `${cookies.approvals}=${value}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=${maxAge}`;
+  // The cookie lives as long as its longest-lived approval; each entry still expires on its own.
+  const cookieMaxAge = Math.max(...approvals.map((entry) => entry.e)) - now;
+  return `${cookies.approvals}=${value}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=${cookieMaxAge}`;
 }
 
 async function readApprovals(cookies: ConsentCookies, request: Request, secret: string): Promise<Approval[]> {
@@ -342,9 +402,9 @@ function isApproval(value: unknown): value is Approval {
   );
 }
 
-/** Approval is bound to the client, where its tokens go, and which resource they are for. */
-async function approvalKey(request: AuthRequest): Promise<string> {
-  const material = JSON.stringify([request.clientId, request.redirectUri, request.resource ?? null]);
+/** Approval is bound to the client, where its tokens go, which resource they are for, and the user if known. */
+async function approvalKey(request: AuthRequest, subject: string | undefined): Promise<string> {
+  const material = JSON.stringify([request.clientId, request.redirectUri, request.resource ?? null, subject ?? null]);
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(material));
   return base64url(new Uint8Array(digest));
 }

@@ -786,12 +786,13 @@ export interface OAuthHelpers {
   /**
    * Whether an approval remembered by `approveConsent(…, { remember })` covers this request: the
    * same client, redirect URI and resource, asking for a subset of the approved scopes. Pass the
-   * same `secret`. Don't call it to ask on every authorization.
+   * same `secret`, and the same `subject` if the approval was bound to a user. Don't call it to ask
+   * on every authorization.
    */
   isConsentRemembered(
     request: Request,
     authRequest: AuthRequest,
-    remember: Pick<RememberConsentOptions, 'secret'>
+    remember: Pick<RememberConsentOptions, 'secret' | 'subject'>
   ): Promise<boolean>;
 
   /**
@@ -7068,18 +7069,21 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
    * @param userId - The ID of the user who owns the grant
    * @returns A Promise resolving when the revocation is confirmed.
    */
+  /** {@inheritDoc OAuthHelpers.isConsentRemembered} */
   isConsentRemembered(
     request: Request,
     authRequest: AuthRequest,
-    remember: Pick<RememberConsentOptions, 'secret'>
+    remember: Pick<RememberConsentOptions, 'secret' | 'subject'>
   ): Promise<boolean> {
     return consent.isConsentRemembered(this.provider.consentCookies, request, authRequest, remember);
   }
 
+  /** {@inheritDoc OAuthHelpers.beginConsent} */
   beginConsent(authRequest: AuthRequest): Promise<ConsentTransaction> {
     return consent.beginConsent(this.env.OAUTH_KV, this.provider.consentCookies, authRequest);
   }
 
+  /** {@inheritDoc OAuthHelpers.approveConsent} */
   approveConsent(
     request: Request,
     handle: string,
@@ -7095,10 +7099,12 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
     );
   }
 
+  /** {@inheritDoc OAuthHelpers.denyConsent} */
   denyConsent(request: Request, handle: string, options?: { description?: string }): Promise<DeniedConsent> {
     return consent.denyConsent(this.env.OAUTH_KV, this.provider.consentCookies, request, handle, options);
   }
 
+  /** {@inheritDoc OAuthHelpers.beginUpstream} */
   beginUpstream(
     authRequest: AuthRequest,
     options?: { data?: unknown; headers?: Headers }
@@ -7106,6 +7112,7 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
     return consent.beginUpstream(this.env.OAUTH_KV, this.provider.consentCookies, authRequest, options);
   }
 
+  /** {@inheritDoc OAuthHelpers.finishUpstream} */
   finishUpstream<Data = unknown>(request: Request): Promise<ResumedUpstream<Data>> {
     return consent.finishUpstream<Data>(this.env.OAUTH_KV, this.provider.consentCookies, request);
   }

@@ -190,7 +190,9 @@ Token records store metadata about issued access tokens, including denormalized 
 
 Short-lived records written by the consent and upstream sign-in helpers (`beginConsent()`, `beginUpstream()`), holding the authorization request between the consent page, the third-party redirect, and its callback.
 
-**Key format:** `transaction:{sha256(handle)}`. The handle (the consent form's value, or the `state` sent to the third party) is never stored; the browser's `__Host-` binding cookie holds the same hash.
+**Key format:** `transaction:{sha256(handle)}`. The handle (the consent form's value, or the `state` sent to the third party) is never stored.
+
+**Value:** `{base64url(iv)}.{base64url(ciphertext)}`: AES-GCM over the JSON record, with a key derived from the handle (`SHA-256("oauth-transaction-key:" + handle)`), so only the holder of the handle can read it. Decrypted:
 
 ```json
 {
@@ -201,15 +203,15 @@ Short-lived records written by the consent and upstream sign-in helpers (`beginC
     "redirectUri": "https://client.example/callback",
     "scope": ["read"],
     "state": "client-state",
-    "codeChallenge": "…",
-    "codeChallengeMethod": "S256",
     "resource": "https://mcp.example.com/mcp"
   },
   "data": { "verifier": "deployer data, e.g. the third party's PKCE verifier" }
 }
 ```
 
-**TTL:** 600 seconds. Deleted on first use (`approveConsent()`, `finishUpstream()`); KV cannot make that read-then-delete atomic.
+The browser holds a matching `__Host-` binding cookie per transaction, named `{prefix}consent-{first 16 hex of the hash}` or `{prefix}upstream-…` and holding the full hash.
+
+**TTL:** 600 seconds. Deleted on first successful use (`approveConsent()`, `denyConsent()`, `finishUpstream()`); KV cannot make that read-then-delete atomic.
 
 ## Security Considerations
 

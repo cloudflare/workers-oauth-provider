@@ -91,7 +91,10 @@ describe('consent transactions', () => {
 
     // MCP best practices: __Host- cookie, CSRF protection, and no framing of the consent page.
     const [cookie] = consent.headers.getSetCookie();
-    expect(cookie).toMatch(/^__Host-oauth-consent=[0-9a-f]{64}; Path=\/; Secure; HttpOnly; SameSite=Lax; Max-Age=600$/);
+    // One cookie per transaction, named after its hash and holding the full hash.
+    expect(cookie).toMatch(
+      /^__Host-oauth-consent-([0-9a-f]{16})=\1[0-9a-f]{48}; Path=\/; Secure; HttpOnly; SameSite=Lax; Max-Age=600$/
+    );
     expect(consent.headers.get('Content-Security-Policy')).toBe("frame-ancestors 'none'");
     expect(consent.headers.get('X-Frame-Options')).toBe('DENY');
     expect(consent.headers.get('Cache-Control')).toBe('no-store');
@@ -100,6 +103,11 @@ describe('consent transactions', () => {
     const { keys } = await env.OAUTH_KV.list({ prefix: 'transaction:' });
     expect(keys.map((key) => key.name)).toEqual([expect.stringMatching(/^transaction:[0-9a-f]{64}$/)]);
     expect(keys[0].name).not.toContain(consent.handle);
+    // …and the record is encrypted with a key only the handle derives: KV alone reveals nothing.
+    const stored = String(await env.OAUTH_KV.get(keys[0].name));
+    for (const secret of [request.clientId, 'client.example', 'client-state', 'read']) {
+      expect(stored).not.toContain(secret);
+    }
 
     // A forged form post from another site has the handle but not the cookie.
     await expectLocalRejection(
@@ -113,7 +121,7 @@ describe('consent transactions', () => {
     await expectLocalRejection(
       oauth.approveConsent(attacker.request(`${ISSUER}/authorize`), consent.handle),
       'invalid_request',
-      /different browser session/
+      /not started in this browser/
     );
 
     browser.receive(consent.headers);
@@ -121,7 +129,7 @@ describe('consent transactions', () => {
     expect(approved.request).toEqual(request);
     // The binding cookie is cleared, and nothing is remembered unless the caller asks.
     expect(approved.headers.getSetCookie()).toEqual([
-      '__Host-oauth-consent=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0',
+      expect.stringMatching(/^__Host-oauth-consent-[0-9a-f]{16}=; Path=\/; Secure; HttpOnly; SameSite=Lax; Max-Age=0$/),
     ]);
 
     // Single use: replaying the post is refused even with the cookie still present.
@@ -170,7 +178,7 @@ describe('consent transactions', () => {
     });
     expect(denied.headers.get('Location')).toBe(denied.redirectTo);
     expect(denied.headers.getSetCookie()).toEqual([
-      '__Host-oauth-consent=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0',
+      expect.stringMatching(/^__Host-oauth-consent-[0-9a-f]{16}=; Path=\/; Secure; HttpOnly; SameSite=Lax; Max-Age=0$/),
     ]);
 
     // Declining uses the handle up: it can't be approved afterwards.
@@ -198,6 +206,18 @@ describe('consent transactions', () => {
     // The checkboxes are the user's to edit, so a scope the server doesn't support is refused.
     await expectLocalRejection(approve(['read', 'admin']), 'invalid_scope', /ones this server supports/);
     await expectLocalRejection(approve(['bad scope']), 'invalid_scope', /ones this server supports/);
+
+    // A rejected submission doesn't use the page up: correcting it and posting again works.
+    const consent = await oauth.beginConsent(request);
+    const browser = new Browser();
+    browser.receive(consent.headers);
+    const page = () => browser.request(`${ISSUER}/authorize`);
+    await expectLocalRejection(
+      oauth.approveConsent(page(), consent.handle, { scope: ['read', 'admin'] }),
+      'invalid_scope',
+      /ones this server supports/
+    );
+    expect((await oauth.approveConsent(page(), consent.handle, { scope: ['read'] })).request.scope).toEqual(['read']);
   });
 
   it('remembers an approval only when the call asks, for the same client, redirect URI and resource, and a subset of scopes', async () => {
@@ -244,6 +264,67 @@ describe('consent transactions', () => {
     expect(await remembered(request)).toBe(false);
   });
 
+  it('keeps concurrent authorizations in one browser apart, like two tabs', async () => {
+    const browser = new Browser();
+    const tabA = await oauth.beginConsent(await parsedRequest('read'));
+    browser.receive(tabA.headers);
+    const tabB = await oauth.beginConsent(await parsedRequest('write'));
+    browser.receive(tabB.headers);
+
+    // Tab B finishing doesn't strand tab A, in either order, at either stage.
+    const approvedB = await oauth.approveConsent(browser.request(`${ISSUER}/authorize`), tabB.handle);
+    browser.receive(approvedB.headers);
+    const approvedA = await oauth.approveConsent(browser.request(`${ISSUER}/authorize`), tabA.handle);
+    browser.receive(approvedA.headers);
+    expect([approvedA.request.scope, approvedB.request.scope]).toEqual([['read'], ['write']]);
+
+    const upstreamA = await oauth.beginUpstream(approvedA.request);
+    browser.receive(upstreamA.headers);
+    const upstreamB = await oauth.beginUpstream(approvedB.request);
+    browser.receive(upstreamB.headers);
+    const callback = (state: string) => browser.request(`${ISSUER}/callback?code=c&state=${state}`);
+    expect((await oauth.finishUpstream(callback(upstreamA.state))).request.scope).toEqual(['read']);
+    expect((await oauth.finishUpstream(callback(upstreamB.state))).request.scope).toEqual(['write']);
+  });
+
+  it('binds a remembered approval to the user when the caller knows them', async () => {
+    const request = await parsedRequest('read');
+    const browser = new Browser();
+    const consent = await oauth.beginConsent(request);
+    browser.receive(consent.headers);
+    const approved = await oauth.approveConsent(browser.request(`${ISSUER}/authorize`), consent.handle, {
+      remember: { secret: SECRET, subject: 'alice' },
+    });
+    browser.receive(approved.headers);
+    const remembered = (subject?: string) =>
+      oauth.isConsentRemembered(browser.request(`${ISSUER}/authorize`), request, { secret: SECRET, subject });
+
+    expect(await remembered('alice')).toBe(true);
+    // Another account signed in on the same browser is asked again.
+    expect(await remembered('bob')).toBe(false);
+    // And a browser-wide check doesn't match an approval bound to a user.
+    expect(await remembered()).toBe(false);
+  });
+
+  it('keeps the approvals cookie alive as long as its longest-lived approval', async () => {
+    const browser = new Browser();
+    const approve = async (scope: string, maxAgeSeconds: number) => {
+      const request = await parsedRequest(scope);
+      const consent = await oauth.beginConsent(request);
+      browser.receive(consent.headers);
+      const approved = await oauth.approveConsent(browser.request(`${ISSUER}/authorize`), consent.handle, {
+        remember: { secret: SECRET, maxAgeSeconds },
+      });
+      browser.receive(approved.headers);
+      return approved.headers.getSetCookie().find((cookie) => cookie.startsWith('__Host-oauth-approvals='))!;
+    };
+    await approve('read', 30 * 86400);
+    // A later, shorter approval doesn't shorten the cookie that carries the first one.
+    const cookie = await approve('write', 60);
+    const maxAge = Number(/Max-Age=(\d+)$/.exec(cookie)![1]);
+    expect(maxAge).toBeGreaterThan(30 * 86400 - 5);
+  });
+
   it('rejects a remember secret too short to sign with', async () => {
     const request = await parsedRequest();
     await expect(oauth.isConsentRemembered(new Request(ISSUER), request, { secret: 'short' })).rejects.toThrow(
@@ -274,9 +355,9 @@ describe('upstream transactions', () => {
     expect(upstream.headers).toBe(approved.headers);
     expect(upstream.state).toMatch(/^[A-Za-z0-9_-]{43}$/);
     expect(upstream.headers.getSetCookie()).toEqual([
-      '__Host-oauth-consent=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0',
+      expect.stringMatching(/^__Host-oauth-consent-[0-9a-f]{16}=; Path=\/; Secure; HttpOnly; SameSite=Lax; Max-Age=0$/),
       expect.stringMatching(
-        /^__Host-oauth-upstream=[0-9a-f]{64}; Path=\/; Secure; HttpOnly; SameSite=Lax; Max-Age=600$/
+        /^__Host-oauth-upstream-[0-9a-f]{16}=[0-9a-f]{64}; Path=\/; Secure; HttpOnly; SameSite=Lax; Max-Age=600$/
       ),
     ]);
     browser.receive(upstream.headers);
@@ -296,7 +377,9 @@ describe('upstream transactions', () => {
     expect(resumed.request).toEqual(approved.request);
     expect(resumed.data).toEqual({ codeVerifier: 'upstream-pkce-verifier' });
     expect(resumed.headers.getSetCookie()).toEqual([
-      '__Host-oauth-upstream=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0',
+      expect.stringMatching(
+        /^__Host-oauth-upstream-[0-9a-f]{16}=; Path=\/; Secure; HttpOnly; SameSite=Lax; Max-Age=0$/
+      ),
     ]);
 
     const replay = new Browser();
@@ -341,8 +424,8 @@ describe('cookiePrefix', () => {
     const request = await parsedRequest();
     const consent = await oauth.beginConsent(request);
     const upstream = await oauth.beginUpstream(request);
-    expect(consent.headers.getSetCookie()[0]).toMatch(/^__Host-mcp-consent=/);
-    expect(upstream.headers.getSetCookie()[0]).toMatch(/^__Host-mcp-upstream=/);
+    expect(consent.headers.getSetCookie()[0]).toMatch(/^__Host-mcp-consent-[0-9a-f]{16}=/);
+    expect(upstream.headers.getSetCookie()[0]).toMatch(/^__Host-mcp-upstream-[0-9a-f]{16}=/);
 
     expect(() => createServer({ cookiePrefix: 'mcp-' })).toThrow(/must start with "__Host-"/);
     expect(() => createServer({ cookiePrefix: '__Host-bad name ' })).toThrow(/cookie-name characters/);

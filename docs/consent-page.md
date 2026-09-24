@@ -86,15 +86,16 @@ The authorization request is kept server-side between the two requests; the form
 
 A redirect back to the client is only safe once the client and its exact redirect URI are validated. Everything else is shown on your page.
 
-| Where it fails                                                                     | What to do                                                                                                        |
-| ---------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `parseAuthRequest()` throws `AuthorizationError` **with** `redirectUri`            | Redirect to it with `error`, `error_description`, `state` and `iss` from the error (see the quick start)          |
-| `parseAuthRequest()` throws `AuthorizationError` **without** `redirectUri`         | Render locally. Never redirect: the client or redirect URI isn't trusted                                          |
-| `parseAuthRequest()` / `lookupClient()` throw `CimdFetchError`                     | Render locally: the client's metadata document couldn't be fetched (`error.reason`, `error.detail` for your logs) |
-| `approveConsent()`, `denyConsent()`, `finishUpstream()` throw `AuthorizationError` | Render locally: the page expired, was used, or was opened in another browser. Offer to start again                |
-| The user clicks Deny                                                               | `denyConsent()`, then send its redirect                                                                           |
-| A third-party provider returns `error=` to your callback                           | `finishUpstream()`, then redirect to the client with `access_denied` ([upstream-sign-in.md](upstream-sign-in.md)) |
-| Token endpoint errors                                                              | The library answers them; observe them with `onError`                                                             |
+| Where it fails                                                                     | What to do                                                                                                                         |
+| ---------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `parseAuthRequest()` throws `AuthorizationError` **with** `redirectUri`            | Redirect to it with `error`, `error_description`, `state` and `iss` from the error (see the quick start)                           |
+| `parseAuthRequest()` throws `AuthorizationError` **without** `redirectUri`         | Render locally. Never redirect: the client or redirect URI isn't trusted                                                           |
+| `parseAuthRequest()` / `lookupClient()` throw `CimdFetchError`                     | Render locally: the client's metadata document couldn't be fetched (`error.reason`, `error.detail` for your logs)                  |
+| `approveConsent()`, `denyConsent()`, `finishUpstream()` throw `AuthorizationError` | Render locally: the page expired, was used, or was opened in another browser, or the scopes aren't supported. Offer to start again |
+| Any helper throws something else (`TypeError`, a KV failure)                       | A bug or an outage, not the user's doing: let it surface as a 500                                                                  |
+| The user clicks Deny                                                               | `denyConsent()`, then send its redirect                                                                                            |
+| A third-party provider returns `error=` to your callback                           | `finishUpstream()`, then redirect to the client with `access_denied` ([upstream-sign-in.md](upstream-sign-in.md))                  |
+| Token endpoint errors                                                              | The library answers them; observe them with `onError`                                                                              |
 
 ```ts
 try {
@@ -121,7 +122,7 @@ try {
 By default the page appears on every authorization, which also lets users re-authorize with different scopes. To skip it for clients a user already approved, pass `remember` when approving and check before showing the page:
 
 ```ts
-const remember = { secret: env.CONSENT_SECRET }; // at least 32 characters, from a Worker secret
+const remember = { secret: env.CONSENT_SECRET, subject: session.userId }; // secret: 32+ chars, from a Worker secret
 
 if (await oauth.isConsentRemembered(req, request, remember)) {
   // skip the page: complete the authorization (or start the third-party sign-in) directly
@@ -130,8 +131,8 @@ if (await oauth.isConsentRemembered(req, request, remember)) {
 await oauth.approveConsent(req, handle, { scope, remember }); // maxAgeSeconds defaults to 30 days
 ```
 
-Approvals live in a signed `__Host-` cookie, bound to the client ID, its redirect URI and the resource, and they cover only the scopes that were approved: asking for more brings the page back.
+Approvals live in a signed `__Host-` cookie, bound to the client ID, its redirect URI and the resource, and they cover only the scopes that were approved: asking for more brings the page back. Pass `subject` (the signed-in user) whenever you know it, so another account on the same browser is asked again. Without it an approval belongs to the browser, which is what a proxy server gets, since it learns the user from the third party only after consent.
 
 ## Cookie names
 
-The helpers set `__Host-oauth-consent`, `__Host-oauth-upstream` and `__Host-oauth-approvals`. Change the prefix with the `cookiePrefix` option if those collide with yours; it must start with `__Host-`.
+Each consent page and each third-party redirect gets its own short-lived cookie, `__Host-oauth-consent-…` or `__Host-oauth-upstream-…` (so two tabs can authorize at once), and remembered approvals live in `__Host-oauth-approvals`. Change the prefix with the `cookiePrefix` option if those collide with yours; it must start with `__Host-`.

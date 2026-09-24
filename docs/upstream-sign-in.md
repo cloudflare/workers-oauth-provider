@@ -44,7 +44,9 @@ clear.set('Location', redirectTo);
 return new Response(null, { status: 302, headers: clear });
 ```
 
-Build the consent page itself, and the Deny path (`denyConsent()`), as in [consent-page.md](consent-page.md), which also covers which errors to redirect and which to render. Every helper that fails throws `AuthorizationError` without a `redirectUri`: render it locally.
+Build the consent page itself, and the Deny path (`denyConsent()`), as in [consent-page.md](consent-page.md), which also covers which errors to redirect and which to render. Validation failures throw `AuthorizationError` without a `redirectUri`: render them locally. A `TypeError` (bad options) or a storage failure is a bug or an outage, not the user's doing.
+
+`beginUpstream()` doesn't check consent itself: call it only after `approveConsent()`, or when `isConsentRemembered()` says yes. (A server whose clients are all pre-registered, with no dynamic registration, isn't required to ask per client and can call it directly.)
 
 If the third party sends the user back with an error (they declined there, or it failed), `finishUpstream()` still returns the original request, so answer the client with it:
 
@@ -65,7 +67,7 @@ if (error) {
 
 - **The consent page can't be forged or framed.** `beginConsent()` binds the handle to the browser with a `__Host-` cookie (`Secure`, `HttpOnly`, `SameSite=Lax`, ten minutes) and returns `Content-Security-Policy: frame-ancestors 'none'` and `X-Frame-Options: DENY`. A post from another site has the handle but not the cookie, and is refused.
 - **`state` exists only after consent.** `beginUpstream()` creates it, stores the approved request server-side, and binds it to the browser. The callback is refused without the matching cookie, so a stolen third-party code can't be replayed in another browser.
-- **Single use, ten minutes.** Each handle and `state` works once. KV keys hold only the SHA-256 of the handle. KV can't make `get`-then-`delete` atomic, so two simultaneous requests from the _same_ browser with the same handle could both pass; the cookie binding rules out anyone else.
+- **Single use, ten minutes, several at once.** Each handle and `state` works once, and each has its own binding cookie, so two tabs can authorize at the same time. KV keys hold only the SHA-256 of the handle, and the record, including your `data` (a PKCE verifier, say), is encrypted with a key only the handle derives: reading KV alone reveals nothing. KV can't make `get`-then-`delete` atomic, so two simultaneous requests from the _same_ browser with the same handle could both pass; the cookie binding rules out anyone else.
 - **Nothing trusted comes from the form.** The authorization request is recovered from storage, not from hidden fields, so the page can't be made to approve a different client or redirect URI. `scope` is the page's to choose, fewer or more than the client requested, but only from `scopesSupported`.
 
 ## Remembering consent
