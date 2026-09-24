@@ -13674,6 +13674,35 @@ describe('OAuthProvider', () => {
       expect((await mockEnv.OAUTH_KV.list({ prefix: 'grant:other-' })).keys).toHaveLength(20);
     });
 
+    it('revokes grants as the scan finds them, so a scan cut short still makes progress', async () => {
+      const tokens = await authorizeAndGetTokens('aaa-user');
+      // Make the target's grant a legacy one (no key metadata) that sorts first, followed by more
+      // legacy grants than one read batch: the scan dies reading the second batch.
+      const [grantKey] = (await mockEnv.OAUTH_KV.list({ prefix: 'grant:aaa-user:' })).keys.map((key) => key.name);
+      await mockEnv.OAUTH_KV.put(grantKey, (await mockEnv.OAUTH_KV.get(grantKey))!);
+      for (let i = 0; i < 60; i++) {
+        await mockEnv.OAUTH_KV.put(
+          `grant:zzz-${String(i).padStart(2, '0')}:legacygrant${String(i).padStart(5, '0')}`,
+          JSON.stringify({ id: `legacygrant${String(i).padStart(5, '0')}`, clientId: 'other-client' })
+        );
+      }
+      const get = mockEnv.OAUTH_KV.get.bind(mockEnv.OAUTH_KV);
+      mockEnv.OAUTH_KV.get = ((key: string, options?: any) => {
+        if (key.startsWith('grant:zzz-55:')) throw new Error('Too many subrequests');
+        return get(key, options);
+      }) as typeof mockEnv.OAUTH_KV.get;
+
+      await expect(mockEnv.OAUTH_PROVIDER!.deleteClient(clientId)).rejects.toThrow('Too many subrequests');
+      // The first batch's match was revoked before the scan reached the failing read.
+      expect(await get(grantKey)).toBeNull();
+      const api = await provider.fetch(
+        createMockRequest('https://example.com/api/test', 'GET', { Authorization: `Bearer ${tokens.access_token}` }),
+        mockEnv,
+        mockCtx
+      );
+      expect(api.status).toBe(401);
+    });
+
     it('should delete all grants and tokens when a client is deleted', async () => {
       // Create grants for two different users
       const tokens1 = await authorizeAndGetTokens('user-1');

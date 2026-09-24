@@ -885,9 +885,12 @@ export interface OAuthHelpers {
   updateClient(clientId: string, updates: Partial<ClientInfo>): Promise<ClientInfo | null>;
 
   /**
-   * Deletes an OAuth client
+   * Deletes an OAuth client, then revokes its grants and tokens across all users. The client
+   * stops working as soon as the call starts. If revocation is cut short (for example by a
+   * subrequest limit on a very large namespace), the call throws; call it again to continue,
+   * and `purgeExpiredData()` also removes the leftovers, which are orphaned grants by then.
    * @param clientId - The ID of the client to delete
-   * @returns A Promise resolving when the deletion is confirmed.
+   * @returns A Promise resolving when the client and all its grants are gone.
    */
   deleteClient(clientId: string): Promise<void>;
 
@@ -6820,26 +6823,30 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
     matches: (grant: GrantKeyMetadata) => boolean,
     readConcurrency: number
   ): Promise<string[]> {
-    const grants = await this.findGrants(userId, matches, readConcurrency);
-    return grants.map((grant) => grant.grantId);
+    const grantIds: string[] = [];
+    for await (const grants of this.findGrants(userId, matches, readConcurrency)) {
+      grantIds.push(...grants.map((grant) => grant.grantId));
+    }
+    return grantIds;
   }
 
   /**
    * Finds grants matching `matches`, for one user or, with `userId` undefined, for every user.
    * Metadata-carrying keys are matched without a read; legacy grants are read,
-   * `readConcurrency` at a time.
+   * `readConcurrency` at a time. Matches are yielded as they are found (each page's metadata
+   * matches, then each batch of reads), so a caller can act on them before the scan goes on.
    */
-  private async findGrants(
+  private async *findGrants(
     userId: string | undefined,
     matches: (grant: GrantKeyMetadata) => boolean,
     readConcurrency: number
-  ): Promise<Array<{ userId: string; grantId: string }>> {
+  ): AsyncGenerator<Array<{ userId: string; grantId: string }>> {
     const prefix = userId === undefined ? 'grant:' : `grant:${userId}:`;
-    const found: Array<{ userId: string; grantId: string }> = [];
     let cursor: string | undefined;
     do {
       const page = await this.env.OAUTH_KV.list<unknown>({ prefix, limit: MAX_KV_LIST_LIMIT, cursor });
       const toRead: Array<{ name: string; userId: string; grantId: string }> = [];
+      const found: Array<{ userId: string; grantId: string }> = [];
       for (const key of page.keys) {
         const owner = parseGrantKey(key.name);
         // `grant:a:` also matches a legacy `grant:a:b:{grantId}` belonging to user `a:b`.
@@ -6850,16 +6857,18 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
           toRead.push({ name: key.name, ...owner });
         }
       }
+      if (found.length > 0) yield found;
       for (let start = 0; start < toRead.length; start += readConcurrency) {
         const batch = toRead.slice(start, start + readConcurrency);
         const grants = await Promise.all(batch.map(({ name }) => this.env.OAUTH_KV.get<Grant>(name, { type: 'json' })));
-        grants.forEach((grant, index) => {
-          if (grant && matches(grant)) found.push({ userId: batch[index].userId, grantId: batch[index].grantId });
+        const read = batch.filter((_, index) => {
+          const grant = grants[index];
+          return grant !== null && matches(grant);
         });
+        if (read.length > 0) yield read.map(({ userId, grantId }) => ({ userId, grantId }));
       }
       cursor = page.list_complete ? undefined : page.cursor;
     } while (cursor);
-    return found;
   }
 
   /**
@@ -7048,14 +7057,16 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
     // revoking its grants below fails partway. Calling deleteClient again finishes the job.
     await this.env.OAUTH_KV.delete(`client:${clientId}`);
 
-    // Then its grants across all users, matched from key metadata; only legacy grants are read.
-    const grants = await this.findGrants(
+    // Then its grants across all users, matched from key metadata (only legacy grants are read)
+    // and revoked as they are found, so an attempt cut short by a subrequest limit still makes
+    // progress. What's left is orphaned now that the client is gone: `purgeExpiredData` removes it.
+    const grants = this.findGrants(
       undefined,
       (grant) => grant.clientId === clientId,
       DEFAULT_REVOKE_EXISTING_GRANTS_BATCH_SIZE
     );
-    for (const { userId, grantId } of grants) {
-      await this.revokeGrant(grantId, userId);
+    for await (const found of grants) {
+      for (const { userId, grantId } of found) await this.revokeGrant(grantId, userId);
     }
   }
 
