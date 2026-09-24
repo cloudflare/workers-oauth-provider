@@ -1186,16 +1186,6 @@ export interface CompleteAuthorizationOptions {
    * Set to false to allow multiple concurrent grants per user+client.
    */
   revokeExistingGrants?: boolean;
-
-  /**
-   * How many grants written by a version before 1.0 are read at once while
-   * revoking existing grants. Grants written by 1.0 or later carry their client,
-   * resource and redirect URI as KV key metadata and are matched from `list()`
-   * without being read, so this only bounds the fan-out for older grants. Only
-   * used when revokeExistingGrants is not false. Must be a positive integer;
-   * values above 1000 are clamped. Defaults to 50.
-   */
-  revokeExistingGrantsBatchSize?: number;
 }
 
 /**
@@ -6045,18 +6035,6 @@ const MAX_KV_LIST_LIMIT = 1000;
  */
 const DEFAULT_REVOKE_EXISTING_GRANTS_BATCH_SIZE = 50;
 
-function getRevokeExistingGrantsBatchSize(batchSize: number | undefined): number {
-  if (batchSize === undefined) {
-    return DEFAULT_REVOKE_EXISTING_GRANTS_BATCH_SIZE;
-  }
-
-  if (!Number.isFinite(batchSize) || !Number.isInteger(batchSize) || batchSize < 1) {
-    throw new Error('revokeExistingGrantsBatchSize must be a positive integer.');
-  }
-
-  return Math.min(batchSize, MAX_KV_LIST_LIMIT);
-}
-
 /**
  * The fields a new authorization matches an existing grant on, mirrored into the
  * grant key's KV metadata so `list()` returns them and `completeAuthorization()` does
@@ -6696,7 +6674,7 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
       // without a stored redirectUri never match and are left alone — the bug being fixed
       // is over-revocation, so not revoking is the safe direction.
       const isCimdClient = isClientIdMetadataDocumentUrl(clientId);
-      const readConcurrency = getRevokeExistingGrantsBatchSize(options.revokeExistingGrantsBatchSize);
+      const readConcurrency = DEFAULT_REVOKE_EXISTING_GRANTS_BATCH_SIZE;
       grantsToRevoke = await this.findGrantIds(
         options.userId,
         (grant) =>

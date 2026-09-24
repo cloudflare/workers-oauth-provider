@@ -22,8 +22,6 @@ A typical flow has three steps:
 
 For Client ID Metadata Document clients, whose client_id is the metadata URL shared by every installation, default revocation is additionally scoped to grants created from the same redirect URI, so one installation's re-authorization does not revoke another's. Grants created before the redirect URI was recorded are never auto-revoked by CIMD clients.
 
-For users with many grants, `revokeExistingGrantsBatchSize` controls the KV page size used during that scan. It defaults to `50` and is capped at KV's maximum page size of `1000`.
-
 ### Authorization response issuer
 
 RFC 9207 issuer identification is always enabled. Authorization server metadata advertises `authorization_response_iss_parameter_supported: true`, and successful authorization responses include `iss` automatically.
@@ -156,7 +154,7 @@ Sensitive values are not stored in plaintext:
 
 See [storage-schema.md](../storage-schema.md) for the complete KV layout.
 
-By default `completeAuthorization()` revokes the user's earlier grants for the same client and resource. It finds them from KV key metadata that every grant written by 1.0 or later carries, so the cost is one `list()` per thousand grants the user has, not a read per grant. Grants written before 1.0 are read individually, `revokeExistingGrantsBatchSize` at a time (default 50), until a refresh rewrites them with metadata.
+By default `completeAuthorization()` revokes the user's earlier grants for the same client and resource. It finds them from KV key metadata that every grant written by 1.0 or later carries, so the cost is one `list()` per thousand grants the user has, not a read per grant. Grants written before 1.0 are read individually, 50 at a time, until a refresh rewrites them with metadata.
 
 KV TTLs remove expiring records automatically. `purgeExpiredData()` sweeps orphaned or expired grants and tokens in resumable batches from a Cron Trigger; see [KV cleanup](advanced-configuration.md#kv-cleanup).
 
