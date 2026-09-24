@@ -8,7 +8,6 @@
  * No I/O. No `this`. Returns `Result<ParsedIdJag, EmaValidationError>`.
  */
 
-import { base64UrlToBytes, parseJwtJsonPart } from '../oauth-provider';
 import { err, ok, type EmaValidationError, type Result } from './result';
 import type { ParsedIdJag } from './types';
 
@@ -53,4 +52,34 @@ export function parseIdJag(assertion: string, maxBytes: number): Result<ParsedId
   const signingInput = new TextEncoder().encode(`${encodedHeader}.${encodedClaims}`);
 
   return ok({ header, rawClaims, signingInput, signature });
+}
+
+/**
+ * Decodes a base64url-encoded string to bytes.
+ */
+function base64UrlToBytes(base64Url: string): Uint8Array {
+  const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+  const padded = base64.padEnd(base64.length + ((4 - (base64.length % 4)) % 4), '=');
+  const binaryString = atob(padded);
+  const bytes = new Uint8Array(binaryString.length);
+  for (let i = 0; i < binaryString.length; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return bytes;
+}
+
+/**
+ * Parses a base64url-encoded JWT JSON part into an object.
+ */
+function parseJwtJsonPart(encoded: string): Record<string, unknown> {
+  try {
+    const json = new TextDecoder().decode(base64UrlToBytes(encoded));
+    const parsed = JSON.parse(json);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      throw new Error('JWT part must be an object');
+    }
+    return parsed as Record<string, unknown>;
+  } catch {
+    throw new Error('Malformed JWT part');
+  }
 }

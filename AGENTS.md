@@ -42,6 +42,7 @@ workers-oauth-provider/
 ├── __tests__/
 │   ├── oauth-provider.test.ts # Comprehensive provider integration suite
 │   ├── oauth-capabilities.test.ts # Pure capability policy tests
+│   ├── public-api.test.ts     # Pins the package's runtime exports
 │   ├── setup.ts               # Vitest setup and mocking
 │   └── mocks/
 │       └── cloudflare-workers.ts
