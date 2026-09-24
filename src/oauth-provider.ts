@@ -1159,7 +1159,9 @@ export interface CompleteAuthorizationOptions {
   request: AuthRequest;
 
   /**
-   * Identifier for the user granting the authorization
+   * Identifier for the user granting the authorization. Must be non-empty and must not contain
+   * `:`, which separates the parts of issued tokens and storage keys; encode namespaced or
+   * composite IDs first (for example `encodeURIComponent('tenant:user')`).
    */
   userId: string;
 
@@ -7091,12 +7093,15 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
       listOptions.cursor = options.cursor;
     }
 
-    // Use the KV list() function to get grant keys with pagination
-    const response = await this.env.OAUTH_KV.list(listOptions);
-    // `grant:a:` also matches a legacy `grant:a:b:{grantId}` belonging to user `a:b`: never list it.
-    const ownKeys = response.keys.filter(
-      (key: { name: string }) => !key.name.slice(listOptions.prefix.length).includes(':')
-    );
+    // `grant:a:` also matches a legacy `grant:a:b:{grantId}` belonging to user `a:b`: never list it,
+    // and don't return an empty page just because such keys filled it.
+    const isOwn = (key: { name: string }) => !key.name.slice(listOptions.prefix.length).includes(':');
+    let response = await this.env.OAUTH_KV.list(listOptions);
+    let ownKeys = response.keys.filter(isOwn);
+    while (ownKeys.length === 0 && !response.list_complete) {
+      response = await this.env.OAUTH_KV.list({ ...listOptions, cursor: response.cursor });
+      ownKeys = response.keys.filter(isOwn);
+    }
 
     // Fetch all grants in parallel and convert to grant summaries
     const grantSummaries: GrantSummary[] = [];

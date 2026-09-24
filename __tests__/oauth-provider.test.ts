@@ -15940,5 +15940,9 @@ describe('user IDs cannot contain ":"', () => {
     await oauth.completeAuthorization({ request, userId: 'a', metadata: {}, scope: [], props: {} });
     expect(await env.OAUTH_KV.get('grant:a:b:legacygrant00001')).not.toBeNull();
     expect((await oauth.listUserGrants('a')).items).toHaveLength(1);
+
+    // A page the legacy key fills entirely doesn't end the listing early: a's grant still comes back.
+    const firstPage = await oauth.listUserGrants('a', { limit: 1 });
+    expect(firstPage.items.map((grant) => grant.userId)).toEqual(['a']);
   });
 });
