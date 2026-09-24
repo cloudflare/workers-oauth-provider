@@ -294,7 +294,7 @@ Use either `apiHandlers` or `apiRoute` plus `apiHandler`, not both. Routes can b
 
 ## External token resolution
 
-`resolveExternalToken` accepts a bearer credential that was not issued or stored by this provider. It runs only after the internal token lookup fails. The credential can be an external OAuth access token, opaque API key, or personal access token (PAT).
+`resolveExternalToken` accepts a bearer credential that was not issued or stored by this provider. It runs only after the internal token lookup fails, and never for a token in this provider's own `userId:grantId:secret` format: an expired or revoked token we issued is answered `invalid_token` directly, so it is never forwarded to an external validator. The credential can be an external OAuth access token, opaque API key, or personal access token (PAT).
 
 ### MCP compatibility warning
 
