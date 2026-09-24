@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { MCP_AUTH_REVISIONS } from './spec-versions';
 import { worker } from './support/harness';
-import { createMcpOAuthClient, MCP_RESOURCE, READ_SCOPE } from './support/oauth-client';
+import { createMcpOAuthClient, MCP_RESOURCE, READ_SCOPE, WRITE_SCOPE } from './support/oauth-client';
 
 /**
  * A resource server in its own Worker validates tokens by asking the authorization server
@@ -19,18 +19,40 @@ describe('separate resource Worker over a Service Binding', () => {
     const api = await worker.getExport();
 
     const accepted = await api.probeResourceServerOverBinding(tokens.access_token);
-    expect(accepted).toMatchObject({ status: 200, body: { subject: 'conformance-user' } });
+    // ctx.props is what the authorization server decrypted; ctx.auth is what it verified, carried
+    // back over the binding: audience, expiry, scopes, subject and client.
+    expect(accepted).toMatchObject({
+      status: 200,
+      body: {
+        subject: 'conformance-user',
+        auth: {
+          token: tokens.access_token,
+          audience: MCP_RESOURCE,
+          expiresAt: expect.any(Number),
+          scope: [READ_SCOPE],
+          userId: 'conformance-user',
+          clientId: client.clientId,
+        },
+      },
+    });
+
+    // MCP scope challenge handling: a valid token without the operation's scope gets a 403 naming
+    // every scope the operation needs and the same metadata document as the 401.
+    const resourceUrl = new URL(MCP_RESOURCE);
+    const metadataUrl = `${resourceUrl.origin}/.well-known/oauth-protected-resource${resourceUrl.pathname}`;
+    const forbidden = await api.probeResourceServerOverBinding(tokens.access_token, 'DELETE');
+    expect(forbidden.status).toBe(403);
+    expect(forbidden.challenge).toBe(
+      `Bearer realm="OAuth", error="insufficient_scope", scope="${WRITE_SCOPE}", resource_metadata="${metadataUrl}"`
+    );
 
     const forged = await api.probeResourceServerOverBinding('not-an-access-token');
     expect(forged.status).toBe(401);
     expect(forged.challenge).toContain('error="invalid_token"');
 
+    // The initial challenge names the scopes to request (MCP 2026-07-28), and no error.
     const anonymous = await api.probeResourceServerOverBinding(undefined);
     expect(anonymous.status).toBe(401);
-    const resourceUrl = new URL(MCP_RESOURCE);
-    expect(anonymous.challenge).toContain(
-      `resource_metadata="${resourceUrl.origin}/.well-known/oauth-protected-resource${resourceUrl.pathname}"`
-    );
-    expect(anonymous.challenge).not.toContain('error=');
+    expect(anonymous.challenge).toBe(`Bearer realm="OAuth", resource_metadata="${metadataUrl}", scope="${READ_SCOPE}"`);
   });
 });

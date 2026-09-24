@@ -96,6 +96,7 @@ Tests assert only observable HTTP responses, redirects, metadata, challenges, an
 - `protected-resource.test.ts` — RFC 9728 discovery, Bearer challenges, scopes, and audience enforcement.
 - `client-registration.test.ts` — DCR, pre-registration, and CIMD.
 - `token-lifecycle.test.ts` — refresh, downscoping, code replay, and revocation.
+- `resource-server-binding.test.ts` — a separate resource Worker over a Service Binding: `ctx.auth` carried back from the authorization server, the `scope` hint on the initial challenge, and a handler's `insufficientScope()` 403.
 - `spec-versions.ts` — revision applicability matrix.
 
 Application-owned identity, consent presentation, and operation-level authorization policy remain outside the provider and therefore outside this server conformance suite.
