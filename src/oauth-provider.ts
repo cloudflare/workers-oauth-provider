@@ -863,10 +863,14 @@ export interface OAuthHelpers {
   listClients(options?: ListOptions): Promise<ListResult<ClientInfo>>;
 
   /**
-   * Updates an existing OAuth client
+   * Updates an existing OAuth client. Redirect URIs, grant types and response types are held to
+   * the same rules as registration. Client ID Metadata Document clients can't be updated here:
+   * their document owns their metadata.
    * @param clientId - The ID of the client to update
    * @param updates - Partial client information with fields to update
    * @returns A Promise resolving to the updated client info, or null if not found
+   * @throws Error when an update breaks the redirect URI policy or names an unsupported grant or response type
+   * @throws TypeError for a Client ID Metadata Document client while CIMD is enabled
    */
   updateClient(clientId: string, updates: Partial<ClientInfo>): Promise<ClientInfo | null>;
 
