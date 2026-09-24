@@ -1,0 +1,37 @@
+.changeset/require-canonical-resource.md
+  s_1b1f3dce47e01c::t_68f7556cfbf7ff 9
+README.md
+  s_1b1f3dce47e01c::t_4fd466cc570dd4 151,215,446
+__tests__/oauth-provider.test.ts
+  s_1b1f3dce47e01c::t_47bd1b8182b351 16-18,7015-7073,7110-7135
+__tests__/oauth-resource-server.test.ts
+  s_1b1f3dce47e01c::t_c4882f81e06800 5-7,124,129-132,135-140,150-152,267-384
+conformance/README.md
+  s_1b1f3dce47e01c::t_630444fbcbc735 99
+conformance/resource-server-binding.test.ts
+  s_1b1f3dce47e01c::t_f12d2a1b568271 4,22-47,53,56
+conformance/worker/index.ts
+  s_1b1f3dce47e01c::t_5d338f247edcb6 10,12,39,153-155,157-158,160,162-169,172,178
+docs/resource-servers.md
+  s_1b1f3dce47e01c::t_a953736faa10d4 7-10,14-33,140,153
+src/oauth-provider.ts
+  s_1b1f3dce47e01c::t_a36ced2dafaa1b 59,120,4656,4658-4665,4721-4722,4724
+src/oauth-resource-server.ts
+  s_1b1f3dce47e01c::t_0787f250d55792 28,34-62,65-67,80,83-84,106-140,229-238,241-242,368,419-424,443-447
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "334de26532f00f610d8ed3aaba699a8670207319",
+  "prompts": {},
+  "sessions": {
+    "s_1b1f3dce47e01c": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a0b3b8-09e5-75fe-ad90-bf9d48da5b83",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Matt Carey <mcarey@cloudflare.com>"
+    }
+  }
+}
