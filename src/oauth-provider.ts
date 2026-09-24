@@ -2394,7 +2394,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
       let response: Response;
       if (parsed.isRevocationRequest) {
-        response = await this.handleRevocationRequest(parsed.body, parsed.clientInfo, env);
+        response = await this.revokeToken(parsed.body, parsed.clientInfo, env);
       } else {
         response = await this.handleTokenRequest(parsed.body, parsed.clientInfo, env, url, request);
       }
@@ -2820,7 +2820,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       !isClientAuthMethodAllowed(
         clientInfo,
         presentedAuthMethod,
-        !!this.options.clientIdMetadataDocumentEnabled && this.isClientMetadataUrl(clientInfo.clientId)
+        !!this.options.clientIdMetadataDocumentEnabled && isClientIdMetadataDocumentUrl(clientInfo.clientId)
       )
     ) {
       return this.createInvalidClientResponse('Client authentication failed', basicAuthenticationAttempted, {
@@ -4590,17 +4590,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   }
 
   /**
-   * Handles OAuth 2.0 token revocation requests (RFC 7009)
-   * @param body - The parsed request body containing revocation parameters
-   * @param env - Cloudflare Worker environment variables
-   * @returns Response confirming revocation or error
-   */
-  private async handleRevocationRequest(body: any, clientInfo: ClientInfo, env: Env & ProviderEnv): Promise<Response> {
-    // Handle the revocation request with client ownership verification
-    return this.revokeToken(body, clientInfo, env);
-  }
-
-  /**
+   * Handles an RFC 7009 revocation request from an authenticated client.
    * - Access tokens: Revokes only the specific token
    * - Refresh tokens: Revokes the entire grant (access + refresh tokens)
    * Per RFC 7009 §2.1, the server MUST verify the token was issued to the client making the request.
@@ -5283,7 +5273,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
   async getClient(env: Env & ProviderEnv, clientId: string): Promise<StoredClientInfo | null> {
     // Check if this is a CIMD (Client ID Metadata Document) URL
-    if (this.isClientMetadataUrl(clientId)) {
+    if (isClientIdMetadataDocumentUrl(clientId)) {
       if (!this.options.clientIdMetadataDocumentEnabled) {
         // CIMD not enabled — treat as standard KV lookup
         const clientKey = `client:${clientId}`;
@@ -5552,14 +5542,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const compatFlags =
       typeof Cloudflare !== 'undefined' && Cloudflare.compatibilityFlags ? Cloudflare.compatibilityFlags : null;
     return !!compatFlags?.global_fetch_strictly_public;
-  }
-
-  /**
-   * Checks if a client_id is a CIMD URL (HTTPS with non-root path).
-   * Not private because OAuthHelpersImpl needs access for purgeExpiredData.
-   */
-  isClientMetadataUrl(clientId: string): boolean {
-    return isClientIdMetadataDocumentUrl(clientId);
   }
 
   /**
@@ -6620,7 +6602,7 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
       // redirect URI identifies the installation, so scope revocation to it. Legacy grants
       // without a stored redirectUri never match and are left alone — the bug being fixed
       // is over-revocation, so not revoking is the safe direction.
-      const isCimdClient = this.provider.isClientMetadataUrl(clientId);
+      const isCimdClient = isClientIdMetadataDocumentUrl(clientId);
       const readConcurrency = getRevokeExistingGrantsBatchSize(options.revokeExistingGrantsBatchSize);
       grantsToRevoke = await this.findGrantIds(
         options.userId,
@@ -7121,8 +7103,7 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
   async describeConsent(authRequest: AuthRequest): Promise<ConsentDescription> {
     const client = await this.lookupClient(authRequest.clientId);
     const isCimd =
-      !!this.provider.options.clientIdMetadataDocumentEnabled &&
-      this.provider.isClientMetadataUrl(authRequest.clientId);
+      !!this.provider.options.clientIdMetadataDocumentEnabled && isClientIdMetadataDocumentUrl(authRequest.clientId);
     return consent.describeConsent(client, authRequest, isCimd);
   }
 
@@ -7307,7 +7288,7 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
           }
 
           // Orphan check: skip CIMD clients (URL-based client IDs not stored in KV)
-          if (!shouldPurge && purgeOrphanedGrants && !this.provider.isClientMetadataUrl(grantData.clientId)) {
+          if (!shouldPurge && purgeOrphanedGrants && !isClientIdMetadataDocumentUrl(grantData.clientId)) {
             if (knownMissingClients.has(grantData.clientId)) {
               shouldPurge = true;
             } else if (!knownGoodClients.has(grantData.clientId)) {
