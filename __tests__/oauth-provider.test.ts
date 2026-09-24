@@ -1736,6 +1736,27 @@ describe('OAuthProvider', () => {
       expect(error.redirectTo).toBeUndefined();
     });
 
+    it('carries a redirectable implicit-flow error in the fragment, end to end through parseAuthRequest', async () => {
+      // response_type=token with a resource this server doesn't host: rejected after the redirect URI
+      // is validated, so the error is redirectable, and implicit-flow clients read the fragment.
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=token&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}&scope=read&state=state-imp` +
+          `&resource=${encodeURIComponent('https://other.example/api')}`
+      );
+      const error = (await oauthProvider
+        .fetch(authRequest, mockEnv, mockCtx)
+        .catch((thrown) => thrown)) as AuthorizationError;
+      expect(error).toBeInstanceOf(AuthorizationError);
+      const redirect = new URL(error.redirectTo!);
+      expect(redirect.search).toBe('');
+      expect(Object.fromEntries(new URLSearchParams(redirect.hash.slice(1)))).toMatchObject({
+        error: error.code,
+        state: 'state-imp',
+        iss: 'https://example.com',
+      });
+    });
+
     it('keeps unknown clients and invalid redirects local', async () => {
       const unknownClient = createMockRequest(
         `https://example.com/authorize?response_type=code&client_id=unknown` +
