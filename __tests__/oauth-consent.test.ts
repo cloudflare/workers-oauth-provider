@@ -495,6 +495,9 @@ describe('describeConsent', () => {
     // The same URL-shaped ID without CIMD enabled is just an opaque registered ID.
     expect(describeConsent(client, request, false)).not.toHaveProperty('clientDomain');
 
+    // A blank registered name is no identity at all: show the client ID instead.
+    expect(describeConsent({ ...client, clientName: '   ' }, request, true).clientName).toBe(clientId);
+
     // A native app's private-use redirect has no host: the page shows the whole URI.
     const native = { ...request, redirectUri: 'com.example.app:/oauth/callback' };
     expect(describeConsent(client, native, true)).toMatchObject({

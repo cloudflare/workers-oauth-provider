@@ -173,7 +173,8 @@ export function describeConsent(
   const redirectHost = new URL(request.redirectUri).hostname || request.redirectUri;
   return {
     clientId: request.clientId,
-    clientName: client?.clientName || request.clientId,
+    // A blank registered name would leave the page with no visible client identity.
+    clientName: client?.clientName?.trim() ? client.clientName : request.clientId,
     ...(isClientIdMetadataDocument ? { clientDomain: new URL(request.clientId).hostname } : {}),
     ...(client?.clientUri ? { clientUri: client.clientUri } : {}),
     ...(client?.logoUri ? { logoUri: client.logoUri } : {}),

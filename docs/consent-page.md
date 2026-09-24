@@ -56,9 +56,10 @@ const oauth = authorizationServer.getOAuthApi(env); // or env.OAUTH_PROVIDER wit
 
 // GET /authorize (after signing the user in with your own session)
 const request = await oauth.parseAuthRequest(req);
+const details = await oauth.describeConsent(request); // first: a failed lookup leaves nothing in KV
 const consent = await oauth.beginConsent(request);
 consent.headers.set('Content-Type', 'text/html; charset=utf-8');
-return new Response(consentPage(await oauth.describeConsent(request), consent.handle), { headers: consent.headers });
+return new Response(consentPage(details, consent.handle), { headers: consent.headers });
 
 // POST /authorize
 const form = await req.formData();
