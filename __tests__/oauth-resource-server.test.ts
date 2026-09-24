@@ -783,3 +783,38 @@ describe('OAuthResourceServer', () => {
     ).toThrow('resourceMetadata.authorization_servers must contain canonical HTTPS issuer URLs');
   });
 });
+
+describe('CORS on protected responses', () => {
+  it("keeps the handler's own CORS policy and still exposes what OAuth clients need", async () => {
+    const server = createTestServer({
+      handler: {
+        fetch() {
+          return new Response('ok', {
+            headers: {
+              'Access-Control-Allow-Origin': 'https://app.example',
+              'Access-Control-Allow-Methods': 'GET',
+              'Access-Control-Expose-Headers': 'X-Request-Id',
+            },
+          });
+        },
+      },
+    });
+    const response = await server.fetch(
+      new Request(RESOURCE, { headers: { Authorization: 'Bearer token', Origin: 'https://other.example' } }),
+      { deployment: 'test' },
+      new MockExecutionContext() as unknown as ExecutionContext
+    );
+    expect(response.headers.get('Access-Control-Allow-Origin')).toBe('https://app.example');
+    expect(response.headers.get('Access-Control-Allow-Methods')).toBe('GET');
+    expect(response.headers.get('Access-Control-Expose-Headers')).toBe('X-Request-Id, WWW-Authenticate, Retry-After');
+    expect(response.headers.get('Vary')).toBe('Origin');
+
+    // A response that sets none gets the reflecting defaults.
+    const challenge = await server.fetch(
+      new Request(RESOURCE, { headers: { Origin: 'https://other.example' } }),
+      { deployment: 'test' },
+      new MockExecutionContext() as unknown as ExecutionContext
+    );
+    expect(challenge.headers.get('Access-Control-Allow-Origin')).toBe('https://other.example');
+  });
+});

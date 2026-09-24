@@ -5,6 +5,8 @@ import {
   resourceMatches,
   validateResourceUri,
 } from './oauth-resource';
+import { isValidOAuthScopeToken } from './oauth-capabilities';
+import { baselineResourceScopes, withCorsHeaders } from './oauth-http';
 
 const PROTECTED_RESOURCE_WELL_KNOWN_PREFIX = '/.well-known/oauth-protected-resource';
 const NO_CACHE_HEADERS = { 'Cache-Control': 'no-store', Pragma: 'no-cache' } as const;
@@ -119,7 +121,11 @@ type MutableExecutionContext<Props> = Omit<ExecutionContext<Props>, 'props'> & {
  * ```
  */
 export function insufficientScope(auth: OAuthResourceAuth, scope: string[], description?: string): Response {
-  if (!Array.isArray(scope) || scope.length === 0 || scope.some((value) => !isValidScopeToken(value))) {
+  if (
+    !Array.isArray(scope) ||
+    scope.length === 0 ||
+    scope.some((value) => typeof value !== 'string' || !isValidOAuthScopeToken(value))
+  ) {
     throw new TypeError('insufficientScope requires at least one valid OAuth scope token');
   }
   let challenge = `Bearer realm="OAuth", error="insufficient_scope", scope="${[...new Set(scope)].join(' ')}"`;
@@ -170,7 +176,7 @@ export class OAuthResourceServer<Env = Cloudflare.Env, Props = unknown> {
 
     if (isProtectedResourceMetadataPath(url)) {
       if (request.method === 'OPTIONS') {
-        return addCorsHeaders(
+        return withCorsHeaders(
           new Response(null, {
             status: 204,
             headers: { 'Content-Length': '0' },
@@ -182,11 +188,11 @@ export class OAuthResourceServer<Env = Cloudflare.Env, Props = unknown> {
       // RFC 9728 §3 fixes the origin and path; a cache-busting query must not hide the
       // document, while a resource's own query parameters must still be present.
       if (!isMetadataUrlRequest(url, validated.metadataUrl)) {
-        return addCorsHeaders(new Response(null, { status: 404 }), request);
+        return withCorsHeaders(new Response(null, { status: 404 }), request);
       }
 
       if (request.method !== 'GET' && request.method !== 'HEAD') {
-        return addCorsHeaders(
+        return withCorsHeaders(
           new Response(null, {
             status: 405,
             headers: { Allow: 'GET, HEAD, OPTIONS' },
@@ -196,7 +202,7 @@ export class OAuthResourceServer<Env = Cloudflare.Env, Props = unknown> {
       }
 
       const metadata = Response.json(validated.metadata, { headers: NO_CACHE_HEADERS });
-      return addCorsHeaders(
+      return withCorsHeaders(
         request.method === 'HEAD' ? new Response(null, { status: 200, headers: metadata.headers }) : metadata,
         request
       );
@@ -207,7 +213,7 @@ export class OAuthResourceServer<Env = Cloudflare.Env, Props = unknown> {
     }
 
     if (request.method === 'OPTIONS') {
-      return addCorsHeaders(
+      return withCorsHeaders(
         new Response(null, {
           status: 204,
           headers: { 'Content-Length': '0' },
@@ -218,18 +224,18 @@ export class OAuthResourceServer<Env = Cloudflare.Env, Props = unknown> {
 
     const token = parseBearerToken(request.headers.get('Authorization'));
     if (!token) {
-      return addCorsHeaders(createBearerChallenge(url, validated, false), request);
+      return withCorsHeaders(createBearerChallenge(url, validated, false), request);
     }
 
     let validation: OAuthResourceTokenValidation<Props> | null;
     try {
       validation = await options.validateToken(env, request)(validated.resource, token);
     } catch {
-      return addCorsHeaders(createValidationUnavailableResponse(), request);
+      return withCorsHeaders(createValidationUnavailableResponse(), request);
     }
 
     if (!isValidTokenValidation(validation, validated.resource)) {
-      return addCorsHeaders(createBearerChallenge(url, validated, true), request);
+      return withCorsHeaders(createBearerChallenge(url, validated, true), request);
     }
 
     const context = ctx as MutableExecutionContext<Props>;
@@ -246,7 +252,7 @@ export class OAuthResourceServer<Env = Cloudflare.Env, Props = unknown> {
     const response = isEntrypointClass(handler)
       ? await new handler(context, env).fetch(request)
       : await handler.fetch(request, env, context);
-    return addCorsHeaders(response, request);
+    return withCorsHeaders(response, request);
   }
 }
 
@@ -305,10 +311,10 @@ function validateOptions<Env, Props>(options: OAuthResourceServerOptions<Env, Pr
   }
 
   const configuredScopes = options.resourceMetadata.scopes_supported ?? [];
-  if (configuredScopes.some((scope) => !isValidScopeToken(scope))) {
+  if (configuredScopes.some((scope) => typeof scope !== 'string' || !isValidOAuthScopeToken(scope))) {
     throw new TypeError('resourceMetadata.scopes_supported must contain valid OAuth scope tokens');
   }
-  const resourceScopes = [...new Set(configuredScopes)].filter((scope) => scope !== 'offline_access');
+  const resourceScopes = baselineResourceScopes(configuredScopes);
 
   return {
     resource,
@@ -355,10 +361,6 @@ function parseCanonicalUrl(value: unknown): URL | null {
   }
 
   return parsed;
-}
-
-function isValidScopeToken(scope: string): boolean {
-  return typeof scope === 'string' && scope.length > 0 && /^[\x21\x23-\x5b\x5d-\x7e]+$/.test(scope);
 }
 
 function getResourceMetadataUrl(resource: string): string {
@@ -424,7 +426,7 @@ function isValidTokenValidation<Props>(
   }
   if (validation.scope !== undefined) {
     if (!Array.isArray(validation.scope)) return false;
-    if (validation.scope.some((scope) => typeof scope !== 'string' || !isValidScopeToken(scope))) return false;
+    if (validation.scope.some((scope) => typeof scope !== 'string' || !isValidOAuthScopeToken(scope))) return false;
   }
   if (validation.userId !== undefined && typeof validation.userId !== 'string') return false;
   if (validation.clientId !== undefined && typeof validation.clientId !== 'string') return false;
@@ -466,28 +468,4 @@ function createValidationUnavailableResponse(): Response {
     status: 503,
     headers: NO_CACHE_HEADERS,
   });
-}
-
-function addCorsHeaders(response: Response, request: Request): Response {
-  const origin = request.headers.get('Origin');
-  if (!origin) return response;
-
-  const withCors = new Response(response.body, response);
-  withCors.headers.set('Access-Control-Allow-Origin', origin);
-  withCors.headers.set('Access-Control-Allow-Methods', '*');
-  withCors.headers.set('Access-Control-Allow-Headers', 'Authorization, *');
-  appendHeaderValue(withCors.headers, 'Vary', 'Origin');
-  appendHeaderValue(withCors.headers, 'Access-Control-Expose-Headers', 'WWW-Authenticate');
-  appendHeaderValue(withCors.headers, 'Access-Control-Expose-Headers', 'Retry-After');
-  withCors.headers.set('Access-Control-Max-Age', '86400');
-  return withCors;
-}
-
-function appendHeaderValue(headers: Headers, name: string, value: string): void {
-  const values = (headers.get(name) ?? '')
-    .split(',')
-    .map((item) => item.trim())
-    .filter(Boolean);
-  if (!values.some((item) => item.toLowerCase() === value.toLowerCase())) values.push(value);
-  headers.set(name, values.join(', '));
 }

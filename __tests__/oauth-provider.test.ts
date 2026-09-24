@@ -8222,6 +8222,35 @@ describe('OAuthProvider', () => {
       expect(preflightResponse.headers.get('Access-Control-Allow-Headers')).toContain('Authorization');
     });
 
+    it("keeps an API handler's own CORS policy, adding only what OAuth clients need", async () => {
+      const provider = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: {
+          fetch: () =>
+            new Response('ok', {
+              headers: { 'Access-Control-Allow-Origin': 'https://app.example', 'Access-Control-Allow-Methods': 'GET' },
+            }),
+        },
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        resolveExternalToken: async () => ({ props: {}, audience: TEST_RESOURCE }),
+      });
+      const response = await provider.fetch(
+        createMockRequest('https://example.com/api/test', 'GET', {
+          Authorization: 'Bearer external-token',
+          Origin: 'https://other.example',
+        }),
+        mockEnv,
+        mockCtx
+      );
+      expect(response.status).toBe(200);
+      expect(response.headers.get('Access-Control-Allow-Origin')).toBe('https://app.example');
+      expect(response.headers.get('Access-Control-Allow-Methods')).toBe('GET');
+      expect(response.headers.get('Access-Control-Expose-Headers')).toBe('WWW-Authenticate, Retry-After');
+      expect(response.headers.get('Vary')).toBe('Origin');
+    });
+
     it('should add CORS headers to OAuth metadata discovery endpoint', async () => {
       const request = createMockRequest('https://example.com/.well-known/oauth-authorization-server', 'GET', {
         Origin: 'https://client.example.com',
