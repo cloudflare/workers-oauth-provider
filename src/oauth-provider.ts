@@ -4182,7 +4182,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const newAccessToken = await this.createAccessToken({
       userId: tokenSummary.userId,
       grantId: tokenSummary.grantId,
-      clientId: tokenSummary.grant.clientId,
+      // RFC 8693: the token is issued to the client that asked for it; it still lives on the subject's grant.
+      clientId: clientInfo.clientId,
       scope: tokenScopes,
       encryptedProps: encryptedAccessTokenProps,
       encryptionKey: accessTokenEncryptionKey,

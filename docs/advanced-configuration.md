@@ -99,6 +99,8 @@ tokenExchangeCallback: (options) => {
 },
 ```
 
+The exchanged token is issued to the requesting client (RFC 8693): `ctx.auth.clientId` names it, and it can revoke the token. The token still belongs to the subject's grant, so revoking that grant revokes it too.
+
 ## Enterprise-managed authorization
 
 **Experimental.** The [MCP Enterprise-Managed Authorization extension](https://modelcontextprotocol.io/extensions/auth/enterprise-managed-authorization) is itself young, so the `enterpriseManagedAuthorization` option and its exported types (`EmaValidationError`, trust-policy shapes) are exempt from 1.x semver: they may change in a minor release, with the change documented in the changelog. Everything else on this page is stable API.

@@ -4316,6 +4316,48 @@ describe('OAuthProvider', () => {
       await createExchangeClient();
     });
 
+    it('issues a cross-client exchanged token to the requesting client, which can revoke it', async () => {
+      const token = (body: Record<string, string>) =>
+        oauthProvider.fetch(
+          createMockRequest(
+            'https://example.com/oauth/token',
+            'POST',
+            {
+              'Content-Type': 'application/x-www-form-urlencoded',
+              Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+            },
+            new URLSearchParams(body).toString()
+          ),
+          mockEnv,
+          mockCtx
+        );
+      const api = (bearer: string) =>
+        oauthProvider.fetch(
+          createMockRequest('https://example.com/api/test', 'GET', { Authorization: `Bearer ${bearer}` }),
+          mockEnv,
+          mockCtx
+        );
+
+      const exchanged = await (
+        await token({
+          grant_type: 'urn:ietf:params:oauth:grant-type:token-exchange',
+          subject_token: accessToken,
+          subject_token_type: 'urn:ietf:params:oauth:token-type:access_token',
+        })
+      ).json<any>();
+
+      // RFC 8693: issued to the client that asked, although it lives on the original client's grant.
+      await oauthProvider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
+      const summary = await mockEnv.OAUTH_PROVIDER!.unwrapToken(exchanged.access_token);
+      expect(summary?.grant.clientId).toBe(clientId);
+      expect(clientId).not.toBe(originalClientId);
+
+      // So the requesting client can revoke what it was given; the original client's token is untouched.
+      expect((await token({ token: exchanged.access_token })).status).toBe(200);
+      expect((await api(exchanged.access_token)).status).toBe(401);
+      expect((await api(accessToken)).status).toBe(200);
+    });
+
     it('should exchange an access token for a new one via HTTP endpoint', async () => {
       const params = new URLSearchParams();
       params.append('grant_type', 'urn:ietf:params:oauth:grant-type:token-exchange');
