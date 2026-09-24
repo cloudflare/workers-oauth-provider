@@ -1,5 +1,46 @@
 # @cloudflare/workers-oauth-provider
 
+## 1.0.0
+
+### Major Changes
+
+- [#289](https://github.com/cloudflare/workers-oauth-provider/pull/289) [`a6c2e4a`](https://github.com/cloudflare/workers-oauth-provider/commit/a6c2e4a29d0fdae53caf47c7974c70b428c4145e) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Split the authorization server and resource server roles, and bind every token to one canonical resource. Migration guide: [docs/migration-1.0.md](https://github.com/cloudflare/workers-oauth-provider/blob/main/docs/migration-1.0.md) — for most 0.x deployments the diff is adding `resourceMetadata: { resource }`.
+  - `OAuthAuthorizationServer` declares its `resources` at construction and validates its access tokens for any of them with `validateToken(resource, token, env)`. Metadata advertises the registry as RFC 9728 `protected_resources`. Every resource is hosted by `OAuthResourceServer`, in the same Worker or another: its `validateToken` option returns the validator for a request, the host calls it with its own canonical resource and the bearer token, and the two topologies differ only in what that points at, `(env) => (resource, token) => authorizationServer.validateToken(resource, token, env)` locally or `(env) => env.AUTH_SERVER.validateToken` over a Service Binding to a `WorkerEntrypoint` (`AuthorizationServerBinding` types it). `resolveExternalToken` stays on the combined `OAuthProvider` only; a role-based resource that must accept another issuer's tokens does so in its own `validateToken`.
+  - `OAuthResourceServer` publishes RFC 9728 metadata (a cache-busting query does not hide it; a resource's own query must be present), issues Bearer challenges, and enforces audience and expiry on whatever the validator returns.
+  - Handlers on both hosts receive `ctx.auth` (`token`, `audience`, `expiresAt`, `scope`, `userId`, `clientId`) beside `ctx.props`; the initial `401` names `scopes_supported`; `insufficientScope(ctx.auth, scopes)` builds the MCP `403 insufficient_scope` challenge with every required scope and the resource's metadata URL. A validator may report `scope`, `userId` and `clientId`; malformed values fail closed.
+  - Every new grant and access token is bound to exactly one registered resource. A multi-resource server requires `resource` unless `defaultResource` is set; code exchange and refresh inherit the grant's resource and reject retargeting; a new grant replaces only same-resource grants.
+  - Stored 0.x state keeps working. A sole resource, or `legacyGrantResource`, is the migration target for grants and tokens without one; an array audience resolves to the registered resource it contains; a grant that cannot be bound fails refresh with `invalid_grant`, which conformant clients answer with a new authorization.
+  - Breaking: `resourceMetadata.resource` is required and canonical (`http` only on loopback hosts). Construction rejects routes the resource does not cover, absolute routes on another origin or with a conflicting query, hosted resources whose queries nest, and resources inside the metadata namespace. Removed: `resourceMatchOriginOnly`, `registerResource()`, the three-argument `validateToken()`, the `originOnly` parameter of `resourceMatches()`, and `EmaValidationInput.matchOriginOnly`. `ResolveExternalTokenResult.audience` is required and a single string; `ExchangeTokenOptions.aud`, `AuthRequest.resource`, and `TokenExchangeCallbackOptions.resource` are single strings.
+  - Protocol: `redirect_uri` on a code exchange must equal the authorization request's (OAuth 2.1 §4.1.3); registered `grant_types` are enforced with `unauthorized_client`; token exchange is bound to the grant's client unless `tokenExchangeCallback` returns `allowCrossClientExchange: true`, and subject-token failures return `invalid_request`; an empty resource path equals `/`; a repeated identical `resource` is accepted; challenges carry `resource_metadata` on the resource and its path descendants; discovery answers HEAD and OPTIONS, every 405 carries `Allow`, and a query-bearing resource accepts extra request parameters.
+
+### Minor Changes
+
+- [#317](https://github.com/cloudflare/workers-oauth-provider/pull/317) [`1e0aa19`](https://github.com/cloudflare/workers-oauth-provider/commit/1e0aa19505bd4cbb09f1fe01d4d6a336ccb5c789) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Bound the KV work `completeAuthorization()` does to revoke a user's earlier grants for the same client.
+
+  Every grant key now carries its `clientId`, `resource` and `redirectUri` as KV key metadata, so the grants a new authorization replaces are found from `list()` alone. The cost is one `list()` per thousand grants the user has instead of one `get()` per grant, which exceeded a Worker's subrequest limit for a user with more than a few hundred grants on the paid plan, or a few dozen on the free plan.
+
+  Grants written before this version have no key metadata and are still read individually; `revokeExistingGrantsBatchSize` now bounds how many of those are read at once (default 50, maximum 1000) rather than the `list()` page size. A refresh rewrites its grant with metadata, so that share shrinks on its own. Nothing about tokens, refresh tokens or grant records changes, and no migration is needed.
+
+- [#327](https://github.com/cloudflare/workers-oauth-provider/pull/327) [`6e03aaa`](https://github.com/cloudflare/workers-oauth-provider/commit/6e03aaa6894678f4faaead912e5809f9ff3aad3b) Thanks [@mattzcarey](https://github.com/mattzcarey)! - `onError.internal` is now set on every error the library originates, not only the EMA path: `{ category, reason, detail? }` names the exact check that failed (`refresh_token_mismatch` vs `refresh_token_expired` vs `grant_not_found`, `code_replayed`, `client_secret_mismatch`, `resource_not_configured`, …) while the wire response stays exactly as before (RFC 6749 §5.2). The shape is exported as `OAuthErrorInternal`; category slugs are kebab-case subsystems, reason slugs snake_case checks, and both are stable. `OAuthError` accepts `options.internal` so a `tokenExchangeCallback` can tag its own errors; one thrown without it reaches `onError` as `{ category: 'token-exchange-callback', reason: 'callback_error', detail: error }`.
+
+- [#318](https://github.com/cloudflare/workers-oauth-provider/pull/318) [`2181402`](https://github.com/cloudflare/workers-oauth-provider/commit/218140231ec0bd2e8d194c3064680c4601799099) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Add opt-in sliding expiry for refresh tokens.
+
+  A grant's lifetime is fixed at the code exchange by default: it expires `refreshTokenTTL` seconds later however often it is refreshed. The new `refreshTokenIdleTTL` option makes that lifetime slide, moving the grant's expiry, and the KV expiration of its record, to that many seconds after every successful refresh. `tokenExchangeCallback` can return `refreshTokenIdleTTL` during a refresh to set the lifetime for that refresh alone, so a Worker that proxies an upstream OAuth service can give the grant exactly the lifetime of the upstream refresh token it just rotated.
+
+  The slide happens only when a refresh succeeds: a throwing callback, an expired grant, or a grant that expires while the callback runs leaves the old expiry in place. Returning `refreshTokenIdleTTL` for any other grant type, or a value that is not an integer of at least 60 seconds, is rejected with `invalid_request`. Nothing changes for deployments that do not set it.
+
+- [#319](https://github.com/cloudflare/workers-oauth-provider/pull/319) [`2c902a7`](https://github.com/cloudflare/workers-oauth-provider/commit/2c902a79d3c186e52a5d28e5ef2ce196919fd854) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Keep dynamically registered clients alive while they are in use.
+
+  A DCR registration expired `clientRegistrationTTL` after it was created, whatever the client was doing. A grant that outlived its registration, which any never-expiring or long-lived grant does, then failed every refresh with `invalid_client` although nothing had been revoked. Registrations written under the TTL now record when they expire, and a successful client-authenticated token endpoint request made in the second half of that lifetime rewrites the registration for the full TTL, at most once per half TTL per client.
+
+  Clients created through `createClient()`, CIMD clients, and registrations written before this version are never rewritten; the last expire on their original schedule and re-register once.
+
+### Patch Changes
+
+- [#303](https://github.com/cloudflare/workers-oauth-provider/pull/303) [`742e222`](https://github.com/cloudflare/workers-oauth-provider/commit/742e222c55f5adbd8975c964f2248ea8a1670770) Thanks [@kanywst](https://github.com/kanywst)! - Fix uncaught 500 when an ID-JAG assertion has under 60 seconds left. The EMA replay marker
+  took its KV TTL straight from the assertion's remaining lifetime, so KV rejected the write
+  and the request crashed instead of exchanging. The marker's TTL is now floored at 60s.
+
 ## 0.10.3
 
 ### Patch Changes
