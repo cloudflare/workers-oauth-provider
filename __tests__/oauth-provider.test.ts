@@ -5877,6 +5877,14 @@ describe('OAuthProvider', () => {
       expect(tokens.access_token).toBeDefined();
       expect(tokens.expires_in).toBe(3600);
       expect(tokens.refresh_token).toBeUndefined();
+
+      // With nothing to refresh it, the grant expires with its access token instead of staying in KV for good.
+      const [grantKey] = (await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys.map((key) => key.name);
+      const { expiresAt } = (await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' })) as { expiresAt?: number };
+      expect(expiresAt).toBeGreaterThanOrEqual(Math.floor(Date.now() / 1000) + 3600 - 5);
+      expect(expiresAt).toBeLessThanOrEqual(Math.floor(Date.now() / 1000) + 3600 + 5);
+      mockEnv.OAUTH_KV.advanceTime(3601 * 1000);
+      expect(await mockEnv.OAUTH_KV.get(grantKey)).toBeNull();
     });
 
     it('should allow callback to enable refresh tokens when globally disabled', async () => {
