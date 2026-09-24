@@ -10188,6 +10188,29 @@ describe('OAuthProvider', () => {
   });
 
   describe('OAuthHelpers', () => {
+    it('holds createClient and updateClient to the grant and response types this server implements', async () => {
+      await oauthProvider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
+      const oauth = mockEnv.OAUTH_PROVIDER!;
+      const redirectUris = ['https://client.example.com/callback'];
+
+      // Implicit isn't implemented: a client registered for it would fail every authorization.
+      await expect(
+        oauth.createClient({ redirectUris, grantTypes: ['implicit'], responseTypes: ['token'] })
+      ).rejects.toThrow('Unsupported grant_type: implicit');
+      await expect(
+        oauth.createClient({ redirectUris, grantTypes: ['refresh_token'], responseTypes: ['code'] })
+      ).rejects.toThrow('grant_types authorization_code and response_types code must be registered together');
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'client:' })).keys).toHaveLength(0);
+
+      const client = await oauth.createClient({ redirectUris });
+      await expect(oauth.updateClient(client.clientId, { responseTypes: ['token'] })).rejects.toThrow(
+        'Unsupported response_type: token'
+      );
+      expect((await oauth.lookupClient(client.clientId))!.responseTypes).toEqual(['code']);
+      // Unrelated updates don't re-run the check.
+      expect((await oauth.updateClient(client.clientId, { clientName: 'Renamed' }))!.clientName).toBe('Renamed');
+    });
+
     it('should allow listing and revoking grants', async () => {
       // Create a client
       const clientData = {

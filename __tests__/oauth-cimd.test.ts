@@ -448,6 +448,22 @@ describe('Client ID Metadata Document (CIMD)', () => {
     });
   });
 
+  describe('Client helpers', () => {
+    it('refuses updateClient for a CIMD client: its document owns the metadata', async () => {
+      await oauthProvider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
+      const fetchSpy = vi.fn();
+      globalThis.fetch = fetchSpy;
+      const cimdUrl = 'https://client.example.com/oauth/metadata.json';
+
+      await expect(mockEnv.OAUTH_PROVIDER!.updateClient(cimdUrl, { clientName: 'Renamed' })).rejects.toThrow(
+        'Client ID Metadata Document clients are updated by changing their document'
+      );
+      // No stored copy that would become the client if CIMD were turned off, and no fetch.
+      expect(await mockEnv.OAUTH_KV.get(`client:${cimdUrl}`)).toBeNull();
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+  });
+
   describe('Metadata Validation', () => {
     it('should treat mismatched client_id as invalid client', async () => {
       const cimdUrl = 'https://client.example.com/oauth/metadata.json';
