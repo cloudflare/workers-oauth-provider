@@ -2,6 +2,8 @@
 
 `@cloudflare/workers-oauth-provider` adds OAuth 2.1 authorization to HTTP APIs and remote MCP servers running on Cloudflare Workers.
 
+> **1.0 is out, with a new split API.** The authorization server (`OAuthAuthorizationServer`) and resource server (`OAuthResourceServer`) are now separate classes that can run in one Worker or several; the [quick start](#quick-start) shows both. The single-Worker `OAuthProvider` is still supported. Upgrading from 0.x? Read the [migration guide](docs/migration-1.0.md), or point your coding agent at the skill in [`skills/migrate-to-1.0/`](skills/migrate-to-1.0/SKILL.md), which also ships in the npm package.
+
 ## Install
 
 ```sh
@@ -33,107 +35,24 @@ See [Client registration](#client-registration) for the matching provider option
 
 ## Quick start
 
-The provider accepts either plain `ExportedHandler` objects or classes extending `WorkerEntrypoint`. This example uses both.
+An MCP deployment has two roles. The **authorization server** signs users in and issues tokens. The **resource server** is your MCP endpoint: it accepts those tokens and checks them with the authorization server over a [Service Binding](https://developers.cloudflare.com/workers/runtime-apis/bindings/service-bindings/). Each is one class.
+
+### Authorization server Worker
 
 ```ts
-import {
-  AuthorizationError,
-  OAuthProvider,
-  type AuthRequest,
-  type OAuthHelpers,
-} from '@cloudflare/workers-oauth-provider';
+import { AuthorizationError, OAuthAuthorizationServer, type AuthRequest } from '@cloudflare/workers-oauth-provider';
 import { WorkerEntrypoint } from 'cloudflare:workers';
-
-interface AuthProps {
-  userId: string;
-  displayName: string;
-}
 
 interface Env {
   OAUTH_KV: KVNamespace;
-  OAUTH_PROVIDER: OAuthHelpers;
 }
 
-class McpApiHandler extends WorkerEntrypoint<Env, AuthProps> {
-  fetch(request: Request): Response {
-    return Response.json({
-      authenticated: true,
-      userId: this.ctx.props.userId,
-      displayName: this.ctx.props.displayName,
-    });
-  }
-}
-
-const defaultHandler: ExportedHandler<Env> = {
-  async fetch(request, env) {
-    const url = new URL(request.url);
-
-    if (url.pathname !== '/authorize') {
-      return new Response('Not found', { status: 404 });
-    }
-
-    // This parses the OAuth parameters and validates the client, redirect URI,
-    // response type, resource indicators, and configured PKCE restrictions.
-    let oauthRequest: AuthRequest;
-    try {
-      oauthRequest = await env.OAUTH_PROVIDER.parseAuthRequest(request);
-    } catch (error) {
-      if (!(error instanceof AuthorizationError)) throw error;
-      if (!error.redirectUri) {
-        // Unknown clients and invalid redirects must be rendered locally.
-        return new Response(error.description, { status: 400 });
-      }
-      const redirect = new URL(error.redirectUri);
-      redirect.searchParams.set('error', error.code);
-      redirect.searchParams.set('error_description', error.description);
-      if (error.state) redirect.searchParams.set('state', error.state);
-      if (error.issuer) redirect.searchParams.set('iss', error.issuer);
-      return Response.redirect(redirect, 302);
-    }
-
-    const client = await env.OAUTH_PROVIDER.lookupClient(oauthRequest.clientId);
-
-    if (!client) {
-      return new Response('Unknown OAuth client', { status: 400 });
-    }
-
-    // Authenticate the user and obtain consent here. Do not automatically
-    // approve a request in production. This example assumes those steps have
-    // produced the following user and scope values.
-    const user = { id: 'user-123', displayName: 'Ada' };
-    const grantedScopes = oauthRequest.scope.filter((scope) => scope === 'mcp:read');
-
-    const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
-      request: oauthRequest,
-      userId: user.id,
-      metadata: { clientName: client.clientName },
-      scope: grantedScopes,
-      props: {
-        userId: user.id,
-        displayName: user.displayName,
-      },
-    });
-
-    return Response.redirect(redirectTo, 302);
-  },
-};
-
-export default new OAuthProvider<Env>({
-  apiRoute: '/mcp',
-  apiHandler: McpApiHandler,
-  defaultHandler,
-
+const authorizationServer = new OAuthAuthorizationServer<Env>({
+  issuer: 'https://auth.example.com',
+  resources: ['https://mcp.example.com/mcp'],
   authorizeEndpoint: '/authorize',
   tokenEndpoint: '/oauth/token',
-
   scopesSupported: ['mcp:read'],
-
-  resourceMetadata: {
-    resource: 'https://mcp.example.com/mcp',
-    authorization_servers: ['https://mcp.example.com'],
-    scopes_supported: ['mcp:read'],
-    resource_name: 'Example MCP server',
-  },
 
   // Preferred for clients with no pre-existing relationship.
   // Also requires global_fetch_strictly_public in wrangler.jsonc.
@@ -142,65 +61,128 @@ export default new OAuthProvider<Env>({
   // Optional compatibility fallback. MCP 2026 deprecates DCR for new clients.
   clientRegistrationEndpoint: '/oauth/register',
 });
-```
 
-## Protecting routes
+async function authorize(request: Request, env: Env): Promise<Response> {
+  const oauth = authorizationServer.getOAuthApi(env);
 
-`apiRoute` and `apiHandler` protect one or more route prefixes with a single handler. Use `apiHandlers` when different prefixes need different handlers.
+  // Parses the OAuth parameters and validates the client, redirect URI,
+  // response type, resource indicator, and PKCE.
+  let oauthRequest: AuthRequest;
+  try {
+    oauthRequest = await oauth.parseAuthRequest(request);
+  } catch (error) {
+    if (!(error instanceof AuthorizationError)) throw error;
+    if (!error.redirectUri) {
+      // Unknown clients and invalid redirects must be rendered locally.
+      return new Response(error.description, { status: 400 });
+    }
+    const redirect = new URL(error.redirectUri);
+    redirect.searchParams.set('error', error.code);
+    redirect.searchParams.set('error_description', error.description);
+    if (error.state) redirect.searchParams.set('state', error.state);
+    if (error.issuer) redirect.searchParams.set('iss', error.issuer);
+    return Response.redirect(redirect.href, 302);
+  }
 
-Before calling a protected handler, the provider reads the bearer token, rejects missing, invalid, or expired credentials, checks its audience, and exposes the authenticated application data through `ctx.props` and what it verified about the token through `ctx.auth` (`scope`, `userId`, `clientId`, `audience`, `expiresAt`). The handler does not need to parse or validate the token, but it still enforces application permissions such as scope, ownership, and tenancy; `insufficientScope(ctx.auth, scopes)` builds the MCP `403` challenge when a token lacks what an operation needs.
+  const client = await oauth.lookupClient(oauthRequest.clientId);
+  if (!client) return new Response('Unknown OAuth client', { status: 400 });
 
-Requests outside the protected route prefixes go to `defaultHandler`. In the example above, that handler owns `/authorize`.
+  // Authenticate the user and obtain consent here. Never approve automatically
+  // in production; this example assumes those steps produced these values.
+  const user = { id: 'user-123', displayName: 'Ada' };
+  const { redirectTo } = await oauth.completeAuthorization({
+    request: oauthRequest,
+    userId: user.id,
+    metadata: { clientName: client.clientName },
+    scope: oauthRequest.scope.filter((scope) => scope === 'mcp:read'),
+    props: { userId: user.id, displayName: user.displayName },
+  });
+  return Response.redirect(redirectTo, 302);
+}
 
-## One authorization server with multiple MCP resources
-
-`OAuthAuthorizationServer` is the authorization-server role on its own: discovery, token, revocation and registration endpoints from `fetch()`, the interactive flow through `getOAuthApi()`, and `validateToken(resource, token, env)` for any resource in its fixed `resources` registry. Each resource is hosted by `new OAuthResourceServer()`, whose `validateToken` option points back at the authorization server — in this Worker or another. Same host, same `ctx.props`, wherever the resource runs.
-
-**Same Worker.** Route the authorization server's origin to `authorizationServer.fetch()`, your `/authorize` page to `getOAuthApi()`, and each resource to its host. The validator is a direct call:
-
-```ts
-const authorizationServer = new OAuthAuthorizationServer<Env>({
-  issuer: 'https://auth.example.com',
-  resources: ['https://calendar.example.com/mcp'],
-  authorizeEndpoint: '/authorize',
-  tokenEndpoint: '/oauth/token',
-});
-
-const calendar = new OAuthResourceServer<Env, AuthProps>({
-  resourceMetadata: {
-    resource: 'https://calendar.example.com/mcp',
-    authorization_servers: ['https://auth.example.com'],
-  },
-  validateToken: (env) => (resource, token) => authorizationServer.validateToken(resource, token, env),
-  handler: { fetch: (_request, _env, ctx) => Response.json({ userId: ctx.props.userId }) },
-});
-```
-
-**Separate Workers.** The authorization Worker exposes `validateToken` from a `WorkerEntrypoint`; the resource Worker holds a Service Binding to it and hands the host that method. Nothing else to configure, and the validator is a binding, not a URL — it is not reachable from the public internet:
-
-```ts
-// auth Worker
 export default class AuthServer extends WorkerEntrypoint<Env> {
+  // Your /authorize page; everything else (discovery, token, revocation, registration) is the library's.
   fetch(request: Request) {
+    if (new URL(request.url).pathname === '/authorize') return authorize(request, this.env);
     return authorizationServer.fetch(request, this.env, this.ctx);
   }
+
+  // Called by resource Workers over their Service Binding.
   validateToken(resource: string, token: string) {
     return authorizationServer.validateToken(resource, token, this.env);
   }
 }
+```
 
-// calendar Worker, with `"services": [{ "binding": "AUTH_SERVER", "service": "auth" }]` in wrangler.jsonc
+### Resource server Worker
+
+```jsonc
+// wrangler.jsonc
+{
+  "services": [{ "binding": "AUTH_SERVER", "service": "auth-server" }],
+}
+```
+
+```ts
+import { OAuthResourceServer, type AuthorizationServerBinding } from '@cloudflare/workers-oauth-provider';
+
+interface AuthProps {
+  userId: string;
+  displayName: string;
+}
+
+interface Env {
+  AUTH_SERVER: AuthorizationServerBinding<AuthProps>;
+}
+
 export default new OAuthResourceServer<Env, AuthProps>({
   resourceMetadata: {
-    resource: 'https://calendar.example.com/mcp',
+    resource: 'https://mcp.example.com/mcp',
     authorization_servers: ['https://auth.example.com'],
+    scopes_supported: ['mcp:read'],
+    resource_name: 'Example MCP server',
   },
   validateToken: (env) => env.AUTH_SERVER.validateToken,
-  handler,
+  handler: {
+    fetch(request, env, ctx) {
+      // ctx.props: what completeAuthorization() stored. ctx.auth: the verified token (scope, userId, clientId, …).
+      return Response.json({ userId: ctx.props.userId, scope: ctx.auth.scope });
+    },
+  },
 });
 ```
 
-Either way the resource server publishes its own RFC 9728 metadata, issues Bearer challenges that point at it, checks the returned audience against its canonical resource, and answers `503` when validation infrastructure fails. Tokens are opaque throughout; a validator returns the decrypted `props` the authorization flow stored. See [docs/resource-servers.md](docs/resource-servers.md) for the three-domain Hono example, the `AuthorizationServerBinding` type for your `Env`, and how to validate tokens from another issuer at your own risk.
+The resource server publishes its RFC 9728 metadata, answers unauthenticated requests with a Bearer challenge that points at it, validates every token for its own resource only, and passes the handler `ctx.props` and `ctx.auth`. The handler still enforces permissions such as ownership and tenancy; `insufficientScope(ctx.auth, scopes)` builds the MCP `403` when a token lacks a scope an operation needs. The binding is not a URL, so the validator is not reachable from the public internet.
+
+### More resources, or one Worker
+
+- **Another MCP resource**: add it to `resources` and deploy another `OAuthResourceServer` with the same binding. A token issued for one resource is refused by every other.
+- **Both roles in one Worker**: construct the `OAuthResourceServer` next to the authorization server with a local validator, `validateToken: (env) => (resource, token) => authorizationServer.validateToken(resource, token, env)`, and route to it from your `fetch`.
+
+[docs/resource-servers.md](docs/resource-servers.md) covers both, including a three-domain Hono example, and how to accept another issuer's tokens at your own risk.
+
+## Single Worker: `OAuthProvider`
+
+When one Worker is both the authorization server and its only resource, which was the 0.x shape, `OAuthProvider` combines the two roles. Requests to `apiRoute` are protected and reach `apiHandler` with `ctx.props` and `ctx.auth`; everything else that isn't an OAuth endpoint goes to `defaultHandler`, which owns `/authorize` and reaches the same helpers as `env.OAUTH_PROVIDER`:
+
+```ts
+export default new OAuthProvider<Env>({
+  apiRoute: '/mcp', // or apiHandlers: { '/mcp': …, '/mcp/admin': … }
+  apiHandler: McpApiHandler, // an object with fetch, or a WorkerEntrypoint class
+  defaultHandler, // /authorize, using env.OAUTH_PROVIDER.parseAuthRequest() / completeAuthorization()
+  authorizeEndpoint: '/authorize',
+  tokenEndpoint: '/oauth/token',
+  scopesSupported: ['mcp:read'],
+  resourceMetadata: {
+    resource: 'https://mcp.example.com/mcp',
+    authorization_servers: ['https://mcp.example.com'],
+    scopes_supported: ['mcp:read'],
+  },
+  clientIdMetadataDocumentEnabled: true,
+});
+```
+
+Every protected route must be the canonical `resource` path or a descendant of it; construction rejects anything else.
 
 ## How MCP authorization discovery works
 
@@ -222,10 +204,10 @@ For an MCP endpoint at `https://mcp.example.com/mcp`:
    ```
 
 4. That document identifies one or more authorization server issuers through `authorization_servers`.
-5. The client fetches RFC 8414 authorization server metadata from the selected issuer. In the single-origin quick start that is:
+5. The client fetches RFC 8414 authorization server metadata from the selected issuer. In the quick start that is:
 
    ```text
-   https://mcp.example.com/.well-known/oauth-authorization-server
+   https://auth.example.com/.well-known/oauth-authorization-server
    ```
 
 6. The metadata tells the client where to authorize, exchange tokens, and register if registration is enabled.
@@ -421,23 +403,6 @@ ASCII case differences in the URI scheme and host are accepted, but port, path, 
 Token exchange cannot change the resource. Both the subject-token audience and any explicit requested resource must resolve to the same registered canonical value. A token is exchanged by the client its grant was issued to unless `tokenExchangeCallback` returns `allowCrossClientExchange: true`. Internally and externally validated tokens are accepted at a protected route only when their audience matches that route's resource.
 
 Path-aware API validation uses path-boundary prefix matching. A canonical audience for `https://example.com/mcp` covers `/mcp` and `/mcp/tools`, but not `/mcp-other`. A canonical trailing slash remains significant.
-
-### Upgrading to 1.0
-
-The step-by-step guide, including an "Am I affected" checklist and an agent skill (`skills/migrate-to-1.0/`), is [docs/migration-1.0.md](docs/migration-1.0.md). The compatibility rules it relies on:
-
-The existing combined `OAuthProvider` configuration has one `resourceMetadata.resource`. That sole resource automatically acts as both the omitted-authorization default and the migration destination for grants created before resource binding, so existing single-resource clients can continue without adding a `resource` parameter.
-
-For a multi-resource `OAuthAuthorizationServer`, `defaultResource` and `legacyGrantResource` solve different compatibility problems:
-
-- `defaultResource` selects the resource for a new authorization request that omits `resource`.
-- `legacyGrantResource` is the server-controlled migration destination for an old stored grant or access token that has no resource. A client-supplied token-request parameter cannot choose or change this destination. It is deployment policy rather than an issuance-time claim, so changing it re-targets every surviving unbound record; keep it fixed for the migration window.
-
-Both values must name a declared resource and are checked at construction. If a multi-resource server omits `legacyGrantResource`, an old unbound grant cannot be migrated safely. A stored grant already bound to a registered resource keeps that resource, and a stored 0.x array that contains the registered resource resolves to it. A grant bound only to unregistered values fails its refresh with `invalid_grant`, which conformant clients answer by starting a new authorization.
-
-Previously issued access tokens with no audience keep working until they expire. They are treated as bound to the server-selected migration resource (the sole resource, or `legacyGrantResource`), and refresh binds the grant and returns a bound replacement token. A multi-resource server without `legacyGrantResource` has no safe destination, so it rejects such tokens and their refresh grants must be reauthorized. Multiple resources can share the same authorization server, provider implementation, and KV namespace; separate storage is an optional deployment boundary, not a resource-binding requirement.
-
-The 1.0 API removes `resourceMatchOriginOnly`, and a configuration that still sets it fails at construction. Canonical matching with scheme/host case tolerance replaces it.
 
 ## Scopes and step-up authorization
 
