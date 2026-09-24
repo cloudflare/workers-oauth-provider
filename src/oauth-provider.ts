@@ -3593,6 +3593,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       grantData.previousRefreshTokenId = undefined; // No previous token for first use
       grantData.previousRefreshTokenWrappedKey = undefined; // No previous token for first use
       grantData.expiresAt = expiresAt;
+    } else {
+      // Without a refresh token the grant is useless once its access token expires: let KV drop it
+      // then, rather than keeping it for good.
+      grantData.expiresAt = now + accessTokenTTL;
     }
 
     if (resourceResolution.grantResourceBackfill) {
