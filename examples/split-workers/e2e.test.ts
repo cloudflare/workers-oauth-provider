@@ -9,8 +9,7 @@ const AUTH_SERVER = { configPath: './examples/split-workers/auth-server/wrangler
 const MCP_SERVER = { configPath: './examples/split-workers/mcp-server/wrangler.jsonc' };
 
 // Both Workers run in workerd; mcp-server reaches auth-server over a real Service Binding.
-// DEMO_USER_ID stands in for the sign-in the example leaves to you.
-const harness = createTestHarness({ workers: [{ ...AUTH_SERVER, vars: { DEMO_USER_ID: 'user-123' } }, MCP_SERVER] });
+const harness = createTestHarness({ workers: [AUTH_SERVER, MCP_SERVER] });
 const auth = harness.getWorker('auth-server');
 const mcp = harness.getWorker('mcp-server');
 
@@ -98,12 +97,6 @@ it('answers a token without mcp:read with the MCP insufficient_scope challenge',
   const call = await mcp.fetch(RESOURCE, { headers: { Authorization: `Bearer ${token}` } });
   expect(call.status).toBe(403);
   expect(call.headers.get('WWW-Authenticate')).toContain('error="insufficient_scope", scope="mcp:read"');
-});
-
-it('refuses every authorization until sign-in is implemented', async () => {
-  await harness.update({ workers: [AUTH_SERVER, MCP_SERVER] });
-  const { response } = await authorize(await discover(), 'mcp:read');
-  expect(response.status).toBe(501);
 });
 
 it('is the README quick start, verbatim', () => {
