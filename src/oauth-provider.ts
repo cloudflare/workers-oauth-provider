@@ -1970,7 +1970,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         `refreshTokenTTL must be 0 (no refresh tokens), undefined (no expiry), or an integer of at least ${KV_MIN_EXPIRATION_TTL_SECONDS} seconds (Cloudflare KV's minimum expiration window).`
       );
     }
-    if (this.options.clientRegistrationTTL !== undefined && !isValidAccessTokenTTL(this.options.clientRegistrationTTL)) {
+    if (
+      this.options.clientRegistrationTTL !== undefined &&
+      !isValidAccessTokenTTL(this.options.clientRegistrationTTL)
+    ) {
       throw new TypeError(
         `clientRegistrationTTL must be undefined (no expiry) or an integer of at least ${KV_MIN_EXPIRATION_TTL_SECONDS} seconds (Cloudflare KV's minimum expiration window).`
       );
