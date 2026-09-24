@@ -15513,6 +15513,43 @@ describe('onError.internal coverage across generic error paths', () => {
     expect(await ema.json<any>()).toMatchObject({ error: 'unsupported_grant_type' });
   });
 
+  it('never hands an expired or unknown token in our own format to resolveExternalToken', async () => {
+    const resolver = vi.fn(async ({ token }: { token: string }) =>
+      token === 'external-api-token' ? { props: { userId: 'external' }, audience: TEST_RESOURCE } : null
+    );
+    const provider = createProvider({ resolveExternalToken: resolver, accessTokenTTL: 3600 });
+    const api = (token: string) =>
+      provider.fetch(
+        createMockRequest('https://example.com/api/x', 'GET', { Authorization: `Bearer ${token}` }),
+        env,
+        ctx
+      );
+
+    // A real access token, aged out of storage: what every MCP client sends before it refreshes.
+    const { code, credentials } = await authorizationCode(provider);
+    const tokens = await (
+      await provider.fetch(
+        form(`grant_type=authorization_code&code=${code}&redirect_uri=${encodeURIComponent(REDIRECT)}&${credentials}`),
+        env,
+        ctx
+      )
+    ).json<any>();
+    env.OAUTH_KV.advanceTime(3601 * 1000);
+    const expired = await api(tokens.access_token);
+    expect(expired.status).toBe(401);
+    expect(last()).toEqual({ category: 'protected-resource', reason: 'token_not_found' });
+
+    // A forgery of our format is ours too: never forwarded as an external credential, including
+    // for a user ID that itself contains colons.
+    expect((await api(`someone:${'a'.repeat(16)}:${'b'.repeat(32)}`)).status).toBe(401);
+    expect((await api(`tenant:acme:user-7:${'a'.repeat(16)}:${'b'.repeat(32)}`)).status).toBe(401);
+    expect(resolver).not.toHaveBeenCalled();
+
+    // A genuinely external credential still reaches the resolver.
+    expect((await api('external-api-token')).status).toBe(200);
+    expect(resolver).toHaveBeenCalledTimes(1);
+  });
+
   it('revokes the grant when tokenExchangeCallback throws invalid_grant, which can never recover', async () => {
     // A proxy server's upstream refresh token is dead for good: the grant goes too, so the client
     // re-authorizes instead of refreshing a grant that can never work again.

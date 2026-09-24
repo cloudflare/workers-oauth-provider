@@ -4938,8 +4938,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       tokenData = await env.OAUTH_KV.get(`token:${userId}:${grantId}:${id}`, { type: 'json' });
     }
 
-    // No internal token found in KV and no external token validator provided
-    if (!tokenData && !externalTokenResolver) {
+    // No internal token found, and either no external validator, or the token is in this provider's
+    // own format: an expired or revoked token we issued (or a forgery of our format) is never an
+    // external credential, so it must not be handed to resolveExternalToken or sent upstream.
+    if (!tokenData && (!externalTokenResolver || isIssuedTokenFormat(accessToken))) {
       return this.createErrorResponse(
         'invalid_token',
         {
@@ -5980,6 +5982,8 @@ function isGrantKeyMetadata(value: unknown): value is GrantKeyMetadata {
  * Length of generated token strings
  */
 const TOKEN_LENGTH = 32;
+const ISSUED_GRANT_ID_PATTERN = /^[A-Za-z0-9_-]{16}$/;
+const ISSUED_TOKEN_SECRET_PATTERN = new RegExp(`^[A-Za-z0-9_-]{${TOKEN_LENGTH}}$`);
 
 // Helper Functions
 /**
@@ -6106,6 +6110,22 @@ function parseBasicAuthorizationHeader(header: string | null): BasicAuthorizatio
  */
 function decodeFormUrlEncodedComponent(value: string): string {
   return decodeURIComponent(value.replace(/\+/g, ' '));
+}
+
+/**
+ * Whether a bearer credential has the exact shape of a token this provider issues:
+ * `{userId}:{grantId}:{secret}`, with a 16-character grant ID and a TOKEN_LENGTH secret from
+ * generateRandomString's alphabet. Parsed from the right, because a deployer's user ID may itself
+ * contain `:`. An external credential with exactly this shape would be treated as ours; opaque API
+ * keys, PATs and JWTs don't have it.
+ */
+function isIssuedTokenFormat(token: string): boolean {
+  const parts = token.split(':');
+  if (parts.length < 3) return false;
+  const secret = parts[parts.length - 1];
+  const grantId = parts[parts.length - 2];
+  const userId = parts.slice(0, -2).join(':');
+  return userId.length > 0 && ISSUED_GRANT_ID_PATTERN.test(grantId) && ISSUED_TOKEN_SECRET_PATTERN.test(secret);
 }
 
 /**
