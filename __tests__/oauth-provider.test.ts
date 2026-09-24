@@ -974,6 +974,7 @@ describe('OAuthProvider', () => {
     }
 
     it('disallowPublicClientRegistration registers a secret method when one is on offer and refuses none alone', async () => {
+      const reasons: string[] = [];
       const provider = new OAuthProvider({
         apiRoute: ['/api/'],
         apiHandler: TestApiHandler,
@@ -982,6 +983,9 @@ describe('OAuthProvider', () => {
         tokenEndpoint: '/oauth/token',
         clientRegistrationEndpoint: '/oauth/register',
         disallowPublicClientRegistration: true,
+        onError: ({ internal }) => {
+          reasons.push(internal.reason);
+        },
       });
       const register = (metadata: Record<string, unknown>) =>
         provider.fetch(
@@ -998,7 +1002,11 @@ describe('OAuthProvider', () => {
       // Only `none`: refused.
       const publicOnly = await register({ token_endpoint_auth_method: 'none' });
       expect(publicOnly.status).toBe(400);
-      expect(await publicOnly.json<any>()).toMatchObject({ error: 'invalid_client_metadata' });
+      expect(await publicOnly.json<any>()).toMatchObject({
+        error: 'invalid_client_metadata',
+        error_description: 'Public client registration is not allowed',
+      });
+      expect(reasons).toEqual(['public_client_forbidden']);
 
       // Prefers `none` but also supports a secret method: registered with the secret method.
       const either = await register({

@@ -4769,7 +4769,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       );
     }
 
-    let clientMetadata: Record<string, unknown>;
+    let clientMetadata: Record<string, unknown> | undefined;
     let metadata: ResolvedDynamicClientRegistrationMetadata;
     try {
       clientMetadata = requireJsonObject(parsedJson);
@@ -4785,6 +4785,16 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         : this.serverCapabilities;
       metadata = resolveDynamicClientRegistrationMetadata(clientMetadata, capabilities);
     } catch (error) {
+      if (
+        this.options.disallowPublicClientRegistration &&
+        wouldRegisterPublicClient(clientMetadata, this.serverCapabilities)
+      ) {
+        return this.createErrorResponse(
+          'invalid_client_metadata',
+          { description: 'Public client registration is not allowed' },
+          { category: 'client-registration', reason: 'public_client_forbidden' }
+        );
+      }
       return this.createErrorResponse(
         'invalid_client_metadata',
         {
@@ -5911,6 +5921,19 @@ const DEFAULT_CLIENT_REGISTRATION_TTL = 90 * 24 * 60 * 60;
  * to clamp absolute expirations when writing grants back to KV.
  */
 const KV_MIN_EXPIRATION_TTL_SECONDS = 60;
+
+/** Whether a registration refused without `none` on offer would otherwise have been a public client. */
+function wouldRegisterPublicClient(
+  clientMetadata: Record<string, unknown> | undefined,
+  server: OAuthServerCapabilities
+): boolean {
+  if (!clientMetadata) return false;
+  try {
+    return resolveDynamicClientRegistrationMetadata(clientMetadata, server).tokenEndpointAuthMethod === 'none';
+  } catch {
+    return false;
+  }
+}
 
 /** A refresh-token lifetime: 0 for "issue no refresh token", else a lifetime KV can store. */
 function isValidRefreshTokenTTL(ttl: unknown): ttl is number {
