@@ -17,6 +17,7 @@ const defaults = buildOAuthServerCapabilities({
   allowPlainPKCE: false,
   allowTokenExchangeGrant: false,
   enterpriseManagedAuthorization: false,
+  allowPrivateUseRedirectUris: false,
 });
 
 const withPlainPkce = buildOAuthServerCapabilities({
@@ -24,6 +25,7 @@ const withPlainPkce = buildOAuthServerCapabilities({
   allowPlainPKCE: true,
   allowTokenExchangeGrant: false,
   enterpriseManagedAuthorization: false,
+  allowPrivateUseRedirectUris: false,
 });
 
 describe('OAuth server capabilities', () => {
@@ -33,6 +35,7 @@ describe('OAuth server capabilities', () => {
       allowPlainPKCE: true,
       allowTokenExchangeGrant: true,
       enterpriseManagedAuthorization: true,
+      allowPrivateUseRedirectUris: false,
     });
 
     expect(defaults).toEqual({
@@ -40,6 +43,7 @@ describe('OAuth server capabilities', () => {
       responseTypes: ['code'],
       tokenEndpointAuthMethods: ['client_secret_basic', 'client_secret_post', 'none'],
       codeChallengeMethods: ['S256'],
+      allowPrivateUseRedirectUris: false,
     });
     expect(enabled.grantTypes).toEqual([
       'authorization_code',
@@ -125,6 +129,7 @@ describe('OAuth server capabilities', () => {
       allowPlainPKCE: false,
       allowTokenExchangeGrant: false,
       enterpriseManagedAuthorization: true,
+      allowPrivateUseRedirectUris: false,
     });
 
     expect(

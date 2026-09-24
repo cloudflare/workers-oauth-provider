@@ -18,7 +18,7 @@ import {
   isClientIdMetadataDocumentUrl,
   requireJsonObject,
   resolveDynamicClientRegistrationMetadata,
-  validateRedirectUriScheme,
+  validateRedirectUri,
   type ResolvedDynamicClientRegistrationMetadata,
 } from './oauth-client-metadata';
 import {
@@ -635,6 +635,13 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
     internal: OAuthErrorInternal;
     request?: Request;
   }) => Response | void;
+
+  /**
+   * Accept RFC 8252 private-use URI scheme redirect URIs (for example `com.example.app:/oauth`)
+   * for native apps. By default redirect URIs must use `https`, or `http` on a loopback host, as
+   * MCP and OAuth 2.1 require; remote `http` is never accepted. Leave this off for MCP servers.
+   */
+  allowPrivateUseRedirectUris?: boolean;
 
   /**
    * Explicitly enable Client ID Metadata Document (CIMD) support.
@@ -1949,6 +1956,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       allowPlainPKCE: this.options.allowPlainPKCE === true,
       allowTokenExchangeGrant: !!this.options.allowTokenExchangeGrant,
       enterpriseManagedAuthorization: !!this.options.enterpriseManagedAuthorization,
+      allowPrivateUseRedirectUris: this.options.allowPrivateUseRedirectUris === true,
     });
     validateAuthorizationServerScopes(this.options.scopesSupported);
     this.validateEmaOptions(this.options.enterpriseManagedAuthorization);
@@ -6505,7 +6513,8 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
     }
 
     try {
-      validateRedirectUriScheme(redirectUri);
+      // Applied at authorization too, so clients registered before the policy are held to it.
+      validateRedirectUri(redirectUri, this.provider.serverCapabilities);
     } catch {
       throw new AuthorizationError('invalid_request', { description: 'Invalid redirect URI' });
     }
@@ -6865,9 +6874,9 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
       ...(authMethodWasExplicit ? { authMethodExplicit: true as const } : {}),
     };
 
-    // Validate each redirect URI scheme
+    // Validate each redirect URI against the redirect policy
     for (const uri of newClient.redirectUris) {
-      validateRedirectUriScheme(uri);
+      validateRedirectUri(uri, this.provider.serverCapabilities);
     }
 
     // Only generate and store client secret for confidential clients
@@ -6942,6 +6951,14 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
     const client = await this.provider.getClient(this.env, clientId);
     if (!client) {
       return null;
+    }
+
+    // New redirect URIs are held to the same policy as registration and createClient().
+    if (updates.redirectUris !== undefined) {
+      if (!Array.isArray(updates.redirectUris) || updates.redirectUris.length === 0) {
+        throw new Error('redirectUris must not be empty');
+      }
+      for (const uri of updates.redirectUris) validateRedirectUri(uri, this.provider.serverCapabilities);
     }
 
     // Determine token endpoint auth method
