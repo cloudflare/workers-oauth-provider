@@ -6503,7 +6503,7 @@ describe('OAuthProvider', () => {
       expect(tokens.refresh_token).toBeDefined();
 
       const [grantKey] = (await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys.map((key) => key.name);
-      const { expiresAt } = (await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' })) as any;
+      const { expiresAt } = (await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' })) as { expiresAt?: number };
 
       // A callback shared between grant types returns refreshTokenTTL on refresh too. Rejecting it would
       // fail the refresh after the callback's side effects, such as rotating an upstream refresh token.
@@ -6522,7 +6522,9 @@ describe('OAuthProvider', () => {
 
       const refreshResponse = await providerWithBadCallback.fetch(refreshRequest, mockEnv, mockCtx);
       expect(refreshResponse.status).toBe(200);
-      expect(((await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' })) as any).expiresAt).toBe(expiresAt);
+      expect(((await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' })) as { expiresAt?: number }).expiresAt).toBe(
+        expiresAt
+      );
     });
   });
 
