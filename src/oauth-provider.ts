@@ -1373,7 +1373,8 @@ export interface Token extends TokenBase {
    */
   grant: {
     /**
-     * Client that received this grant
+     * Client this token was issued to: the grant's client, or, for a token from an allowed
+     * cross-client token exchange, the client that requested it (RFC 8693).
      */
     clientId: string;
 
@@ -1399,7 +1400,8 @@ export interface TokenSummary<T = any> extends TokenBase {
    */
   grant: {
     /**
-     * Client that received this grant
+     * Client this token was issued to: the grant's client, or, for a token from an allowed
+     * cross-client token exchange, the client that requested it (RFC 8693).
      */
     clientId: string;
 
