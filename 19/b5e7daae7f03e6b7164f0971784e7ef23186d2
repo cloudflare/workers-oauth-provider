@@ -1,0 +1,25 @@
+README.md
+  s_1b1f3dce47e01c::t_5fc29e4552ba79 48,91-94,129-133,155-156,163
+examples/split-workers/auth-server/index.ts
+  s_1b1f3dce47e01c::t_c92937fbd1f2ee 6,49-52
+examples/split-workers/e2e.test.ts
+  s_1b1f3dce47e01c::t_fef9d29dd44f4b 8-10,12-13,23-24,32,35,37-38,48,52,57,59,63-71,80,86-87,89-91,96-108
+examples/split-workers/mcp-server/index.ts
+  s_1b1f3dce47e01c::t_558257e04190ff 1-5,27-28
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "19b5e7daae7f03e6b7164f0971784e7ef23186d2",
+  "prompts": {},
+  "sessions": {
+    "s_1b1f3dce47e01c": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a0b3b8-09e5-75fe-ad90-bf9d48da5b83",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Matt Carey <mcarey@cloudflare.com>"
+    }
+  }
+}
