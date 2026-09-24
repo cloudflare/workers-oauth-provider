@@ -886,9 +886,12 @@ export interface OAuthHelpers {
 
   /**
    * Deletes an OAuth client, then revokes its grants and tokens across all users. The client
-   * stops working as soon as the call starts. If revocation is cut short (for example by a
-   * subrequest limit on a very large namespace), the call throws; call it again to continue,
-   * and `purgeExpiredData()` also removes the leftovers, which are orphaned grants by then.
+   * can no longer authenticate, authorize or refresh as soon as the call starts. Access tokens
+   * it already holds stay valid until revocation reaches them or they expire (`accessTokenTTL`):
+   * validating an access token reads only the token record, never the client. If revocation is
+   * cut short (for example by a subrequest limit on a very large namespace), the call throws;
+   * call it again to continue, and `purgeExpiredData()` also removes the leftovers, which are
+   * orphaned grants by then.
    * @param clientId - The ID of the client to delete
    * @returns A Promise resolving when the client and all its grants are gone.
    */
@@ -6032,7 +6035,6 @@ function grantPutOptions(grant: Grant, expiry: KVNamespacePutOptions = {}): KVNa
   return metadata ? { ...expiry, metadata } : expiry;
 }
 
-/** Whether a listed key carries metadata this version can match a grant on. */
 /** Splits `grant:{userId}:{grantId}`. Grant IDs never contain `:`, so the last one separates them. */
 function parseGrantKey(name: string): { userId: string; grantId: string } | undefined {
   const rest = name.slice('grant:'.length);
@@ -6041,6 +6043,7 @@ function parseGrantKey(name: string): { userId: string; grantId: string } | unde
   return { userId: rest.slice(0, separator), grantId: rest.slice(separator + 1) };
 }
 
+/** Whether a listed key carries metadata this version can match a grant on. */
 function isGrantKeyMetadata(value: unknown): value is GrantKeyMetadata {
   if (typeof value !== 'object' || value === null) return false;
   const { clientId, resource, redirectUri } = value as Record<string, unknown>;
