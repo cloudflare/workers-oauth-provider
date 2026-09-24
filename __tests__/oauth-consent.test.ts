@@ -145,8 +145,8 @@ describe('consent transactions', () => {
     );
   });
 
-  it('narrows the approval to a subset of the requested scopes, never beyond them', async () => {
-    const request = await parsedRequest('read write');
+  it('lets the consent page choose any scope the server supports, like cloudflare/mcp, and nothing else', async () => {
+    const request = await parsedRequest('read');
     const approve = async (scope: string[]) => {
       const consent = await oauth.beginConsent(request);
       const browser = new Browser();
@@ -154,9 +154,12 @@ describe('consent transactions', () => {
       return oauth.approveConsent(browser.request(`${ISSUER}/authorize`), consent.handle, { scope });
     };
 
-    expect((await approve(['read'])).request.scope).toEqual(['read']);
-    // The checkboxes are the user's to edit; a scope nobody requested is refused.
-    await expectLocalRejection(approve(['read', 'admin']), 'invalid_scope', /subset of those requested/);
+    // Narrower or wider than the client asked for: the page decides.
+    expect((await approve([])).request.scope).toEqual([]);
+    expect((await approve(['read', 'write', 'write'])).request.scope).toEqual(['read', 'write']);
+    // The checkboxes are the user's to edit, so a scope the server doesn't support is refused.
+    await expectLocalRejection(approve(['read', 'admin']), 'invalid_scope', /ones this server supports/);
+    await expectLocalRejection(approve(['bad scope']), 'invalid_scope', /ones this server supports/);
   });
 
   it('remembers an approval only when the call asks, for the same client, redirect URI and resource, and a subset of scopes', async () => {

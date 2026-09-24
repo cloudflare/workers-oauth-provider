@@ -20,7 +20,7 @@ return new Response(renderConsentPage({ client, request, handle: consent.handle 
 // POST /authorize: the user approved. Now, and only now, start the third-party redirect.
 const form = await req.formData();
 const approved = await oauth.approveConsent(req, String(form.get('handle')), {
-  scope: form.getAll('scope').map(String), // optional: the scopes the user ticked
+  scope: form.getAll('scope').map(String), // optional: the scopes the user ticked, from any in scopesSupported
 });
 const verifier = crypto.randomUUID() + crypto.randomUUID();
 const { state, headers } = await oauth.beginUpstream(approved.request, {
@@ -51,7 +51,7 @@ The consent page must name the client, show the scopes and the `redirect_uri` it
 - **The consent page can't be forged or framed.** `beginConsent()` binds the handle to the browser with a `__Host-` cookie (`Secure`, `HttpOnly`, `SameSite=Lax`, ten minutes) and returns `Content-Security-Policy: frame-ancestors 'none'` and `X-Frame-Options: DENY`. A post from another site has the handle but not the cookie, and is refused.
 - **`state` exists only after consent.** `beginUpstream()` creates it, stores the approved request server-side, and binds it to the browser. The callback is refused without the matching cookie, so a stolen third-party code can't be replayed in another browser.
 - **Single use, ten minutes.** Each handle and `state` works once. KV keys hold only the SHA-256 of the handle. KV can't make `get`-then-`delete` atomic, so two simultaneous requests from the _same_ browser with the same handle could both pass; the cookie binding rules out anyone else.
-- **Nothing trusted comes from the form.** The authorization request is recovered from storage, not from hidden fields, and `scope` can only narrow what was requested.
+- **Nothing trusted comes from the form.** The authorization request is recovered from storage, not from hidden fields, so the page can't be made to approve a different client or redirect URI. `scope` is the page's to choose, fewer or more than the client requested, but only from `scopesSupported`.
 
 ## Remembering consent
 
@@ -76,14 +76,17 @@ The helpers set `__Host-oauth-consent`, `__Host-oauth-upstream` and `__Host-oaut
 
 ## When the third party revokes access
 
-Store the third party's refresh token in `props` and refresh it in `tokenExchangeCallback`. When it answers `invalid_grant`, the user has revoked your app or the token is gone for good. Throw with `revokeGrant: true` so this grant is revoked too, and the MCP client re-authorizes instead of retrying:
+Store the third party's refresh token in `props` and refresh it in `tokenExchangeCallback`. When it answers `invalid_grant`, the user has revoked your app or the token is gone for good. Throw `invalid_grant` too: the library revokes this grant, with its tokens, so the MCP client re-authorizes instead of retrying a grant that can never work. For a transient failure (the provider is down, rate limited), throw `temporarily_unavailable` instead, which leaves the grant for the retry.
 
 ```ts
 tokenExchangeCallback: async ({ grantType, props }) => {
   if (grantType !== 'refresh_token') return;
   const upstream = await refreshGithubToken(props.githubRefreshToken);
   if (upstream.error === 'bad_refresh_token') {
-    throw new OAuthError('invalid_grant', { description: 'GitHub access was revoked', revokeGrant: true });
+    throw new OAuthError('invalid_grant', { description: 'GitHub access was revoked' }); // revokes this grant
+  }
+  if (!upstream.ok) {
+    throw new OAuthError('temporarily_unavailable', { description: 'GitHub is unavailable', statusCode: 503 });
   }
   return { newProps: { ...props, githubToken: upstream.accessToken, githubRefreshToken: upstream.refreshToken } };
 },

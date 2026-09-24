@@ -220,7 +220,7 @@ onError({ code, internal }) {
 
 `OAuthError(code, options)` supports token-endpoint errors from `tokenExchangeCallback`. `ExternalTokenError(code, options)` supports protected-resource errors from `resolveExternalToken`, including `requiredScopes` for an `insufficient_scope` challenge.
 
-Both classes accept a public `description`, `statusCode`, and response `headers`. Only the exported class intended for that callback boundary is converted. Other errors remain unexpected failures. An `OAuthError` may also set `options.internal` to give `onError` its own category and reason; without one it arrives as `{ category: 'token-exchange-callback', reason: 'callback_error', detail: error }`. From `tokenExchangeCallback`, `revokeGrant: true` revokes the grant the callback ran for, with its tokens, before answering; use it when an upstream grant is gone for good (see [upstream-sign-in.md](upstream-sign-in.md#when-the-third-party-revokes-access)).
+Both classes accept a public `description`, `statusCode`, and response `headers`. Only the exported class intended for that callback boundary is converted. Other errors remain unexpected failures. An `OAuthError` may also set `options.internal` to give `onError` its own category and reason; without one it arrives as `{ category: 'token-exchange-callback', reason: 'callback_error', detail: error }`. An `invalid_grant` thrown from `tokenExchangeCallback` also revokes the grant the callback ran for, with its tokens: it means the grant can never work again. Use `temporarily_unavailable` for transient upstream failures (see [upstream-sign-in.md](upstream-sign-in.md#when-the-third-party-revokes-access)).
 
 ## Token and client lifetimes
 

@@ -7,6 +7,7 @@
  *   headers on the consent page;
  * - remembered consent, chosen per call, in a signed `__Host-` cookie bound to the client, its redirect
  *   URI and resource, reused only for a subset of the approved scopes;
+ * - the approved scopes chosen on the consent page, from any the server supports;
  * - a random `state` stored server-side only after consent, bound to the browser by a `__Host-` cookie,
  *   single-use and short-lived.
  *
@@ -16,7 +17,7 @@
  * with the same handle could both pass. The cookie binding confines that to the browser that started
  * the transaction.
  */
-import { AuthorizationError } from './oauth-capabilities';
+import { AuthorizationError, isValidOAuthScopeToken } from './oauth-capabilities';
 import type { AuthRequest } from './oauth-provider';
 
 /** Remember an approval so the consent page can be skipped for requests it already covers. */
@@ -121,13 +122,14 @@ export async function beginConsent(
 }
 
 /**
- * Consume a consent transaction the user approved. `scope`, when given, must be a subset of the
- * requested scopes (it usually comes from the page's checkboxes, which the user controls).
- * `remember` stores the approval in a signed cookie for `isConsentRemembered()`.
+ * Consume a consent transaction the user approved. `scope`, when given, replaces the requested
+ * scopes: the page may narrow them or offer more, but each must be one the server supports
+ * (`supportedScopes`, from `scopesSupported`). `remember` stores the approval in a signed cookie.
  */
 export async function approveConsent(
   kv: KVNamespace,
   cookies: ConsentCookies,
+  supportedScopes: readonly string[] | undefined,
   request: Request,
   handle: string,
   options: { scope?: string[]; remember?: RememberConsentOptions } = {}
@@ -136,10 +138,14 @@ export async function approveConsent(
   const record = await consumeTransaction(kv, request, cookies.consent, handle, 'consent');
   let approved = record.request;
   if (options.scope !== undefined) {
-    const requested = new Set(approved.scope);
-    if (!Array.isArray(options.scope) || options.scope.some((scope) => !requested.has(scope))) {
+    // The checkboxes are the user's to edit, so every value is checked against what the server
+    // supports; with no scopesSupported configured, any well-formed scope is the page's call.
+    const supported = supportedScopes ? new Set(supportedScopes) : undefined;
+    const valid = (scope: unknown) =>
+      typeof scope === 'string' && isValidOAuthScopeToken(scope) && (!supported || supported.has(scope));
+    if (!Array.isArray(options.scope) || !options.scope.every(valid)) {
       throw new AuthorizationError('invalid_scope', {
-        description: 'Approved scopes must be a subset of those requested',
+        description: 'Approved scopes must be ones this server supports',
       });
     }
     approved = { ...approved, scope: [...new Set(options.scope)] };

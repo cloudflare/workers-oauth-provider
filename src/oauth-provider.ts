@@ -800,9 +800,9 @@ export interface OAuthHelpers {
 
   /**
    * Accept the consent form. `handle` is the value your form posted; the browser's binding cookie
-   * must match it, and it works once. `scope` narrows the approval to a subset of the requested
-   * scopes; `remember` stores it in a signed cookie for `isConsentRemembered()`. Send the returned
-   * `headers` on the next response.
+   * must match it, and it works once. `scope` is what the user approved: fewer or more than the
+   * client requested, each one in `scopesSupported`. `remember` stores the approval in a signed
+   * cookie for `isConsentRemembered()`. Send the returned `headers` on the next response.
    * @throws AuthorizationError when the handle is missing, unbound, expired, or already used
    */
   approveConsent(
@@ -3112,9 +3112,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * unexpected failures still surface as 500s.
    */
   /**
-   * Run `tokenExchangeCallback`. An `OAuthError` it throws with `revokeGrant: true` revokes the grant
-   * it ran for first, so a dead upstream grant stops being refreshable here too. A failed revocation
-   * is logged and the callback's error still answers the request.
+   * Run `tokenExchangeCallback`. An `invalid_grant` it throws means the grant can never work again
+   * (RFC 6749 §5.2: invalid, expired, or revoked; transient failures are `temporarily_unavailable`),
+   * so the grant it ran for is revoked, with its tokens, before the error answers. A failed
+   * revocation is logged and the callback's error still answers the request.
    */
   private async callTokenExchangeCallback(
     options: TokenExchangeCallbackOptions,
@@ -3123,11 +3124,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     try {
       return await Promise.resolve(this.options.tokenExchangeCallback!(options));
     } catch (error) {
-      if (error instanceof OAuthError && error.options.revokeGrant) {
+      if (error instanceof OAuthError && error.code === 'invalid_grant') {
         try {
           await this.createOAuthHelpers(env).revokeGrant(options.grantId, options.userId);
         } catch (revokeError) {
-          console.warn(`Failed to revoke grant ${options.grantId} after tokenExchangeCallback asked to:`, revokeError);
+          console.warn(
+            `Failed to revoke grant ${options.grantId} after tokenExchangeCallback answered invalid_grant:`,
+            revokeError
+          );
         }
       }
       throw error;
@@ -5685,13 +5689,6 @@ export interface OAuthErrorOptions {
    * `{ category: 'token-exchange-callback', reason: 'callback_error', detail: error }`.
    */
   internal?: OAuthErrorInternal;
-
-  /**
-   * Honoured only when thrown from `tokenExchangeCallback`: revoke the grant the callback ran for,
-   * with all its tokens, before answering. Use it when the upstream grant behind this one is gone
-   * for good (an upstream `invalid_grant`), so the client re-authorizes instead of retrying a dead grant.
-   */
-  revokeGrant?: boolean;
 }
 
 /**
@@ -5719,6 +5716,7 @@ export interface OAuthErrorOptions {
  * async function refreshUpstream(props) {
  *   const res = await fetch(...);
  *   if (res.status === 401) {
+ *     // invalid_grant can never recover: the provider also revokes this grant and its tokens.
  *     throw new OAuthError('invalid_grant', { description: 'upstream refresh token is invalid' });
  *   }
  *   if (res.status === 429) {
@@ -7077,7 +7075,14 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
     handle: string,
     options?: { scope?: string[]; remember?: RememberConsentOptions }
   ): Promise<ApprovedConsent> {
-    return consent.approveConsent(this.env.OAUTH_KV, this.provider.consentCookies, request, handle, options);
+    return consent.approveConsent(
+      this.env.OAUTH_KV,
+      this.provider.consentCookies,
+      this.provider.options.scopesSupported,
+      request,
+      handle,
+      options
+    );
   }
 
   beginUpstream(
