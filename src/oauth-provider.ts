@@ -4776,6 +4776,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       // Content-Length is only a claim, and a chunked body has none: stop reading at the limit.
       const text = await readTextWithLimit(request, 1048576);
       if (text === undefined) {
+        // Cancel the clone's branch too: the request stream is torn down only once both are.
+        callbackRequest.body?.cancel().catch(() => undefined);
         return this.createErrorResponse(
           'invalid_request',
           {
@@ -5994,7 +5996,7 @@ async function readTextWithLimit(request: Request, maxBytes: number): Promise<st
     total += value.byteLength;
     if (total > maxBytes) {
       // Not awaited: on a teed body (the handler keeps a clone for the registration callback),
-      // cancelling one branch settles only once the other is cancelled too.
+      // cancelling one branch settles only once the caller cancels the other too.
       reader.cancel().catch(() => undefined);
       return undefined;
     }

@@ -1516,11 +1516,15 @@ describe('OAuthProvider', () => {
       // Offer 10 MiB in 512 KiB chunks and count how many are pulled: reading must stop at the limit.
       const chunk = new TextEncoder().encode(' '.repeat(512 * 1024));
       let pulled = 0;
+      let cancelled = false;
       const body = new ReadableStream<Uint8Array>({
         pull(controller) {
           if (pulled === 20) return controller.close();
           pulled++;
           controller.enqueue(chunk);
+        },
+        cancel() {
+          cancelled = true;
         },
       });
       const request = new Request('https://example.com/oauth/register', {
@@ -1536,6 +1540,9 @@ describe('OAuthProvider', () => {
       expect(await response.json<any>()).toMatchObject({ error: 'invalid_request' });
       // Three chunks pass the limit; the clone kept for the callback reads a little ahead. All 20 before.
       expect(pulled).toBeLessThanOrEqual(6);
+      // And the request stream itself is torn down, not left open behind the 413.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(cancelled).toBe(true);
       expect((await mockEnv.OAUTH_KV.list({ prefix: 'client:' })).keys).toHaveLength(0);
     });
 
