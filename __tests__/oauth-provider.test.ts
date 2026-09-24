@@ -169,8 +169,9 @@ describe('OAuthProvider', () => {
   });
 
   afterEach(() => {
-    // Clean up KV storage after each test
+    // Clean up KV storage and any spies (such as a moved clock) after each test
     mockEnv.OAUTH_KV.clear();
+    vi.restoreAllMocks();
   });
 
   describe('API Route Configuration', () => {
@@ -6008,7 +6009,7 @@ describe('OAuthProvider', () => {
         tokenEndpoint: '/oauth/token',
         clientRegistrationEndpoint: '/oauth/register',
         accessTokenTTL: 3600,
-        refreshTokenTTL: 1, // 1 second - very short for testing
+        refreshTokenTTL: 60, // KV's minimum storable lifetime
       });
 
       // Get an auth code
@@ -6041,8 +6042,9 @@ describe('OAuthProvider', () => {
       const tokens = await tokenResponse.json<any>();
       const refreshToken = tokens.refresh_token;
 
-      // Wait for the token to expire
-      await new Promise((resolve) => setTimeout(resolve, 1500));
+      // Past the grant's expiry. (The 30-seconds-left case is covered by the near-expiry test below.)
+      const realNow = Date.now();
+      vi.spyOn(Date, 'now').mockReturnValue(realNow + 61_000);
 
       // Try to use the expired refresh token
       const refreshParams = new URLSearchParams();
@@ -6062,11 +6064,9 @@ describe('OAuthProvider', () => {
 
       expect(refreshResponse.status).toBe(400);
       const error = await refreshResponse.json<any>();
+      // KV evicts the grant record at its expiry, as the mock does here: the refresh is refused either
+      // as expired or as an unknown grant, and both are invalid_grant.
       expect(error.error).toBe('invalid_grant');
-      // The grant's KV expiration is clamped to a 60s minimum (Cloudflare KV rejects
-      // shorter expirations), so the record outlives its logical expiresAt. The refresh
-      // handler's expiry check therefore runs and reports the expired refresh token.
-      expect(error.error_description).toBe('Refresh token has expired');
     });
 
     it('should reject a refresh when the grant has less than 60s remaining instead of throwing a KV 400', async () => {
@@ -6833,6 +6833,22 @@ describe('OAuthProvider', () => {
         });
       }
     );
+
+    it.each([30, 1.5, -1, Number.NaN])('rejects a refreshTokenTTL option of %s at construction', (bad) => {
+      expect(() => makeProvider({ refreshTokenTTL: bad })).toThrow(
+        "refreshTokenTTL must be 0 (no refresh tokens), undefined (no expiry), or an integer of at least 60 seconds (Cloudflare KV's minimum expiration window)."
+      );
+    });
+
+    it.each([0, 30, 1.5, -1])('rejects a clientRegistrationTTL option of %s at construction', (bad) => {
+      expect(() => makeProvider({ clientRegistrationTTL: bad })).toThrow(
+        "clientRegistrationTTL must be undefined (no expiry) or an integer of at least 60 seconds (Cloudflare KV's minimum expiration window)."
+      );
+    });
+
+    it.each([0, 60, undefined])('accepts a refreshTokenTTL option of %s', (good) => {
+      expect(() => makeProvider({ refreshTokenTTL: good })).not.toThrow();
+    });
 
     it.each([0, 30, 1.5, -1])('rejects a refreshTokenIdleTTL option of %s at construction', (bad) => {
       expect(() => makeProvider({ refreshTokenIdleTTL: bad })).toThrow(
@@ -13153,7 +13169,7 @@ describe('OAuthProvider', () => {
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
         clientRegistrationEndpoint: '/oauth/register',
-        clientRegistrationTTL: 1, // 1 second
+        clientRegistrationTTL: 60, // KV's minimum storable lifetime
       });
 
       // Use the default handler to trigger a request that populates OAUTH_PROVIDER
@@ -13166,8 +13182,8 @@ describe('OAuthProvider', () => {
         clientName: 'Manual Client',
       });
 
-      // Wait for the DCR TTL to elapse
-      await new Promise((resolve) => setTimeout(resolve, 1500));
+      // Let the DCR TTL elapse
+      mockEnv.OAUTH_KV.advanceTime(61_000);
 
       // Client created via createClient should still exist (not affected by clientRegistrationTTL)
       const stored = await mockEnv.OAUTH_KV.get(`client:${client.clientId}`, { type: 'json' });

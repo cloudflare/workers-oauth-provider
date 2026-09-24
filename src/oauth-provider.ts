@@ -505,6 +505,7 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
    * Defaults to 30 days (2,592,000 seconds).
    * Set to 0 to disable refresh tokens entirely.
    * Set to `undefined` explicitly for refresh tokens that never expire.
+   * Anything else must be an integer of at least 60 seconds (Cloudflare KV's minimum expiration window).
    * For example: 3600 = 1 hour, 2592000 = 30 days
    */
   refreshTokenTTL?: number;
@@ -527,7 +528,8 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
    * Defaults to 90 days (7,776,000 seconds).
    * Clients created via the DCR endpoint will automatically expire after this duration.
    * Clients created via `OAuthHelpers.createClient()` are not affected by this setting.
-   * Set to `undefined` explicitly for clients that never expire.
+   * Set to `undefined` explicitly for clients that never expire; otherwise an integer of at
+   * least 60 seconds (Cloudflare KV's minimum expiration window).
    */
   clientRegistrationTTL?: number;
 
@@ -1969,6 +1971,20 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     if (this.options.refreshTokenIdleTTL !== undefined && !isValidAccessTokenTTL(this.options.refreshTokenIdleTTL)) {
       throw new TypeError(
         `refreshTokenIdleTTL must be an integer of at least ${KV_MIN_EXPIRATION_TTL_SECONDS} seconds (Cloudflare KV's minimum expiration window).`
+      );
+    }
+    // The same KV floor applies to the grant a code exchange writes and to a DCR client record.
+    if (this.options.refreshTokenTTL !== undefined && !isValidRefreshTokenTTL(this.options.refreshTokenTTL)) {
+      throw new TypeError(
+        `refreshTokenTTL must be 0 (no refresh tokens), undefined (no expiry), or an integer of at least ${KV_MIN_EXPIRATION_TTL_SECONDS} seconds (Cloudflare KV's minimum expiration window).`
+      );
+    }
+    if (
+      this.options.clientRegistrationTTL !== undefined &&
+      !isValidAccessTokenTTL(this.options.clientRegistrationTTL)
+    ) {
+      throw new TypeError(
+        `clientRegistrationTTL must be undefined (no expiry) or an integer of at least ${KV_MIN_EXPIRATION_TTL_SECONDS} seconds (Cloudflare KV's minimum expiration window).`
       );
     }
 
@@ -4894,7 +4910,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     if (clientSecret) {
       response.client_secret = clientSecret; // Return the original unhashed secret
       response.client_secret_expires_at =
-        this.options.clientRegistrationTTL && clientInfo.registrationDate
+        this.options.clientRegistrationTTL !== undefined && clientInfo.registrationDate
           ? clientInfo.registrationDate + this.options.clientRegistrationTTL
           : 0;
       response.client_secret_issued_at = clientInfo.registrationDate;
