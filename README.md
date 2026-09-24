@@ -148,7 +148,7 @@ export default new OAuthProvider<Env>({
 
 `apiRoute` and `apiHandler` protect one or more route prefixes with a single handler. Use `apiHandlers` when different prefixes need different handlers.
 
-Before calling a protected handler, the provider reads the bearer token, rejects missing, invalid, or expired credentials, checks its audience, and exposes the authenticated application data through `ctx.props`. The handler does not need to parse or validate the token, but it must still enforce application permissions such as scope, ownership, and tenancy.
+Before calling a protected handler, the provider reads the bearer token, rejects missing, invalid, or expired credentials, checks its audience, and exposes the authenticated application data through `ctx.props` and what it verified about the token through `ctx.auth` (`scope`, `userId`, `clientId`, `audience`, `expiresAt`). The handler does not need to parse or validate the token, but it still enforces application permissions such as scope, ownership, and tenancy; `insufficientScope(ctx.auth, scopes)` builds the MCP `403` challenge when a token lacks what an operation needs.
 
 Requests outside the protected route prefixes go to `defaultHandler`. In the example above, that handler owns `/authorize`.
 
@@ -212,7 +212,7 @@ For an MCP endpoint at `https://mcp.example.com/mcp`:
 2. The provider returns `401 Unauthorized` with a challenge similar to:
 
    ```http
-   WWW-Authenticate: Bearer realm="OAuth", resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource/mcp"
+   WWW-Authenticate: Bearer realm="OAuth", resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource/mcp", scope="mcp:read"
    ```
 
 3. The client fetches the protected resource metadata:
@@ -443,7 +443,7 @@ The 1.0 API removes `resourceMatchOriginOnly`, and a configuration that still se
 
 The application decides which requested scopes to grant through `completeAuthorization({ scope })`. Token and refresh requests can only narrow those scopes.
 
-The provider does not expose a standard effective-token authorization context to API handlers or enforce operation-level scope policy. Protected resource metadata supplies baseline scope guidance in Bearer challenges. Advanced integrations can provide operation-specific step-up guidance through external-token validation.
+Both hosts name `scopes_supported` in the initial `401` challenge, so a client asks for the right scopes first time. Operation-level policy stays in the handler, which reads the token's scopes from `ctx.auth.scope` and answers a shortfall with `insufficientScope(ctx.auth, ['files:write'])`: `403`, `error="insufficient_scope"`, every scope the operation needs in one challenge, and the resource's metadata URL. See [docs/resource-servers.md](docs/resource-servers.md#what-the-handler-sees).
 
 ## Advanced features
 

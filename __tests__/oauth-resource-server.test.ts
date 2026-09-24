@@ -2,6 +2,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { WorkerEntrypoint } from 'cloudflare:workers';
 import {
   OAuthResourceServer,
+  insufficientScope,
+  type OAuthResourceAuth,
+  type OAuthResourceContext,
   type OAuthResourceServerOptions,
   type OAuthResourceTokenValidation,
 } from '../src/oauth-resource-server';
@@ -118,14 +121,23 @@ describe('OAuthResourceServer', () => {
     }
   });
 
-  it('challenges an unauthenticated request to the canonical resource with its metadata URL', async () => {
+  it('challenges an unauthenticated request with its metadata URL and the scopes to request', async () => {
     const server = createTestServer();
     const response = await server.fetch(new Request(RESOURCE), env, new MockExecutionContext());
 
     expect(response.status).toBe(401);
-    expect(response.headers.get('WWW-Authenticate')).toBe(`Bearer realm="OAuth", resource_metadata="${METADATA_URL}"`);
+    // MCP 2026-07-28: the initial challenge SHOULD carry `scope`, so a client asks for the right scopes first time.
+    expect(response.headers.get('WWW-Authenticate')).toBe(
+      `Bearer realm="OAuth", resource_metadata="${METADATA_URL}", scope="mcp:read"`
+    );
     expect(response.headers.get('Cache-Control')).toBe('no-store');
     expect(response.headers.get('Pragma')).toBe('no-cache');
+
+    const unscoped = createTestServer({
+      resourceMetadata: { resource: RESOURCE, authorization_servers: ['https://auth.example.com'] },
+    });
+    const bare = await unscoped.fetch(new Request(RESOURCE), env, new MockExecutionContext());
+    expect(bare.headers.get('WWW-Authenticate')).toBe(`Bearer realm="OAuth", resource_metadata="${METADATA_URL}"`);
   });
 
   it('advertises the canonical metadata from a descendant challenge', async () => {
@@ -135,7 +147,9 @@ describe('OAuthResourceServer', () => {
     // RFC 9728 §5.1: the canonical path is the base audience for its descendants, so a
     // 401 at /mcp/tools still points the client at the one canonical document.
     expect(response.status).toBe(401);
-    expect(response.headers.get('WWW-Authenticate')).toBe(`Bearer realm="OAuth", resource_metadata="${METADATA_URL}"`);
+    expect(response.headers.get('WWW-Authenticate')).toBe(
+      `Bearer realm="OAuth", resource_metadata="${METADATA_URL}", scope="mcp:read"`
+    );
   });
 
   it('hosts a WorkerEntrypoint class as the handler, like the combined provider does', async () => {
@@ -248,6 +262,136 @@ describe('OAuthResourceServer', () => {
     });
     expect(ctx.props).toEqual({ userId: 'validated-user', scopes: ['mcp:read'] });
     expect(validateToken).toHaveBeenCalledWith(RESOURCE, 'opaque-access-token');
+  });
+
+  it('exposes what it verified as ctx.auth beside ctx.props, to both handler shapes', async () => {
+    const expiresAt = Math.floor(Date.now() / 1000) + 60;
+    const validation: OAuthResourceTokenValidation<TestProps> = {
+      props: { userId: 'validated-user', scopes: ['mcp:read'] },
+      audience: 'https://MCP.example.com/mcp', // accepted alias; ctx.auth still names the canonical resource
+      expiresAt,
+      scope: ['mcp:read', 'offline_access'],
+      userId: 'validated-user',
+      clientId: 'client-1',
+    };
+    const expectedAuth: OAuthResourceAuth = {
+      token: 'opaque-access-token',
+      audience: RESOURCE,
+      expiresAt,
+      scope: ['mcp:read', 'offline_access'],
+      userId: 'validated-user',
+      clientId: 'client-1',
+    };
+    const request = () =>
+      new Request(`${RESOURCE}/tools`, { headers: { Authorization: 'Bearer opaque-access-token' } });
+
+    const objectHost = createTestServer({
+      validateToken: () => async () => validation,
+      handler: { fetch: (_request, _env, ctx) => Response.json(ctx.auth) },
+    });
+    await expect(objectHost.fetch(request(), env, new MockExecutionContext()).then((r) => r.json())).resolves.toEqual(
+      expectedAuth
+    );
+
+    class EntrypointHandler extends WorkerEntrypoint<TestEnv, TestProps> {
+      declare ctx: OAuthResourceContext<TestProps>;
+      fetch() {
+        return Response.json({ props: this.ctx.props, auth: this.ctx.auth });
+      }
+    }
+    const classHost = createTestServer({ validateToken: () => async () => validation, handler: EntrypointHandler });
+    await expect(classHost.fetch(request(), env, new MockExecutionContext()).then((r) => r.json())).resolves.toEqual({
+      props: validation.props,
+      auth: expectedAuth,
+    });
+
+    // A validator that reports only the required fields leaves the optional ones out and scope empty.
+    const minimalHost = createTestServer({
+      validateToken: () => async () => ({ props: { userId: 'u', scopes: [] }, audience: RESOURCE }),
+      handler: { fetch: (_request, _env, ctx) => Response.json(ctx.auth) },
+    });
+    await expect(minimalHost.fetch(request(), env, new MockExecutionContext()).then((r) => r.json())).resolves.toEqual({
+      token: 'opaque-access-token',
+      audience: RESOURCE,
+      scope: [],
+    });
+  });
+
+  it('answers a valid token that lacks a scope with the MCP insufficient_scope challenge', async () => {
+    const server = createTestServer({
+      handler: {
+        fetch(request, _env, ctx) {
+          if (request.method === 'DELETE' && !ctx.auth.scope.includes('mcp:write')) {
+            return insufficientScope(ctx.auth, ['mcp:write', 'mcp:admin', 'mcp:write'], 'Deleting needs "write"');
+          }
+          return new Response('deleted');
+        },
+      },
+    });
+    const request = (method: string) =>
+      new Request(`${RESOURCE}/tools/1`, {
+        method,
+        headers: { Authorization: 'Bearer opaque-access-token', Origin: 'https://client.example.com' },
+      });
+
+    const forbidden = await server.fetch(request('DELETE'), env, new MockExecutionContext());
+    expect(forbidden.status).toBe(403);
+    // RFC 6750 §3.1 / MCP scope challenge handling: every needed scope in one challenge, quotes stripped,
+    // and the same metadata URL the 401 advertised, derived from the canonical resource.
+    expect(forbidden.headers.get('WWW-Authenticate')).toBe(
+      `Bearer realm="OAuth", error="insufficient_scope", scope="mcp:write mcp:admin", resource_metadata="${METADATA_URL}", error_description="Deleting needs write"`
+    );
+    expect(forbidden.headers.get('Cache-Control')).toBe('no-store');
+    expect(forbidden.headers.get('Access-Control-Expose-Headers')).toContain('WWW-Authenticate');
+    await expect(forbidden.json()).resolves.toEqual({
+      error: 'insufficient_scope',
+      error_description: 'Deleting needs "write"',
+    });
+
+    // The handler owns the policy; a request the scopes do cover goes through untouched.
+    await expect(server.fetch(request('GET'), env, new MockExecutionContext()).then((r) => r.text())).resolves.toBe(
+      'deleted'
+    );
+
+    // Misuse fails loudly at the call site, not as a malformed challenge on the wire.
+    const auth: OAuthResourceAuth = { token: 't', audience: RESOURCE, scope: [] };
+    expect(() => insufficientScope(auth, [])).toThrow(TypeError);
+    expect(() => insufficientScope(auth, ['mcp:read', 'not a scope'])).toThrow(TypeError);
+
+    // A description a header cannot carry (newlines, non-ASCII) is flattened in the challenge and
+    // kept verbatim in the body, rather than making the Response constructor throw.
+    const awkward = insufficientScope(auth, ['mcp:write'], 'Write access required\nContact 管理员 "now"');
+    expect(awkward.headers.get('WWW-Authenticate')).toContain('error_description="Write access required Contact now"');
+    await expect(awkward.json()).resolves.toEqual({
+      error: 'insufficient_scope',
+      error_description: 'Write access required\nContact 管理员 "now"',
+    });
+    expect(insufficientScope(auth, ['mcp:write'], '\n').headers.get('WWW-Authenticate')).not.toContain(
+      'error_description'
+    );
+  });
+
+  it.each([
+    ['a scope string instead of a list', { scope: 'mcp:read' }],
+    ['a scope list holding a malformed token', { scope: ['mcp:read', 'bad scope'] }],
+    ['a non-string userId', { userId: 42 }],
+    ['a non-string clientId', { clientId: { id: 'client' } }],
+  ])('fails closed when the validator reports %s', async (_label, extra) => {
+    const server = createTestServer({
+      validateToken: () => async () =>
+        ({
+          props: { userId: 'u', scopes: [] },
+          audience: RESOURCE,
+          ...extra,
+        }) as OAuthResourceTokenValidation<TestProps>,
+    });
+    const response = await server.fetch(
+      new Request(RESOURCE, { headers: { Authorization: 'Bearer token' } }),
+      env,
+      new MockExecutionContext()
+    );
+    expect(response.status).toBe(401);
+    expect(response.headers.get('WWW-Authenticate')).toContain('error="invalid_token"');
   });
 
   it('preserves handler CORS exposure and varies reflected origins', async () => {

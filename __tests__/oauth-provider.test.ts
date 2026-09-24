@@ -13,6 +13,9 @@ import {
   type Grant,
   type Token,
   OAuthResourceServer,
+  insufficientScope,
+  type OAuthResourceAuth,
+  type OAuthResourceContext,
   type OAuthResourceMetadata,
 } from '../src/oauth-provider';
 import type { ExecutionContext } from '@cloudflare/workers-types';
@@ -7009,6 +7012,65 @@ describe('OAuthProvider', () => {
       expect(data.success).toBe(true);
       expect(data.user).toEqual({ userId: 'test-user-123', username: 'TestUser' });
     });
+
+    it('sets ctx.auth from its own token record and lets the handler answer insufficient_scope', async () => {
+      // The provider is stateless (options + env), so a second instance over the same KV and options
+      // validates the token the suite's instance issued; only the handler differs.
+      const seen: OAuthResourceAuth[] = [];
+      const provider = new OAuthProvider<TestEnv>({
+        apiRoute: ['/api/'],
+        apiHandler: {
+          fetch(request: Request, _env: TestEnv, ctx: ExecutionContext) {
+            // OAuthProvider types its handlers with the platform context; the field is there at runtime.
+            const { auth } = ctx as OAuthResourceContext<unknown>;
+            seen.push(auth);
+            if (request.method === 'DELETE' && !auth.scope.includes('admin')) {
+              return insufficientScope(auth, ['admin']);
+            }
+            return new Response('ok');
+          },
+        },
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        scopesSupported: ['read', 'write', 'profile'],
+        accessTokenTTL: 3600,
+      });
+      const [, grantId] = accessToken.split(':');
+      const headers = { Authorization: `Bearer ${accessToken}` };
+
+      const ok = await provider.fetch(
+        createMockRequest('https://example.com/api/test', 'GET', headers),
+        mockEnv,
+        mockCtx
+      );
+      expect(ok.status).toBe(200);
+      expect(seen[0]).toEqual({
+        token: accessToken,
+        audience: 'https://example.com',
+        expiresAt: expect.any(Number),
+        scope: ['read', 'write'],
+        userId: 'test-user-123',
+        clientId: expect.any(String),
+      });
+      expect(mockEnv.OAUTH_KV.get(`grant:test-user-123:${grantId}`)).resolves.toBeTruthy();
+
+      // The same metadata URL the provider's own 401 advertises, so clients re-authorize against one document.
+      const challenge = await provider.fetch(createMockRequest('https://example.com/api/test'), mockEnv, mockCtx);
+      const forbidden = await provider.fetch(
+        createMockRequest('https://example.com/api/test', 'DELETE', headers),
+        mockEnv,
+        mockCtx
+      );
+      expect(forbidden.status).toBe(403);
+      expect(forbidden.headers.get('WWW-Authenticate')).toBe(
+        'Bearer realm="OAuth", error="insufficient_scope", scope="admin", resource_metadata="https://example.com/.well-known/oauth-protected-resource"'
+      );
+      expect(challenge.headers.get('WWW-Authenticate')).toContain(
+        'resource_metadata="https://example.com/.well-known/oauth-protected-resource"'
+      );
+    });
   });
 
   describe('Canonical audience validation (RFC 7519 Section 4.1.3)', () => {
@@ -7043,6 +7105,32 @@ describe('OAuthProvider', () => {
       expect((await provider.fetch(externalRequest('https://example.com/api/parent/'), mockEnv, mockCtx)).status).toBe(
         200
       );
+    });
+
+    it('gives handlers ctx.auth for an external token with what the resolver vouched for: the audience', async () => {
+      let auth: OAuthResourceAuth | undefined;
+      const provider = new OAuthProvider<TestEnv>({
+        apiRoute: ['/api/parent'],
+        apiHandler: {
+          fetch(_request: Request, _env: TestEnv, ctx: ExecutionContext) {
+            auth = (ctx as OAuthResourceContext<unknown>).auth;
+            return new Response('ok');
+          },
+        },
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        resourceMetadata: { resource: 'https://example.com/api/parent' },
+        resolveExternalToken: async ({ token }) =>
+          token === 'external-token'
+            ? { props: { userId: 'external-user' }, audience: 'https://example.com/api/parent' }
+            : null,
+      });
+
+      expect((await provider.fetch(externalRequest('https://example.com/api/parent'), mockEnv, mockCtx)).status).toBe(
+        200
+      );
+      expect(auth).toEqual({ token: 'external-token', audience: 'https://example.com/api/parent', scope: [] });
     });
 
     it('treats a trailing-slash canonical path as the descendant boundary', async () => {

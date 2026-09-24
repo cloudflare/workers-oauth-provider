@@ -7,7 +7,9 @@ import {
   OAuthProvider,
   OAuthResourceServer,
   getOAuthApi,
+  insufficientScope,
   type OAuthHelpers,
+  type OAuthResourceAuth,
   type OAuthProviderOptions,
 } from '../../src/oauth-provider';
 import {
@@ -34,7 +36,7 @@ export interface ConformanceWorkerEnv {
 /** What the resource-server probe returns to the test. */
 export interface ResourceServerProbe {
   status: number;
-  body: { subject?: string } | null;
+  body: { subject?: string; auth?: OAuthResourceAuth } | null;
   challenge: string | null;
 }
 
@@ -148,23 +150,32 @@ export default class McpOAuthConformanceWorker extends WorkerEntrypoint<Conforma
 
   /**
    * Run a resource server whose validator is `env.AUTH_SERVER.validateToken`, the detached RPC
-   * stub the documentation hands to `OAuthResourceServer`, and report what it answered.
+   * stub the documentation hands to `OAuthResourceServer`, and report what it answered. The
+   * handler echoes `ctx.props` and `ctx.auth`, and refuses a write the token's scopes do not
+   * cover with the MCP `insufficient_scope` challenge.
    */
-  async probeResourceServerOverBinding(token: string | undefined): Promise<ResourceServerProbe> {
-    const { origin, resource } = requireConfiguration();
+  async probeResourceServerOverBinding(token: string | undefined, method = 'GET'): Promise<ResourceServerProbe> {
+    const { origin, resource, resourceScopes } = requireConfiguration();
     const resourceServer = new OAuthResourceServer<ConformanceWorkerEnv, { subject: string }>({
-      resourceMetadata: { resource, authorization_servers: [origin] },
+      resourceMetadata: { resource, authorization_servers: [origin], scopes_supported: resourceScopes },
       validateToken: (env) => env.AUTH_SERVER.validateToken,
-      handler: { fetch: (_request, _env, ctx) => Response.json(ctx.props) },
+      handler: {
+        fetch: (request, _env, ctx) => {
+          if (request.method === 'DELETE' && !ctx.auth.scope.includes(WRITE_SCOPE)) {
+            return insufficientScope(ctx.auth, [WRITE_SCOPE]);
+          }
+          return Response.json({ ...ctx.props, auth: ctx.auth });
+        },
+      },
     });
     const response = await resourceServer.fetch(
-      new Request(resource, { headers: token === undefined ? {} : { Authorization: `Bearer ${token}` } }),
+      new Request(resource, { method, headers: token === undefined ? {} : { Authorization: `Bearer ${token}` } }),
       this.env,
       this.ctx
     );
     return {
       status: response.status,
-      body: response.status === 200 ? await response.json<{ subject?: string }>() : null,
+      body: response.status === 200 ? await response.json<{ subject?: string; auth?: OAuthResourceAuth }>() : null,
       challenge: response.headers.get('WWW-Authenticate'),
     };
   }

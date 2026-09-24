@@ -4,13 +4,33 @@ An `OAuthAuthorizationServer` issues tokens; a resource server accepts them. Eve
 
 ```ts
 new OAuthResourceServer<Env, Props>({
-  resourceMetadata: { resource, authorization_servers: [issuer] },
-  validateToken: (env, request) => (resource, token) => Promise<{ props; audience; expiresAt? } | null>,
-  handler: { fetch(request, env, ctx) {} }, // ctx.props: Props
+  resourceMetadata: { resource, authorization_servers: [issuer], scopes_supported: ['calendar:read'] },
+  validateToken: (env, request) => (resource, token) =>
+    Promise<{ props; audience; expiresAt?; scope?; userId?; clientId? } | null>,
+  handler: { fetch(request, env, ctx) {} }, // ctx.props: Props, ctx.auth: OAuthResourceAuth
 });
 ```
 
-The host publishes RFC 9728 metadata at `/.well-known/oauth-protected-resource<path>`, answers unauthenticated requests with a Bearer challenge that names it, calls your validator with its own canonical resource and the presented token, refuses a result whose `audience` is not that resource, and answers `503` when the validator throws. Only `validateToken` changes between the topologies below.
+The host publishes RFC 9728 metadata at `/.well-known/oauth-protected-resource<path>`, answers unauthenticated requests with a Bearer challenge that names it and the `scopes_supported` to ask for, calls your validator with its own canonical resource and the presented token, refuses a result whose `audience` is not that resource, and answers `503` when the validator throws. Only `validateToken` changes between the topologies below.
+
+## What the handler sees
+
+`ctx.props` is the application data the validator returned. `ctx.auth` is what was verified about the token: `{ token, audience, expiresAt?, scope, userId?, clientId? }`. `OAuthAuthorizationServer.validateToken()` fills all of it; a validator of your own reports what it knows and `scope` defaults to `[]`.
+
+Scope policy is the handler's. When a valid token lacks what an operation needs, answer with `insufficientScope`, which builds the MCP scope challenge — `403`, `error="insufficient_scope"`, every scope the operation requires, and the same `resource_metadata` URL the `401` advertised — so the client can step up in one round trip:
+
+```ts
+handler: {
+  fetch(request, env, ctx) {
+    if (request.method === 'DELETE' && !ctx.auth.scope.includes('calendar:write')) {
+      return insufficientScope(ctx.auth, ['calendar:write']);
+    }
+    // …
+  },
+},
+```
+
+A `WorkerEntrypoint` handler reads the same fields from `this.ctx`; declare it as `OAuthResourceContext<Props>` to type them. `OAuthProvider` sets `ctx.auth` for its `apiHandler` too, from its own token record, so a handler moves between the two hosts unchanged.
 
 ## Same Worker
 
@@ -117,7 +137,7 @@ export default new OAuthResourceServer<Env, AuthProps>({
 });
 ```
 
-The host calls the method it is handed with its resource and the token, so neither is repeated. The binding is not a URL: the validator is never exposed to the public internet, and the resource Worker cannot ask about another resource's tokens by accident because the host always passes its own. One RPC per request, on Cloudflare's network. `ctx.props` is the same `AuthProps` the authorization flow stored, decrypted by the authorization server, and revocation is immediate.
+The host calls the method it is handed with its resource and the token, so neither is repeated. The binding is not a URL: the validator is never exposed to the public internet, and the resource Worker cannot ask about another resource's tokens by accident because the host always passes its own. One RPC per request, on Cloudflare's network. `ctx.props` is the same `AuthProps` the authorization flow stored, decrypted by the authorization server; `ctx.auth` carries the token's scopes, subject and client back with it; and revocation is immediate.
 
 ## Another issuer, at your own risk
 
@@ -130,4 +150,4 @@ validateToken: (env) => async (resource, token) => {
 },
 ```
 
-The host still enforces the audience and expiry it is given. Everything else about that issuer's tokens is between you and it. MCP's security guidance is blunt on the point that a resource server must accept only tokens issued for it; keep `audience` honest.
+The host still enforces the audience and expiry it is given, and it fails closed on a malformed `scope`, `userId` or `clientId`. Everything else about that issuer's tokens is between you and it. MCP's security guidance is blunt on the point that a resource server must accept only tokens issued for it; keep `audience` honest.

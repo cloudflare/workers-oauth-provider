@@ -56,6 +56,7 @@ import {
 export { AuthorizationError } from './oauth-capabilities';
 export type { AuthorizationErrorCode, AuthorizationErrorOptions } from './oauth-capabilities';
 export * from './oauth-resource-server';
+import type { OAuthResourceAuth } from './oauth-resource-server';
 
 export type {
   EmaClaimsMapper,
@@ -116,7 +117,7 @@ export enum GrantType {
 }
 
 /** ExecutionContext with writable props — ctx.props is read-only in types but writable at runtime */
-type MutableExecutionContext = Omit<ExecutionContext, 'props'> & { props: any };
+type MutableExecutionContext = Omit<ExecutionContext, 'props'> & { props: any; auth: OAuthResourceAuth };
 
 /**
  * Aliases for either type of Handler that makes .fetch required
@@ -4652,8 +4653,16 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       // Decrypt the props
       const decryptedProps = await decryptProps(encryptionKey, tokenData.grant.encryptedProps);
 
-      // Set the decrypted props on the context object
+      // Set the decrypted props and the verified token facts on the context object
       (ctx as MutableExecutionContext).props = decryptedProps;
+      (ctx as MutableExecutionContext).auth = {
+        token: accessToken,
+        audience: configuredResource,
+        expiresAt: tokenData.expiresAt,
+        scope: [...(tokenData.scope || tokenData.grant.scope)],
+        userId: tokenData.userId,
+        clientId: tokenData.grant.clientId,
+      };
     } else if (externalTokenResolver) {
       // No token data was found, so we validate the provided token with the provided validator.
       // Convert only the package's exported ExternalTokenError into a structured response;
@@ -4709,8 +4718,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         }
       }
 
-      // Set the external props on the context object
+      // Set the external props on the context object. The resolver vouches only for the
+      // audience, so the verified facts stop there.
       (ctx as MutableExecutionContext).props = ext.props;
+      (ctx as MutableExecutionContext).auth = { token: accessToken, audience: configuredResource, scope: [] };
     }
 
     // Inject OAuth helpers into env if not already present

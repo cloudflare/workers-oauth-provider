@@ -25,18 +25,45 @@ export interface OAuthResourceMetadata {
 
 /** Successful result returned by the application's token validator. */
 export interface OAuthResourceTokenValidation<Props> {
-  /**
-   * Application authorization context exposed to the protected handler as
-   * `ctx.props`. Include every identity, scope, tenant, or policy value the
-   * handler needs; the resource-server wrapper does not infer authorization
-   * fields from the token beyond audience and expiry.
-   */
+  /** Application data exposed to the protected handler as `ctx.props`. */
   props: Props;
   /** Canonical audience to which the token is bound. */
   audience: string;
   /** Optional absolute expiry as seconds since the Unix epoch. */
   expiresAt?: number;
+  /**
+   * Scopes the token carries. `OAuthAuthorizationServer.validateToken()` always reports them;
+   * a handler needs them to answer with {@link insufficientScope}.
+   */
+  scope?: string[];
+  /** Subject the token was issued for. */
+  userId?: string;
+  /** Client the token was issued to. */
+  clientId?: string;
 }
+
+/**
+ * What the host verified about the bearer token before calling the handler, exposed as
+ * `ctx.auth` beside the application's `ctx.props`. Both hosts set it: `OAuthResourceServer`
+ * from the validator's result, `OAuthProvider` from its own token record.
+ */
+export interface OAuthResourceAuth {
+  /** The token as presented. It is already in the request's `Authorization` header; never log it. */
+  token: string;
+  /** Canonical resource the token was accepted for. */
+  audience: string;
+  /** Absolute expiry as seconds since the Unix epoch, when known. */
+  expiresAt?: number;
+  /** Scopes the token carries; empty when the validator reported none. */
+  scope: string[];
+  /** Subject the token was issued for, when known. */
+  userId?: string;
+  /** Client the token was issued to, when known. */
+  clientId?: string;
+}
+
+/** The execution context a protected handler receives: `props` from the validator, `auth` from the host. */
+export type OAuthResourceContext<Props> = ExecutionContext<Props> & { readonly auth: OAuthResourceAuth };
 
 /**
  * Validates a bearer token presented to one resource. `null` for a token that is not
@@ -50,11 +77,11 @@ export type OAuthResourceTokenValidator<Props> = (
 /**
  * Protected application handler called after successful token validation: an object with
  * `fetch`, or a `WorkerEntrypoint` subclass instantiated per request with `(ctx, env)`. Either
- * way `ctx.props` carries what the validator returned.
+ * way `ctx.props` carries what the validator returned and `ctx.auth` what the host verified.
  */
 export type OAuthResourceHandler<Env, Props> =
-  | { fetch(request: Request, env: Env, ctx: ExecutionContext<Props>): Response | Promise<Response> }
-  | (new (ctx: ExecutionContext<Props>, env: Env) => { fetch(request: Request): Response | Promise<Response> });
+  | { fetch(request: Request, env: Env, ctx: OAuthResourceContext<Props>): Response | Promise<Response> }
+  | (new (ctx: OAuthResourceContext<Props>, env: Env) => { fetch(request: Request): Response | Promise<Response> });
 
 /** Configuration for {@link OAuthResourceServer}. */
 export interface OAuthResourceServerOptions<Env = Cloudflare.Env, Props = unknown> {
@@ -76,7 +103,47 @@ export interface OAuthResourceServerOptions<Env = Cloudflare.Env, Props = unknow
   validateToken(env: Env, request: Request): OAuthResourceTokenValidator<Props>;
 }
 
-type MutableExecutionContext<Props> = Omit<ExecutionContext<Props>, 'props'> & { props: Props };
+type MutableExecutionContext<Props> = Omit<ExecutionContext<Props>, 'props'> & {
+  props: Props;
+  auth: OAuthResourceAuth;
+};
+
+/**
+ * The response for a valid token that lacks the scopes an operation needs (RFC 6750 §3.1,
+ * MCP scope challenge handling): `403` with `WWW-Authenticate: Bearer error="insufficient_scope"`,
+ * the `scope` the operation requires and the `resource_metadata` URL the client already knows.
+ * Name every scope the operation needs in one response; clients treat the list as complete.
+ *
+ * ```ts
+ * if (!ctx.auth.scope.includes('calendar:write')) return insufficientScope(ctx.auth, ['calendar:write']);
+ * ```
+ */
+export function insufficientScope(auth: OAuthResourceAuth, scope: string[], description?: string): Response {
+  if (!Array.isArray(scope) || scope.length === 0 || scope.some((value) => !isValidScopeToken(value))) {
+    throw new TypeError('insufficientScope requires at least one valid OAuth scope token');
+  }
+  let challenge = `Bearer realm="OAuth", error="insufficient_scope", scope="${[...new Set(scope)].join(' ')}"`;
+  challenge += `, resource_metadata="${getResourceMetadataUrl(auth.audience)}"`;
+  if (description !== undefined) {
+    // The header copy must be a valid quoted-string (RFC 7230 §3.2.6) and a valid header value:
+    // visible ASCII and spaces only, without quotes or backslashes. The JSON body keeps the original.
+    const quotable = description
+      .replace(/["\\]/g, '')
+      .replace(/[^\x21-\x7e]+/g, ' ')
+      .trim();
+    if (quotable) challenge += `, error_description="${quotable}"`;
+  }
+  return new Response(
+    JSON.stringify({
+      error: 'insufficient_scope',
+      ...(description !== undefined ? { error_description: description } : {}),
+    }),
+    {
+      status: 403,
+      headers: { ...NO_CACHE_HEADERS, 'Content-Type': 'application/json', 'WWW-Authenticate': challenge },
+    }
+  );
+}
 
 /**
  * One OAuth protected resource, in the authorization server's Worker or its own. Publishes
@@ -165,11 +232,20 @@ export class OAuthResourceServer<Env = Cloudflare.Env, Props = unknown> {
       return addCorsHeaders(createBearerChallenge(url, validated, true), request);
     }
 
-    (ctx as MutableExecutionContext<Props>).props = validation.props;
+    const context = ctx as MutableExecutionContext<Props>;
+    context.props = validation.props;
+    context.auth = {
+      token,
+      audience: validated.resource,
+      ...(validation.expiresAt !== undefined ? { expiresAt: validation.expiresAt } : {}),
+      scope: [...(validation.scope ?? [])],
+      ...(validation.userId !== undefined ? { userId: validation.userId } : {}),
+      ...(validation.clientId !== undefined ? { clientId: validation.clientId } : {}),
+    };
     const handler = options.handler;
     const response = isEntrypointClass(handler)
-      ? await new handler(ctx as ExecutionContext<Props>, env).fetch(request)
-      : await handler.fetch(request, env, ctx as ExecutionContext<Props>);
+      ? await new handler(context, env).fetch(request)
+      : await handler.fetch(request, env, context);
     return addCorsHeaders(response, request);
   }
 }
@@ -295,7 +371,7 @@ function getResourceMetadataUrl(resource: string): string {
 function isEntrypointClass<Env, Props>(
   handler: OAuthResourceHandler<Env, Props>
 ): handler is new (
-  ctx: ExecutionContext<Props>,
+  ctx: OAuthResourceContext<Props>,
   env: Env
 ) => { fetch(request: Request): Response | Promise<Response> } {
   return typeof handler === 'function' && handler.prototype instanceof WorkerEntrypoint;
@@ -346,6 +422,12 @@ function isValidTokenValidation<Props>(
     if (typeof validation.expiresAt !== 'number' || !Number.isFinite(validation.expiresAt)) return false;
     if (validation.expiresAt <= Date.now() / 1000) return false;
   }
+  if (validation.scope !== undefined) {
+    if (!Array.isArray(validation.scope)) return false;
+    if (validation.scope.some((scope) => typeof scope !== 'string' || !isValidScopeToken(scope))) return false;
+  }
+  if (validation.userId !== undefined && typeof validation.userId !== 'string') return false;
+  if (validation.clientId !== undefined && typeof validation.clientId !== 'string') return false;
 
   return true;
 }
@@ -363,6 +445,11 @@ function createBearerChallenge(
   }
   if (invalidToken) {
     challenge += ', error="invalid_token"';
+  }
+  // MCP: the initial challenge names the scopes to request, so a client can ask for them up front.
+  const scopes = validated.metadata.scopes_supported;
+  if (scopes && scopes.length > 0) {
+    challenge += `, scope="${scopes.join(' ')}"`;
   }
 
   return new Response(null, {
