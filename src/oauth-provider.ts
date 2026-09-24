@@ -56,6 +56,23 @@ import {
 export { AuthorizationError } from './oauth-capabilities';
 export type { AuthorizationErrorCode, AuthorizationErrorOptions } from './oauth-capabilities';
 export * from './oauth-resource-server';
+export type {
+  ApprovedConsent,
+  ConsentTransaction,
+  DeniedConsent,
+  RememberConsentOptions,
+  ResumedUpstream,
+  UpstreamTransaction,
+} from './oauth-consent';
+import * as consent from './oauth-consent';
+import type {
+  ApprovedConsent,
+  ConsentTransaction,
+  DeniedConsent,
+  RememberConsentOptions,
+  ResumedUpstream,
+  UpstreamTransaction,
+} from './oauth-consent';
 import type { OAuthResourceAuth } from './oauth-resource-server';
 
 export type {
@@ -622,6 +639,13 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
   clientIdMetadataDocumentEnabled?: boolean;
 
   /**
+   * Prefix for the cookies the consent and upstream helpers set (`<prefix>consent`,
+   * `<prefix>upstream`, `<prefix>approvals`). Must start with `__Host-`, which keeps them
+   * `Secure`, host-only and `Path=/`. Defaults to `__Host-oauth-`.
+   */
+  cookiePrefix?: string;
+
+  /**
    * Metadata for RFC 9728 OAuth 2.0 Protected Resource Metadata.
    * Controls the response served at /.well-known/oauth-protected-resource.
    */
@@ -758,6 +782,62 @@ export interface OAuthHelpers {
    * @throws {@link CimdFetchError} when the client ID is a CIMD URL whose document cannot be resolved
    */
   completeAuthorization(options: CompleteAuthorizationOptions): Promise<{ redirectTo: string }>;
+
+  /**
+   * Whether an approval remembered by `approveConsent(…, { remember })` covers this request: the
+   * same client, redirect URI and resource, asking for a subset of the approved scopes. Pass the
+   * same `secret`, and the same `subject` if the approval was bound to a user. Don't call it to ask
+   * on every authorization.
+   */
+  isConsentRemembered(
+    request: Request,
+    authRequest: AuthRequest,
+    remember: Pick<RememberConsentOptions, 'secret' | 'subject'>
+  ): Promise<boolean>;
+
+  /**
+   * Start a consent page for a request. Render your page with `handle` in the form and send
+   * `headers` with it: they bind the handle to this browser and forbid framing the page.
+   */
+  beginConsent(authRequest: AuthRequest): Promise<ConsentTransaction>;
+
+  /**
+   * Accept the consent form. `handle` is the value your form posted; the browser's binding cookie
+   * must match it, and it works once. `scope` is what the user approved: fewer or more than the
+   * client requested, each one in `scopesSupported`. `remember` stores the approval in a signed
+   * cookie for `isConsentRemembered()`. Send the returned `headers` on the next response.
+   * @throws AuthorizationError when the handle is missing, unbound, expired, or already used
+   */
+  approveConsent(
+    request: Request,
+    handle: string,
+    options?: { scope?: string[]; remember?: RememberConsentOptions }
+  ): Promise<ApprovedConsent>;
+
+  /**
+   * Decline the consent form: consumes the handle like `approveConsent()` and returns the redirect
+   * back to the client with `error=access_denied`, its `state` and `iss`. Send `headers` with the
+   * redirect (they include `Location`).
+   * @throws AuthorizationError when the handle is missing, unbound, expired, or already used
+   */
+  denyConsent(request: Request, handle: string, options?: { description?: string }): Promise<DeniedConsent>;
+
+  /**
+   * Save an approved request before redirecting to a third-party provider, and get the `state`
+   * to send it. Call only after consent. `data` is returned at the callback, e.g. a PKCE verifier.
+   * Pass `headers` to add the binding cookie to headers you are already sending.
+   */
+  beginUpstream(
+    authRequest: AuthRequest,
+    options?: { data?: unknown; headers?: Headers }
+  ): Promise<UpstreamTransaction>;
+
+  /**
+   * At the third-party provider's callback, recover the approved request and your `data` from the
+   * `state` parameter. The browser's binding cookie must match, and it works once.
+   * @throws AuthorizationError when `state` is missing, unbound, expired, or already used
+   */
+  finishUpstream<Data = unknown>(request: Request): Promise<ResumedUpstream<Data>>;
 
   /**
    * Creates a new OAuth client
@@ -1671,6 +1751,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
   /** Every protected-resource role hosted by this provider. */
   private readonly resourceServers: NormalizedResourceServer<Env>[];
+  /** Cookie names for the consent and upstream helpers, from `cookiePrefix`. */
+  consentCookies!: consent.ConsentCookies;
 
   /** Resource chosen when a new authorization request omits RFC 8707 `resource`. */
   private readonly configuredDefaultAuthorizationResource: string | undefined;
@@ -1768,6 +1850,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     this.validateEndpoint(this.options.authorizeEndpoint, 'authorizeEndpoint');
     this.validateEndpoint(this.options.tokenEndpoint, 'tokenEndpoint');
+    this.consentCookies = consent.consentCookies(this.options.cookiePrefix);
     if (this.options.clientRegistrationEndpoint) {
       this.validateEndpoint(this.options.clientRegistrationEndpoint, 'clientRegistrationEndpoint');
     }
@@ -3039,6 +3122,33 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * token issuance or `tokenExchangeCallback`. Anything else is re-thrown so
    * unexpected failures still surface as 500s.
    */
+  /**
+   * Run `tokenExchangeCallback`. An `invalid_grant` it throws means the grant can never work again
+   * (RFC 6749 §5.2: invalid, expired, or revoked; transient failures are `temporarily_unavailable`),
+   * so the grant it ran for is revoked, with its tokens, before the error answers. A failed
+   * revocation is logged and the callback's error still answers the request.
+   */
+  private async callTokenExchangeCallback(
+    options: TokenExchangeCallbackOptions,
+    env: Env & ProviderEnv
+  ): Promise<TokenExchangeCallbackResult | void> {
+    try {
+      return await Promise.resolve(this.options.tokenExchangeCallback!(options));
+    } catch (error) {
+      if (error instanceof OAuthError && error.code === 'invalid_grant') {
+        try {
+          await this.createOAuthHelpers(env).revokeGrant(options.grantId, options.userId);
+        } catch (revokeError) {
+          console.warn(
+            `Failed to revoke grant ${options.grantId} after tokenExchangeCallback answered invalid_grant:`,
+            revokeError
+          );
+        }
+      }
+      throw error;
+    }
+  }
+
   private createOAuthErrorResponse(error: unknown): Response | undefined {
     if (!(error instanceof OAuthError)) return undefined;
     return this.createErrorResponse(
@@ -3328,7 +3438,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         props: decryptedProps,
       };
 
-      const callbackResult = await Promise.resolve(this.options.tokenExchangeCallback(callbackOptions));
+      const callbackResult = await this.callTokenExchangeCallback(callbackOptions, env);
 
       if (callbackResult) {
         // Use the returned props if provided, otherwise keep the original props
@@ -3620,7 +3730,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         props: decryptedProps,
       };
 
-      const callbackResult = await Promise.resolve(this.options.tokenExchangeCallback(callbackOptions));
+      const callbackResult = await this.callTokenExchangeCallback(callbackOptions, env);
 
       if (callbackResult) {
         // Use the returned props if provided, otherwise keep the original props
@@ -3961,7 +4071,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         props: decryptedProps,
       };
 
-      const callbackResult = await Promise.resolve(this.options.tokenExchangeCallback(callbackOptions));
+      const callbackResult = await this.callTokenExchangeCallback(callbackOptions, env);
       if (crossClientExchange && callbackResult?.allowCrossClientExchange !== true) {
         throw crossClientRejection();
       }
@@ -5617,6 +5727,7 @@ export interface OAuthErrorOptions {
  * async function refreshUpstream(props) {
  *   const res = await fetch(...);
  *   if (res.status === 401) {
+ *     // invalid_grant can never recover: the provider also revokes this grant and its tokens.
  *     throw new OAuthError('invalid_grant', { description: 'upstream refresh token is invalid' });
  *   }
  *   if (res.status === 429) {
@@ -6958,6 +7069,54 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
    * @param userId - The ID of the user who owns the grant
    * @returns A Promise resolving when the revocation is confirmed.
    */
+  /** {@inheritDoc OAuthHelpers.isConsentRemembered} */
+  isConsentRemembered(
+    request: Request,
+    authRequest: AuthRequest,
+    remember: Pick<RememberConsentOptions, 'secret' | 'subject'>
+  ): Promise<boolean> {
+    return consent.isConsentRemembered(this.provider.consentCookies, request, authRequest, remember);
+  }
+
+  /** {@inheritDoc OAuthHelpers.beginConsent} */
+  beginConsent(authRequest: AuthRequest): Promise<ConsentTransaction> {
+    return consent.beginConsent(this.env.OAUTH_KV, this.provider.consentCookies, authRequest);
+  }
+
+  /** {@inheritDoc OAuthHelpers.approveConsent} */
+  approveConsent(
+    request: Request,
+    handle: string,
+    options?: { scope?: string[]; remember?: RememberConsentOptions }
+  ): Promise<ApprovedConsent> {
+    return consent.approveConsent(
+      this.env.OAUTH_KV,
+      this.provider.consentCookies,
+      this.provider.options.scopesSupported,
+      request,
+      handle,
+      options
+    );
+  }
+
+  /** {@inheritDoc OAuthHelpers.denyConsent} */
+  denyConsent(request: Request, handle: string, options?: { description?: string }): Promise<DeniedConsent> {
+    return consent.denyConsent(this.env.OAUTH_KV, this.provider.consentCookies, request, handle, options);
+  }
+
+  /** {@inheritDoc OAuthHelpers.beginUpstream} */
+  beginUpstream(
+    authRequest: AuthRequest,
+    options?: { data?: unknown; headers?: Headers }
+  ): Promise<UpstreamTransaction> {
+    return consent.beginUpstream(this.env.OAUTH_KV, this.provider.consentCookies, authRequest, options);
+  }
+
+  /** {@inheritDoc OAuthHelpers.finishUpstream} */
+  finishUpstream<Data = unknown>(request: Request): Promise<ResumedUpstream<Data>> {
+    return consent.finishUpstream<Data>(this.env.OAUTH_KV, this.provider.consentCookies, request);
+  }
+
   async revokeGrant(grantId: string, userId: string): Promise<void> {
     // Construct the full grant key with user ID
     const grantKey = `grant:${userId}:${grantId}`;

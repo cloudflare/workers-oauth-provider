@@ -12,11 +12,12 @@ The system implements end-to-end encryption for sensitive application-specific p
 
 All keys in the KV namespace follow a consistent pattern to make them easily identifiable:
 
-| Prefix            | Purpose                   | Example                |
-| ----------------- | ------------------------- | ---------------------- |
-| `client:`         | Client registration data  | `client:abc123`        |
-| `grant:{userId}:` | Authorization grant data  | `grant:user123:xyz789` |
-| `token:`          | Access and refresh tokens | `token:ghi789`         |
+| Prefix            | Purpose                                   | Example                |
+| ----------------- | ----------------------------------------- | ---------------------- |
+| `client:`         | Client registration data                  | `client:abc123`        |
+| `grant:{userId}:` | Authorization grant data                  | `grant:user123:xyz789` |
+| `token:`          | Access and refresh tokens                 | `token:ghi789`         |
+| `transaction:`    | Consent and upstream sign-in transactions | `transaction:5e88…`    |
 
 ## Data Structures
 
@@ -184,6 +185,33 @@ Token records store metadata about issued access tokens, including denormalized 
 > **Audience safety:** Every access token issued by 1.0 carries exactly one registered canonical resource as its audience. Token exchange cannot change that audience. Persisted token types keep the field optional so old KV records can be decoded: a record with no audience is treated as bound to the server-selected migration resource (the sole resource, or `legacyGrantResource`) until it expires, a stored 0.x array is bound to the configured resource it contains, and a record whose audience belongs only to other resources is rejected. Refresh binds the grant and returns a replacement token with an explicit audience.
 
 **TTL:** Access tokens typically have a 1 hour (3600 seconds) TTL by default
+
+### Transactions
+
+Short-lived records written by the consent and upstream sign-in helpers (`beginConsent()`, `beginUpstream()`), holding the authorization request between the consent page, the third-party redirect, and its callback.
+
+**Key format:** `transaction:{sha256(handle)}`. The handle (the consent form's value, or the `state` sent to the third party) is never stored.
+
+**Value:** `{base64url(iv)}.{base64url(ciphertext)}`: AES-GCM over the JSON record, with a key derived from the handle (`SHA-256("oauth-transaction-key:" + handle)`), so only the holder of the handle can read it. Decrypted:
+
+```json
+{
+  "kind": "upstream",
+  "request": {
+    "responseType": "code",
+    "clientId": "abc123",
+    "redirectUri": "https://client.example/callback",
+    "scope": ["read"],
+    "state": "client-state",
+    "resource": "https://mcp.example.com/mcp"
+  },
+  "data": { "verifier": "deployer data, e.g. the third party's PKCE verifier" }
+}
+```
+
+The browser holds a matching `__Host-` binding cookie per transaction, named `{prefix}consent-{first 16 hex of the hash}` or `{prefix}upstream-…` and holding the full hash.
+
+**TTL:** 600 seconds. Deleted on first successful use (`approveConsent()`, `denyConsent()`, `finishUpstream()`); KV cannot make that read-then-delete atomic.
 
 ## Security Considerations
 

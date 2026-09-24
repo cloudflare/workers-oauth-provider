@@ -37,6 +37,7 @@ workers-oauth-provider/
 │   ├── oauth-provider.ts      # Core provider implementation
 │   ├── oauth-capabilities.ts  # Pure server/client metadata capability policy
 │   ├── oauth-client-metadata.ts # Typed DCR parsing and CIMD resolution pipeline
+│   ├── oauth-consent.ts       # Consent and upstream sign-in transactions (MCP confused-deputy MUSTs)
 │   └── ema/                   # Enterprise-Managed Authorization pipeline
 ├── __tests__/
 │   ├── oauth-provider.test.ts # Comprehensive provider integration suite
@@ -64,7 +65,7 @@ workers-oauth-provider/
 └── README.md                  # Usage documentation
 ```
 
-**Audit-oriented architecture:** Request orchestration and storage-backed OAuth behavior remain in `src/oauth-provider.ts`. Typed OAuth client metadata parsing plus CIMD fetching and resolution live in `src/oauth-client-metadata.ts`; pure authorization-server/client capability policy lives in `src/oauth-capabilities.ts`. The experimental Enterprise-Managed Authorization validation pipeline is isolated in `src/ema/` so its JWT and trust-boundary code can be reviewed independently.
+**Audit-oriented architecture:** Request orchestration and storage-backed OAuth behavior remain in `src/oauth-provider.ts`. Typed OAuth client metadata parsing plus CIMD fetching and resolution live in `src/oauth-client-metadata.ts`; pure authorization-server/client capability policy lives in `src/oauth-capabilities.ts`. Consent pages and third-party sign-in transactions (the MCP confused-deputy protections: `__Host-` browser binding, single-use state, signed remembered approvals) live in `src/oauth-consent.ts`. The experimental Enterprise-Managed Authorization validation pipeline is isolated in `src/ema/` so its JWT and trust-boundary code can be reviewed independently.
 
 ## Setup
 

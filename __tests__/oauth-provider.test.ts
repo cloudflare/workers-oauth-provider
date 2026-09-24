@@ -15513,6 +15513,57 @@ describe('onError.internal coverage across generic error paths', () => {
     expect(await ema.json<any>()).toMatchObject({ error: 'unsupported_grant_type' });
   });
 
+  it('revokes the grant when tokenExchangeCallback throws invalid_grant, which can never recover', async () => {
+    // A proxy server's upstream refresh token is dead for good: the grant goes too, so the client
+    // re-authorizes instead of refreshing a grant that can never work again.
+    let failure: OAuthError | undefined;
+    const provider = createProvider({
+      tokenExchangeCallback: ({ grantType }: { grantType: string }) => {
+        if (grantType === 'refresh_token' && failure) throw failure;
+      },
+    });
+    const refresh = (refreshToken: string, credentials: string) =>
+      provider.fetch(form(`grant_type=refresh_token&refresh_token=${refreshToken}&${credentials}`), env, ctx);
+    const grantKeys = async () => (await env.OAUTH_KV.list({ prefix: 'grant:' })).keys.length;
+    const issue = async () => {
+      const { code, credentials } = await authorizationCode(provider);
+      const tokens = await (
+        await provider.fetch(
+          form(
+            `grant_type=authorization_code&code=${code}&redirect_uri=${encodeURIComponent(REDIRECT)}&${credentials}`
+          ),
+          env,
+          ctx
+        )
+      ).json<any>();
+      return { refreshToken: tokens.refresh_token as string, accessToken: tokens.access_token as string, credentials };
+    };
+
+    // A transient upstream failure answers and the grant survives, ready for the retry.
+    failure = new OAuthError('temporarily_unavailable', { description: 'Upstream is down', statusCode: 503 });
+    const kept = await issue();
+    expect((await refresh(kept.refreshToken, kept.credentials)).status).toBe(503);
+    expect(await grantKeys()).toBe(1);
+
+    // invalid_grant: the same answer to the client, and the grant and its access token are gone.
+    failure = new OAuthError('invalid_grant', { description: 'Upstream grant revoked' });
+    const revoked = await issue();
+    expect(await grantKeys()).toBe(2);
+    const denied = await refresh(revoked.refreshToken, revoked.credentials);
+    expect(await denied.json<any>()).toEqual({ error: 'invalid_grant', error_description: 'Upstream grant revoked' });
+    expect(await grantKeys()).toBe(1);
+    const api = await provider.fetch(
+      createMockRequest('https://example.com/api/x', 'GET', { Authorization: `Bearer ${revoked.accessToken}` }),
+      env,
+      ctx
+    );
+    expect(api.status).toBe(401);
+
+    // A retry now fails in the library, before the callback runs.
+    await refresh(revoked.refreshToken, revoked.credentials);
+    expect(last()).toEqual({ category: 'refresh-token-grant', reason: 'grant_not_found' });
+  });
+
   it('wraps a callback OAuthError as callback_error and passes a callback-supplied internal through', async () => {
     const throwing = createProvider({
       tokenExchangeCallback: () => {
