@@ -199,6 +199,8 @@ Changes affecting the public API or bug fixes need a changeset:
 npx changeset    # Interactive: select semver bump, write description
 ```
 
+The changesets bot keeps a **Version Packages** PR (`changeset-release/*`) open on `main` and `v0`. Merging it publishes to npm, moves dist-tags and creates the git tag and GitHub release, none of which can be undone. Only a human maintainer merges it. An agent may read it, check that its version and changelog are right, and report what it would publish, but must never merge, approve, or auto-merge it, even with admin rights or when asked to "finish the release". Hand it back to a human instead.
+
 ### Pull request process
 
 CI runs on every PR:
@@ -269,6 +271,7 @@ This library implements multiple OAuth/security RFCs. When making changes, maint
 - Break existing handler patterns
 - Use `any` type without explicit justification
 - Force push to main
+- Merge, approve, or enable auto-merge on a Version Packages PR: releases are for humans only
 
 ## Keeping AGENTS.md updated
 
