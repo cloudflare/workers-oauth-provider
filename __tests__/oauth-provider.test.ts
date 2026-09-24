@@ -3688,6 +3688,40 @@ describe('OAuthProvider', () => {
       expect(tokens.scope).toBe('read');
     });
 
+    it('answers invalid_scope when a code exchange names none of the granted scopes', async () => {
+      const authResponse = await oauthProvider.fetch(
+        createMockRequest(
+          `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+            `&redirect_uri=${encodeURIComponent(redirectUri)}&scope=read%20write&state=xyz123`
+        ),
+        mockEnv,
+        mockCtx
+      );
+      const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
+      const tokenResponse = await oauthProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          new URLSearchParams({
+            grant_type: 'authorization_code',
+            code,
+            redirect_uri: redirectUri,
+            client_id: clientId,
+            client_secret: clientSecret,
+            scope: 'admin',
+          }).toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+      expect(tokenResponse.status).toBe(400);
+      expect(await tokenResponse.json<any>()).toMatchObject({
+        error: 'invalid_scope',
+        error_description: 'None of the requested scopes were granted',
+      });
+    });
+
     it('should silently filter invalid scopes during auth code exchange', async () => {
       const authRequest = createMockRequest(
         `https://example.com/authorize?response_type=code&client_id=${clientId}` +
@@ -4455,6 +4489,33 @@ describe('OAuthProvider', () => {
 
       const filteredToken = await exchangeAccessToken(narrowedToken.access_token, 'read write admin');
       expect(filteredToken.scope).toBe('read');
+    });
+
+    it('answers invalid_scope when a token exchange names none of the subject token scopes', async () => {
+      const params = new URLSearchParams({
+        grant_type: 'urn:ietf:params:oauth:grant-type:token-exchange',
+        subject_token: accessToken,
+        subject_token_type: 'urn:ietf:params:oauth:token-type:access_token',
+        scope: 'delete',
+      });
+      const exchangeResponse = await oauthProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+          },
+          params.toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+      expect(exchangeResponse.status).toBe(400);
+      expect(await exchangeResponse.json<any>()).toMatchObject({
+        error: 'invalid_scope',
+        error_description: 'None of the requested scopes were granted',
+      });
     });
 
     it('should silently remove invalid scopes from token exchange', async () => {
