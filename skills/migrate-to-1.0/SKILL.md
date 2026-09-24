@@ -29,7 +29,7 @@ Read it fully before editing. This skill is the procedure around it; do not work
 
 1. `tsc`/typecheck and the project's tests pass.
 2. `wrangler dev`, then:
-   - `curl http://localhost:8787/.well-known/oauth-protected-resource` → 200, `resource` equals the chosen canonical value (loopback `http` is allowed in dev).
-   - `curl -i http://localhost:8787<api route>` → 401 with a `WWW-Authenticate` header naming `resource_metadata`.
+   - `curl -i http://localhost:8787<api route>` → 401 whose `WWW-Authenticate` names `resource_metadata="…/.well-known/oauth-protected-resource<resource path>"`. This works locally whatever the configured resource's origin.
+   - The metadata document itself is origin-strict (RFC 9728 §3): its well-known URL is `<resource origin>/.well-known/oauth-protected-resource<resource path>`. When the dev config's resource is on the loopback origin (e.g. `http://localhost:8787/mcp`), `curl http://localhost:8787/.well-known/oauth-protected-resource/mcp` → 200 with the exact `resource`. A production resource origin serves its document only there — after deploy: `curl https://<host>/.well-known/oauth-protected-resource<resource path>`.
    - Construction errors surface on the first request and name the violated rule; fix per the guide.
 3. If the deployment has live users, re-read "Existing stored data — nothing to do" in the guide and confirm no step you took contradicts it (no KV edits, no `legacyGrantResource` changes after rollout).
