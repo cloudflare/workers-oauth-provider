@@ -1,0 +1,27 @@
+.changeset/require-canonical-resource.md
+  s_1b1f3dce47e01c::t_37a04e0824c729 5
+README.md
+  s_1b1f3dce47e01c::t_91640b15b43dfb 427-428
+docs/advanced-configuration.md
+  s_1b1f3dce47e01c::t_c83b4351bde7d5 102-103
+docs/migration-1.0.md
+  s_1b1f3dce47e01c::t_f08fc8939e1481 1-97
+package.json
+  s_1b1f3dce47e01c::t_2c1dde37180862 11-13
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "185db82c26d621f0e9bda5d578451a2a463fb3f8",
+  "prompts": {},
+  "sessions": {
+    "s_1b1f3dce47e01c": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a0b3b8-09e5-75fe-ad90-bf9d48da5b83",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Matt Carey <mcarey@cloudflare.com>"
+    }
+  }
+}
