@@ -79,7 +79,7 @@ Grant records store information about permissions a user has granted to an appli
 }
 ```
 
-`completeAuthorization()` finds the grants a new authorization replaces from `list()` alone, without reading a record per grant, so its KV cost is one `list()` per thousand grants the user has rather than one `get()` per grant. Grants written before 1.0 have no key metadata and are read individually (`revokeExistingGrantsBatchSize` at a time); every refresh rewrites the grant with metadata. A grant whose metadata would exceed KV's 1,024-byte limit is written without it and read individually in the same way. None of these fields is secret: the record itself stores all three in the clear.
+`completeAuthorization()` finds the grants a new authorization replaces from `list()` alone, without reading a record per grant, so its KV cost is one `list()` per thousand grants the user has rather than one `get()` per grant. Grants written before 1.0 have no key metadata and are read individually, 50 at a time; every refresh rewrites the grant with metadata. A grant whose metadata would exceed KV's 1,024-byte limit is written without it and read individually in the same way. None of these fields is secret: the record itself stores all three in the clear.
 
 **Content Example (during authorization):**
 

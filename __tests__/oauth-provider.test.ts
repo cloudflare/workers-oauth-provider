@@ -12266,9 +12266,7 @@ describe('OAuthProvider', () => {
         const provider = new OAuthProvider({
           apiRoute: ['/api/'],
           apiHandler: TestApiHandler,
-          defaultHandler: createDefaultHandlerWithRevoke(() => propsFromAuthorize, {
-            revokeExistingGrantsBatchSize: 2,
-          }),
+          defaultHandler: createDefaultHandlerWithRevoke(() => propsFromAuthorize),
           authorizeEndpoint: '/authorize',
           tokenEndpoint: '/oauth/token',
           clientRegistrationEndpoint: '/oauth/register',
@@ -12283,9 +12281,9 @@ describe('OAuthProvider', () => {
 
         const ops = grantKeyOps(reAuthEnv.OAUTH_KV);
         const code2 = await authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, clientId);
-        // The eight legacy records were read, two at a time; the grant with metadata was not.
+        // The eight legacy records were read, all in one batch; the grant with metadata was not.
         expect(ops.grantReads()).toBe(8);
-        expect(ops.peakInFlight()).toBe(2);
+        expect(ops.peakInFlight()).toBe(8);
         await exchangeCodeForTokens(provider, reAuthEnv, reAuthCtx, code2, clientId, clientSecret);
 
         const after = await reAuthEnv.OAUTH_PROVIDER!.listUserGrants('user-1');
@@ -12313,51 +12311,6 @@ describe('OAuthProvider', () => {
 
         expect(ops.grantReads()).toBe(60);
         expect(ops.peakInFlight()).toBe(50);
-      });
-
-      it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])(
-        'rejects invalid revokeExistingGrantsBatchSize value %s',
-        async (revokeExistingGrantsBatchSize) => {
-          const provider = new OAuthProvider({
-            apiRoute: ['/api/'],
-            apiHandler: TestApiHandler,
-            defaultHandler: createDefaultHandlerWithRevoke(() => propsFromAuthorize, {
-              revokeExistingGrantsBatchSize,
-            }),
-            authorizeEndpoint: '/authorize',
-            tokenEndpoint: '/oauth/token',
-            clientRegistrationEndpoint: '/oauth/register',
-            scopesSupported: ['read', 'write'],
-          });
-
-          const { clientId } = await registerClient(provider, reAuthEnv, reAuthCtx);
-
-          await expect(authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, clientId)).rejects.toThrow(
-            'revokeExistingGrantsBatchSize must be a positive integer.'
-          );
-        }
-      );
-
-      it('clamps revokeExistingGrantsBatchSize to the Cloudflare KV maximum', async () => {
-        const provider = new OAuthProvider({
-          apiRoute: ['/api/'],
-          apiHandler: TestApiHandler,
-          defaultHandler: createDefaultHandlerWithRevoke(() => propsFromAuthorize, {
-            revokeExistingGrantsBatchSize: 5000,
-          }),
-          authorizeEndpoint: '/authorize',
-          tokenEndpoint: '/oauth/token',
-          clientRegistrationEndpoint: '/oauth/register',
-          scopesSupported: ['read', 'write'],
-        });
-        const { clientId } = await registerClient(provider, reAuthEnv, reAuthCtx);
-        for (let i = 0; i < 1001; i++) await seedLegacyGrant(`legacy-${i}`, 'some-other-client');
-
-        const ops = grantKeyOps(reAuthEnv.OAUTH_KV);
-        await authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, clientId);
-
-        expect(ops.grantReads()).toBe(1001);
-        expect(ops.peakInFlight()).toBe(1000);
       });
 
       it('writes a grant without key metadata when it would exceed the KV limit, and still replaces it later', async () => {
@@ -12464,7 +12417,7 @@ describe('OAuthProvider', () => {
         const before = await reAuthEnv.OAUTH_PROVIDER!.listUserGrants('user-1');
         expect(before.items.length).toBe(5);
 
-        // Phase 2: re-authorize with a small batch size forcing multiple pages.
+        // Phase 2: re-authorize; revoking walks every page of the user's grants.
         const smallBatchHandler = {
           async fetch(request: Request, env: any, _ctx: ExecutionContext) {
             const url = new URL(request.url);
@@ -12476,7 +12429,6 @@ describe('OAuthProvider', () => {
                 metadata: {},
                 scope: oauthReqInfo.scope,
                 props: propsFromAuthorize,
-                revokeExistingGrantsBatchSize: 2,
               });
               return Response.redirect(redirectTo, 302);
             }
