@@ -5,6 +5,7 @@ import {
   type AuthRequest,
   type OAuthHelpers,
 } from '../src/oauth-provider';
+import { describeConsent } from '../src/oauth-consent';
 import { createMockEnv, type TestEnv } from './test-helpers';
 
 const ISSUER = 'https://auth.example.com';
@@ -429,5 +430,69 @@ describe('cookiePrefix', () => {
 
     expect(() => createServer({ cookiePrefix: 'mcp-' })).toThrow(/must start with "__Host-"/);
     expect(() => createServer({ cookiePrefix: '__Host-bad name ' })).toThrow(/cookie-name characters/);
+  });
+});
+
+describe('describeConsent', () => {
+  it("gives the page what it must show for a registered client, whose name isn't verified", async () => {
+    const named = await oauth.createClient({
+      clientName: 'Acme <b>Tools</b>',
+      redirectUris: [REDIRECT_URI],
+      tokenEndpointAuthMethod: 'none',
+    });
+    expect(await oauth.describeConsent(await parsedRequest('read', named.clientId))).toEqual({
+      clientId: named.clientId,
+      clientName: 'Acme <b>Tools</b>', // raw: the page escapes it
+      redirectUri: REDIRECT_URI,
+      redirectHost: 'client.example',
+      redirectIsLoopback: false,
+      scope: ['read'],
+    });
+
+    const loopback = 'http://127.0.0.1:8123/callback';
+    const unnamed = await oauth.createClient({ redirectUris: [loopback], tokenEndpointAuthMethod: 'none' });
+    const url = new URL(`${ISSUER}/authorize`);
+    url.search = new URLSearchParams({
+      response_type: 'code',
+      client_id: unnamed.clientId,
+      redirect_uri: loopback,
+      scope: 'read',
+      code_challenge: 'E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM',
+      code_challenge_method: 'S256',
+      resource: RESOURCE,
+    }).toString();
+    const described = await oauth.describeConsent(await oauth.parseAuthRequest(new Request(url)));
+    // No name: fall back to the client ID. Loopback: the page should warn.
+    expect(described).toMatchObject({
+      clientName: unnamed.clientId,
+      redirectHost: '127.0.0.1',
+      redirectIsLoopback: true,
+    });
+    expect(described).not.toHaveProperty('clientDomain');
+  });
+
+  it("shows a CIMD client's verified domain, and flags a localhost listener", () => {
+    const clientId = 'https://app.example.com/oauth/client.json';
+    const request: AuthRequest = {
+      responseType: 'code',
+      clientId,
+      redirectUri: 'http://localhost:33418/callback',
+      scope: ['read'],
+      state: 's',
+    };
+    const client = {
+      clientId,
+      clientName: 'Example App',
+      redirectUris: [request.redirectUri],
+      tokenEndpointAuthMethod: 'none',
+    };
+    expect(describeConsent(client, request, true)).toMatchObject({
+      clientName: 'Example App',
+      clientDomain: 'app.example.com',
+      redirectHost: 'localhost',
+      redirectIsLoopback: true,
+    });
+    // The same URL-shaped ID without CIMD enabled is just an opaque registered ID.
+    expect(describeConsent(client, request, false)).not.toHaveProperty('clientDomain');
   });
 });

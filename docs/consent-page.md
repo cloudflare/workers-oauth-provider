@@ -18,19 +18,19 @@ From the MCP authorization spec and security best practices:
 
 ## A minimal page
 
+`describeConsent(request)` returns exactly those facts: the client's name, its verified domain for a CIMD client, the redirect URI's hostname, whether that is a local app, and the scopes.
+
 ```ts
-import type { AuthRequest, ClientInfo } from '@cloudflare/workers-oauth-provider';
+import type { ConsentDescription } from '@cloudflare/workers-oauth-provider';
 
 const escape = (value: string) => value.replace(/[&<>"']/g, (char) => `&#${char.charCodeAt(0)};`);
 
-function consentPage(client: ClientInfo, request: AuthRequest, handle: string): string {
-  const name = escape(client.clientName ?? client.clientId);
-  const redirectHost = new URL(request.redirectUri).hostname;
-  const local = /^(localhost|127(\.\d{1,3}){3}|\[::1\])$/.test(redirectHost);
-  const origin = client.clientId.startsWith('https://')
-    ? `Published by <strong>${escape(new URL(client.clientId).hostname)}</strong>.`
+function consentPage(details: ConsentDescription, handle: string): string {
+  const name = escape(details.clientName);
+  const origin = details.clientDomain
+    ? `Published by <strong>${escape(details.clientDomain)}</strong>.`
     : 'This app registered itself; its name is not verified.';
-  const scopes = request.scope
+  const scopes = details.scope
     .map(
       (scope) => `<label><input type="checkbox" name="scope" value="${escape(scope)}" checked> ${escape(scope)}</label>`
     )
@@ -39,8 +39,8 @@ function consentPage(client: ClientInfo, request: AuthRequest, handle: string): 
 <meta charset="utf-8">
 <title>Authorize ${name}</title>
 <h1>Allow ${name} to access your account?</h1>
-<p>${origin} Access will be sent to <strong>${escape(redirectHost)}</strong>.</p>
-${local ? '<p><strong>This sends access to an app on your computer.</strong> Continue only if you just started signing in from it.</p>' : ''}
+<p>${origin} Access will be sent to <strong>${escape(details.redirectHost)}</strong>.</p>
+${details.redirectIsLoopback ? '<p><strong>This sends access to an app on your computer.</strong> Continue only if you just started signing in from it.</p>' : ''}
 <form method="post">
   <input type="hidden" name="handle" value="${escape(handle)}">
   ${scopes}
@@ -56,10 +56,9 @@ const oauth = authorizationServer.getOAuthApi(env); // or env.OAUTH_PROVIDER wit
 
 // GET /authorize (after signing the user in with your own session)
 const request = await oauth.parseAuthRequest(req);
-const client = await oauth.lookupClient(request.clientId);
 const consent = await oauth.beginConsent(request);
 consent.headers.set('Content-Type', 'text/html; charset=utf-8');
-return new Response(consentPage(client!, request, consent.handle), { headers: consent.headers });
+return new Response(consentPage(await oauth.describeConsent(request), consent.handle), { headers: consent.headers });
 
 // POST /authorize
 const form = await req.formData();

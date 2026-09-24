@@ -58,6 +58,7 @@ export type { AuthorizationErrorCode, AuthorizationErrorOptions } from './oauth-
 export * from './oauth-resource-server';
 export type {
   ApprovedConsent,
+  ConsentDescription,
   ConsentTransaction,
   DeniedConsent,
   RememberConsentOptions,
@@ -67,6 +68,7 @@ export type {
 import * as consent from './oauth-consent';
 import type {
   ApprovedConsent,
+  ConsentDescription,
   ConsentTransaction,
   DeniedConsent,
   RememberConsentOptions,
@@ -795,6 +797,14 @@ export interface OAuthHelpers {
    * @throws {@link CimdFetchError} when the client ID is a CIMD URL whose document cannot be resolved
    */
   completeAuthorization(options: CompleteAuthorizationOptions): Promise<{ redirectTo: string }>;
+
+  /**
+   * The facts a consent page must show for a request: the client's name (and, for a Client ID
+   * Metadata Document client, its verified domain), the redirect URI's hostname, whether it goes
+   * to a local app, and the scopes. Every string may come from the client: escape it.
+   * @throws CimdFetchError when the client's metadata document cannot be resolved
+   */
+  describeConsent(authRequest: AuthRequest): Promise<ConsentDescription>;
 
   /**
    * Whether an approval remembered by `approveConsent(…, { remember })` covers this request: the
@@ -7112,6 +7122,15 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
    * @param userId - The ID of the user who owns the grant
    * @returns A Promise resolving when the revocation is confirmed.
    */
+  /** {@inheritDoc OAuthHelpers.describeConsent} */
+  async describeConsent(authRequest: AuthRequest): Promise<ConsentDescription> {
+    const client = await this.lookupClient(authRequest.clientId);
+    const isCimd =
+      !!this.provider.options.clientIdMetadataDocumentEnabled &&
+      this.provider.isClientMetadataUrl(authRequest.clientId);
+    return consent.describeConsent(client, authRequest, isCimd);
+  }
+
   /** {@inheritDoc OAuthHelpers.isConsentRemembered} */
   isConsentRemembered(
     request: Request,

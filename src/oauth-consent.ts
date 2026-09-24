@@ -21,7 +21,8 @@
  * that started the transaction.
  */
 import { AuthorizationError, authorizationErrorRedirect, isValidOAuthScopeToken } from './oauth-capabilities';
-import type { AuthRequest } from './oauth-provider';
+import type { AuthRequest, ClientInfo } from './oauth-provider';
+import { isLoopbackHostname } from './oauth-resource';
 
 /** Remember an approval so the consent page can be skipped for requests it already covers. */
 export interface RememberConsentOptions {
@@ -36,6 +37,35 @@ export interface RememberConsentOptions {
    * third party after consent.
    */
   subject?: string;
+}
+
+/**
+ * What a consent page must show, per the MCP authorization spec and security best practices.
+ * Every string here may come from the client (dynamic registration or a CIMD document), so
+ * escape all of it before rendering.
+ */
+export interface ConsentDescription {
+  clientId: string;
+  /** The client's name, or its client ID when it gave none. Self-asserted unless `clientDomain` is set. */
+  clientName: string;
+  /**
+   * For a Client ID Metadata Document client: the hostname of its HTTPS client ID, a domain the
+   * client controls. Show it prominently. Absent for registered clients, whose names are unverified.
+   */
+  clientDomain?: string;
+  clientUri?: string;
+  logoUri?: string;
+  /** Where the tokens will be sent. */
+  redirectUri: string;
+  /** The redirect URI's hostname, which the page MUST display. */
+  redirectHost: string;
+  /**
+   * The redirect goes to a local app (`localhost`, `127.0.0.0/8`, `::1`). The page SHOULD warn:
+   * any local process could be listening, whatever name the client claims.
+   */
+  redirectIsLoopback: boolean;
+  /** The scopes being requested. */
+  scope: string[];
 }
 
 /** A consent page to render: post `handle` back to {@link approveConsent}; send `headers` with the page. */
@@ -129,6 +159,26 @@ function validateRememberConsentOptions(options: RememberConsentOptions): void {
   if (options.subject !== undefined && (typeof options.subject !== 'string' || options.subject.length === 0)) {
     throw new TypeError('remember.subject must be a non-empty string');
   }
+}
+
+/** The facts a consent page must show for a request, given the client `lookupClient()` resolved. */
+export function describeConsent(
+  client: ClientInfo | null,
+  request: AuthRequest,
+  isClientIdMetadataDocument: boolean
+): ConsentDescription {
+  const redirectHost = new URL(request.redirectUri).hostname;
+  return {
+    clientId: request.clientId,
+    clientName: client?.clientName || request.clientId,
+    ...(isClientIdMetadataDocument ? { clientDomain: new URL(request.clientId).hostname } : {}),
+    ...(client?.clientUri ? { clientUri: client.clientUri } : {}),
+    ...(client?.logoUri ? { logoUri: client.logoUri } : {}),
+    redirectUri: request.redirectUri,
+    redirectHost,
+    redirectIsLoopback: isLoopbackHostname(redirectHost),
+    scope: [...request.scope],
+  };
 }
 
 /** Start a consent transaction for an authorization request that must be shown to the user. */
