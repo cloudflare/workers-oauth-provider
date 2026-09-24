@@ -1490,6 +1490,13 @@ export interface PurgeOptions {
    * Defaults to true.
    */
   purgeOrphanedTokens?: boolean;
+
+  /**
+   * Where to resume: the `cursor` from the previous invocation's result. Omit it to start
+   * a new sweep. Persist the returned cursor between invocations (for example in KV), or
+   * every invocation re-checks the same first `batchSize` records.
+   */
+  cursor?: string;
 }
 
 /**
@@ -1508,8 +1515,10 @@ export interface PurgeResult {
   /** Number of token records purged (orphaned) */
   tokensPurged: number;
 
-  /** True if the full key space was scanned in this invocation (both grants and tokens) */
+  /** True once the sweep has covered both key spaces; there is no `cursor` then. */
   done: boolean;
+  /** Pass as `PurgeOptions.cursor` to the next invocation to continue this sweep. Absent when `done`. */
+  cursor?: string;
 }
 
 /**
@@ -5907,6 +5916,21 @@ function isValidRefreshTokenTTL(ttl: unknown): ttl is number {
   return ttl === 0 || isValidAccessTokenTTL(ttl as number);
 }
 
+/**
+ * Reads a `purgeExpiredData` cursor: the phase to resume and KV's opaque cursor within it
+ * (empty for the start of that phase). No cursor starts a new sweep with the grants.
+ */
+function parsePurgeCursor(cursor: string | undefined): { phase: 'grants' | 'tokens'; kvCursor?: string } {
+  if (cursor === undefined) return { phase: 'grants' };
+  const separator = cursor.indexOf(':');
+  const phase = cursor.slice(0, separator);
+  if (separator < 0 || (phase !== 'grants' && phase !== 'tokens')) {
+    throw new TypeError('Invalid purgeExpiredData cursor');
+  }
+  const kvCursor = cursor.slice(separator + 1);
+  return kvCursor ? { phase, kvCursor } : { phase };
+}
+
 function isValidAccessTokenTTL(value: number): boolean {
   return Number.isInteger(value) && value >= KV_MIN_EXPIRATION_TTL_SECONDS;
 }
@@ -7277,6 +7301,7 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
     const purgeOrphanedGrants = options?.purgeOrphanedGrants !== false;
     const purgeExpiredGrants = options?.purgeExpiredGrants !== false;
     const purgeOrphanedTokens = options?.purgeOrphanedTokens !== false;
+    const start = parsePurgeCursor(options?.cursor);
     const now = Math.floor(Date.now() / 1000);
 
     const result: PurgeResult = {
@@ -7288,10 +7313,10 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
     };
 
     // Phase 1: Grant sweep
-    if (purgeOrphanedGrants || purgeExpiredGrants) {
+    if (start.phase === 'grants' && (purgeOrphanedGrants || purgeExpiredGrants)) {
       const knownGoodClients = new Set<string>();
       const knownMissingClients = new Set<string>();
-      let grantCursor: string | undefined;
+      let grantCursor: string | undefined = start.kvCursor;
       let grantsDone = false;
 
       while (!grantsDone && result.grantsChecked < batchSize) {
@@ -7347,9 +7372,9 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
         }
       }
 
-      // If grant sweep didn't finish, skip token sweep
+      // The budget ran out mid-sweep: resume the grants here next time.
       if (!grantsDone) {
-        return result;
+        return { ...result, cursor: `grants:${grantCursor ?? ''}` };
       }
     }
 
@@ -7357,7 +7382,7 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
     if (purgeOrphanedTokens) {
       const knownGoodGrants = new Set<string>();
       const knownMissingGrants = new Set<string>();
-      let tokenCursor: string | undefined;
+      let tokenCursor: string | undefined = start.phase === 'tokens' ? start.kvCursor : undefined;
       let tokensDone = false;
 
       while (!tokensDone && result.tokensChecked < batchSize) {
@@ -7403,7 +7428,7 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
       }
 
       if (!tokensDone) {
-        return result;
+        return { ...result, cursor: `tokens:${tokenCursor ?? ''}` };
       }
     }
 

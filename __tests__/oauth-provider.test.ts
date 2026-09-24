@@ -13978,13 +13978,58 @@ describe('OAuthProvider', () => {
       expect(result1.grantsPurged).toBe(3);
       expect(result1.done).toBe(false);
 
-      // Second batch: purge remaining 2
-      const result2 = await mockEnv.OAUTH_PROVIDER!.purgeExpiredData({ batchSize: 3 });
+      // Second batch, resumed after the three it deleted: KV cursors continue after a key, so the
+      // deletions don't shift the remaining two out of reach.
+      const result2 = await mockEnv.OAUTH_PROVIDER!.purgeExpiredData({ batchSize: 3, cursor: result1.cursor });
       expect(result2.grantsPurged).toBe(2);
       expect(result2.done).toBe(true);
 
       const grantsAfter = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
       expect(grantsAfter.keys.length).toBe(0);
+    });
+
+    it('resumes from the cursor, so live grants ahead of an orphan never stall the sweep', async () => {
+      await initHelpers();
+      const live = await registerClient();
+      for (let i = 0; i < 5; i++) await authorizeClient(live.clientId, live.clientSecret, `live-${i}`);
+      const doomed = await registerClient();
+      await authorizeClient(doomed.clientId, doomed.clientSecret, 'orphan-user');
+      await mockEnv.OAUTH_KV.delete(`client:${doomed.clientId}`);
+      const now = Math.floor(Date.now() / 1000);
+      await mockEnv.OAUTH_KV.put(
+        'token:ghost-user:ghost-grant:ghost-token',
+        JSON.stringify({
+          id: 'ghost-token',
+          grantId: 'ghost-grant',
+          userId: 'ghost-user',
+          createdAt: now,
+          expiresAt: now + 3600,
+          wrappedEncryptionKey: 'key',
+          scope: [],
+          grant: { clientId: 'gone', scope: [], encryptedProps: 'data' },
+        })
+      );
+
+      // Without a cursor every run re-checked the same first three grants and never reached the rest.
+      let cursor: string | undefined;
+      const runs = [];
+      do {
+        const result = await mockEnv.OAUTH_PROVIDER!.purgeExpiredData({ batchSize: 3, cursor });
+        runs.push(result);
+        cursor = result.cursor;
+        expect(result.done).toBe(cursor === undefined);
+      } while (cursor !== undefined && runs.length < 10);
+
+      expect(runs[runs.length - 1].done).toBe(true);
+      expect(runs.reduce((sum, run) => sum + run.grantsPurged, 0)).toBe(1);
+      expect(runs.reduce((sum, run) => sum + run.tokensPurged, 0)).toBeGreaterThanOrEqual(1);
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'grant:orphan-user:' })).keys).toHaveLength(0);
+      expect(await mockEnv.OAUTH_KV.get('token:ghost-user:ghost-grant:ghost-token')).toBeNull();
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'grant:live-' })).keys).toHaveLength(5);
+
+      await expect(mockEnv.OAUTH_PROVIDER!.purgeExpiredData({ cursor: 'somewhere' })).rejects.toThrow(
+        'Invalid purgeExpiredData cursor'
+      );
     });
 
     it('should purge orphaned tokens whose grant no longer exists', async () => {
@@ -15926,19 +15971,20 @@ describe('user IDs cannot contain ":"', () => {
     expect((await env.OAUTH_KV.list({ prefix: 'grant:' })).keys).toHaveLength(0);
   });
 
-  it("keeps a legacy grant for user a:b out of user a's list and revocation", async () => {
+  it("keeps another user's legacy grant out of user a's list and revocation", async () => {
     const oauth = await helpers();
     const client = await oauth.createClient({
       redirectUris: ['https://client.example/cb'],
       tokenEndpointAuthMethod: 'none',
     });
-    // A grant stored before this rule, for user `a:b`, whose key `grant:a:b:…` starts with `grant:a:`.
+    // A grant stored before this rule, for user `a:!`, whose key starts with `grant:a:` and, since `!`
+    // sorts before every grant ID character, is listed ahead of a's own grants.
     await env.OAUTH_KV.put(
-      'grant:a:b:legacygrant00001',
+      'grant:a:!:legacygrant00001',
       JSON.stringify({
         id: 'legacygrant00001',
         clientId: client.clientId,
-        userId: 'a:b',
+        userId: 'a:!',
         scope: [],
         metadata: { label: 'someone else' },
         createdAt: 1,
@@ -15947,7 +15993,7 @@ describe('user IDs cannot contain ":"', () => {
     );
     expect((await oauth.listUserGrants('a')).items).toEqual([]);
 
-    // Completing an authorization for `a` revokes a's earlier grants for the client, not a:b's.
+    // Completing an authorization for `a` revokes a's earlier grants for the client, not a:!'s.
     const request = await oauth.parseAuthRequest(
       new Request(
         `https://example.com/authorize?response_type=code&client_id=${client.clientId}` +
@@ -15956,7 +16002,7 @@ describe('user IDs cannot contain ":"', () => {
       )
     );
     await oauth.completeAuthorization({ request, userId: 'a', metadata: {}, scope: [], props: {} });
-    expect(await env.OAUTH_KV.get('grant:a:b:legacygrant00001')).not.toBeNull();
+    expect(await env.OAUTH_KV.get('grant:a:!:legacygrant00001')).not.toBeNull();
     expect((await oauth.listUserGrants('a')).items).toHaveLength(1);
 
     // A page the legacy key fills entirely doesn't end the listing early: a's grant still comes back.
