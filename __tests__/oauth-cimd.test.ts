@@ -65,7 +65,6 @@ describe('Client ID Metadata Document (CIMD)', () => {
       clientRegistrationEndpoint: '/oauth/register',
       scopesSupported: ['read', 'write', 'profile'],
       accessTokenTTL: 3600,
-      allowImplicitFlow: true,
       allowTokenExchangeGrant: true,
       clientIdMetadataDocumentEnabled: true,
     });
@@ -978,7 +977,6 @@ describe('Client ID Metadata Document (CIMD)', () => {
         clientRegistrationEndpoint: '/oauth/register',
         scopesSupported: ['read', 'write', 'profile'],
         accessTokenTTL: 3600,
-        allowImplicitFlow: true,
         allowTokenExchangeGrant: true,
       });
 
@@ -1006,7 +1004,6 @@ describe('Client ID Metadata Document (CIMD)', () => {
         clientRegistrationEndpoint: '/oauth/register',
         scopesSupported: ['read', 'write', 'profile'],
         accessTokenTTL: 3600,
-        allowImplicitFlow: true,
         allowTokenExchangeGrant: true,
       });
 

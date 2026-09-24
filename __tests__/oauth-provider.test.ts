@@ -163,7 +163,6 @@ describe('OAuthProvider', () => {
       clientRegistrationEndpoint: '/oauth/register',
       scopesSupported: ['read', 'write', 'profile'],
       accessTokenTTL: 3600,
-      allowImplicitFlow: true, // Enable implicit flow for tests
       allowTokenExchangeGrant: true, // Enable token exchange for tests
     });
   });
@@ -361,53 +360,12 @@ describe('OAuthProvider', () => {
       expect(metadata.protected_resources).toEqual(['https://example.com']);
       expect(metadata.registration_endpoint).toBe('https://example.com/oauth/register');
       expect(metadata.scopes_supported).toEqual(['read', 'write', 'profile']);
-      expect(metadata.response_types_supported).toContain('code');
-      expect(metadata.response_types_supported).toContain('token'); // Implicit flow enabled
+      expect(metadata.response_types_supported).toEqual(['code']);
       expect(metadata.grant_types_supported).toContain('authorization_code');
-      expect(metadata.grant_types_supported).toContain('implicit');
+      expect(metadata.grant_types_supported).not.toContain('implicit');
       expect(metadata.code_challenge_methods_supported).toContain('S256');
       expect(metadata.authorization_response_iss_parameter_supported).toBe(true);
-      // Implicit flow is enabled in the default test provider, so fragment mode should be advertised
-      expect(metadata.response_modes_supported).toContain('query');
-      expect(metadata.response_modes_supported).toContain('fragment');
-    });
-
-    it('should not include fragment response mode when implicit flow is disabled', async () => {
-      const providerNoImplicit = new OAuthProvider({
-        apiRoute: ['/api/'],
-        apiHandler: TestApiHandler,
-        defaultHandler: testDefaultHandler,
-        authorizeEndpoint: '/authorize',
-        tokenEndpoint: '/oauth/token',
-        allowImplicitFlow: false,
-      });
-      const request = createMockRequest('https://example.com/.well-known/oauth-authorization-server');
-      const response = await providerNoImplicit.fetch(request, mockEnv, mockCtx);
-      const metadata = await response.json<any>();
       expect(metadata.response_modes_supported).toEqual(['query']);
-      expect(metadata.authorization_response_iss_parameter_supported).toBe(true);
-    });
-
-    it('should not include token response type when implicit flow is disabled', async () => {
-      // Create a provider with implicit flow disabled
-      const providerWithoutImplicit = new OAuthProvider({
-        apiRoute: ['/api/'],
-        apiHandler: TestApiHandler,
-        defaultHandler: testDefaultHandler,
-        authorizeEndpoint: '/authorize',
-        tokenEndpoint: '/oauth/token',
-        scopesSupported: ['read', 'write'],
-        allowImplicitFlow: false, // Explicitly disable
-      });
-
-      const request = createMockRequest('https://example.com/.well-known/oauth-authorization-server');
-      const response = await providerWithoutImplicit.fetch(request, mockEnv, mockCtx);
-
-      expect(response.status).toBe(200);
-
-      const metadata = await response.json<any>();
-      expect(metadata.response_types_supported).toContain('code');
-      expect(metadata.response_types_supported).not.toContain('token');
     });
 
     it('should advertise only S256 PKCE by default', async () => {
@@ -1133,13 +1091,8 @@ describe('OAuthProvider', () => {
     it('should accept enabled extension grant and response types', async () => {
       const response = await registerMetadata({
         token_endpoint_auth_method: 'none',
-        grant_types: [
-          'authorization_code',
-          'refresh_token',
-          'implicit',
-          'urn:ietf:params:oauth:grant-type:token-exchange',
-        ],
-        response_types: ['code', 'token'],
+        grant_types: ['authorization_code', 'refresh_token', 'urn:ietf:params:oauth:grant-type:token-exchange'],
+        response_types: ['code'],
       });
 
       expect(response.status).toBe(201);
@@ -1147,10 +1100,9 @@ describe('OAuthProvider', () => {
       expect(client.grant_types).toEqual([
         'authorization_code',
         'refresh_token',
-        'implicit',
         'urn:ietf:params:oauth:grant-type:token-exchange',
       ]);
-      expect(client.response_types).toEqual(['code', 'token']);
+      expect(client.response_types).toEqual(['code']);
     });
 
     it.each([
@@ -1763,7 +1715,7 @@ describe('OAuthProvider', () => {
       expect(Object.fromEntries(minimal.searchParams)).toEqual({ error: 'access_denied' });
     });
 
-    it('drops stale error parameters, uses the fragment for the implicit flow, and stays local for an unparseable URI', () => {
+    it('drops stale error parameters and stays local for an unparseable URI', () => {
       // A registered redirect URI's own query can't stand in for the error response's parameters.
       const stale = new URL(
         authorizationErrorRedirect(
@@ -1773,46 +1725,27 @@ describe('OAuthProvider', () => {
       );
       expect(Object.fromEntries(stale.searchParams)).toEqual({ keep: '1', error: 'access_denied' });
 
-      // RFC 6749 §4.2.2.1: implicit-flow errors travel in the fragment.
-      const implicit = new URL(
-        authorizationErrorRedirect(
-          {
-            redirectUri: 'https://client.example/cb',
-            state: 's',
-            issuer: 'https://example.com',
-            responseType: 'token',
-          },
-          'access_denied'
-        )
-      );
-      expect(implicit.search).toBe('');
-      expect(Object.fromEntries(new URLSearchParams(implicit.hash.slice(1)))).toEqual({
-        error: 'access_denied',
-        state: 's',
-        iss: 'https://example.com',
-      });
-
       // A registered URI that can't be parsed leaves no redirect instead of throwing: render locally.
       const error = new AuthorizationError('invalid_request', { description: 'x', redirectUri: 'http://[bad' });
       expect(error.redirectTo).toBeUndefined();
     });
 
-    it('carries a redirectable implicit-flow error in the fragment, end to end through parseAuthRequest', async () => {
-      // response_type=token with a resource this server doesn't host: rejected after the redirect URI
-      // is validated, so the error is redirectable, and implicit-flow clients read the fragment.
+    it('refuses an implicit-flow request with unsupported_response_type, in the query', async () => {
+      // OAuth 2.1 dropped the implicit grant: response_type=token is refused once the redirect URI is
+      // known good, so the client hears about it the ordinary way.
       const authRequest = createMockRequest(
         `https://example.com/authorize?response_type=token&client_id=${clientId}` +
-          `&redirect_uri=${encodeURIComponent(redirectUri)}&scope=read&state=state-imp` +
-          `&resource=${encodeURIComponent('https://other.example/api')}`
+          `&redirect_uri=${encodeURIComponent(redirectUri)}&scope=read&state=state-imp`
       );
       const error = (await oauthProvider
         .fetch(authRequest, mockEnv, mockCtx)
         .catch((thrown) => thrown)) as AuthorizationError;
       expect(error).toBeInstanceOf(AuthorizationError);
+      expect(error.code).toBe('unsupported_response_type');
       const redirect = new URL(error.redirectTo!);
-      expect(redirect.search).toBe('');
-      expect(Object.fromEntries(new URLSearchParams(redirect.hash.slice(1)))).toMatchObject({
-        error: error.code,
+      expect(redirect.hash).toBe('');
+      expect(Object.fromEntries(redirect.searchParams)).toMatchObject({
+        error: 'unsupported_response_type',
         state: 'state-imp',
         iss: 'https://example.com',
       });
@@ -1861,10 +1794,10 @@ describe('OAuthProvider', () => {
           { 'Content-Type': 'application/json' },
           JSON.stringify({
             redirect_uris: [redirectUri],
-            client_name: 'Implicit Only Client',
+            client_name: 'Token Exchange Only Client',
             token_endpoint_auth_method: 'none',
-            grant_types: ['implicit'],
-            response_types: ['token'],
+            grant_types: ['urn:ietf:params:oauth:grant-type:token-exchange'],
+            response_types: [],
           })
         ),
         mockEnv,
@@ -2077,7 +2010,7 @@ describe('OAuthProvider', () => {
     });
   });
 
-  describe('Implicit Flow', () => {
+  describe('Public clients and PKCE', () => {
     let clientId: string;
     let redirectUri: string;
 
@@ -2087,8 +2020,6 @@ describe('OAuthProvider', () => {
         redirect_uris: ['https://spa-client.example.com/callback'],
         client_name: 'SPA Test Client',
         token_endpoint_auth_method: 'none', // Public client
-        grant_types: ['authorization_code', 'implicit'],
-        response_types: ['code', 'token'],
       };
 
       const request = createMockRequest(
@@ -2109,53 +2040,6 @@ describe('OAuthProvider', () => {
       await createPublicClient();
     });
 
-    it('should handle implicit flow request and redirect with token in fragment', async () => {
-      // Create an implicit flow authorization request
-      const authRequest = createMockRequest(
-        `https://example.com/authorize?response_type=token&client_id=${clientId}` +
-          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-          `&scope=read%20write&state=xyz123`
-      );
-
-      // The default handler will process this request and generate a redirect
-      const response = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
-
-      expect(response.status).toBe(302);
-
-      // Check that we're redirected to the client's redirect_uri with token in fragment
-      const location = response.headers.get('Location');
-      expect(location).toBeDefined();
-      expect(location).toContain(redirectUri);
-
-      const url = new URL(location!);
-
-      // Check that there's no code parameter in the query string
-      expect(url.searchParams.has('code')).toBe(false);
-
-      // Check that we have a hash/fragment with token parameters
-      expect(url.hash).toBeTruthy();
-
-      // Parse the fragment
-      const fragment = new URLSearchParams(url.hash.substring(1)); // Remove the # character
-
-      // Verify token parameters
-      expect(fragment.get('access_token')).toBeTruthy();
-      expect(fragment.get('token_type')).toBe('bearer');
-      expect(fragment.get('expires_in')).toBe('3600');
-      expect(fragment.get('scope')).toBe('read write');
-      expect(fragment.get('resource')).toBe(TEST_RESOURCE);
-      expect(fragment.get('state')).toBe('xyz123');
-      expect(fragment.get('iss')).toBe('https://example.com');
-
-      // Verify a grant was created in KV
-      const grants = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
-      expect(grants.keys.length).toBe(1);
-
-      // Verify access token was stored in KV
-      const tokenEntries = await mockEnv.OAUTH_KV.list({ prefix: 'token:' });
-      expect(tokenEntries.keys.length).toBe(1);
-    });
-
     it('should reject authorization code requests from public clients without PKCE', async () => {
       const authRequest = createMockRequest(
         `https://example.com/authorize?response_type=code&client_id=${clientId}` +
@@ -2170,26 +2054,27 @@ describe('OAuthProvider', () => {
       expect((await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys).toHaveLength(0);
     });
 
-    it('should reject implicit flow when allowImplicitFlow is disabled', async () => {
-      // Create a provider with implicit flow disabled
-      const providerWithoutImplicit = new OAuthProvider({
+    it('rejects the removed allowImplicitFlow at construction and refuses response_type=token', async () => {
+      const options = {
         apiRoute: ['/api/'],
         apiHandler: TestApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
         scopesSupported: ['read', 'write'],
-        allowImplicitFlow: false, // Explicitly disable
-      });
+      };
+      // JavaScript callers get a clear error instead of implicit clients silently breaking.
+      expect(() => new OAuthProvider({ ...options, allowImplicitFlow: true } as typeof options)).toThrow(
+        'allowImplicitFlow has been removed: OAuth 2.1 and MCP use the authorization code flow with PKCE.'
+      );
+      const provider = new OAuthProvider({ ...options, allowImplicitFlow: false } as typeof options);
 
-      // Create an implicit flow authorization request
       const authRequest = createMockRequest(
         `https://example.com/authorize?response_type=token&client_id=${clientId}` +
           `&redirect_uri=${encodeURIComponent(redirectUri)}` +
           `&scope=read%20write&state=xyz123`
       );
-
-      await expect(providerWithoutImplicit.fetch(authRequest, mockEnv, mockCtx)).rejects.toMatchObject({
+      await expect(provider.fetch(authRequest, mockEnv, mockCtx)).rejects.toMatchObject({
         code: 'unsupported_response_type',
       });
       expect((await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys).toHaveLength(0);
@@ -2223,7 +2108,6 @@ describe('OAuthProvider', () => {
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
         scopesSupported: ['read', 'write'],
-        allowImplicitFlow: true,
         allowPlainPKCE: true,
       });
       const authRequest = createMockRequest(
@@ -2264,37 +2148,6 @@ describe('OAuthProvider', () => {
       );
 
       expect((await oauthProvider.fetch(authRequest, mockEnv, mockCtx)).status).toBe(302);
-    });
-
-    it('should use the access token to access API directly', async () => {
-      // Create an implicit flow authorization request
-      const authRequest = createMockRequest(
-        `https://example.com/authorize?response_type=token&client_id=${clientId}` +
-          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-          `&scope=read%20write&state=xyz123`
-      );
-
-      // The default handler will process this request and generate a redirect
-      const response = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
-      const location = response.headers.get('Location')!;
-
-      // Parse the fragment to get the access token
-      const url = new URL(location);
-      const fragment = new URLSearchParams(url.hash.substring(1));
-      const accessToken = fragment.get('access_token')!;
-
-      // Now use the access token for an API request
-      const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
-        Authorization: `Bearer ${accessToken}`,
-      });
-
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
-
-      expect(apiResponse.status).toBe(200);
-
-      const apiData = await apiResponse.json<any>();
-      expect(apiData.success).toBe(true);
-      expect(apiData.user).toEqual({ userId: 'test-user-123', username: 'TestUser' });
     });
   });
 
@@ -4264,7 +4117,6 @@ describe('OAuthProvider', () => {
         clientRegistrationEndpoint: '/oauth/register',
         scopesSupported: ['read', 'write', 'profile'],
         accessTokenTTL: 3600,
-        allowImplicitFlow: true,
         allowTokenExchangeGrant: true,
         tokenExchangeCallback: () => ({ allowCrossClientExchange: true }),
       });
@@ -8478,7 +8330,6 @@ describe('OAuthProvider', () => {
         clientRegistrationEndpoint: '/oauth/register',
         scopesSupported: ['read', 'write', 'profile'],
         accessTokenTTL: 3600,
-        allowImplicitFlow: true,
         tokenExchangeCallback,
       });
     }
