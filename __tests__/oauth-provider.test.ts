@@ -376,20 +376,18 @@ describe('OAuthProvider', () => {
       expect((await response.json<any>()).code_challenge_methods_supported).toEqual(['S256']);
     });
 
-    it('should advertise legacy plain PKCE only when explicitly enabled', async () => {
-      const providerWithPlainPkce = new OAuthProvider({
+    it('rejects the removed allowPlainPKCE option at construction', () => {
+      const options = {
         apiRoute: ['/api/'],
         apiHandler: TestApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
-        allowPlainPKCE: true,
-      });
-      const request = createMockRequest('https://example.com/.well-known/oauth-authorization-server');
-      const response = await providerWithPlainPkce.fetch(request, mockEnv, mockCtx);
-
-      expect(response.status).toBe(200);
-      expect((await response.json<any>()).code_challenge_methods_supported).toEqual(['plain', 'S256']);
+      };
+      expect(() => new OAuthProvider({ ...options, allowPlainPKCE: true } as typeof options)).toThrow(
+        'allowPlainPKCE has been removed: MCP and OAuth 2.1 clients use S256 PKCE.'
+      );
+      expect(() => new OAuthProvider({ ...options, allowPlainPKCE: false } as typeof options)).not.toThrow();
     });
   });
 
@@ -2097,30 +2095,27 @@ describe('OAuthProvider', () => {
       );
     });
 
-    it.each([
-      ['an explicit plain method', '&code_challenge_method=plain'],
-      ['an omitted method', ''],
-    ])('should accept legacy plain PKCE with %s only when explicitly enabled', async (_label, method) => {
-      const providerWithPlainPkce = new OAuthProvider({
-        apiRoute: ['/api/'],
-        apiHandler: TestApiHandler,
-        defaultHandler: testDefaultHandler,
-        authorizeEndpoint: '/authorize',
-        tokenEndpoint: '/oauth/token',
-        scopesSupported: ['read', 'write'],
-        allowPlainPKCE: true,
-      });
-      const authRequest = createMockRequest(
-        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
-          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-          `&scope=read%20write&state=xyz123` +
-          `&code_challenge=legacy-plain-code-verifier-that-is-at-least-43-characters${method}`
+    it('refuses a code issued with a plain challenge before the upgrade', async () => {
+      const authResponse = await oauthProvider.fetch(
+        createMockRequest(
+          `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+            `&redirect_uri=${encodeURIComponent(redirectUri)}&scope=read&state=xyz123` +
+            `&code_challenge=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk&code_challenge_method=S256`
+        ),
+        mockEnv,
+        mockCtx
+      );
+      const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
+      // What an older version with allowPlainPKCE stored: the verifier itself, method plain.
+      const verifier = 'legacy-plain-code-verifier-that-is-at-least-43-characters';
+      const [grantKey] = (await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys.map((key) => key.name);
+      const grant = (await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' })) as Record<string, unknown>;
+      await mockEnv.OAUTH_KV.put(
+        grantKey,
+        JSON.stringify({ ...grant, codeChallenge: verifier, codeChallengeMethod: 'plain' })
       );
 
-      const authResponse = await providerWithPlainPkce.fetch(authRequest, mockEnv, mockCtx);
-      expect(authResponse.status).toBe(302);
-      const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
-      const tokenResponse = await providerWithPlainPkce.fetch(
+      const tokenResponse = await oauthProvider.fetch(
         createMockRequest(
           'https://example.com/oauth/token',
           'POST',
@@ -2130,13 +2125,17 @@ describe('OAuthProvider', () => {
             code,
             redirect_uri: redirectUri,
             client_id: clientId,
-            code_verifier: 'legacy-plain-code-verifier-that-is-at-least-43-characters',
+            code_verifier: verifier,
           }).toString()
         ),
         mockEnv,
         mockCtx
       );
-      expect(tokenResponse.status).toBe(200);
+      expect(tokenResponse.status).toBe(400);
+      expect(await tokenResponse.json<any>()).toMatchObject({
+        error: 'invalid_grant',
+        error_description: 'The plain PKCE method is not allowed. Use S256 instead.',
+      });
     });
 
     it('should accept S256 PKCE by default', async () => {

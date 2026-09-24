@@ -109,13 +109,7 @@ Clients created by `OAuthHelpers.createClient()` are not affected by the DCR TTL
 
 ## PKCE and token lifecycle
 
-Public clients must use PKCE with authorization code flow. PKCE challenges use only S256 by default. Confidential clients may still omit PKCE.
-
-Legacy deployments with clients that cannot use S256 can opt back into plain PKCE:
-
-```ts
-allowPlainPKCE: true;
-```
+Public clients must use PKCE with the authorization code flow, and only the S256 method is accepted, as MCP requires. Confidential clients may still omit PKCE.
 
 The implicit grant (`response_type=token`) is not supported: OAuth 2.1 removed it, and MCP clients use the authorization code flow with PKCE.
 
@@ -185,7 +179,6 @@ The existing `OAuthProvider` combined configuration uses these options:
 | `clientIdMetadataDocumentEnabled`  | Enable CIMD lookup and advertisement                                        | `false`                                  |
 | `allowPrivateUseRedirectUris`      | Accept RFC 8252 private-use scheme redirect URIs for native apps            | `false`                                  |
 | `cookiePrefix`                     | Prefix for the consent and upstream helpers' cookies (must be `__Host-…`)   | `__Host-oauth-`                          |
-| `allowPlainPKCE`                   | Permit the legacy plain PKCE method                                         | `false`                                  |
 | `disallowPublicClientRegistration` | Reject public clients at DCR                                                | `false`                                  |
 | `clientRegistrationCallback`       | Apply application policy before storing a DCR client                        | None                                     |
 | `allowTokenExchangeGrant`          | Enable RFC 8693                                                             | `false`                                  |
