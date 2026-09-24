@@ -357,6 +357,18 @@ describe('OAuthResourceServer', () => {
     const auth: OAuthResourceAuth = { token: 't', audience: RESOURCE, scope: [] };
     expect(() => insufficientScope(auth, [])).toThrow(TypeError);
     expect(() => insufficientScope(auth, ['mcp:read', 'not a scope'])).toThrow(TypeError);
+
+    // A description a header cannot carry (newlines, non-ASCII) is flattened in the challenge and
+    // kept verbatim in the body, rather than making the Response constructor throw.
+    const awkward = insufficientScope(auth, ['mcp:write'], 'Write access required\nContact 管理员 "now"');
+    expect(awkward.headers.get('WWW-Authenticate')).toContain('error_description="Write access required Contact now"');
+    await expect(awkward.json()).resolves.toEqual({
+      error: 'insufficient_scope',
+      error_description: 'Write access required\nContact 管理员 "now"',
+    });
+    expect(insufficientScope(auth, ['mcp:write'], '\n').headers.get('WWW-Authenticate')).not.toContain(
+      'error_description'
+    );
   });
 
   it.each([

@@ -125,7 +125,13 @@ export function insufficientScope(auth: OAuthResourceAuth, scope: string[], desc
   let challenge = `Bearer realm="OAuth", error="insufficient_scope", scope="${[...new Set(scope)].join(' ')}"`;
   challenge += `, resource_metadata="${getResourceMetadataUrl(auth.audience)}"`;
   if (description !== undefined) {
-    challenge += `, error_description="${description.replace(/["\\]/g, '')}"`;
+    // The header copy must be a valid quoted-string (RFC 7230 §3.2.6) and a valid header value:
+    // visible ASCII and spaces only, without quotes or backslashes. The JSON body keeps the original.
+    const quotable = description
+      .replace(/["\\]/g, '')
+      .replace(/[^\x21-\x7e]+/g, ' ')
+      .trim();
+    if (quotable) challenge += `, error_description="${quotable}"`;
   }
   return new Response(
     JSON.stringify({
