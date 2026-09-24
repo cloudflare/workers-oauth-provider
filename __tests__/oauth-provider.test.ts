@@ -13703,6 +13703,21 @@ describe('OAuthProvider', () => {
       expect(api.status).toBe(401);
     });
 
+    it('revokes a client with more grants than one KV page', async () => {
+      // Revoking a page's grants must not make the next page skip any: KV cursors continue after a key.
+      for (let i = 0; i < 1005; i++) {
+        await mockEnv.OAUTH_KV.put(
+          `grant:user-${String(i).padStart(4, '0')}:grant${String(i).padStart(11, '0')}`,
+          '{}',
+          {
+            metadata: { clientId },
+          }
+        );
+      }
+      await mockEnv.OAUTH_PROVIDER!.deleteClient(clientId);
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys).toHaveLength(0);
+    });
+
     it('should delete all grants and tokens when a client is deleted', async () => {
       // Create grants for two different users
       const tokens1 = await authorizeAndGetTokens('user-1');
