@@ -45,6 +45,7 @@ import { WorkerEntrypoint } from 'cloudflare:workers';
 
 interface Env {
   OAUTH_KV: KVNamespace;
+  DEMO_USER_ID?: string;
 }
 
 const authorizationServer = new OAuthAuthorizationServer<Env>({
@@ -80,9 +81,10 @@ async function authorize(request: Request, env: Env): Promise<Response> {
   const client = await oauth.lookupClient(oauthRequest.clientId);
   if (!client) return new Response('Unknown OAuth client', { status: 400 });
 
-  // Authenticate the user and obtain consent here. Never approve automatically
-  // in production; this example assumes those steps produced these values.
-  const user = { id: 'user-123', displayName: 'Ada' };
+  // Sign the user in and ask for consent here. Until you do, every request is
+  // refused; the example's test sets DEMO_USER_ID to stand in for a signed-in user.
+  const user = env.DEMO_USER_ID ? { id: env.DEMO_USER_ID, displayName: 'Demo user' } : null;
+  if (!user) return new Response('Sign-in is not implemented', { status: 501 });
   const { redirectTo } = await oauth.completeAuthorization({
     request: oauthRequest,
     userId: user.id,
@@ -117,7 +119,11 @@ export default class AuthServer extends WorkerEntrypoint<Env> {
 ```
 
 ```ts
-import { OAuthResourceServer, type AuthorizationServerBinding } from '@cloudflare/workers-oauth-provider';
+import {
+  OAuthResourceServer,
+  insufficientScope,
+  type AuthorizationServerBinding,
+} from '@cloudflare/workers-oauth-provider';
 
 interface AuthProps {
   userId: string;
@@ -139,13 +145,15 @@ export default new OAuthResourceServer<Env, AuthProps>({
   handler: {
     fetch(request, env, ctx) {
       // ctx.props: what completeAuthorization() stored. ctx.auth: the verified token (scope, userId, clientId, …).
+      // Authorization is the handler's: a token without the scope gets the MCP 403 challenge.
+      if (!ctx.auth.scope.includes('mcp:read')) return insufficientScope(ctx.auth, ['mcp:read']);
       return Response.json({ userId: ctx.props.userId, scope: ctx.auth.scope });
     },
   },
 });
 ```
 
-The resource server publishes its RFC 9728 metadata, answers unauthenticated requests with a Bearer challenge that points at it, validates every token for its own resource only, and passes the handler `ctx.props` and `ctx.auth`. The handler still enforces permissions such as ownership and tenancy; `insufficientScope(ctx.auth, scopes)` builds the MCP `403` when a token lacks a scope an operation needs. The binding is not a URL, so the validator is not reachable from the public internet.
+The resource server publishes its RFC 9728 metadata, answers unauthenticated requests with a Bearer challenge that points at it, validates every token for its own resource only, and passes the handler `ctx.props` and `ctx.auth`. The handler owns authorization: it checks scopes (answering a shortfall with `insufficientScope()`, the MCP `403` challenge) and anything else such as ownership and tenancy. The binding is not a URL, so the validator is not reachable from the public internet.
 
 ### More resources, or one Worker
 

@@ -1,4 +1,8 @@
-import { OAuthResourceServer, type AuthorizationServerBinding } from '@cloudflare/workers-oauth-provider';
+import {
+  OAuthResourceServer,
+  insufficientScope,
+  type AuthorizationServerBinding,
+} from '@cloudflare/workers-oauth-provider';
 
 interface AuthProps {
   userId: string;
@@ -20,6 +24,8 @@ export default new OAuthResourceServer<Env, AuthProps>({
   handler: {
     fetch(request, env, ctx) {
       // ctx.props: what completeAuthorization() stored. ctx.auth: the verified token (scope, userId, clientId, …).
+      // Authorization is the handler's: a token without the scope gets the MCP 403 challenge.
+      if (!ctx.auth.scope.includes('mcp:read')) return insufficientScope(ctx.auth, ['mcp:read']);
       return Response.json({ userId: ctx.props.userId, scope: ctx.auth.scope });
     },
   },

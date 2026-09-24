@@ -3,6 +3,7 @@ import { WorkerEntrypoint } from 'cloudflare:workers';
 
 interface Env {
   OAUTH_KV: KVNamespace;
+  DEMO_USER_ID?: string;
 }
 
 const authorizationServer = new OAuthAuthorizationServer<Env>({
@@ -45,9 +46,10 @@ async function authorize(request: Request, env: Env): Promise<Response> {
   const client = await oauth.lookupClient(oauthRequest.clientId);
   if (!client) return new Response('Unknown OAuth client', { status: 400 });
 
-  // Authenticate the user and obtain consent here. Never approve automatically
-  // in production; this example assumes those steps produced these values.
-  const user = { id: 'user-123', displayName: 'Ada' };
+  // Sign the user in and ask for consent here. Until you do, every request is
+  // refused; the example's test sets DEMO_USER_ID to stand in for a signed-in user.
+  const user = env.DEMO_USER_ID ? { id: env.DEMO_USER_ID, displayName: 'Demo user' } : null;
+  if (!user) return new Response('Sign-in is not implemented', { status: 501 });
   const { redirectTo } = await oauth.completeAuthorization({
     request: oauthRequest,
     userId: user.id,
