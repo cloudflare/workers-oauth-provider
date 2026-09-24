@@ -1,5 +1,5 @@
 ---
-'@cloudflare/workers-oauth-provider': major
+'@cloudflare/workers-oauth-provider': minor
 ---
 
 Redirect URIs must use `https`, or `http` on a loopback host (`localhost`, `127.0.0.0/8`, `::1`), as MCP and OAuth 2.1 require, with no userinfo or fragment. The rule is enforced at dynamic registration, in CIMD documents, in `createClient()` and `updateClient()` (which previously validated nothing), and on every authorization request, so clients registered before the policy are held to it: their authorizations fail with a locally rendered `invalid_request`, never a redirect.
