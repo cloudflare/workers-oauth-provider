@@ -4016,6 +4016,41 @@ describe('OAuthProvider', () => {
       expect(newTokens.scope).toBe('read'); // 'admin' silently removed
     });
 
+    it('answers invalid_scope when none of the requested scopes were granted, and keeps the grant', async () => {
+      const refresh = (scope?: string) => {
+        const params = new URLSearchParams({
+          grant_type: 'refresh_token',
+          refresh_token: refreshToken,
+          client_id: clientId,
+          client_secret: clientSecret,
+          ...(scope === undefined ? {} : { scope }),
+        });
+        return oauthProvider.fetch(
+          createMockRequest(
+            'https://example.com/oauth/token',
+            'POST',
+            { 'Content-Type': 'application/x-www-form-urlencoded' },
+            params.toString()
+          ),
+          mockEnv,
+          mockCtx
+        );
+      };
+
+      // Used to return 200 with an access token carrying no scope at all.
+      const refused = await refresh('admin'); // the grant has 'read write'
+      expect(refused.status).toBe(400);
+      expect(await refused.json<any>()).toMatchObject({
+        error: 'invalid_scope',
+        error_description: 'None of the requested scopes were granted',
+      });
+
+      // Nothing was rotated: the same refresh token still works.
+      const retried = await refresh();
+      expect(retried.status).toBe(200);
+      expect((await retried.json<any>()).scope).toBe('read write');
+    });
+
     it('should return full grant scopes when no scope param on refresh', async () => {
       const params = new URLSearchParams();
       params.append('grant_type', 'refresh_token');
