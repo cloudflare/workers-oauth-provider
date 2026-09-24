@@ -1,6 +1,7 @@
 import { describe, it, expect, expectTypeOf, beforeEach, vi, afterEach } from 'vitest';
 import {
   AuthorizationError,
+  authorizationErrorRedirect,
   CimdFetchError,
   ExternalTokenError,
   OAuthError,
@@ -1656,15 +1657,104 @@ describe('OAuthProvider', () => {
           `&scope=read&state=state-123${responseType}`
       );
 
-      await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toMatchObject({
+      const error = (await oauthProvider
+        .fetch(authRequest, mockEnv, mockCtx)
+        .catch((thrown) => thrown)) as AuthorizationError;
+      expect(error).toMatchObject({
         name: 'AuthorizationError',
         code,
         redirectUri,
         state: 'state-123',
         issuer: 'https://example.com',
       });
+      // A ready error redirect back to the client: error, description, state and iss.
+      const redirect = new URL(error.redirectTo!);
+      expect(redirect.origin + redirect.pathname).toBe(redirectUri);
+      expect(Object.fromEntries(redirect.searchParams)).toEqual({
+        error: code,
+        error_description: error.description,
+        state: 'state-123',
+        iss: 'https://example.com',
+      });
       expect((await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys).toHaveLength(0);
       expect((await mockEnv.OAUTH_KV.list({ prefix: 'token:' })).keys).toHaveLength(0);
+    });
+
+    it('builds the error redirect for a validated request, omitting what the client did not send', () => {
+      const full = new URL(
+        authorizationErrorRedirect(
+          { redirectUri: 'https://client.example/cb?keep=1', state: 's', issuer: 'https://example.com' },
+          'access_denied',
+          'The user declined'
+        )
+      );
+      expect(full.searchParams.get('keep')).toBe('1');
+      expect(Object.fromEntries(full.searchParams)).toEqual({
+        keep: '1',
+        error: 'access_denied',
+        error_description: 'The user declined',
+        state: 's',
+        iss: 'https://example.com',
+      });
+      const minimal = new URL(
+        authorizationErrorRedirect({ redirectUri: 'https://client.example/cb' }, 'access_denied')
+      );
+      expect(Object.fromEntries(minimal.searchParams)).toEqual({ error: 'access_denied' });
+    });
+
+    it('drops stale error parameters, uses the fragment for the implicit flow, and stays local for an unparseable URI', () => {
+      // A registered redirect URI's own query can't stand in for the error response's parameters.
+      const stale = new URL(
+        authorizationErrorRedirect(
+          { redirectUri: 'https://client.example/cb?keep=1&state=old&iss=https://evil&error_description=old' },
+          'access_denied'
+        )
+      );
+      expect(Object.fromEntries(stale.searchParams)).toEqual({ keep: '1', error: 'access_denied' });
+
+      // RFC 6749 §4.2.2.1: implicit-flow errors travel in the fragment.
+      const implicit = new URL(
+        authorizationErrorRedirect(
+          {
+            redirectUri: 'https://client.example/cb',
+            state: 's',
+            issuer: 'https://example.com',
+            responseType: 'token',
+          },
+          'access_denied'
+        )
+      );
+      expect(implicit.search).toBe('');
+      expect(Object.fromEntries(new URLSearchParams(implicit.hash.slice(1)))).toEqual({
+        error: 'access_denied',
+        state: 's',
+        iss: 'https://example.com',
+      });
+
+      // A registered URI that can't be parsed leaves no redirect instead of throwing: render locally.
+      const error = new AuthorizationError('invalid_request', { description: 'x', redirectUri: 'http://[bad' });
+      expect(error.redirectTo).toBeUndefined();
+    });
+
+    it('carries a redirectable implicit-flow error in the fragment, end to end through parseAuthRequest', async () => {
+      // response_type=token with a resource this server doesn't host: rejected after the redirect URI
+      // is validated, so the error is redirectable, and implicit-flow clients read the fragment.
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=token&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}&scope=read&state=state-imp` +
+          `&resource=${encodeURIComponent('https://other.example/api')}`
+      );
+      const error = (await oauthProvider
+        .fetch(authRequest, mockEnv, mockCtx)
+        .catch((thrown) => thrown)) as AuthorizationError;
+      expect(error).toBeInstanceOf(AuthorizationError);
+      const redirect = new URL(error.redirectTo!);
+      expect(redirect.search).toBe('');
+      expect(Object.fromEntries(new URLSearchParams(redirect.hash.slice(1)))).toMatchObject({
+        error: error.code,
+        state: 'state-imp',
+        iss: 'https://example.com',
+      });
     });
 
     it('keeps unknown clients and invalid redirects local', async () => {
@@ -1685,6 +1775,7 @@ describe('OAuthProvider', () => {
           expect(error).toBeInstanceOf(AuthorizationError);
           expect(error).toMatchObject({ name: 'AuthorizationError', code: 'invalid_request' });
           expect((error as AuthorizationError).redirectUri).toBeUndefined();
+          expect((error as AuthorizationError).redirectTo).toBeUndefined();
           expect((error as AuthorizationError).state).toBeUndefined();
         }
       }

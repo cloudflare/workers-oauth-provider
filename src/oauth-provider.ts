@@ -53,7 +53,7 @@ import {
   validateResourceUri,
 } from './oauth-resource';
 
-export { AuthorizationError } from './oauth-capabilities';
+export { AuthorizationError, authorizationErrorRedirect } from './oauth-capabilities';
 export type { AuthorizationErrorCode, AuthorizationErrorOptions } from './oauth-capabilities';
 export * from './oauth-resource-server';
 export type {
@@ -6523,7 +6523,7 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
     }
 
     const withRedirect = (error: AuthorizationError): never => {
-      throw withAuthorizationRedirect(error, redirectUri, state || undefined, issuer);
+      throw withAuthorizationRedirect(error, redirectUri, state || undefined, issuer, responseType);
     };
 
     // Resource, response type, and PKCE errors are redirectable only after the

@@ -20,7 +20,7 @@
  * same browser with the same handle could both pass; the cookie binding confines that to the browser
  * that started the transaction.
  */
-import { AuthorizationError, isValidOAuthScopeToken } from './oauth-capabilities';
+import { AuthorizationError, authorizationErrorRedirect, isValidOAuthScopeToken } from './oauth-capabilities';
 import type { AuthRequest } from './oauth-provider';
 
 /** Remember an approval so the consent page can be skipped for requests it already covers. */
@@ -202,14 +202,10 @@ export async function denyConsent(
   const transaction = await openTransaction(kv, request, cookies.consent, handle, 'consent');
   await transaction.consume();
   const record = transaction.record;
-  const redirect = new URL(record.request.redirectUri);
-  redirect.searchParams.set('error', 'access_denied');
-  if (options.description) redirect.searchParams.set('error_description', options.description);
-  if (record.request.state) redirect.searchParams.set('state', record.request.state);
-  if (record.request.issuer) redirect.searchParams.set('iss', record.request.issuer);
-  const headers = new Headers({ 'Cache-Control': 'no-store', Location: redirect.href });
+  const redirectTo = authorizationErrorRedirect(record.request, 'access_denied', options.description);
+  const headers = new Headers({ 'Cache-Control': 'no-store', Location: redirectTo });
   headers.append('Set-Cookie', clearCookie(transaction.cookieName));
-  return { request: record.request, redirectTo: redirect.href, headers };
+  return { request: record.request, redirectTo, headers };
 }
 
 /** Whether a remembered approval covers this request: same client, redirect URI and resource, subset of scopes. */
