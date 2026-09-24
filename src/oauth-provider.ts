@@ -7,6 +7,7 @@ import {
   normalizePkceCodeChallengeMethod,
   validateAuthorizationPkce,
   validateAuthorizationResponseType,
+  validateClientCapabilities,
   validatePkceCodeChallengeMethod,
   validateAuthorizationServerScopes,
   withAuthorizationRedirect,
@@ -862,10 +863,14 @@ export interface OAuthHelpers {
   listClients(options?: ListOptions): Promise<ListResult<ClientInfo>>;
 
   /**
-   * Updates an existing OAuth client
+   * Updates an existing OAuth client. Redirect URIs, grant types and response types are held to
+   * the same rules as registration. Client ID Metadata Document clients can't be updated here:
+   * their document owns their metadata.
    * @param clientId - The ID of the client to update
    * @param updates - Partial client information with fields to update
    * @returns A Promise resolving to the updated client info, or null if not found
+   * @throws Error when an update breaks the redirect URI policy or names an unsupported grant or response type
+   * @throws TypeError for a Client ID Metadata Document client while CIMD is enabled
    */
   updateClient(clientId: string, updates: Partial<ClientInfo>): Promise<ClientInfo | null>;
 
@@ -877,6 +882,8 @@ export interface OAuthHelpers {
    * cut short (for example by a subrequest limit on a very large namespace), the call throws;
    * call it again to continue, and `purgeExpiredData()` also removes the leftovers, which are
    * orphaned grants by then.
+   * For a Client ID Metadata Document client there is no stored record: this revokes its grants,
+   * and the client can authorize again as long as its document resolves.
    * @param clientId - The ID of the client to delete
    * @returns A Promise resolving when the client and all its grants are gone.
    */
@@ -6836,10 +6843,16 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
       ...(authMethodWasExplicit ? { authMethodExplicit: true as const } : {}),
     };
 
-    // Validate each redirect URI against the redirect policy
+    // Validate each redirect URI against the redirect policy, and the grant and response types
+    // against what this server implements, as dynamic registration does.
     for (const uri of newClient.redirectUris) {
       validateRedirectUri(uri, this.provider.serverCapabilities);
     }
+    validateClientCapabilities(this.provider.serverCapabilities, {
+      grantTypes: newClient.grantTypes!,
+      responseTypes: newClient.responseTypes!,
+      tokenEndpointAuthMethod,
+    });
 
     // Only generate and store client secret for confidential clients
     let clientSecret: string | undefined;
@@ -6910,6 +6923,11 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
    * @returns A Promise resolving to the updated client info, or null if not found
    */
   async updateClient(clientId: string, updates: Partial<ClientInfo>): Promise<ClientInfo | null> {
+    // A CIMD client's metadata is its document's. A stored copy would do nothing while CIMD is on,
+    // and would become the client if CIMD were later turned off.
+    if (this.provider.options.clientIdMetadataDocumentEnabled && isClientIdMetadataDocumentUrl(clientId)) {
+      throw new TypeError('Client ID Metadata Document clients are updated by changing their document');
+    }
     const client = await this.provider.getClient(this.env, clientId);
     if (!client) {
       return null;
@@ -6950,6 +6968,18 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
       // the public Partial<ClientInfo> update object.
       authMethodExplicit: authMethodWasExplicit ? true : client.authMethodExplicit,
     };
+
+    if (
+      updates.grantTypes !== undefined ||
+      updates.responseTypes !== undefined ||
+      updates.tokenEndpointAuthMethod !== undefined
+    ) {
+      validateClientCapabilities(this.provider.serverCapabilities, {
+        grantTypes: updatedClient.grantTypes ?? [GrantType.AUTHORIZATION_CODE, GrantType.REFRESH_TOKEN],
+        responseTypes: updatedClient.responseTypes ?? ['code'],
+        tokenEndpointAuthMethod: authMethod,
+      });
+    }
 
     // Only include client secret for confidential clients
     if (!isPublicClient && secretToStore) {
