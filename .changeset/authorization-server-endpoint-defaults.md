@@ -1,5 +1,5 @@
 ---
-'@cloudflare/workers-oauth-provider': minor
+'@cloudflare/workers-oauth-provider': patch
 ---
 
 `OAuthAuthorizationServer`'s `authorizeEndpoint` and `tokenEndpoint` are optional and default to `${issuer}/authorize` and `${issuer}/oauth/token`, under the issuer's path if it has one. `OAuthProvider` still requires both.
