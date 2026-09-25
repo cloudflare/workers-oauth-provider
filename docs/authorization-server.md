@@ -6,6 +6,8 @@ The authorization endpoint, client registration, tokens, resources, scopes, stor
 
 Your `authorizeEndpoint` is application code, because user authentication and consent are application-specific. With split roles it is the `/authorize` route in your authorization server's `fetch`, using `authorizationServer.getOAuthApi(env)`; with `OAuthProvider` it lives in `defaultHandler`, using `env.OAUTH_PROVIDER`. The helpers are the same. The provider is not an identity provider.
 
+`OAuthAuthorizationServer` advertises the endpoint at `${issuer}/authorize` and serves its token endpoint at `${issuer}/oauth/token`, under the issuer's path if it has one; set `authorizeEndpoint` or `tokenEndpoint` to use other paths. Route the authorization endpoint before calling `authorizationServer.fetch()`. `parseAuthRequest()` rejects a request that arrives anywhere but the advertised endpoint, so a route on the wrong path fails on its first request. `OAuthProvider` requires both options.
+
 A typical flow has three steps:
 
 1. Call `parseAuthRequest(request)` to validate the client, redirect URI, response type, resource, and PKCE restrictions.
@@ -206,6 +208,7 @@ The functional role API adds these surfaces without removing `OAuthProvider`:
 | Surface                                                  | Purpose                                                                                     |
 | -------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
 | `new OAuthAuthorizationServer({ issuer, resources, … })` | Create the AS role with a canonical RFC 8414 issuer and its fixed resource registry         |
+| `authorizeEndpoint`, `tokenEndpoint`                     | Optional here; default to `${issuer}/authorize` and `${issuer}/oauth/token`                 |
 | `validateToken(resource, token, env)`                    | Validate an access token for one declared resource; what a resource server calls            |
 | `defaultResource`                                        | Select a deliberate default for new authorization requests that omit it                     |
 | `legacyGrantResource`                                    | Select the server-controlled migration target for old unbound grants                        |

@@ -39,8 +39,6 @@ A `WorkerEntrypoint` handler reads the same fields from `this.ctx`; declare it a
 const authorizationServer = new OAuthAuthorizationServer<Env>({
   issuer: 'https://auth.example.com',
   resources: ['https://calendar.example.com/mcp', 'https://drive.example.com/mcp'],
-  authorizeEndpoint: '/authorize',
-  tokenEndpoint: '/oauth/token',
 });
 
 const local = (env: Env) => (resource: string, token: string) =>

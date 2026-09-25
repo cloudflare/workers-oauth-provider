@@ -21,8 +21,6 @@ An MCP deployment has two roles. The **authorization server** signs users in and
 const authorizationServer = new OAuthAuthorizationServer<Env>({
   issuer: 'https://auth.example.com',
   resources: ['https://mcp.example.com/mcp'],
-  authorizeEndpoint: '/authorize',
-  tokenEndpoint: '/oauth/token',
   scopesSupported: ['mcp:read', 'mcp:write', 'offline_access'], // everything this server can grant
   clientIdMetadataDocumentEnabled: true,
 });

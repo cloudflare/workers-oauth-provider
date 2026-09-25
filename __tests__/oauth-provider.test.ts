@@ -14472,8 +14472,6 @@ describe('functional authorization-server and resource-server composition', () =
     const authorizationServer = new OAuthAuthorizationServer<TestEnv>({
       issuer,
       resources: [calendarResource, driveResource],
-      authorizeEndpoint: '/authorize',
-      tokenEndpoint: '/oauth/token',
       clientRegistrationEndpoint: '/oauth/register',
       scopesSupported: ['calendar:read', 'drive:read'],
       ...policy,
@@ -14701,8 +14699,6 @@ describe('functional authorization-server and resource-server composition', () =
           new OAuthAuthorizationServer<TestEnv>({
             issuer: unsafeIssuer,
             resources: [calendarResource],
-            authorizeEndpoint: '/authorize',
-            tokenEndpoint: '/oauth/token',
           })
       ).toThrow('authorizationServer.issuer');
     }
@@ -14736,8 +14732,6 @@ describe('functional authorization-server and resource-server composition', () =
         new OAuthAuthorizationServer<TestEnv>({
           issuer: 'http://auth.example.com',
           resources: [calendarResource],
-          authorizeEndpoint: '/authorize',
-          tokenEndpoint: '/oauth/token',
         })
     ).toThrow('authorizationServer.issuer must be a canonical absolute HTTPS URL');
 
@@ -14811,11 +14805,96 @@ describe('functional authorization-server and resource-server composition', () =
         new OAuthAuthorizationServer<TestEnv>({
           issuer,
           resources: [calendarResource],
-          authorizeEndpoint: '/authorize',
-          tokenEndpoint: '/oauth/token',
           clientRegistrationEndpoint: '/.well-known/oauth-authorization-server',
         })
     ).toThrow('clientRegistrationEndpoint must not collide with the authorization server metadata endpoint');
+
+    // Metadata is served whatever the query, so a static query doesn't set an endpoint apart.
+    for (const option of ['tokenEndpoint', 'clientRegistrationEndpoint', 'authorizeEndpoint']) {
+      expect(
+        () =>
+          new OAuthAuthorizationServer<TestEnv>({
+            issuer,
+            resources: [calendarResource],
+            [option]: '/.well-known/oauth-authorization-server?tenant=acme',
+          })
+      ).toThrow(`${option} must not collide with the authorization server metadata endpoint`);
+    }
+    // The token endpoint accepts added query parameters, so an endpoint that is the token endpoint
+    // plus a query would only ever reach the token endpoint.
+    expect(
+      () =>
+        new OAuthAuthorizationServer<TestEnv>({
+          issuer,
+          resources: [calendarResource],
+          clientRegistrationEndpoint: '/oauth/token?register=1',
+        })
+    ).toThrow('clientRegistrationEndpoint must not collide with tokenEndpoint');
+    expect(
+      () =>
+        new OAuthAuthorizationServer<TestEnv>({
+          issuer,
+          resources: [calendarResource],
+          authorizeEndpoint: '/oauth/token',
+        })
+    ).toThrow('authorizeEndpoint must not collide with tokenEndpoint');
+    expect(
+      () =>
+        new OAuthAuthorizationServer<TestEnv>({
+          issuer,
+          resources: [calendarResource],
+          authorizeEndpoint: '/oauth/register',
+          clientRegistrationEndpoint: '/oauth/register',
+        })
+    ).toThrow('authorizeEndpoint must not collide with clientRegistrationEndpoint');
+  });
+
+  it('defaults its endpoints under the issuer, a path issuer included, and honours explicit ones', async () => {
+    const tenantIssuer = 'https://auth.example.com/tenant';
+    const tenant = new OAuthAuthorizationServer<TestEnv>({ issuer: tenantIssuer, resources: [calendarResource] });
+    const metadata = await tenant.fetch(
+      createMockRequest('https://auth.example.com/.well-known/oauth-authorization-server/tenant'),
+      env,
+      ctx
+    );
+    await expect(metadata.json()).resolves.toMatchObject({
+      issuer: tenantIssuer,
+      authorization_endpoint: `${tenantIssuer}/authorize`,
+      token_endpoint: `${tenantIssuer}/oauth/token`,
+      revocation_endpoint: `${tenantIssuer}/oauth/token`,
+    });
+    // parseAuthRequest() accepts requests only where the endpoint is advertised, so a route on
+    // another path fails on its first request.
+    const oauth = tenant.getOAuthApi(env);
+    const client = await oauth.createClient({
+      redirectUris: ['https://client.example.com/callback'],
+      tokenEndpointAuthMethod: 'client_secret_post',
+    });
+    const query = `?response_type=code&client_id=${client.clientId}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}`;
+    await expect(oauth.parseAuthRequest(createMockRequest(`${tenantIssuer}/authorize${query}`))).resolves.toMatchObject(
+      {
+        clientId: client.clientId,
+      }
+    );
+    await expect(oauth.parseAuthRequest(createMockRequest(`${issuer}/authorize${query}`))).rejects.toMatchObject({
+      description: 'Authorization request was sent to an unconfigured endpoint',
+    });
+
+    const custom = new OAuthAuthorizationServer<TestEnv>({
+      issuer,
+      resources: [calendarResource],
+      authorizeEndpoint: '/oauth2/auth',
+      tokenEndpoint: '/oauth2/token',
+    });
+    const customMetadata = await custom.fetch(
+      createMockRequest(`${issuer}/.well-known/oauth-authorization-server`),
+      env,
+      ctx
+    );
+    await expect(customMetadata.json()).resolves.toMatchObject({
+      authorization_endpoint: `${issuer}/oauth2/auth`,
+      token_endpoint: `${issuer}/oauth2/token`,
+    });
   });
 
   it('retains static authorization queries and distinguishes same-path AS endpoints', async () => {
@@ -14890,8 +14969,6 @@ describe('functional authorization-server and resource-server composition', () =
     const authorizationServer = new OAuthAuthorizationServer<TestEnv>({
       issuer,
       resources: [calendarResource],
-      authorizeEndpoint: '/authorize',
-      tokenEndpoint: '/oauth/token',
     });
     const calendar = host(authorizationServer, resourceMetadata, 'calendar');
 
@@ -15068,7 +15145,7 @@ describe('functional authorization-server and resource-server composition', () =
   });
 
   it('validates the resource registry and policy options at construction', async () => {
-    const base = { issuer, authorizeEndpoint: '/authorize', tokenEndpoint: '/oauth/token' };
+    const base = { issuer };
     expect(() => new OAuthAuthorizationServer<TestEnv>({ ...base, resources: [] })).toThrow(
       'resources must list at least one canonical protected resource identifier'
     );
@@ -15107,8 +15184,6 @@ describe('functional authorization-server and resource-server composition', () =
     const authorizationServer = new OAuthAuthorizationServer<TestEnv>({
       issuer,
       resources: [calendarResource, driveResource],
-      authorizeEndpoint: '/authorize',
-      tokenEndpoint: '/oauth/token',
       clientRegistrationEndpoint: '/oauth/register',
       scopesSupported: ['calendar:read', 'drive:read'],
     });
@@ -15164,8 +15239,6 @@ describe('functional authorization-server and resource-server composition', () =
     const authorizationServer = new OAuthAuthorizationServer<TestEnv>({
       issuer,
       resources: [tenantA, tenantB],
-      authorizeEndpoint: '/authorize',
-      tokenEndpoint: '/oauth/token',
     });
     const a = host(authorizationServer, { resource: tenantA }, 'a');
     const b = host(authorizationServer, { resource: tenantB }, 'b');
@@ -15188,8 +15261,6 @@ describe('functional authorization-server and resource-server composition', () =
     const authorizationServer = new OAuthAuthorizationServer<TestEnv>({
       issuer,
       resources: [calendarResource, driveResource],
-      authorizeEndpoint: '/authorize',
-      tokenEndpoint: '/oauth/token',
     });
     const response = await authorizationServer.fetch(
       createMockRequest(`${issuer}/.well-known/oauth-authorization-server`),
@@ -15272,8 +15343,6 @@ describe('functional authorization-server and resource-server composition', () =
     const authorizationServer = new OAuthAuthorizationServer<TestEnv>({
       issuer,
       resources: [originResource],
-      authorizeEndpoint: '/authorize',
-      tokenEndpoint: '/oauth/token',
       clientRegistrationEndpoint: '/oauth/register',
       scopesSupported: ['calendar:read'],
     });
@@ -15305,8 +15374,6 @@ describe('functional authorization-server and resource-server composition', () =
     const authorizationServer = new OAuthAuthorizationServer<TestEnv>({
       issuer,
       resources: [tenantResource],
-      authorizeEndpoint: '/authorize',
-      tokenEndpoint: '/oauth/token',
       clientRegistrationEndpoint: '/oauth/register',
       scopesSupported: ['calendar:read'],
     });

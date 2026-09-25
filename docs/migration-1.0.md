@@ -91,6 +91,7 @@ Completing a new authorization replaces the user and client's earlier grant _for
 None of these require changes to a migrated 0.x deployment:
 
 - **Role classes** — `OAuthAuthorizationServer` (one AS, many resources) and `OAuthResourceServer` (host a resource in the AS Worker or its own, validating over a Service Binding). See [resource-servers.md](resource-servers.md).
+- **Default endpoints on `OAuthAuthorizationServer` (1.2).** `authorizeEndpoint` and `tokenEndpoint` are optional and default to `${issuer}/authorize` and `${issuer}/oauth/token`, under the issuer's path if it has one. Delete them when they match. You still route the authorization endpoint before `authorizationServer.fetch()`, and `parseAuthRequest()` rejects a request that arrives anywhere else, so a route on the wrong path fails on its first request. Construction also rejects an endpoint another would claim, such as one on the metadata path behind a query. `OAuthProvider` still requires both options.
 - **`ctx.auth` and `insufficientScope()`** — handlers see the verified token facts beside `ctx.props` and answer scope shortfalls with the MCP `403` challenge. See [Scopes and step-up authorization](authorization-server.md#scopes-and-step-up-authorization).
 - **`onError.internal`** — every library error carries a stable `{ category, reason }` for logs and alerting; the wire stays generic.
 - **`refreshTokenIdleTTL`** — opt-in sliding refresh-token expiry.
