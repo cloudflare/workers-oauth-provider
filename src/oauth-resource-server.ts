@@ -6,7 +6,7 @@ import {
   validateResourceUri,
 } from './oauth-resource';
 import { isValidOAuthScopeToken } from './oauth-capabilities';
-import { baselineResourceScopes, resolveBaseScopes, withCorsHeaders } from './oauth-http';
+import { baselineResourceScopes, resolveRequiredScopes, withCorsHeaders } from './oauth-http';
 
 const PROTECTED_RESOURCE_WELL_KNOWN_PREFIX = '/.well-known/oauth-protected-resource';
 const NO_CACHE_HEADERS = { 'Cache-Control': 'no-store', Pragma: 'no-cache' } as const;
@@ -19,7 +19,7 @@ export interface OAuthResourceMetadata {
   authorization_servers: string[];
   /**
    * Minimal scopes used to access the protected resource.
-   * @deprecated Use `baseScopes`, which this becomes on the wire. Setting both is refused.
+   * @deprecated Use `requiredScopes`, which this becomes on the wire. Setting both is refused.
    */
   scopes_supported?: string[];
   /** Bearer-token presentation methods. This implementation supports only `header`. */
@@ -93,13 +93,17 @@ export interface OAuthResourceServerOptions<Env = Cloudflare.Env, Props = unknow
   /** RFC 9728 metadata, including this server's one canonical resource. */
   resourceMetadata: OAuthResourceMetadata;
   /**
-   * The scopes MCP clients should request up front for this resource: the minimum for basic use
-   * (published as its protected resource metadata's `scopes_supported` and named in the `401`
-   * challenge). Operations that need more ask for it with `insufficientScope()` (step-up). Not the
-   * authorization server's catalogue, `scopesSupported`. Leave unset when your consent page picks
-   * the scopes: the `401` then names none. `offline_access` is removed automatically.
+   * The scopes required for accessing this resource (MCP: the minimal set for basic use). Published
+   * as its protected resource metadata's `scopes_supported` and named in the `401` challenge, so
+   * clients request them first; not the authorization server's catalogue, `scopesSupported`.
+   * Operations that need more ask for it with `insufficientScope()` (step-up). `offline_access` is
+   * removed automatically. Leave unset when your consent page picks the scopes.
+   *
+   * Advertised, not enforced: the handler decides whether a token is sufficient (`ctx.auth.scope`),
+   * because only it knows the deployment's scope hierarchy (a broader scope implying a narrower
+   * one), which MCP requires servers to honour.
    */
-  baseScopes?: string[];
+  requiredScopes?: string[];
 
   /** Application handler for the canonical resource URL and its path descendants. */
   handler: OAuthResourceHandler<Env, Props>;
@@ -322,10 +326,11 @@ function validateOptions<Env, Props>(options: OAuthResourceServerOptions<Env, Pr
     throw new TypeError("resourceMetadata.bearer_methods_supported only supports 'header'");
   }
 
-  const configuredScopes = resolveBaseScopes(options.baseScopes, options.resourceMetadata.scopes_supported) ?? [];
+  const configuredScopes =
+    resolveRequiredScopes(options.requiredScopes, options.resourceMetadata.scopes_supported) ?? [];
   if (configuredScopes.some((scope) => typeof scope !== 'string' || !isValidOAuthScopeToken(scope))) {
     throw new TypeError(
-      'baseScopes (or the deprecated resourceMetadata.scopes_supported) must contain valid OAuth scope tokens'
+      'requiredScopes (or the deprecated resourceMetadata.scopes_supported) must contain valid OAuth scope tokens'
     );
   }
   const resourceScopes = baselineResourceScopes(configuredScopes);

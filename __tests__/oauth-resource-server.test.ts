@@ -819,11 +819,11 @@ describe('CORS on protected responses', () => {
   });
 });
 
-describe('baseScopes', () => {
+describe('requiredScopes', () => {
   it('publishes the up-front scopes as scopes_supported and names them in the 401', async () => {
     const server = createTestServer({
       resourceMetadata: { resource: RESOURCE, authorization_servers: ['https://auth.example.com'] },
-      baseScopes: ['mcp:read', 'offline_access'],
+      requiredScopes: ['mcp:read', 'offline_access'],
     });
     const env = { deployment: 'test' };
     const ctx = new MockExecutionContext() as unknown as ExecutionContext;
@@ -834,7 +834,7 @@ describe('baseScopes', () => {
     expect(challenge.headers.get('WWW-Authenticate')).toContain('scope="mcp:read"');
   });
 
-  it('refuses baseScopes together with the deprecated resourceMetadata.scopes_supported', () => {
+  it('refuses requiredScopes together with the deprecated resourceMetadata.scopes_supported', () => {
     expect(() =>
       createTestServer({
         resourceMetadata: {
@@ -842,8 +842,8 @@ describe('baseScopes', () => {
           authorization_servers: ['https://auth.example.com'],
           scopes_supported: ['mcp:read'],
         },
-        baseScopes: ['mcp:read'],
+        requiredScopes: ['mcp:read'],
       })
-    ).toThrow('Set baseScopes only: resourceMetadata.scopes_supported is deprecated in its favour');
+    ).toThrow('Set requiredScopes only: resourceMetadata.scopes_supported is deprecated in its favour');
   });
 });

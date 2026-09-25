@@ -19,8 +19,9 @@ export default new OAuthResourceServer<Env, AuthProps>({
     authorization_servers: ['https://auth.example.com'],
     resource_name: 'Example MCP server',
   },
-  // What a client should request up front: the minimum for basic use (MCP). More comes by step-up.
-  baseScopes: ['mcp:read'],
+  // Needed for any access (MCP: the minimum for basic use), so clients request it first. More comes by
+  // step-up. Advertised, not enforced: the handler below checks it.
+  requiredScopes: ['mcp:read'],
   validateToken: (env) => env.AUTH_SERVER.validateToken,
   handler: {
     fetch(request, env, ctx) {

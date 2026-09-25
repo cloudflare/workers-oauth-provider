@@ -5,14 +5,14 @@ An `OAuthAuthorizationServer` issues tokens; a resource server accepts them. Eve
 ```ts
 new OAuthResourceServer<Env, Props>({
   resourceMetadata: { resource, authorization_servers: [issuer] },
-  baseScopes: ['calendar:read'], // what clients request up front
+  requiredScopes: ['calendar:read'], // needed for any access; advertised, checked by your handler
   validateToken: (env, request) => (resource, token) =>
     Promise<{ props; audience; expiresAt?; scope?; userId?; clientId? } | null>,
   handler: { fetch(request, env, ctx) {} }, // ctx.props: Props, ctx.auth: OAuthResourceAuth
 });
 ```
 
-The host publishes RFC 9728 metadata at `/.well-known/oauth-protected-resource<path>`, answers unauthenticated requests with a Bearer challenge that names it and the `baseScopes` to ask for (published as `scopes_supported`), calls your validator with its own canonical resource and the presented token, refuses a result whose `audience` is not that resource, and answers `503` when the validator throws. Only `validateToken` changes between the topologies below.
+The host publishes RFC 9728 metadata at `/.well-known/oauth-protected-resource<path>`, answers unauthenticated requests with a Bearer challenge that names it and the `requiredScopes` to ask for (published as `scopes_supported`), calls your validator with its own canonical resource and the presented token, refuses a result whose `audience` is not that resource, and answers `503` when the validator throws. Only `validateToken` changes between the topologies below.
 
 ## What the handler sees
 
