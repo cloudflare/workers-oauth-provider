@@ -138,11 +138,25 @@ Path-aware API validation uses path-boundary prefix matching. A canonical audien
 
 ## Scopes and step-up authorization
 
-`scopesSupported` is published only in authorization server metadata. Configure each protected resource's `resourceMetadata.scopes_supported` explicitly with the minimal scopes required for its basic functionality and baseline Bearer challenges.
+Three places carry scopes on the wire. Two share the name `scopes_supported`, because RFC 8414 and RFC 9728 each define one, but they mean different things:
 
-The application decides which requested scopes to grant through `completeAuthorization({ scope })`. Token and refresh requests can only narrow those scopes.
+| On the wire                                      | Standard                                                                     | Means                                                                                      | Configure with                                                                 |
+| ------------------------------------------------ | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------ |
+| Authorization server metadata `scopes_supported` | RFC 8414                                                                     | everything this authorization server can grant, across its resources                       | `OAuthAuthorizationServer` (or `OAuthProvider`) `scopesSupported`              |
+| Protected resource metadata `scopes_supported`   | RFC 9728; MCP: "the minimal set of scopes necessary for basic functionality" | what a client should request up front for this resource                                    | `OAuthResourceServer` (or `OAuthProvider`) `resourceMetadata.scopes_supported` |
+| `WWW-Authenticate: Bearer … scope="…"`           | RFC 6750                                                                     | what's needed right now: the resource's baseline on a `401`, the missing scopes on a `403` | automatic on `401`; `insufficientScope(ctx.auth, scopes)` for a `403`          |
 
-Both hosts name `scopes_supported` in the initial `401` challenge, so a client asks for the right scopes first time. Operation-level policy stays in the handler, which reads the token's scopes from `ctx.auth.scope` and answers a shortfall with `insufficientScope(ctx.auth, ['files:write'])`: `403`, `error="insufficient_scope"`, every scope the operation needs in one challenge, and the resource's metadata URL. See [docs/resource-servers.md](resource-servers.md#what-the-handler-sees).
+With split roles the two lists live in different Workers, and the resource server never sees the authorization server's. MCP clients choose scopes from the `401` challenge or the resource's list, so keep the resource's list to the baseline and let the authorization server's list be the whole catalogue. Copying the catalogue into the resource would make every client request everything on first sign-in. `offline_access` is removed from a resource's list and challenges automatically: refresh tokens are not a resource requirement.
+
+A request flows through them like this:
+
+1. An unauthenticated call gets `401` with `scope="mcp:read"`, the resource's baseline.
+2. The client authorizes with `scope=mcp:read`. Your `/authorize` decides what to grant: `completeAuthorization({ scope })` stores it, and `approveConsent()` accepts only scopes in `scopesSupported`. Requests are not otherwise filtered against the catalogue, so the application stays in charge. Token and refresh requests can only narrow the grant.
+3. The resource sees the token's scopes as `ctx.auth.scope`. An operation that needs more answers with every scope it needs, baseline included: `insufficientScope(ctx.auth, ['mcp:read', 'mcp:write'])` gives a `403` with `error="insufficient_scope"`, `scope="mcp:read mcp:write"` and the resource's metadata URL. The client re-authorizes for those scopes. See [docs/resource-servers.md](resource-servers.md#what-the-handler-sees).
+
+[`examples/split-workers`](../examples/split-workers) walks this whole flow, from the first `401` through a read to a write after step-up, in its end-to-end test.
+
+Leaving a resource's `scopes_supported` unset is legitimate when your consent page, rather than the client, picks the scopes: the `401` then names none, MCP clients request none, and `/authorize` applies its own default. Either way, advertise the catalogue as `scopesSupported` so clients can discover it.
 
 ## KV storage and cleanup
 

@@ -5,12 +5,16 @@ interface Env {
   OAUTH_KV: KVNamespace;
 }
 
+// Everything this server can grant, across all its resources. Resources advertise their own,
+// smaller, up-front baseline; this is the catalogue.
+const SCOPES = ['mcp:read', 'mcp:write', 'offline_access'];
+
 const authorizationServer = new OAuthAuthorizationServer<Env>({
   issuer: 'https://auth.example.com',
   resources: ['https://mcp.example.com/mcp'],
   authorizeEndpoint: '/authorize',
   tokenEndpoint: '/oauth/token',
-  scopesSupported: ['mcp:read'],
+  scopesSupported: SCOPES,
 
   // Preferred for clients with no pre-existing relationship.
   // Also requires global_fetch_strictly_public in wrangler.jsonc.
@@ -44,7 +48,8 @@ async function authorize(request: Request, env: Env): Promise<Response> {
     request: oauthRequest,
     userId: user.id,
     metadata: { clientName: client.clientName },
-    scope: oauthRequest.scope.filter((scope) => scope === 'mcp:read'),
+    // Grant what was asked for, within the catalogue. (Or less: the user may decline some.)
+    scope: oauthRequest.scope.filter((scope) => SCOPES.includes(scope)),
     props: { userId: user.id, displayName: user.displayName },
   });
   return Response.redirect(redirectTo, 302);
