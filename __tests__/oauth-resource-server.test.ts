@@ -818,3 +818,32 @@ describe('CORS on protected responses', () => {
     expect(challenge.headers.get('Access-Control-Allow-Origin')).toBe('https://other.example');
   });
 });
+
+describe('baseScopes', () => {
+  it('publishes the up-front scopes as scopes_supported and names them in the 401', async () => {
+    const server = createTestServer({
+      resourceMetadata: { resource: RESOURCE, authorization_servers: ['https://auth.example.com'] },
+      baseScopes: ['mcp:read', 'offline_access'],
+    });
+    const env = { deployment: 'test' };
+    const ctx = new MockExecutionContext() as unknown as ExecutionContext;
+
+    const metadata = await (await server.fetch(new Request(METADATA_URL), env, ctx)).json<any>();
+    expect(metadata.scopes_supported).toEqual(['mcp:read']); // offline_access is never a resource requirement
+    const challenge = await server.fetch(new Request(RESOURCE), env, ctx);
+    expect(challenge.headers.get('WWW-Authenticate')).toContain('scope="mcp:read"');
+  });
+
+  it('refuses baseScopes together with the deprecated resourceMetadata.scopes_supported', () => {
+    expect(() =>
+      createTestServer({
+        resourceMetadata: {
+          resource: RESOURCE,
+          authorization_servers: ['https://auth.example.com'],
+          scopes_supported: ['mcp:read'],
+        },
+        baseScopes: ['mcp:read'],
+      })
+    ).toThrow('Set baseScopes only: resourceMetadata.scopes_supported is deprecated in its favour');
+  });
+});

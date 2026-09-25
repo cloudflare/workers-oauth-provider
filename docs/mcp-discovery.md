@@ -41,10 +41,10 @@ Every protected resource needs its own `resourceMetadata.resource`. Configure ea
 resourceMetadata: {
   resource: 'https://mcp.example.com/mcp',
   authorization_servers: ['https://auth.example.com'],
-  scopes_supported: ['files:read'],
   bearer_methods_supported: ['header'],
   resource_name: 'Files MCP server',
-}
+},
+baseScopes: ['files:read'], // published as this document's scopes_supported
 ```
 
 For the example above, an unauthenticated request to the exact canonical URL receives a Bearer challenge pointing to:

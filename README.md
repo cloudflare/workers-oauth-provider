@@ -47,8 +47,8 @@ export default new OAuthResourceServer<Env, AuthProps>({
   resourceMetadata: {
     resource: 'https://mcp.example.com/mcp',
     authorization_servers: ['https://auth.example.com'],
-    scopes_supported: ['mcp:read'], // what a client requests up front: the minimum for basic use
   },
+  baseScopes: ['mcp:read'], // what a client requests up front: the minimum for basic use
   validateToken: (env) => env.AUTH_SERVER.validateToken,
   handler: {
     fetch(request, env, ctx) {
@@ -66,7 +66,7 @@ export default new OAuthResourceServer<Env, AuthProps>({
 
 The resource server publishes its RFC 9728 metadata, answers unauthenticated requests with a challenge pointing at it, and accepts only tokens issued for its own resource. The handler owns authorization beyond that: scopes, ownership, tenancy.
 
-Both roles publish a `scopes_supported`, as the specs name them, meaning different things: the authorization server's is everything it can grant; a resource's is what MCP clients request up front, and more comes by step-up. See [Scopes](docs/authorization-server.md#scopes-and-step-up-authorization).
+On the wire both lists are called `scopes_supported`, as the specs name them, but they mean different things: `scopesSupported` is everything the authorization server can grant; a resource's `baseScopes` is what MCP clients request up front, and more comes by step-up. See [Scopes](docs/authorization-server.md#scopes-and-step-up-authorization).
 
 ## One Worker: `OAuthProvider`
 
@@ -83,8 +83,8 @@ export default new OAuthProvider<Env>({
   resourceMetadata: {
     resource: 'https://mcp.example.com/mcp',
     authorization_servers: ['https://mcp.example.com'],
-    scopes_supported: ['mcp:read'], // what a client requests up front
   },
+  baseScopes: ['mcp:read'], // what a client requests up front
   clientIdMetadataDocumentEnabled: true,
 });
 ```

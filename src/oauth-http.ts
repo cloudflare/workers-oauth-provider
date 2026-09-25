@@ -41,6 +41,21 @@ export function appendHeaderValue(headers: Headers, name: string, value: string)
 }
 
 /**
+ * A resource's up-front scopes: `baseScopes`, or the deprecated `resourceMetadata.scopes_supported`
+ * it replaces. Both at once is ambiguous and refused.
+ */
+export function resolveBaseScopes(
+  baseScopes: readonly string[] | undefined,
+  deprecatedScopesSupported: readonly string[] | undefined
+): string[] | undefined {
+  if (baseScopes !== undefined && deprecatedScopesSupported !== undefined) {
+    throw new TypeError('Set baseScopes only: resourceMetadata.scopes_supported is deprecated in its favour');
+  }
+  const scopes = baseScopes ?? deprecatedScopesSupported;
+  return scopes === undefined ? undefined : [...scopes];
+}
+
+/**
  * The scopes a protected resource advertises and challenges with: deduplicated, and without
  * `offline_access`, which is an authorization-server capability rather than a resource requirement.
  */
