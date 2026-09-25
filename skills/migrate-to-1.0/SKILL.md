@@ -1,35 +1,49 @@
 ---
 name: workers-oauth-provider-migrate-1.0
-description: Migrate a Cloudflare Worker from @cloudflare/workers-oauth-provider 0.x to 1.0. Use when upgrading that dependency, when OAuthProvider construction throws about resourceMetadata.resource or resourceMatchOriginOnly, or when asked to adopt the 1.0 role-based API (OAuthAuthorizationServer / OAuthResourceServer).
+description: Upgrade a Cloudflare Worker's @cloudflare/workers-oauth-provider from 0.x, 1.0 or 1.1 to the latest 1.x. Use when bumping that dependency, or when OAuthProvider / OAuthAuthorizationServer / OAuthResourceServer construction throws after an upgrade.
 ---
 
-# Migrate @cloudflare/workers-oauth-provider 0.x → 1.0
+# Upgrade @cloudflare/workers-oauth-provider to the latest 1.x
 
-The single source of truth for every change is the migration guide shipped with the package:
-`node_modules/@cloudflare/workers-oauth-provider/docs/migration-1.0.md`
-(also at https://github.com/cloudflare/workers-oauth-provider/blob/main/docs/migration-1.0.md).
-Read it fully before editing. This skill is the procedure around it; do not work from memory of 0.x or from this file alone.
+Reference (read the section for every hit): `node_modules/@cloudflare/workers-oauth-provider/docs/migration-1.0.md`.
+Types and JSDoc: `node_modules/@cloudflare/workers-oauth-provider/dist/oauth-provider.d.ts`.
+No KV migration exists or is needed; never edit stored data.
 
 ## Procedure
 
-1. **Detect the shape.** Find `new OAuthProvider(` and read its options. The common shape is one Worker acting as authorization server and resource server; that shape stays on `OAuthProvider` in 1.0. Do not introduce `OAuthAuthorizationServer`/`OAuthResourceServer` unless the user asks for a multi-Worker or multi-resource topology.
-2. **Choose the canonical resource — ask the user.** `resourceMetadata: { resource }` is required in 1.0. The value is the URL MCP clients connect to (often an existing `apiRoute` on the Worker's public origin, e.g. `https://mcp.example.com/mcp`). Infer a candidate from `wrangler.jsonc` routes/custom domains plus `apiRoute`, present it, and get confirmation — it becomes the token audience, so it must be right.
-3. **Apply the guide's changes** that match the code: add `resourceMetadata.resource`; delete `resourceMatchOriginOnly`; make `resolveExternalToken` return the canonical `audience`; single-string `resource`/`aud` types; check `apiRoute`s are the resource path or descendants.
-4. **Bump the dependency** to `^1.0.0` and install.
-5. **Verify** (below), then walk the user through the guide's "Existing stored data" section so they know what their live clients will experience (nothing, in the common case).
+1. Note the installed version (`package.json`). Skip guide sections tagged older than it.
+2. Search the project for each pattern below and apply the fix.
+3. Bump to the latest `^1`, install, typecheck, run tests. Construction errors quote the rule; grep the guide for the message.
+4. Keep `OAuthProvider` if the project uses it. Don't move to `OAuthAuthorizationServer`/`OAuthResourceServer` unless asked.
 
-## Stop and ask the user
+| Pattern in the project                                                                                                                          | Fix                                                                                                   | Guide section                                                 |
+| ----------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- | ------------------------------------------------------------- |
+| `new OAuthProvider(` without `resourceMetadata`                                                                                                 | add `resourceMetadata: { resource }` (ask the user for the value)                                     | The canonical resource is required                            |
+| `resourceMatchOriginOnly`                                                                                                                       | delete                                                                                                | Removed: `resourceMatchOriginOnly`                            |
+| `resolveExternalToken`                                                                                                                          | return `audience: <resource>`                                                                         | `resolveExternalToken` names its audience                     |
+| `scopes_supported` inside `resourceMetadata`                                                                                                    | move to top-level `requiredScopes`                                                                    | `requiredScopes` replaces `resourceMetadata.scopes_supported` |
+| `allowImplicitFlow`, `allowPlainPKCE`                                                                                                           | delete; own clients must use code + S256                                                              | Removed: the implicit grant and plain PKCE                    |
+| `redirectUris` / redirect URIs with `http://` non-loopback or a custom scheme                                                                   | https or loopback; native apps: `allowPrivateUseRedirectUris: true`                                   | Redirect URIs must be HTTPS or loopback HTTP                  |
+| `clientRegistrationTTL: 0`; any `*TTL` below 60                                                                                                 | `0` → `undefined`; raise to ≥ 60                                                                      | Lifetimes are validated at construction                       |
+| `userId:` built with `:` (e.g. `` `${a}:${b}` ``)                                                                                               | `encodeURIComponent(...)`, same value in `listUserGrants`/`revokeGrant`                               | User IDs cannot contain `:`                                   |
+| `revokeExistingGrantsBatchSize`                                                                                                                 | delete                                                                                                | Removed: `revokeExistingGrantsBatchSize`                      |
+| imports of `resourceMatches`, `validateResourceUri`, `isValidOAuthScopeToken`, `base64UrlToBytes`, `parseJwtJsonPart`, `getJwtCryptoAlgorithms` | inline the logic; no replacement export                                                               | Internal helpers are no longer exported                       |
+| `createClient(` / `updateClient(`                                                                                                               | only `authorization_code`/`refresh_token`/enabled grants, `code` responses; don't update CIMD clients | Client helpers validate what they store                       |
+| `tokenExchangeCallback`                                                                                                                         | `OAuthError('invalid_grant')` now revokes the grant; `env` is available; check returned TTLs          | `tokenExchangeCallback`                                       |
+| `purgeExpiredData(`                                                                                                                             | persist `result.cursor`, pass it back as `cursor`                                                     | `purgeExpiredData()` resumes from a cursor                    |
+| `new OAuthAuthorizationServer(`                                                                                                                 | drop `authorizeEndpoint`/`tokenEndpoint` if they equal `${issuer}/authorize`, `${issuer}/oauth/token` | `OAuthAuthorizationServer` endpoints have defaults            |
+| `ExchangeTokenOptions.aud`, `AuthRequest.resource` as arrays                                                                                    | single strings                                                                                        | Type changes                                                  |
 
-- The canonical `resource` value (step 2). Never guess silently.
-- On a multi-resource `OAuthAuthorizationServer`: which resource is `legacyGrantResource` (the migration destination for pre-1.0 grants). Omitting it makes old grants reauthorize.
-- Any DCR client base registered with narrow `grant_types`: 1.0 enforces them; confirm the registered types cover what clients actually send before deploying.
-- Adopting new 1.0 surface (role classes, `ctx.auth`, `insufficientScope`, `onError.internal`) is optional — offer, don't do unasked.
+## Ask the user, don't guess
+
+- The canonical `resource` (the URL MCP clients connect to; becomes the token audience).
+- On a multi-resource `OAuthAuthorizationServer`: `legacyGrantResource`, the destination for pre-1.0 grants. Fixed once deployed.
+- Whether registered clients use remote `http` or custom-scheme redirect URIs (they stop authorizing), and whether any user IDs contain `:`. Neither shows up in a typecheck.
+- Whether DCR clients registered narrow `grant_types` (now enforced).
+- Adopting optional features (role classes, `ctx.auth`, `insufficientScope`, consent helpers, `refreshTokenIdleTTL`): offer, don't do unasked.
 
 ## Verify
 
-1. `tsc`/typecheck and the project's tests pass.
-2. `wrangler dev`, then:
-   - `curl -i http://localhost:8787<api route>` → 401 whose `WWW-Authenticate` names `resource_metadata="…/.well-known/oauth-protected-resource<resource path>"`. This works locally whatever the configured resource's origin.
-   - The metadata document itself is origin-strict (RFC 9728 §3): its well-known URL is `<resource origin>/.well-known/oauth-protected-resource<resource path>`. When the dev config's resource is on the loopback origin (e.g. `http://localhost:8787/mcp`), `curl http://localhost:8787/.well-known/oauth-protected-resource/mcp` → 200 with the exact `resource`. A production resource origin serves its document only there — after deploy: `curl https://<host>/.well-known/oauth-protected-resource<resource path>`.
-   - Construction errors surface on the first request and name the violated rule; fix per the guide.
-3. If the deployment has live users, re-read "Existing stored data — nothing to do" in the guide and confirm no step you took contradicts it (no KV edits, no `legacyGrantResource` changes after rollout).
+- `wrangler dev`, then `curl -i http://localhost:8787<api route>`: `401` whose `WWW-Authenticate` has `resource_metadata="…/.well-known/oauth-protected-resource<resource path>"`.
+- With a loopback dev resource, `curl http://localhost:8787/.well-known/oauth-protected-resource<resource path>`: `200` with the exact `resource`. Production serves it only on the resource's own origin.
+- `curl http://localhost:8787/.well-known/oauth-authorization-server`: `authorization_endpoint` and `token_endpoint` unchanged from before the upgrade.
