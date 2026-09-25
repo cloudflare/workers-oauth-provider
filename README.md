@@ -2,7 +2,7 @@
 
 `@cloudflare/workers-oauth-provider` adds OAuth 2.1 authorization to HTTP APIs and remote MCP servers running on Cloudflare Workers.
 
-> **Upgrading from 0.x?** Read the [migration guide](docs/migration-1.0.md), or point your coding agent at [`skills/migrate-to-1.0/`](skills/migrate-to-1.0/SKILL.md), which also ships in the npm package.
+> **Upgrading from 0.x, 1.0 or 1.1?** Read the [migration guide](docs/migration-1.0.md), which covers every change since 0.10 with code, or point your coding agent at [`skills/migrate-to-1.0/`](skills/migrate-to-1.0/SKILL.md), which also ships in the npm package.
 
 ## Install
 
