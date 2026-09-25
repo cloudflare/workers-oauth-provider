@@ -17,10 +17,10 @@ export default new OAuthResourceServer<Env, AuthProps>({
   resourceMetadata: {
     resource: 'https://mcp.example.com/mcp',
     authorization_servers: ['https://auth.example.com'],
-    // What a client should request up front: the minimum for basic use (MCP). More comes by step-up.
-    scopes_supported: ['mcp:read'],
     resource_name: 'Example MCP server',
   },
+  // What a client should request up front: the minimum for basic use (MCP). More comes by step-up.
+  baseScopes: ['mcp:read'],
   validateToken: (env) => env.AUTH_SERVER.validateToken,
   handler: {
     fetch(request, env, ctx) {

@@ -13,7 +13,7 @@ import {
   withAuthorizationRedirect,
   type OAuthServerCapabilities,
 } from './oauth-capabilities';
-import { baselineResourceScopes, withCorsHeaders } from './oauth-http';
+import { baselineResourceScopes, resolveBaseScopes, withCorsHeaders } from './oauth-http';
 import {
   fetchClientIdMetadataDocument,
   isClientIdMetadataDocumentUrl,
@@ -416,7 +416,10 @@ export interface OAuthProtectedResourceMetadata {
    */
   authorization_servers?: string[];
 
-  /** Minimal scopes required for basic protected-resource functionality. */
+  /**
+   * Minimal scopes required for basic protected-resource functionality.
+   * @deprecated Use `baseScopes`, which this becomes on the wire. Setting both is refused.
+   */
   scopes_supported?: string[];
 
   /** Methods by which bearer tokens can be presented. Defaults to `["header"]`. */
@@ -534,8 +537,8 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
 
   /**
    * Scopes supported by the authorization server.
-   * These are advertised only in authorization server metadata; configure
-   * `resourceMetadata.scopes_supported` separately for protected resource requirements.
+   * These are advertised only in authorization server metadata; configure a resource's
+   * up-front scopes separately, with `baseScopes`.
    */
   scopesSupported?: string[];
 
@@ -652,6 +655,15 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
    * Controls the response served at /.well-known/oauth-protected-resource.
    */
   resourceMetadata: OAuthProtectedResourceMetadata;
+
+  /**
+   * The scopes MCP clients should request up front for this resource: the minimum for basic use
+   * (published as its protected resource metadata's `scopes_supported` and named in the `401`
+   * challenge). Operations that need more ask for it with `insufficientScope()` (step-up). Not the
+   * authorization server's catalogue, `scopesSupported`. Leave unset when your consent page picks
+   * the scopes: the `401` then names none. `offline_access` is removed automatically.
+   */
+  baseScopes?: string[];
 }
 
 /** The authorization-server role when one Worker hosts several MCP resources. */
@@ -696,6 +708,7 @@ type InternalOAuthAuthorizationServerOptions<Env = Cloudflare.Env> = Omit<
   | 'tokenEndpoint'
   | 'clientRegistrationEndpoint'
   | 'resourceMetadata'
+  | 'baseScopes'
 > & {
   authorizationServer: OAuthAuthorizationServerConfiguration;
 };
@@ -708,7 +721,13 @@ type InternalOAuthAuthorizationServerOptions<Env = Cloudflare.Env> = Omit<
  */
 export type OAuthAuthorizationServerOptions<Env = Cloudflare.Env> = Omit<
   OAuthProviderOptions<Env>,
-  'apiRoute' | 'apiHandler' | 'apiHandlers' | 'defaultHandler' | 'resourceMetadata' | 'resolveExternalToken'
+  | 'apiRoute'
+  | 'apiHandler'
+  | 'apiHandlers'
+  | 'defaultHandler'
+  | 'resourceMetadata'
+  | 'baseScopes'
+  | 'resolveExternalToken'
 > & {
   /** Canonical RFC 8414 issuer. */
   issuer: string;
@@ -1858,7 +1877,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       normalizedOptions = options;
       configuredResourceServers = [
         {
-          resourceMetadata: options.resourceMetadata,
+          // One internal shape: baseScopes, or the deprecated field it replaces, as scopes_supported.
+          resourceMetadata: withBaseScopes(options.resourceMetadata, options.baseScopes),
           resolveExternalToken: options.resolveExternalToken,
         },
       ];
@@ -2254,7 +2274,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     if (options.scopes_supported?.some((scope) => !isValidOAuthScopeToken(scope))) {
-      throw new TypeError('resourceMetadata.scopes_supported must contain valid OAuth scope tokens');
+      throw new TypeError(
+        'baseScopes (or the deprecated resourceMetadata.scopes_supported) must contain valid OAuth scope tokens'
+      );
     }
 
     if (options.bearer_methods_supported?.some((method) => method !== 'header')) {
@@ -5903,6 +5925,17 @@ function wouldRegisterPublicClient(
   } catch {
     return false;
   }
+}
+
+/** The combined provider's resource metadata with its up-front scopes resolved into `scopes_supported`. */
+function withBaseScopes(
+  metadata: OAuthProtectedResourceMetadata,
+  baseScopes: string[] | undefined
+): OAuthProtectedResourceMetadata {
+  if (!metadata || typeof metadata !== 'object') return metadata;
+  const { scopes_supported: deprecated, ...rest } = metadata;
+  const scopes = resolveBaseScopes(baseScopes, deprecated);
+  return scopes === undefined ? rest : { ...rest, scopes_supported: scopes };
 }
 
 /** A refresh-token lifetime: 0 for "issue no refresh token", else a lifetime KV can store. */

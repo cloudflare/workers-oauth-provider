@@ -658,7 +658,7 @@ describe('OAuthProvider', () => {
       [
         'an invalid scope token',
         { scopes_supported: ['scope with spaces'] },
-        'resourceMetadata.scopes_supported must contain valid OAuth scope tokens',
+        'baseScopes (or the deprecated resourceMetadata.scopes_supported) must contain valid OAuth scope tokens',
       ],
       [
         'an unsupported bearer method',
@@ -710,6 +710,41 @@ describe('OAuthProvider', () => {
       expect(() => new BaseOAuthProvider(invalidTypedOptions)).toThrow(
         'resourceMetadata.resource is required and must be an absolute HTTPS URI without a fragment'
       );
+    });
+
+    it('takes a resource baseline from baseScopes, and refuses it with the deprecated field too', async () => {
+      const options = {
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        scopesSupported: ['read', 'write', 'offline_access'],
+      };
+      const provider = new OAuthProvider({
+        ...options,
+        resourceMetadata: { resource: 'https://api.example.com' },
+        baseScopes: ['read'],
+      });
+      const metadata = await (
+        await provider.fetch(
+          createMockRequest('https://api.example.com/.well-known/oauth-protected-resource'),
+          mockEnv,
+          mockCtx
+        )
+      ).json<any>();
+      expect(metadata.scopes_supported).toEqual(['read']);
+      const challenge = await provider.fetch(createMockRequest('https://api.example.com/api/x'), mockEnv, mockCtx);
+      expect(challenge.headers.get('WWW-Authenticate')).toContain('scope="read"');
+
+      expect(
+        () =>
+          new OAuthProvider({
+            ...options,
+            resourceMetadata: { resource: 'https://api.example.com', scopes_supported: ['read'] },
+            baseScopes: ['read'],
+          })
+      ).toThrow('Set baseScopes only: resourceMetadata.scopes_supported is deprecated in its favour');
     });
 
     it('should not infer protected resource requirements from authorization server scopes', async () => {

@@ -140,11 +140,11 @@ Path-aware API validation uses path-boundary prefix matching. A canonical audien
 
 Three places carry scopes on the wire. Two share the name `scopes_supported`, because RFC 8414 and RFC 9728 each define one, but they mean different things:
 
-| On the wire                                      | Standard                                                                     | Means                                                                                      | Configure with                                                                 |
-| ------------------------------------------------ | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------ |
-| Authorization server metadata `scopes_supported` | RFC 8414                                                                     | everything this authorization server can grant, across its resources                       | `OAuthAuthorizationServer` (or `OAuthProvider`) `scopesSupported`              |
-| Protected resource metadata `scopes_supported`   | RFC 9728; MCP: "the minimal set of scopes necessary for basic functionality" | what a client should request up front for this resource                                    | `OAuthResourceServer` (or `OAuthProvider`) `resourceMetadata.scopes_supported` |
-| `WWW-Authenticate: Bearer … scope="…"`           | RFC 6750                                                                     | what's needed right now: the resource's baseline on a `401`, the missing scopes on a `403` | automatic on `401`; `insufficientScope(ctx.auth, scopes)` for a `403`          |
+| On the wire                                      | Standard                                                                     | Means                                                                                      | Configure with                                                        |
+| ------------------------------------------------ | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ | --------------------------------------------------------------------- |
+| Authorization server metadata `scopes_supported` | RFC 8414                                                                     | everything this authorization server can grant, across its resources                       | `OAuthAuthorizationServer` (or `OAuthProvider`) `scopesSupported`     |
+| Protected resource metadata `scopes_supported`   | RFC 9728; MCP: "the minimal set of scopes necessary for basic functionality" | what a client should request up front for this resource                                    | `OAuthResourceServer` (or `OAuthProvider`) `baseScopes`               |
+| `WWW-Authenticate: Bearer … scope="…"`           | RFC 6750                                                                     | what's needed right now: the resource's baseline on a `401`, the missing scopes on a `403` | automatic on `401`; `insufficientScope(ctx.auth, scopes)` for a `403` |
 
 With split roles the two lists live in different Workers, and the resource server never sees the authorization server's. MCP clients choose scopes from the `401` challenge or the resource's list, so keep the resource's list to the baseline and let the authorization server's list be the whole catalogue. Copying the catalogue into the resource would make every client request everything on first sign-in. `offline_access` is removed from a resource's list and challenges automatically: refresh tokens are not a resource requirement.
 
@@ -156,7 +156,9 @@ A request flows through them like this:
 
 [`examples/split-workers`](../examples/split-workers) walks this whole flow, from the first `401` through a read to a write after step-up, in its end-to-end test.
 
-Leaving a resource's `scopes_supported` unset is legitimate when your consent page, rather than the client, picks the scopes: the `401` then names none, MCP clients request none, and `/authorize` applies its own default. Either way, advertise the catalogue as `scopesSupported` so clients can discover it.
+Leaving a resource's `baseScopes` unset is legitimate when your consent page, rather than the client, picks the scopes: the `401` then names none, MCP clients request none, and `/authorize` applies its own default. Either way, advertise the catalogue as `scopesSupported` so clients can discover it.
+
+`baseScopes` replaced `resourceMetadata.scopes_supported` in 1.2. The old field still works, but is deprecated: move its value to `baseScopes`. Setting both throws at construction.
 
 ## KV storage and cleanup
 
