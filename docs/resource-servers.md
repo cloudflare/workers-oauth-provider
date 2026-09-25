@@ -152,3 +152,27 @@ validateToken: (env) => async (resource, token) => {
 ```
 
 The host still enforces the audience and expiry it is given, and it fails closed on a malformed `scope`, `userId` or `clientId`. Everything else about that issuer's tokens is between you and it. MCP's security guidance is blunt on the point that a resource server must accept only tokens issued for it; keep `audience` honest.
+
+### Alongside your own tokens
+
+One resource can also accept both this authorization server's tokens and an upstream API's own credentials, such as a proxy that lets users present their API token directly. Recognise the upstream's tokens by shape, and validate them yourself. Check the upstream first, and only by a shape the upstream uses, so an expired token of your own is never sent to a third party:
+
+```ts
+validateToken: (env) => async (resource, token) => {
+  if (token.startsWith('cfut_')) {
+    const upstream = await fetch('https://api.example.com/user', { headers: { Authorization: `Bearer ${token}` } });
+    if (upstream.status === 429) {
+      throw new OAuthError('temporarily_unavailable', {
+        description: 'Upstream rate limited',
+        statusCode: 429,
+        headers: { 'Retry-After': upstream.headers.get('Retry-After') ?? '30' },
+      });
+    }
+    if (!upstream.ok) return null; // 401 invalid_token
+    return { props: await upstream.json(), audience: resource };
+  }
+  return env.AUTH_SERVER.validateToken(resource, token);
+},
+```
+
+Return `null` for a token that isn't valid here, which gets the `401` challenge. Throw `OAuthError` for a specific answer: `invalid_token` becomes a `401` and `insufficient_scope` a `403` with its challenge (naming `requiredScopes`, or the resource's), each with a Bearer challenge; any other code keeps its status and headers. Anything else thrown is a `503`. Throw it in this Worker's validator: an `OAuthError` thrown in another Worker arrives over RPC as a plain `Error`. With the combined `OAuthProvider`, the same job is `resolveExternalToken`, which throws `ExternalTokenError`.

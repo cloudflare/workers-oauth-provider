@@ -6,6 +6,7 @@ import {
   validateResourceUri,
 } from './oauth-resource';
 import { isValidOAuthScopeToken } from './oauth-capabilities';
+import { OAuthError } from './oauth-error';
 import { baselineResourceScopes, resolveRequiredScopes, withCorsHeaders } from './oauth-http';
 
 const PROTECTED_RESOURCE_WELL_KNOWN_PREFIX = '/.well-known/oauth-protected-resource';
@@ -116,7 +117,15 @@ export interface OAuthResourceServerOptions<Env = Cloudflare.Env, Props = unknow
    *   `(env) => env.AUTH_SERVER.validateToken`
    * - The authorization server in this Worker:
    *   `(env) => (resource, token) => authorizationServer.validateToken(resource, token, env)`
-   * - Anything else, at your own risk: a function that validates the token for `resource`.
+   * - Anything else, at your own risk: a function that validates the token for `resource`,
+   *   such as one that recognises an upstream API's credentials and validates them itself
+   *   before falling back to the authorization server.
+   *
+   * Return `null` for a token that isn't valid here (a `401` challenge). Throw an `OAuthError`
+   * for a specific answer: `temporarily_unavailable` with `statusCode: 429` and a `Retry-After`
+   * header, `insufficient_scope` with `requiredScopes`, or `invalid_token` with a description.
+   * Anything else thrown is a validator failure (`503`). An `OAuthError` thrown in another
+   * Worker arrives over RPC as a plain `Error`, so throw it in this Worker's validator.
    */
   validateToken(env: Env, request: Request): OAuthResourceTokenValidator<Props>;
 }
@@ -246,7 +255,10 @@ export class OAuthResourceServer<Env = Cloudflare.Env, Props = unknown> {
     let validation: OAuthResourceTokenValidation<Props> | null;
     try {
       validation = await options.validateToken(env, request)(validated.resource, token);
-    } catch {
+    } catch (error) {
+      // An OAuthError is the validator's answer (429 with Retry-After, 403 insufficient_scope, ...);
+      // anything else is the validator failing.
+      if (error instanceof OAuthError) return withCorsHeaders(createOAuthErrorResponse(error, url, validated), request);
       return withCorsHeaders(createValidationUnavailableResponse(), request);
     }
 
@@ -480,6 +492,40 @@ function createBearerChallenge(
       'WWW-Authenticate': challenge,
     },
   });
+}
+
+/**
+ * A validator's `OAuthError` as the response. RFC 6750 fixes `invalid_token` at `401` and
+ * `insufficient_scope` at `403`, each with a Bearer challenge (unless the error brings its own);
+ * any other code keeps the error's status and headers, such as a `429` with `Retry-After`.
+ */
+function createOAuthErrorResponse(
+  error: OAuthError,
+  requestUrl: URL,
+  validated: ValidatedResourceConfiguration
+): Response {
+  const headers: Record<string, string> = { ...NO_CACHE_HEADERS, 'Content-Type': 'application/json', ...error.headers };
+  const hasChallenge = Object.keys(headers).some((name) => name.toLowerCase() === 'www-authenticate');
+  let status = error.statusCode;
+  if (error.code === 'invalid_token') {
+    status = 401;
+    if (!hasChallenge)
+      headers['WWW-Authenticate'] = createBearerChallenge(requestUrl, validated, true).headers.get('WWW-Authenticate')!;
+  } else if (error.code === 'insufficient_scope') {
+    status = 403;
+    if (!hasChallenge) {
+      const scopes = [...new Set(error.requiredScopes ?? validated.metadata.scopes_supported ?? [])];
+      // A malformed answer from the validator is the validator failing, like any other bad throw.
+      if (scopes.some((scope) => typeof scope !== 'string' || !isValidOAuthScopeToken(scope))) {
+        return createValidationUnavailableResponse();
+      }
+      headers['WWW-Authenticate'] =
+        'Bearer realm="OAuth", error="insufficient_scope"' +
+        (scopes.length > 0 ? `, scope="${scopes.join(' ')}"` : '') +
+        `, resource_metadata="${validated.metadataUrl.href}"`;
+    }
+  }
+  return new Response(JSON.stringify({ error: error.code, error_description: error.description }), { status, headers });
 }
 
 function createValidationUnavailableResponse(): Response {

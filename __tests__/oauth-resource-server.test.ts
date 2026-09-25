@@ -8,6 +8,7 @@ import {
   type OAuthResourceServerOptions,
   type OAuthResourceTokenValidation,
 } from '../src/oauth-resource-server';
+import { OAuthError } from '../src/oauth-error';
 import type { ExecutionContext } from '@cloudflare/workers-types';
 
 const RESOURCE = 'https://mcp.example.com/mcp';
@@ -845,5 +846,69 @@ describe('requiredScopes', () => {
         requiredScopes: ['mcp:read'],
       })
     ).toThrow('Set requiredScopes only: resourceMetadata.scopes_supported is deprecated in its favour');
+  });
+});
+
+describe('validateToken throwing OAuthError', () => {
+  const env = { deployment: 'test' };
+  const call = (error: unknown, headers: Record<string, string> = {}) =>
+    createTestServer({
+      requiredScopes: ['mcp:read'],
+      resourceMetadata: { resource: RESOURCE, authorization_servers: ['https://auth.example.com'] },
+      // A composed validator: an upstream API's credential, validated here, answers for itself.
+      validateToken: () => async () => {
+        throw error;
+      },
+    }).fetch(
+      new Request(RESOURCE, { headers: { Authorization: 'Bearer cfut_upstream', ...headers } }),
+      env,
+      new MockExecutionContext() as unknown as ExecutionContext
+    );
+
+  it('passes a rate limit through with its status and Retry-After', async () => {
+    const response = await call(
+      new OAuthError('temporarily_unavailable', {
+        description: 'Upstream rate limited',
+        statusCode: 429,
+        headers: { 'Retry-After': '30' },
+      }),
+      { Origin: 'https://app.example' }
+    );
+    expect(response.status).toBe(429);
+    expect(response.headers.get('Retry-After')).toBe('30');
+    expect(response.headers.get('Access-Control-Expose-Headers')).toContain('Retry-After');
+    expect(await response.json()).toEqual({
+      error: 'temporarily_unavailable',
+      error_description: 'Upstream rate limited',
+    });
+  });
+
+  it('turns insufficient_scope into the MCP 403 challenge, defaulting to the required scopes', async () => {
+    const named = await call(
+      new OAuthError('insufficient_scope', { description: 'needs account:read', requiredScopes: ['account:read'] })
+    );
+    expect(named.status).toBe(403);
+    expect(named.headers.get('WWW-Authenticate')).toBe(
+      `Bearer realm="OAuth", error="insufficient_scope", scope="account:read", resource_metadata="${METADATA_URL}"`
+    );
+    const defaulted = await call(new OAuthError('insufficient_scope', { description: 'no scope' }));
+    expect(defaulted.headers.get('WWW-Authenticate')).toContain('scope="mcp:read"');
+  });
+
+  it('answers invalid_token with 401 and the Bearer challenge, whatever the status given', async () => {
+    const response = await call(new OAuthError('invalid_token', { description: 'Upstream token revoked' }));
+    expect(response.status).toBe(401);
+    expect(response.headers.get('WWW-Authenticate')).toContain('error="invalid_token"');
+    expect(response.headers.get('WWW-Authenticate')).toContain(`resource_metadata="${METADATA_URL}"`);
+    expect(await response.json()).toMatchObject({
+      error: 'invalid_token',
+      error_description: 'Upstream token revoked',
+    });
+  });
+
+  it('still treats any other throw, or a malformed OAuthError, as the validator failing', async () => {
+    expect((await call(new Error('binding exploded'))).status).toBe(503);
+    const malformed = new OAuthError('insufficient_scope', { description: 'x', requiredScopes: ['has space'] });
+    expect((await call(malformed)).status).toBe(503);
   });
 });
