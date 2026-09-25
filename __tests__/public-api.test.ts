@@ -13,6 +13,7 @@ const RUNTIME_EXPORTS = [
   'OAuthProvider',
   'OAuthResourceServer',
   'authorizationErrorRedirect',
+  'createJwtAccessTokenValidator',
   'default',
   'getOAuthApi',
   'insufficientScope',

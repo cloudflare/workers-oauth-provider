@@ -1,0 +1,13 @@
+{
+  "$schema": "../../../node_modules/wrangler/config-schema.json",
+  "name": "jwt-mcp-server",
+  "main": "index.ts",
+  "compatibility_date": "2026-07-29",
+  // Reachable only on its custom domain, which matches the configured resource.
+  "workers_dev": false,
+  "routes": [{ "pattern": "mcp.example.com", "custom_domain": true }],
+  // Used only to fetch the auth server's public keys, which are cached; tokens are verified locally.
+  "services": [{ "binding": "AUTH_SERVER", "service": "jwt-auth-server" }],
+  // Builds against this repository's source. Delete this in your own project.
+  "alias": { "@cloudflare/workers-oauth-provider": "../../../src/oauth-provider.ts" },
+}
