@@ -515,8 +515,9 @@ function createOAuthErrorResponse(
     status = 403;
     if (!hasChallenge) {
       const scopes = [...new Set(error.requiredScopes ?? validated.metadata.scopes_supported ?? [])];
+      // A malformed answer from the validator is the validator failing, like any other bad throw.
       if (scopes.some((scope) => typeof scope !== 'string' || !isValidOAuthScopeToken(scope))) {
-        throw new TypeError('OAuthError requiredScopes must contain valid OAuth scope tokens');
+        return createValidationUnavailableResponse();
       }
       headers['WWW-Authenticate'] =
         'Bearer realm="OAuth", error="insufficient_scope"' +

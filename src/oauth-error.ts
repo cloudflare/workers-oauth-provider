@@ -62,15 +62,19 @@ export interface OAuthErrorOptions {
 }
 
 /**
- * Structured OAuth 2.0 token-endpoint error.
+ * The OAuth error your code throws to the library, to answer with a standard OAuth error instead
+ * of a generic failure. It is honoured in two places:
  *
- * Throw from a `tokenExchangeCallback` or any code it calls to surface a
- * standard OAuth token response (`{ error, error_description }`) instead of a
- * generic `500 Internal Server Error`.
+ * - **`tokenExchangeCallback`** (token endpoint): the response is `{ error, error_description }`
+ *   with `statusCode` (default `400`) and `headers`. `invalid_grant` also revokes the grant.
+ *   Anything else thrown is a `500`.
+ * - **`OAuthResourceServer`'s `validateToken`**: `invalid_token` is a `401` and
+ *   `insufficient_scope` a `403`, each with a Bearer challenge (the latter naming
+ *   `requiredScopes`); any other code keeps `statusCode` and `headers`, such as `429` with
+ *   `Retry-After`. Anything else thrown is a `503`.
  *
- * Anything thrown that is **not** an `OAuthError` continues to surface as
- * a 500 so unexpected failures remain visible — the provider does not
- * catch-everything-and-return-400.
+ * Unexpected failures stay visible that way: the library doesn't catch everything and return 400.
+ * (`OAuthProvider`'s `resolveExternalToken` uses `ExternalTokenError` instead.)
  *
  * @example
  * ```ts

@@ -906,7 +906,9 @@ describe('validateToken throwing OAuthError', () => {
     });
   });
 
-  it('still treats any other throw as the validator failing', async () => {
+  it('still treats any other throw, or a malformed OAuthError, as the validator failing', async () => {
     expect((await call(new Error('binding exploded'))).status).toBe(503);
+    const malformed = new OAuthError('insufficient_scope', { description: 'x', requiredScopes: ['has space'] });
+    expect((await call(malformed)).status).toBe(503);
   });
 });
