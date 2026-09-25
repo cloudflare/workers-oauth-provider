@@ -81,16 +81,24 @@ async function accessToken(as: Record<string, string>, scope: string) {
   return tokens.access_token;
 }
 
-it('walks an MCP client from the first 401 to an authorized call', async () => {
-  const token = await accessToken(await discover(), 'mcp:read');
-  const call = await mcp.fetch(RESOURCE, { headers: { Authorization: `Bearer ${token}` } });
-  expect(call.status).toBe(200);
-  await expect(call.json()).resolves.toEqual({ userId: 'user-123', scope: ['mcp:read'] });
-});
+it('walks an MCP client from the first 401 to a read, then steps up for a write', async () => {
+  // The first 401 names the resource's baseline; the server's metadata lists its whole catalogue.
+  const challenge = await mcp.fetch(RESOURCE);
+  expect(challenge.headers.get('WWW-Authenticate')).toContain('scope="mcp:read"');
+  const as = await discover();
+  expect(as.scopes_supported).toEqual(['mcp:read', 'mcp:write', 'offline_access']);
 
-it('answers a token without mcp:read with the MCP insufficient_scope challenge', async () => {
-  const token = await accessToken(await discover(), 'profile');
-  const call = await mcp.fetch(RESOURCE, { headers: { Authorization: `Bearer ${token}` } });
-  expect(call.status).toBe(403);
-  expect(call.headers.get('WWW-Authenticate')).toContain('error="insufficient_scope", scope="mcp:read"');
+  // The client requests the baseline, as MCP clients do, and can read.
+  const readToken = await accessToken(as, 'mcp:read');
+  const read = await mcp.fetch(RESOURCE, { headers: { Authorization: `Bearer ${readToken}` } });
+  expect(read.status).toBe(200);
+  await expect(read.json()).resolves.toEqual({ userId: 'user-123', scope: ['mcp:read'] });
+
+  // A write needs more: the 403 names mcp:write, and the client re-authorizes for it.
+  const denied = await mcp.fetch(RESOURCE, { method: 'POST', headers: { Authorization: `Bearer ${readToken}` } });
+  expect(denied.status).toBe(403);
+  expect(denied.headers.get('WWW-Authenticate')).toContain('error="insufficient_scope", scope="mcp:write"');
+  const writeToken = await accessToken(as, 'mcp:read mcp:write');
+  const write = await mcp.fetch(RESOURCE, { method: 'POST', headers: { Authorization: `Bearer ${writeToken}` } });
+  expect(write.status).toBe(200);
 });

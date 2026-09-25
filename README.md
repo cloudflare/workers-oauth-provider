@@ -23,7 +23,7 @@ const authorizationServer = new OAuthAuthorizationServer<Env>({
   resources: ['https://mcp.example.com/mcp'],
   authorizeEndpoint: '/authorize',
   tokenEndpoint: '/oauth/token',
-  scopesSupported: ['mcp:read'],
+  scopesSupported: ['mcp:read', 'mcp:write', 'offline_access'], // everything this server can grant
   clientIdMetadataDocumentEnabled: true,
 });
 
@@ -47,13 +47,15 @@ export default new OAuthResourceServer<Env, AuthProps>({
   resourceMetadata: {
     resource: 'https://mcp.example.com/mcp',
     authorization_servers: ['https://auth.example.com'],
-    scopes_supported: ['mcp:read'],
+    scopes_supported: ['mcp:read'], // what a client requests up front: the minimum for basic use
   },
   validateToken: (env) => env.AUTH_SERVER.validateToken,
   handler: {
     fetch(request, env, ctx) {
       // ctx.props: what completeAuthorization() stored. ctx.auth: the verified token.
-      if (!ctx.auth.scope.includes('mcp:read')) return insufficientScope(ctx.auth, ['mcp:read']);
+      // Step-up: a 403 naming the missing scope, and the client re-authorizes for it.
+      const needed = request.method === 'GET' ? 'mcp:read' : 'mcp:write';
+      if (!ctx.auth.scope.includes(needed)) return insufficientScope(ctx.auth, [needed]);
       return Response.json({ userId: ctx.props.userId });
     },
   },
@@ -64,9 +66,11 @@ export default new OAuthResourceServer<Env, AuthProps>({
 
 The resource server publishes its RFC 9728 metadata, answers unauthenticated requests with a challenge pointing at it, and accepts only tokens issued for its own resource. The handler owns authorization beyond that: scopes, ownership, tenancy.
 
+Both roles publish a `scopes_supported`, as the specs name them, meaning different things: the authorization server's is everything it can grant; a resource's is what MCP clients request up front, and more comes by step-up. See [Scopes](docs/authorization-server.md#scopes-and-step-up-authorization).
+
 ## One Worker: `OAuthProvider`
 
-When one Worker is both the authorization server and its only resource, `OAuthProvider` combines the roles. Requests under `apiRoute` reach `apiHandler` with `ctx.props` and `ctx.auth`; everything else goes to `defaultHandler`, which owns `/authorize` and reaches the helpers as `env.OAUTH_PROVIDER`:
+The split roles above are the recommended shape. `OAuthProvider` remains fully supported for one Worker that is both the authorization server and its only resource, which was the 0.x shape: it combines the roles. Requests under `apiRoute` reach `apiHandler` with `ctx.props` and `ctx.auth`; everything else goes to `defaultHandler`, which owns `/authorize` and reaches the helpers as `env.OAUTH_PROVIDER`:
 
 ```ts
 export default new OAuthProvider<Env>({
@@ -75,11 +79,11 @@ export default new OAuthProvider<Env>({
   defaultHandler, // your /authorize page
   authorizeEndpoint: '/authorize',
   tokenEndpoint: '/oauth/token',
-  scopesSupported: ['mcp:read'],
+  scopesSupported: ['mcp:read', 'mcp:write', 'offline_access'], // everything this server can grant
   resourceMetadata: {
     resource: 'https://mcp.example.com/mcp',
     authorization_servers: ['https://mcp.example.com'],
-    scopes_supported: ['mcp:read'],
+    scopes_supported: ['mcp:read'], // what a client requests up front
   },
   clientIdMetadataDocumentEnabled: true,
 });
