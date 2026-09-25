@@ -672,6 +672,10 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
   requiredScopes?: string[];
 }
 
+/** Where the split server's endpoints are unless configured otherwise, under the issuer. */
+const DEFAULT_AUTHORIZE_PATH = '/authorize';
+const DEFAULT_TOKEN_PATH = '/oauth/token';
+
 /** The authorization-server role when one Worker hosts several MCP resources. */
 interface OAuthAuthorizationServerConfiguration {
   /** Canonical RFC 8414 issuer. Its origin gates authorization-server routes. */
@@ -680,11 +684,11 @@ interface OAuthAuthorizationServerConfiguration {
   /** Every canonical protected resource this authorization server issues tokens for. */
   resources: readonly string[];
 
-  /** Authorization endpoint advertised by the AS. A path is resolved against `issuer`. */
-  authorizeEndpoint: string;
+  /** Authorization endpoint advertised by the AS. Defaults to `${issuer}/authorize`. */
+  authorizeEndpoint?: string;
 
-  /** Token and revocation endpoint implemented by the provider. */
-  tokenEndpoint: string;
+  /** Token and revocation endpoint implemented by the provider. Defaults to `${issuer}/oauth/token`. */
+  tokenEndpoint?: string;
 
   /** Optional dynamic client registration endpoint. */
   clientRegistrationEndpoint?: string;
@@ -731,12 +735,27 @@ export type OAuthAuthorizationServerOptions<Env = Cloudflare.Env> = Omit<
   | 'apiHandler'
   | 'apiHandlers'
   | 'defaultHandler'
+  | 'authorizeEndpoint'
+  | 'tokenEndpoint'
   | 'resourceMetadata'
   | 'requiredScopes'
   | 'resolveExternalToken'
 > & {
   /** Canonical RFC 8414 issuer. */
   issuer: string;
+
+  /**
+   * Your authorization endpoint, advertised in metadata. Route it before calling `fetch()`;
+   * `parseAuthRequest()` rejects requests that arrive anywhere else, so a mismatch fails on the
+   * first request. Defaults to `${issuer}/authorize`. A path is on the issuer's origin.
+   */
+  authorizeEndpoint?: string;
+
+  /**
+   * The token endpoint, which also handles revocation, served by `fetch()` and advertised in
+   * metadata. Defaults to `${issuer}/oauth/token`. A path is on the issuer's origin.
+   */
+  tokenEndpoint?: string;
 
   /**
    * Canonical identifiers of every protected resource this authorization server issues
@@ -1861,10 +1880,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       const { authorizationServer, ...commonOptions } = options;
       this.validateAuthorizationServerIssuer(authorizationServer.issuer);
       this.explicitIssuer = authorizationServer.issuer;
+      // Defaults live under the issuer, so tenants with path issuers on one origin don't collide.
+      const issuerBase = authorizationServer.issuer.replace(/\/+$/, '');
       normalizedOptions = {
         ...(commonOptions as Omit<InternalOAuthProviderOptions<Env>, 'authorizeEndpoint' | 'tokenEndpoint'>),
-        authorizeEndpoint: authorizationServer.authorizeEndpoint,
-        tokenEndpoint: authorizationServer.tokenEndpoint,
+        authorizeEndpoint: authorizationServer.authorizeEndpoint ?? `${issuerBase}${DEFAULT_AUTHORIZE_PATH}`,
+        tokenEndpoint: authorizationServer.tokenEndpoint ?? `${issuerBase}${DEFAULT_TOKEN_PATH}`,
         clientRegistrationEndpoint: authorizationServer.clientRegistrationEndpoint,
       };
       const declared = authorizationServer.resources;
@@ -2087,22 +2108,37 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
   }
 
-  /** Reject exact collisions between protocol endpoints owned by the AS fetch surface. */
+  /**
+   * Reject an endpoint another would claim, so it could never be reached. fetch() tries metadata,
+   * then token, then registration; the application routes the authorization endpoint. Each check
+   * asks the predicate fetch() dispatches on, so it agrees with routing (metadata ignores the
+   * query, for one).
+   */
   private validateAuthorizationServerRouteIsolation(): void {
     const issuerUrl = new URL(this.explicitIssuer!);
-    const discoveryEndpoint = this.getAuthorizationServerMetadataUrl(issuerUrl);
     const tokenUrl = new URL(this.getFullEndpointUrl(this.options.tokenEndpoint, issuerUrl));
 
-    if (this.matchEndpoint(tokenUrl, discoveryEndpoint)) {
+    if (this.isAuthorizationServerMetadataRequest(tokenUrl)) {
       throw new TypeError('tokenEndpoint must not collide with the authorization server metadata endpoint');
     }
 
+    const authorizeUrl = new URL(this.getFullEndpointUrl(this.options.authorizeEndpoint, issuerUrl));
+    if (this.isAuthorizationServerMetadataRequest(authorizeUrl)) {
+      throw new TypeError('authorizeEndpoint must not collide with the authorization server metadata endpoint');
+    }
+    if (this.isTokenEndpoint(authorizeUrl)) {
+      throw new TypeError('authorizeEndpoint must not collide with tokenEndpoint');
+    }
+
     if (!this.options.clientRegistrationEndpoint) return;
+    if (this.isClientRegistrationEndpoint(authorizeUrl)) {
+      throw new TypeError('authorizeEndpoint must not collide with clientRegistrationEndpoint');
+    }
     const registrationUrl = new URL(this.getFullEndpointUrl(this.options.clientRegistrationEndpoint, issuerUrl));
-    if (this.matchEndpoint(registrationUrl, this.options.tokenEndpoint)) {
+    if (this.isTokenEndpoint(registrationUrl)) {
       throw new TypeError('clientRegistrationEndpoint must not collide with tokenEndpoint');
     }
-    if (this.matchEndpoint(registrationUrl, discoveryEndpoint)) {
+    if (this.isAuthorizationServerMetadataRequest(registrationUrl)) {
       throw new TypeError(
         'clientRegistrationEndpoint must not collide with the authorization server metadata endpoint'
       );

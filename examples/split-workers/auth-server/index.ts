@@ -12,8 +12,7 @@ const SCOPES = ['mcp:read', 'mcp:write', 'offline_access'];
 const authorizationServer = new OAuthAuthorizationServer<Env>({
   issuer: 'https://auth.example.com',
   resources: ['https://mcp.example.com/mcp'],
-  authorizeEndpoint: '/authorize',
-  tokenEndpoint: '/oauth/token',
+  // The token endpoint is served at /oauth/token and /authorize is advertised, both by default.
   scopesSupported: SCOPES,
 
   // Preferred for clients with no pre-existing relationship.
