@@ -321,6 +321,24 @@ describe('JWT access tokens', () => {
     expect(await jwtServer.validateToken(RESOURCE, opaque.access_token, env)).not.toBeNull();
   });
 
+  it('imports each key once, not on every token it signs or verifies', async () => {
+    const server = createServer(defaultJwtOptions());
+    const first = await authorize(server);
+    const keys = await (
+      await server.fetch(new Request(`${ISSUER}/.well-known/jwks.json`), env, new MockExecutionContext())
+    ).json<{ keys: JwtKey[] }>();
+    const offline = createJwtAccessTokenValidator<TestEnv>({ issuer: ISSUER, keys: () => keys.keys })(env);
+    expect(await offline(RESOURCE, first.access_token)).not.toBeNull();
+
+    // Both keys are imported now. More tokens, signed and verified, import nothing.
+    const importKey = vi.spyOn(crypto.subtle, 'importKey');
+    const second = await authorize(server);
+    expect(await offline(RESOURCE, second.access_token)).not.toBeNull();
+    expect(await offline(RESOURCE, first.access_token)).not.toBeNull();
+    // Only JWK imports are ours; the provider's props encryption imports raw AES keys per token.
+    expect(importKey.mock.calls.filter(([format]) => format === 'jwk')).toEqual([]);
+  });
+
   it('rejects keys that are not EC P-256', async () => {
     const rsa = (await crypto.subtle.generateKey(
       { name: 'RSASSA-PKCS1-v1_5', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' },
