@@ -1,0 +1,14 @@
+{
+  "$schema": "../../../node_modules/wrangler/config-schema.json",
+  "name": "jwt-auth-server",
+  "main": "index.ts",
+  "compatibility_date": "2026-07-29",
+  // Reachable only on its custom domain, which matches the configured issuer.
+  "workers_dev": false,
+  "routes": [{ "pattern": "auth.example.com", "custom_domain": true }],
+  "kv_namespaces": [{ "binding": "OAUTH_KV", "id": "<your KV namespace id>" }],
+  // Secrets, not vars: `node ../generate-signing-key.mjs | npx wrangler secret put JWT_SIGNING_KEY`.
+  "secrets": { "required": ["JWT_SIGNING_KEY"] },
+  // Builds against this repository's source. Delete this in your own project.
+  "alias": { "@cloudflare/workers-oauth-provider": "../../../src/oauth-provider.ts" },
+}

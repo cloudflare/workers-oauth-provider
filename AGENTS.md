@@ -36,6 +36,7 @@ workers-oauth-provider/
 ├── src/
 │   ├── oauth-provider.ts      # Core provider implementation
 │   ├── oauth-capabilities.ts  # Pure server/client metadata capability policy
+│   ├── oauth-jwt.ts           # ES256 JWT access tokens: signing, verification, JWKS (via jose)
 │   ├── oauth-client-metadata.ts # Typed DCR parsing and CIMD resolution pipeline
 │   ├── oauth-http.ts          # CORS and scope helpers shared by both hosts
 │   ├── oauth-error.ts         # OAuthError: what callbacks and validators throw
@@ -70,7 +71,7 @@ workers-oauth-provider/
 └── README.md                  # Usage documentation
 ```
 
-**Audit-oriented architecture:** Request orchestration and storage-backed OAuth behavior remain in `src/oauth-provider.ts`. Typed OAuth client metadata parsing plus CIMD fetching and resolution live in `src/oauth-client-metadata.ts`; pure authorization-server/client capability policy lives in `src/oauth-capabilities.ts`. Consent pages and third-party sign-in transactions (the MCP confused-deputy protections: `__Host-` browser binding, single-use state, signed remembered approvals) live in `src/oauth-consent.ts`. The experimental Enterprise-Managed Authorization validation pipeline is isolated in `src/ema/` so its JWT and trust-boundary code can be reviewed independently.
+**Audit-oriented architecture:** Request orchestration and storage-backed OAuth behavior remain in `src/oauth-provider.ts`. Typed OAuth client metadata parsing plus CIMD fetching and resolution live in `src/oauth-client-metadata.ts`; pure authorization-server/client capability policy lives in `src/oauth-capabilities.ts`. Consent pages and third-party sign-in transactions (the MCP confused-deputy protections: `__Host-` browser binding, single-use state, signed remembered approvals) live in `src/oauth-consent.ts`. JWT access-token signing and verification live in `src/oauth-jwt.ts`, which uses `jose` (the JWT library Cloudflare Codex RFC-042 requires) and signs with ES256 only (Codex RFC-031). The experimental Enterprise-Managed Authorization validation pipeline is isolated in `src/ema/` so its JWT and trust-boundary code can be reviewed independently.
 
 ## Setup
 

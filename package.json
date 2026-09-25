@@ -45,5 +45,8 @@
   "bugs": {
     "url": "https://github.com/cloudflare/workers-oauth-provider/issues"
   },
-  "homepage": "https://github.com/cloudflare/workers-oauth-provider#readme"
+  "homepage": "https://github.com/cloudflare/workers-oauth-provider#readme",
+  "dependencies": {
+    "jose": "^6.2.12"
+  }
 }

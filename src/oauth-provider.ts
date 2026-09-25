@@ -34,6 +34,16 @@ import {
   type EmaSupportedAlg,
 } from './ema/constants';
 import { createKvJtiStore } from './ema/jti';
+import {
+  mergeCustomClaims,
+  readAccessTokenLocation,
+  resolveJwtKeys,
+  signAccessToken,
+  validateAccessTokenOptions,
+  type JwtAccessTokenClaims,
+  type AccessTokenOptions,
+  type JwtAccessTokenOptions,
+} from './oauth-jwt';
 import { createDefaultJwksProvider } from './ema/jwks';
 import { parseIdJag } from './ema/parser';
 import { emaErrorToWire, err, ok, type EmaValidationError, type Result } from './ema/result';
@@ -59,6 +69,17 @@ import {
 export { AuthorizationError, authorizationErrorRedirect } from './oauth-capabilities';
 export type { AuthorizationErrorCode, AuthorizationErrorOptions } from './oauth-capabilities';
 export * from './oauth-resource-server';
+export {
+  createJwtAccessTokenValidator,
+  type AccessTokenOptions,
+  type JwtAccessTokenClaims,
+  type JwtAccessTokenOptions,
+  type JwtAccessTokenValidatorOptions,
+  type JwtClaimsInput,
+  type JwtClaimValue,
+  type JwtKey,
+  type JwtKeySet,
+} from './oauth-jwt';
 export type {
   ApprovedConsent,
   ConsentDescription,
@@ -689,6 +710,9 @@ interface OAuthAuthorizationServerConfiguration {
   /** Optional dynamic client registration endpoint. */
   clientRegistrationEndpoint?: string;
 
+  /** Access-token formats. Omit for opaque access tokens only. */
+  accessTokens?: AccessTokenOptions<any, any>;
+
   /**
    * Resource selected when a new authorization request omits `resource`.
    * Omit this in a multi-resource deployment to require clients to choose.
@@ -755,6 +779,19 @@ export type OAuthAuthorizationServerOptions<Env = Cloudflare.Env> = Omit<
    * re-targets every surviving unbound record, so keep it fixed for the migration window.
    */
   legacyGrantResource?: string;
+
+  /**
+   * Experimental: exempt from 1.x semver, see docs/jwt-access-tokens.md.
+   *
+   * The access-token format to issue. With `jwt` configured the provider accepts ES256-signed
+   * RFC 9068 JWTs and publishes a JWKS and `jwks_uri`; with `issuing: 'jwt'` it issues them.
+   * `validateToken()` still finds the stored token record, so revocation is immediate there.
+   * Without this option access tokens are opaque. Authorization codes and refresh tokens are
+   * always opaque.
+   *
+   * @experimental
+   */
+  accessTokens?: AccessTokenOptions<Env>;
 };
 
 /** Audience-checked token context suitable for a private Service Binding. */
@@ -1591,52 +1628,23 @@ export interface GrantSummary {
 /**
  * Options for creating an access token
  */
-interface CreateAccessTokenOptions {
-  /**
-   * User ID
-   */
+/** Everything needed to mint one access-token string. */
+interface MintAccessTokenInput {
   userId: string;
-
-  /**
-   * Grant ID
-   */
   grantId: string;
-
-  /**
-   * Client ID
-   */
   clientId: string;
-
-  /**
-   * Token scopes
-   */
   scope: string[];
-
-  /**
-   * Encrypted props for the token
-   */
-  encryptedProps: string;
-
-  /**
-   * Encryption key for the props
-   */
-  encryptionKey: CryptoKey;
-
-  /**
-   * TTL for the access token in seconds
-   */
-  expiresIn: number;
-
-  /**
-   * Canonical audience/resource
-   */
   audience: string;
-
-  /**
-   * Cloudflare Worker environment variables
-   */
+  issuedAt: number;
+  /** Lifetime in seconds. */
+  expiresIn: number;
+  encryptedProps: string;
+  encryptionKey: CryptoKey;
   env: ProviderEnv;
 }
+
+/** Everything needed to mint and store one access token issued now. */
+type CreateAccessTokenOptions = Omit<MintAccessTokenInput, 'issuedAt'>;
 
 type InternalOAuthProviderOptions<Env> = Omit<OAuthProviderOptions<Env>, 'resourceMetadata'> & {
   resourceMetadata?: OAuthProtectedResourceMetadata;
@@ -1713,6 +1721,7 @@ export class OAuthAuthorizationServer<Env = Cloudflare.Env> {
       authorizeEndpoint,
       tokenEndpoint,
       clientRegistrationEndpoint,
+      accessTokens,
       ...commonOptions
     } = options;
     this.#impl = new OAuthProviderImpl<Env>({
@@ -1726,6 +1735,7 @@ export class OAuthAuthorizationServer<Env = Cloudflare.Env> {
         authorizeEndpoint,
         tokenEndpoint,
         clientRegistrationEndpoint,
+        accessTokens,
         defaultResource,
         legacyGrantResource,
       },
@@ -1837,6 +1847,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   /** KV-backed best-effort `jti` replay store; only constructed when EMA is configured. */
   private readonly jtiStore: EmaJtiStore | undefined;
 
+  /** JWT configuration when JWT access tokens are accepted (role-based authorization server only). */
+  private readonly acceptedJwt: JwtAccessTokenOptions<any, any> | undefined;
+
+  /** The same configuration when new access tokens are issued as JWTs. */
+  private readonly issuingJwt: JwtAccessTokenOptions<any, any> | undefined;
+
   /**
    * Creates a new OAuth provider instance
    * @param options - Configuration options for the provider
@@ -1861,6 +1877,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       const { authorizationServer, ...commonOptions } = options;
       this.validateAuthorizationServerIssuer(authorizationServer.issuer);
       this.explicitIssuer = authorizationServer.issuer;
+      if (authorizationServer.accessTokens !== undefined) {
+        validateAccessTokenOptions(authorizationServer.accessTokens);
+      }
+      this.acceptedJwt = authorizationServer.accessTokens?.jwt;
+      this.issuingJwt = authorizationServer.accessTokens?.issuing === 'jwt' ? this.acceptedJwt : undefined;
       normalizedOptions = {
         ...(commonOptions as Omit<InternalOAuthProviderOptions<Env>, 'authorizeEndpoint' | 'tokenEndpoint'>),
         authorizeEndpoint: authorizationServer.authorizeEndpoint,
@@ -1880,6 +1901,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       configuredResourceServers = declared.map((resource) => ({ resourceMetadata: { resource } }));
     } else {
       this.explicitIssuer = undefined;
+      this.acceptedJwt = undefined;
+      this.issuingJwt = undefined;
       normalizedOptions = options;
       configuredResourceServers = [
         {
@@ -2358,6 +2381,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       if (
         apiRoute !== undefined ||
         this.isAuthorizationServerMetadataRequest(url) ||
+        this.isJwksEndpoint(url) ||
         (servesProtectedResources && this.isProtectedResourceMetadataPath(url)) ||
         this.isTokenEndpoint(url) ||
         (this.options.clientRegistrationEndpoint && this.isClientRegistrationEndpoint(url))
@@ -2388,6 +2412,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       }
       const response = await this.handleMetadataDiscovery(url);
       return withCorsHeaders(withoutBodyForHead(request, response), request);
+    }
+
+    if (this.isJwksEndpoint(url)) {
+      return withCorsHeaders(await this.handleJwks(request, env), request);
     }
 
     // Handle .well-known/oauth-protected-resource (RFC 9728). A document at
@@ -2476,15 +2504,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @returns Promise resolving to token data with decrypted props, or null if token is invalid
    */
   async unwrapToken<T = any>(token: string, env: Env & ProviderEnv): Promise<TokenSummary<T> | null> {
-    const parts = token.split(':');
-    const isPossiblyInternalFormat = parts.length === 3;
-
-    if (!isPossiblyInternalFormat) {
+    const location = this.locateAccessToken(token);
+    if (!location) {
       return null;
     }
 
     // Retrieve the token from KV
-    const [userId, grantId] = parts;
+    const { userId, grantId } = location;
     const id = await generateTokenId(token);
     const tokenData: Token | null = await env.OAUTH_KV.get(`token:${userId}:${grantId}:${id}`, { type: 'json' });
 
@@ -2517,6 +2543,76 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         props: decryptedProps as T,
       },
     };
+  }
+
+  /**
+   * Where a token's record is stored: `sub` and `grant_id` for a JWT, or the IDs in an opaque
+   * `{userId}:{grantId}:{secret}`. Neither is trusted: the record is found by the token's hash,
+   * so only a token exactly as this server issued it (and hasn't revoked) has one. JWTs are read
+   * only while `accessTokens.jwt` is configured.
+   */
+  private locateAccessToken(token: string): { userId: string; grantId: string } | null {
+    if (this.acceptedJwt) {
+      const location = readAccessTokenLocation(token);
+      if (location) return location;
+    }
+    const parts = token.split(':');
+    if (parts.length !== 3) return null;
+    return { userId: parts[0], grantId: parts[1] };
+  }
+
+  /**
+   * Mint an access-token string without storing it: a signed JWT when `accessTokens.issue` is
+   * `'jwt'`, otherwise an opaque `{userId}:{grantId}:{secret}`. Callers that commit other state
+   * (consuming a code, rotating a refresh token) mint first, so a failure here leaves the client
+   * able to retry.
+   */
+  private async mintAccessToken(input: MintAccessTokenInput): Promise<string> {
+    const { userId, grantId, clientId, scope, audience, issuedAt, expiresIn } = input;
+
+    // Cloudflare KV rejects an `expirationTtl` below 60 seconds, so a TTL from a callback override
+    // or a near-expiry source must not reach the record's write. Callers that clamp to a source's
+    // remaining lifetime should already have rejected this with a more specific error.
+    if (!isValidAccessTokenTTL(expiresIn)) {
+      throw new OAuthError('invalid_request', {
+        description: 'Requested token lifetime must be at least 60 seconds',
+        internal: { category: 'token-issuance', reason: 'requested_ttl_too_short' },
+      });
+    }
+
+    const jwt = this.issuingJwt;
+    if (!jwt) return `${userId}:${grantId}:${generateRandomString(TOKEN_LENGTH)}`;
+
+    try {
+      const env = input.env as Env & ProviderEnv;
+      const keys = await resolveJwtKeys(jwt, env);
+      let claims: JwtAccessTokenClaims = {
+        iss: this.explicitIssuer!,
+        sub: userId,
+        aud: audience,
+        exp: issuedAt + expiresIn,
+        iat: issuedAt,
+        jti: crypto.randomUUID(),
+        client_id: clientId,
+        ...(scope.length > 0 ? { scope: scope.join(' ') } : {}),
+        grant_id: grantId,
+      };
+      if (jwt.claims) {
+        const props = await decryptProps(input.encryptionKey, input.encryptedProps);
+        claims = mergeCustomClaims(
+          claims,
+          await jwt.claims({ userId, grantId, clientId, scope, audience, props, env })
+        );
+      }
+      return await signAccessToken(keys.current, claims);
+    } catch (error) {
+      // A key or claims-hook misconfiguration is the deployer's problem, not the client's.
+      throw new OAuthError('server_error', {
+        description: 'The access token could not be issued',
+        statusCode: 500,
+        internal: { category: 'token-issuance', reason: 'jwt_access_token_signing_failed', detail: error },
+      });
+    }
   }
 
   async validateAccessToken<T = any>(
@@ -2631,6 +2727,35 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   }
 
   /** Exact RFC 8414 discovery location for the configured issuer. */
+  private isJwksEndpoint(url: URL): boolean {
+    return !!this.acceptedJwt && this.matchEndpoint(url, JWKS_ENDPOINT);
+  }
+
+  /** Serve the public keys for JWT access tokens. */
+  private async handleJwks(request: Request, env: Env & ProviderEnv): Promise<Response> {
+    if (request.method !== 'GET' && request.method !== 'HEAD') {
+      return new Response(null, { status: 405, headers: { Allow: 'GET, HEAD, OPTIONS' } });
+    }
+    let publicKeys;
+    try {
+      ({ publicKeys } = await resolveJwtKeys(this.acceptedJwt!, env));
+    } catch (error) {
+      console.error('JWT access-token keys are misconfigured:', error);
+      return new Response(JSON.stringify({ error: 'server_error' }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+      });
+    }
+    const response = new Response(JSON.stringify({ keys: publicKeys }), {
+      headers: {
+        'Content-Type': 'application/jwk-set+json',
+        // Short enough that a rotated-in key reaches verifiers well before it signs anything.
+        'Cache-Control': 'public, max-age=300',
+      },
+    });
+    return withoutBodyForHead(request, response);
+  }
+
   private getAuthorizationServerMetadataUrl(requestUrl: URL): string {
     if (!this.explicitIssuer) return `${requestUrl.origin}/.well-known/oauth-authorization-server`;
     const issuer = new URL(this.explicitIssuer);
@@ -2997,7 +3122,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       ...(this.resourceServers.length > 0
         ? { protected_resources: this.resourceServers.map((server) => server.resourceMetadata.resource) }
         : {}),
-      // not implemented: jwks_uri
+      ...(this.acceptedJwt ? { jwks_uri: this.getFullEndpointUrl(JWKS_ENDPOINT, requestUrl) } : {}),
       registration_endpoint: registrationEndpoint,
       scopes_supported: this.options.scopesSupported,
       response_types_supported: responseTypesSupported,
@@ -3587,21 +3712,27 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       grantData.resource = resourceResolution.grantResourceBackfill;
     }
 
-    // Save the updated grant with TTL matching refresh token expiration (if any)
-    await this.saveGrantWithTTL(env, grantKey, grantData, now);
-
-    // Create and store access token with potentially narrowed scopes
-    const accessToken = await this.createAccessToken({
+    // Mint before saving the grant: saving consumes the authorization code, and a signing failure
+    // after that point would leave the client with neither a code nor a token.
+    const accessTokenInput: MintAccessTokenInput = {
       userId,
       grantId,
       clientId: grantData.clientId,
       scope: tokenScopes,
+      audience,
+      issuedAt: Math.floor(Date.now() / 1000),
+      expiresIn: accessTokenTTL,
       encryptedProps: encryptedAccessTokenProps,
       encryptionKey: accessTokenEncryptionKey,
-      expiresIn: accessTokenTTL,
-      audience,
       env,
-    });
+    };
+    const accessToken = await this.mintAccessToken(accessTokenInput);
+
+    // Save the updated grant with TTL matching refresh token expiration (if any)
+    await this.saveGrantWithTTL(env, grantKey, grantData, now);
+
+    // Store the access token, with potentially narrowed scopes
+    await this.storeAccessToken(accessToken, accessTokenInput);
 
     // Build the response
     const tokenResponse: TokenResponse = {
@@ -3709,11 +3840,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Resolve the token audience before callbacks, rotation, or storage writes.
     const resourceResolution = this.resolveTokenResource(body.resource, grantData);
     const audience = resourceResolution.audience;
-
-    // Generate new access token with embedded user and grant IDs
-    const accessTokenSecret = generateRandomString(TOKEN_LENGTH);
-    const newAccessToken = `${userId}:${grantId}:${accessTokenSecret}`;
-    const accessTokenId = await generateTokenId(newAccessToken);
 
     // Define the access token TTL, may be updated by callback if provided
     let accessTokenTTL = this.options.accessTokenTTL!;
@@ -3899,6 +4025,22 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     const accessTokenExpiresAt = now + accessTokenTTL;
+
+    // Mint once the lifetime and props are final, and before the grant rotates, so a signing
+    // failure leaves the presented refresh token usable.
+    const newAccessToken = await this.mintAccessToken({
+      userId,
+      grantId,
+      clientId: grantData.clientId,
+      scope: tokenScopes,
+      audience,
+      issuedAt: now,
+      expiresIn: accessTokenTTL,
+      encryptedProps: encryptedAccessTokenProps,
+      encryptionKey: accessTokenEncryptionKey,
+      env,
+    });
+    const accessTokenId = await generateTokenId(newAccessToken);
 
     // Wrap the access token key
     const accessTokenWrappedKey = await wrapKeyWithToken(newAccessToken, accessTokenEncryptionKey);
@@ -4609,12 +4751,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         { category: 'token-revocation', reason: 'token_missing' }
       );
     }
-    const tokenParts = token.split(':');
-    if (tokenParts.length !== 3) {
+    // Refresh tokens are always opaque. An access token may be a JWT; an expired or invalid one
+    // has nothing left to revoke, and RFC 7009 §2.2 answers 200 either way.
+    const location = this.locateAccessToken(token);
+    if (!location) {
       return new Response('', { status: 200 });
     }
 
-    const [userId, grantId, _] = tokenParts;
+    const { userId, grantId } = location;
     const tokenId = await generateTokenId(token);
 
     // Use token_type_hint to check the hinted type first (RFC 7009 §2.1).
@@ -5470,54 +5614,30 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     };
   }
 
-  /**
-   * Creates and stores an access token
-   * @param params - Options for creating the access token
-   * @returns The access token string
-   */
+  /** Mint and store an access token issued now. */
   private async createAccessToken(params: CreateAccessTokenOptions): Promise<string> {
-    const { userId, grantId, clientId, scope, encryptedProps, encryptionKey, expiresIn, audience, env } = params;
+    const input: MintAccessTokenInput = { ...params, issuedAt: Math.floor(Date.now() / 1000) };
+    const accessToken = await this.mintAccessToken(input);
+    await this.storeAccessToken(accessToken, input);
+    return accessToken;
+  }
 
-    // Central guard for all access-token writes: Cloudflare KV rejects an `expirationTtl`
-    // below 60 seconds, so a TTL derived from a callback override or a near-expiry source
-    // must not reach the write. Callers that clamp to a source's remaining lifetime should
-    // already have rejected this case with a more specific error; this is the backstop.
-    if (!isValidAccessTokenTTL(expiresIn)) {
-      throw new OAuthError('invalid_request', {
-        description: 'Requested token lifetime must be at least 60 seconds',
-        internal: { category: 'token-issuance', reason: 'requested_ttl_too_short' },
-      });
-    }
-
-    // Generate access token
-    const accessTokenSecret = generateRandomString(TOKEN_LENGTH);
-    const accessToken = `${userId}:${grantId}:${accessTokenSecret}`;
-
-    const now = Math.floor(Date.now() / 1000);
+  /** Store a minted access token's record, with denormalized grant information, under its hash. */
+  private async storeAccessToken(accessToken: string, input: MintAccessTokenInput): Promise<void> {
+    const { userId, grantId, clientId, scope, audience, issuedAt, expiresIn, encryptedProps, encryptionKey, env } =
+      input;
     const accessTokenId = await generateTokenId(accessToken);
-    const accessTokenExpiresAt = now + expiresIn;
-
-    // Wrap the key for the access token
-    const accessTokenWrappedKey = await wrapKeyWithToken(accessToken, encryptionKey);
-
-    // Store access token with denormalized grant information
     const accessTokenData: Token = {
       id: accessTokenId,
-      grantId: grantId,
-      userId: userId,
-      createdAt: now,
-      expiresAt: accessTokenExpiresAt,
-      audience: audience,
-      scope: scope,
-      wrappedEncryptionKey: accessTokenWrappedKey,
-      grant: {
-        clientId: clientId,
-        scope: scope,
-        encryptedProps: encryptedProps,
-      },
+      grantId,
+      userId,
+      createdAt: issuedAt,
+      expiresAt: issuedAt + expiresIn,
+      audience,
+      scope,
+      wrappedEncryptionKey: await wrapKeyWithToken(accessToken, encryptionKey),
+      grant: { clientId, scope, encryptedProps },
     };
-
-    // Save access token with TTL
     try {
       await env.OAUTH_KV.put(`token:${userId}:${grantId}:${accessTokenId}`, JSON.stringify(accessTokenData), {
         expirationTtl: expiresIn,
@@ -5526,8 +5646,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       this.throwRetryableTokenStorageErrorIfKvRateLimited(error);
       throw error;
     }
-
-    return accessToken;
   }
 
   /**
@@ -5785,6 +5903,9 @@ export class CimdFetchError extends Error {
  * Default expiration time for access tokens (1 hour in seconds)
  */
 const DEFAULT_ACCESS_TOKEN_TTL = 60 * 60;
+
+/** Where the authorization server publishes its JWT access-token keys. */
+const JWKS_ENDPOINT = '/.well-known/jwks.json';
 
 /**
  * Default expiration time for refresh tokens (30 days in seconds)

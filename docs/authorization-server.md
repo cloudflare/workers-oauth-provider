@@ -209,6 +209,8 @@ The functional role API adds these surfaces without removing `OAuthProvider`:
 | `validateToken(resource, token, env)`                    | Validate an access token for one declared resource; what a resource server calls            |
 | `defaultResource`                                        | Select a deliberate default for new authorization requests that omit it                     |
 | `legacyGrantResource`                                    | Select the server-controlled migration target for old unbound grants                        |
+| `accessTokens`                                           | Experimental: issue ES256 JWT access tokens; see [JWT access tokens](jwt-access-tokens.md)  |
+| `createJwtAccessTokenValidator({ … })`                   | Experimental: validate those JWTs offline in a resource server                              |
 | `getOAuthApi(env)`                                       | Obtain OAuth helpers for an application-owned authorization route                           |
 | `new OAuthResourceServer({ … })`                         | Host one resource, in this Worker or another; `validateToken` points at the AS or a binding |
 
