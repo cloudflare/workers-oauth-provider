@@ -1,4 +1,13 @@
-import { decodeJwt, decodeProtectedHeader, importJWK, jwtVerify, SignJWT, type JWK, type JWTPayload } from 'jose';
+import {
+  createLocalJWKSet,
+  decodeJwt,
+  decodeProtectedHeader,
+  importJWK,
+  jwtVerify,
+  SignJWT,
+  type JWK,
+  type JWTPayload,
+} from 'jose';
 import type { OAuthResourceTokenValidation, OAuthResourceTokenValidator } from './oauth-resource-server';
 
 /**
@@ -180,7 +189,7 @@ export async function resolveJwtKeys(options: JwtAccessTokenOptions<any, any>, e
 
 /** Sign an access token with the current key. */
 export async function signAccessToken(key: JwtKey, claims: JwtAccessTokenClaims): Promise<string> {
-  const privateKey = await importKey(key, 'sign');
+  const privateKey = await importJWK(key, JWT_ACCESS_TOKEN_ALGORITHM);
   return new SignJWT(claims)
     .setProtectedHeader({ alg: JWT_ACCESS_TOKEN_ALGORITHM, typ: JWT_ACCESS_TOKEN_TYPE, kid: key.kid })
     .sign(privateKey);
@@ -284,7 +293,7 @@ export function createJwtAccessTokenValidator<Env, Props>(
       const keys = await options.keys(env);
       if (!Array.isArray(keys)) throw new TypeError('keys() must return an array of JWKs');
       const usable = keys.filter(isEcP256Jwk).map(toPublicJwk);
-      const claims = await verifyWith(token, usable, issuer, [resource]);
+      const claims = await verifyWith(token, createLocalJWKSet({ keys: usable }), issuer, [resource]);
       if (!claims) return null;
       let props: Props | undefined;
       if (options.mapClaims) {
@@ -329,19 +338,13 @@ function isEcP256Jwk(key: unknown): key is JwtKey {
 
 async function verifyWith(
   token: string,
-  keys: JwtKey[],
+  keys: ReturnType<typeof createLocalJWKSet>,
   issuer: string,
   audiences: string[]
 ): Promise<JwtAccessTokenClaims | null> {
-  // The key the token's `kid` names. `jose` has already pinned `alg` to ES256 before calling this.
-  const keyFor = ({ kid }: { kid?: string }) => {
-    const jwk = keys.find((key) => key.kid === kid);
-    if (!jwk) throw new Error('no key for this kid');
-    return importKey(jwk, 'verify');
-  };
   let payload: JWTPayload;
   try {
-    ({ payload } = await jwtVerify(token, keyFor, {
+    ({ payload } = await jwtVerify(token, keys, {
       algorithms: [JWT_ACCESS_TOKEN_ALGORITHM],
       typ: JWT_ACCESS_TOKEN_TYPE,
       issuer,
@@ -359,30 +362,6 @@ async function verifyWith(
     return null;
   if (scope !== undefined && typeof scope !== 'string') return null;
   return payload as JwtAccessTokenClaims;
-}
-
-/**
- * Imported `CryptoKey`s, reused across requests: `keys()` returns freshly parsed JWKs each time,
- * and importing one is WebCrypto work per token. Keyed by every field that defines the key, the
- * private scalar included for signing keys, so a corrected key is never shadowed by a bad import.
- * The cache lives in isolate memory, beside the imported keys themselves, and private keys are
- * imported non-extractable. Bounded: rotation only ever adds a few keys.
- */
-const importedKeys = new Map<string, Promise<CryptoKey>>();
-const MAX_IMPORTED_KEYS = 16;
-
-function importKey(jwk: JwtKey, use: 'sign' | 'verify'): Promise<CryptoKey> {
-  const id = use === 'sign' ? `sign:${jwk.kid}:${jwk.x}:${jwk.y}:${jwk.d}` : `verify:${jwk.kid}:${jwk.x}:${jwk.y}`;
-  let key = importedKeys.get(id);
-  if (!key) {
-    if (importedKeys.size >= MAX_IMPORTED_KEYS) importedKeys.clear();
-    const source = use === 'sign' ? jwk : toPublicJwk(jwk);
-    key = importJWK(source, JWT_ACCESS_TOKEN_ALGORITHM, { extractable: false }) as Promise<CryptoKey>;
-    importedKeys.set(id, key);
-    // A failed import (a malformed key) is not cached, so a corrected key is picked up.
-    key.catch(() => importedKeys.delete(id));
-  }
-  return key;
 }
 
 function checkKey(key: JwtKey | undefined, name: string): asserts key is JwtKey {
