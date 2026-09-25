@@ -94,11 +94,16 @@ it('walks an MCP client from the first 401 to a read, then steps up for a write'
   expect(read.status).toBe(200);
   await expect(read.json()).resolves.toEqual({ userId: 'user-123', scope: ['mcp:read'] });
 
-  // A write needs more: the 403 names mcp:write, and the client re-authorizes for it.
+  // A write needs more: the 403 names every scope it needs, and the client re-authorizes for them.
   const denied = await mcp.fetch(RESOURCE, { method: 'POST', headers: { Authorization: `Bearer ${readToken}` } });
   expect(denied.status).toBe(403);
-  expect(denied.headers.get('WWW-Authenticate')).toContain('error="insufficient_scope", scope="mcp:write"');
+  expect(denied.headers.get('WWW-Authenticate')).toContain('error="insufficient_scope", scope="mcp:read mcp:write"');
   const writeToken = await accessToken(as, 'mcp:read mcp:write');
   const write = await mcp.fetch(RESOURCE, { method: 'POST', headers: { Authorization: `Bearer ${writeToken}` } });
   expect(write.status).toBe(200);
+
+  // Write scope alone isn't enough: every operation needs the baseline too.
+  const writeOnly = await accessToken(as, 'mcp:write');
+  const refused = await mcp.fetch(RESOURCE, { method: 'POST', headers: { Authorization: `Bearer ${writeOnly}` } });
+  expect(refused.status).toBe(403);
 });

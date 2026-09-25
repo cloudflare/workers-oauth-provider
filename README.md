@@ -54,8 +54,8 @@ export default new OAuthResourceServer<Env, AuthProps>({
     fetch(request, env, ctx) {
       // ctx.props: what completeAuthorization() stored. ctx.auth: the verified token.
       // Step-up: a 403 naming the missing scope, and the client re-authorizes for it.
-      const needed = request.method === 'GET' ? 'mcp:read' : 'mcp:write';
-      if (!ctx.auth.scope.includes(needed)) return insufficientScope(ctx.auth, [needed]);
+      const needed = request.method === 'GET' ? ['mcp:read'] : ['mcp:read', 'mcp:write'];
+      if (!needed.every((scope) => ctx.auth.scope.includes(scope))) return insufficientScope(ctx.auth, needed);
       return Response.json({ userId: ctx.props.userId });
     },
   },
