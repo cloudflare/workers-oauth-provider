@@ -10,7 +10,7 @@ The suite intentionally tests only MCP authorization. It does not test MCP JSON-
 npm run test:conformance
 ```
 
-The normal `npm test` and `npm run check` commands also discover these tests, so a conformance regression fails CI.
+The normal `npm test` and `npm run check` commands also discover these tests, so a conformance regression fails CI. `npm run test:conformance:upstream` runs the official MCP conformance runner against the same Worker (see below).
 
 ## Tested revisions
 
@@ -66,9 +66,20 @@ Authorization extensions are versioned separately from the core release. Stable 
 
 ## Relationship to the official conformance runner
 
-The upstream `@modelcontextprotocol/conformance` authorization-server mode currently exposes two scenarios—metadata and authorization code grant—and applies both to all four dates. The real Worker fixture passed both upstream scenarios for every date using upstream `0.2.0-alpha.10` (`49103de`) over a local HTTPS issuer.
+The official [`@modelcontextprotocol/conformance`](https://github.com/modelcontextprotocol/conformance) runner's authorization-server mode has two scenarios, metadata and the authorization code grant, applied to all four dates. CI runs it against the real Worker fixture on every change:
 
-The upstream authorization-code scenario does not send RFC 8707 `resource`. The provider safely defaults a configured canonical resource at authorization and inherits it at code exchange, so that compatibility scenario remains audience-bound. This suite also tests explicit Resource Indicators and adds the revision-specific protected-resource, audience, registration, scope, refresh, revocation, and issuer scenarios listed above.
+```sh
+npm run test:conformance:upstream
+```
+
+`upstream/run.mjs` starts the fixture in Workerd with a loopback issuer, pre-registers the public client the runner uses, plays the browser for the authorization code scenario, and runs every revision. The runner is a pinned devDependency; Dependabot proposes its new releases (`.github/dependabot.yml`), so the job keeps up with upstream. To try an unreleased runner, point `CONFORMANCE_CLI` at its built `dist/index.js`.
+
+| Runner                           | RFC 8707 `resource` | 2025-03-26 | 2025-06-18 | 2025-11-25 | 2026-07-28 |
+| -------------------------------- | ------------------- | ---------- | ---------- | ---------- | ---------- |
+| `0.2.0-alpha.11` (pinned)        | not sent            | 2/2        | 2/2        | 3/3        | 3/3        |
+| `main` at `7169291` (unreleased) | sent                | 2/2        | 2/2        | 3/3        | 3/3        |
+
+Upstream now sends `resource` in the authorization and token requests when given one ([#466](https://github.com/modelcontextprotocol/conformance/pull/466)). The script passes the fixture's canonical resource whenever the runner supports it, so the next release exercises explicit Resource Indicators too. Older runners omit it; the provider then defaults the configured canonical resource at authorization and inherits it at code exchange, so those runs remain audience-bound. This suite additionally tests explicit Resource Indicators and the revision-specific protected-resource, audience, registration, scope, refresh, revocation, and issuer scenarios listed above.
 
 ## Test architecture
 
@@ -98,5 +109,6 @@ Tests assert only observable HTTP responses, redirects, metadata, challenges, an
 - `token-lifecycle.test.ts` — refresh, downscoping, code replay, and revocation.
 - `resource-server-binding.test.ts` — a separate resource Worker over a Service Binding: `ctx.auth` carried back from the authorization server, the `scope` hint on the initial challenge, and a handler's `insufficientScope()` 403.
 - `spec-versions.ts` — revision applicability matrix.
+- `upstream/run.mjs` — runs the official `@modelcontextprotocol/conformance` runner against the Worker.
 
 Application-owned identity, consent presentation, and operation-level authorization policy remain outside the provider and therefore outside this server conformance suite.

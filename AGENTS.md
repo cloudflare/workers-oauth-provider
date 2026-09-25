@@ -55,6 +55,7 @@ workers-oauth-provider/
 │   ├── shared.ts              # Typed Worker RPC contract and fixture constants
 │   ├── spec-versions.ts       # Ordered MCP authorization revision timeline
 │   ├── support/               # Workerd lifecycle and OAuth client
+│   ├── upstream/              # Official @modelcontextprotocol/conformance runner, run in CI
 │   └── worker/                # Real Wrangler Worker with local KV
 ├── dist/                      # Build output (tsdown)
 ├── docs/
@@ -83,15 +84,16 @@ Node 24+ required.
 
 ## Commands
 
-| Command                    | What it does                              |
-| -------------------------- | ----------------------------------------- |
-| `npm run build`            | Builds single-file ESM bundle with tsdown |
-| `npm run check`            | Runs typecheck + tests                    |
-| `npm run typecheck`        | TypeScript type checking (no emit)        |
-| `npm run test`             | Runs vitest test suite                    |
-| `npm run test:conformance` | Runs MCP auth conformance tests           |
-| `npm run test:watch`       | Runs vitest in watch mode                 |
-| `npm run prettier`         | Formats all files with Prettier           |
+| Command                             | What it does                                                            |
+| ----------------------------------- | ----------------------------------------------------------------------- |
+| `npm run build`                     | Builds single-file ESM bundle with tsdown                               |
+| `npm run check`                     | Runs typecheck + tests                                                  |
+| `npm run typecheck`                 | TypeScript type checking (no emit)                                      |
+| `npm run test`                      | Runs vitest test suite                                                  |
+| `npm run test:conformance`          | Runs MCP auth conformance tests                                         |
+| `npm run test:conformance:upstream` | Runs the official MCP conformance runner against the conformance Worker |
+| `npm run test:watch`                | Runs vitest in watch mode                                               |
+| `npm run prettier`                  | Formats all files with Prettier                                         |
 
 ## Code standards
 

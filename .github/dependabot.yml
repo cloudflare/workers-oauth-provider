@@ -1,0 +1,10 @@
+version: 2
+updates:
+  # Only the official MCP conformance runner: its releases are how the upstream-conformance CI job
+  # stays current. Other dependencies keep to security updates.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    allow:
+      - dependency-name: '@modelcontextprotocol/conformance'

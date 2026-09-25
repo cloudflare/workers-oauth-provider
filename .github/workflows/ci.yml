@@ -31,6 +31,28 @@ jobs:
       - name: Run checks (typecheck + tests)
         run: npm run check
 
+  # The official MCP conformance runner against the real conformance Worker, for every dated
+  # authorization revision. Separate from "test" so an upstream runner change can't block it.
+  upstream-conformance:
+    name: Upstream MCP conformance
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run @modelcontextprotocol/conformance
+        run: npm run test:conformance:upstream
+
   # Check code formatting (fast, runs in parallel)
   format:
     name: Format Check
