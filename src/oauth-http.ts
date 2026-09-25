@@ -41,17 +41,17 @@ export function appendHeaderValue(headers: Headers, name: string, value: string)
 }
 
 /**
- * A resource's up-front scopes: `baseScopes`, or the deprecated `resourceMetadata.scopes_supported`
+ * A resource's required scopes: `requiredScopes`, or the deprecated `resourceMetadata.scopes_supported`
  * it replaces. Both at once is ambiguous and refused.
  */
-export function resolveBaseScopes(
-  baseScopes: readonly string[] | undefined,
+export function resolveRequiredScopes(
+  requiredScopes: readonly string[] | undefined,
   deprecatedScopesSupported: readonly string[] | undefined
 ): string[] | undefined {
-  if (baseScopes !== undefined && deprecatedScopesSupported !== undefined) {
-    throw new TypeError('Set baseScopes only: resourceMetadata.scopes_supported is deprecated in its favour');
+  if (requiredScopes !== undefined && deprecatedScopesSupported !== undefined) {
+    throw new TypeError('Set requiredScopes only: resourceMetadata.scopes_supported is deprecated in its favour');
   }
-  const scopes = baseScopes ?? deprecatedScopesSupported;
+  const scopes = requiredScopes ?? deprecatedScopesSupported;
   return scopes === undefined ? undefined : [...scopes];
 }
 

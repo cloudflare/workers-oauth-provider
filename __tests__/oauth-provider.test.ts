@@ -658,7 +658,7 @@ describe('OAuthProvider', () => {
       [
         'an invalid scope token',
         { scopes_supported: ['scope with spaces'] },
-        'baseScopes (or the deprecated resourceMetadata.scopes_supported) must contain valid OAuth scope tokens',
+        'requiredScopes (or the deprecated resourceMetadata.scopes_supported) must contain valid OAuth scope tokens',
       ],
       [
         'an unsupported bearer method',
@@ -712,7 +712,7 @@ describe('OAuthProvider', () => {
       );
     });
 
-    it('takes a resource baseline from baseScopes, and refuses it with the deprecated field too', async () => {
+    it('takes a resource baseline from requiredScopes, and refuses it with the deprecated field too', async () => {
       const options = {
         apiRoute: ['/api/'],
         apiHandler: TestApiHandler,
@@ -724,7 +724,7 @@ describe('OAuthProvider', () => {
       const provider = new OAuthProvider({
         ...options,
         resourceMetadata: { resource: 'https://api.example.com' },
-        baseScopes: ['read'],
+        requiredScopes: ['read'],
       });
       const metadata = await (
         await provider.fetch(
@@ -742,9 +742,9 @@ describe('OAuthProvider', () => {
           new OAuthProvider({
             ...options,
             resourceMetadata: { resource: 'https://api.example.com', scopes_supported: ['read'] },
-            baseScopes: ['read'],
+            requiredScopes: ['read'],
           })
-      ).toThrow('Set baseScopes only: resourceMetadata.scopes_supported is deprecated in its favour');
+      ).toThrow('Set requiredScopes only: resourceMetadata.scopes_supported is deprecated in its favour');
     });
 
     it('should not infer protected resource requirements from authorization server scopes', async () => {

@@ -44,7 +44,7 @@ resourceMetadata: {
   bearer_methods_supported: ['header'],
   resource_name: 'Files MCP server',
 },
-baseScopes: ['files:read'], // published as this document's scopes_supported
+requiredScopes: ['files:read'], // published as this document's scopes_supported
 ```
 
 For the example above, an unauthenticated request to the exact canonical URL receives a Bearer challenge pointing to:

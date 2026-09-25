@@ -13,7 +13,7 @@ import {
   withAuthorizationRedirect,
   type OAuthServerCapabilities,
 } from './oauth-capabilities';
-import { baselineResourceScopes, resolveBaseScopes, withCorsHeaders } from './oauth-http';
+import { baselineResourceScopes, resolveRequiredScopes, withCorsHeaders } from './oauth-http';
 import {
   fetchClientIdMetadataDocument,
   isClientIdMetadataDocumentUrl,
@@ -418,7 +418,7 @@ export interface OAuthProtectedResourceMetadata {
 
   /**
    * Minimal scopes required for basic protected-resource functionality.
-   * @deprecated Use `baseScopes`, which this becomes on the wire. Setting both is refused.
+   * @deprecated Use `requiredScopes`, which this becomes on the wire. Setting both is refused.
    */
   scopes_supported?: string[];
 
@@ -538,7 +538,7 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
   /**
    * Scopes supported by the authorization server.
    * These are advertised only in authorization server metadata; configure a resource's
-   * up-front scopes separately, with `baseScopes`.
+   * required scopes separately, with `requiredScopes`.
    */
   scopesSupported?: string[];
 
@@ -657,13 +657,17 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
   resourceMetadata: OAuthProtectedResourceMetadata;
 
   /**
-   * The scopes MCP clients should request up front for this resource: the minimum for basic use
-   * (published as its protected resource metadata's `scopes_supported` and named in the `401`
-   * challenge). Operations that need more ask for it with `insufficientScope()` (step-up). Not the
-   * authorization server's catalogue, `scopesSupported`. Leave unset when your consent page picks
-   * the scopes: the `401` then names none. `offline_access` is removed automatically.
+   * The scopes required for accessing this resource (MCP: the minimal set for basic use). Published
+   * as its protected resource metadata's `scopes_supported` and named in the `401` challenge, so
+   * clients request them first; not the authorization server's catalogue, `scopesSupported`.
+   * Operations that need more ask for it with `insufficientScope()` (step-up). `offline_access` is
+   * removed automatically. Leave unset when your consent page picks the scopes.
+   *
+   * Advertised, not enforced: the handler decides whether a token is sufficient (`ctx.auth.scope`),
+   * because only it knows the deployment's scope hierarchy (a broader scope implying a narrower
+   * one), which MCP requires servers to honour.
    */
-  baseScopes?: string[];
+  requiredScopes?: string[];
 }
 
 /** The authorization-server role when one Worker hosts several MCP resources. */
@@ -708,7 +712,7 @@ type InternalOAuthAuthorizationServerOptions<Env = Cloudflare.Env> = Omit<
   | 'tokenEndpoint'
   | 'clientRegistrationEndpoint'
   | 'resourceMetadata'
-  | 'baseScopes'
+  | 'requiredScopes'
 > & {
   authorizationServer: OAuthAuthorizationServerConfiguration;
 };
@@ -726,7 +730,7 @@ export type OAuthAuthorizationServerOptions<Env = Cloudflare.Env> = Omit<
   | 'apiHandlers'
   | 'defaultHandler'
   | 'resourceMetadata'
-  | 'baseScopes'
+  | 'requiredScopes'
   | 'resolveExternalToken'
 > & {
   /** Canonical RFC 8414 issuer. */
@@ -1877,8 +1881,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       normalizedOptions = options;
       configuredResourceServers = [
         {
-          // One internal shape: baseScopes, or the deprecated field it replaces, as scopes_supported.
-          resourceMetadata: withBaseScopes(options.resourceMetadata, options.baseScopes),
+          // One internal shape: requiredScopes, or the deprecated field it replaces, as scopes_supported.
+          resourceMetadata: withRequiredScopes(options.resourceMetadata, options.requiredScopes),
           resolveExternalToken: options.resolveExternalToken,
         },
       ];
@@ -2275,7 +2279,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     if (options.scopes_supported?.some((scope) => !isValidOAuthScopeToken(scope))) {
       throw new TypeError(
-        'baseScopes (or the deprecated resourceMetadata.scopes_supported) must contain valid OAuth scope tokens'
+        'requiredScopes (or the deprecated resourceMetadata.scopes_supported) must contain valid OAuth scope tokens'
       );
     }
 
@@ -5927,14 +5931,14 @@ function wouldRegisterPublicClient(
   }
 }
 
-/** The combined provider's resource metadata with its up-front scopes resolved into `scopes_supported`. */
-function withBaseScopes(
+/** The combined provider's resource metadata with its required scopes resolved into `scopes_supported`. */
+function withRequiredScopes(
   metadata: OAuthProtectedResourceMetadata,
-  baseScopes: string[] | undefined
+  requiredScopes: string[] | undefined
 ): OAuthProtectedResourceMetadata {
   if (!metadata || typeof metadata !== 'object') return metadata;
   const { scopes_supported: deprecated, ...rest } = metadata;
-  const scopes = resolveBaseScopes(baseScopes, deprecated);
+  const scopes = resolveRequiredScopes(requiredScopes, deprecated);
   return scopes === undefined ? rest : { ...rest, scopes_supported: scopes };
 }
 

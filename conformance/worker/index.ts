@@ -98,7 +98,7 @@ function createProviderOptions(configuration: WorkerConfiguration): OAuthProvide
       bearer_methods_supported: ['header'],
       resource_name: 'MCP auth conformance server',
     },
-    baseScopes: configuration.resourceScopes,
+    requiredScopes: configuration.resourceScopes,
     resolveExternalToken: async ({ token }) => {
       // A valid upstream credential issued for another resource: the provider must reject it
       // because its audience is not this server's canonical resource.
@@ -158,7 +158,7 @@ export default class McpOAuthConformanceWorker extends WorkerEntrypoint<Conforma
     const { origin, resource, resourceScopes } = requireConfiguration();
     const resourceServer = new OAuthResourceServer<ConformanceWorkerEnv, { subject: string }>({
       resourceMetadata: { resource, authorization_servers: [origin] },
-      baseScopes: resourceScopes,
+      requiredScopes: resourceScopes,
       validateToken: (env) => env.AUTH_SERVER.validateToken,
       handler: {
         fetch: (request, _env, ctx) => {
