@@ -41,10 +41,6 @@ export function appendHeaderValue(headers: Headers, name: string, value: string)
 }
 
 /**
- * The scopes a protected resource advertises and challenges with: deduplicated, and without
- * `offline_access`, which is an authorization-server capability rather than a resource requirement.
- */
-/**
  * A resource's up-front scopes: `baseScopes`, or the deprecated `resourceMetadata.scopes_supported`
  * it replaces. Both at once is ambiguous and refused.
  */
@@ -59,6 +55,10 @@ export function resolveBaseScopes(
   return scopes === undefined ? undefined : [...scopes];
 }
 
+/**
+ * The scopes a protected resource advertises and challenges with: deduplicated, and without
+ * `offline_access`, which is an authorization-server capability rather than a resource requirement.
+ */
 export function baselineResourceScopes(scopes: readonly string[]): string[] {
   return [...new Set(scopes)].filter((scope) => scope !== 'offline_access');
 }
