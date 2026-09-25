@@ -152,7 +152,7 @@ A request flows through them like this:
 
 1. An unauthenticated call gets `401` with `scope="mcp:read"`, the resource's baseline.
 2. The client authorizes with `scope=mcp:read`. Your `/authorize` decides what to grant: `completeAuthorization({ scope })` stores it, and `approveConsent()` accepts only scopes in `scopesSupported`. Requests are not otherwise filtered against the catalogue, so the application stays in charge. Token and refresh requests can only narrow the grant.
-3. The resource sees the token's scopes as `ctx.auth.scope`. An operation that needs more answers `insufficientScope(ctx.auth, ['mcp:write'])`: a `403` with `error="insufficient_scope"`, every scope the operation needs in one challenge, and the resource's metadata URL. The client re-authorizes for the baseline plus those scopes. See [docs/resource-servers.md](resource-servers.md#what-the-handler-sees).
+3. The resource sees the token's scopes as `ctx.auth.scope`. An operation that needs more answers with every scope it needs, baseline included: `insufficientScope(ctx.auth, ['mcp:read', 'mcp:write'])` gives a `403` with `error="insufficient_scope"`, `scope="mcp:read mcp:write"` and the resource's metadata URL. The client re-authorizes for those scopes. See [docs/resource-servers.md](resource-servers.md#what-the-handler-sees).
 
 [`examples/split-workers`](../examples/split-workers) walks this whole flow, from the first `401` through a read to a write after step-up, in its end-to-end test.
 
