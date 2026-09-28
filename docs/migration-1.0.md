@@ -203,6 +203,7 @@ These need no code change, but responses differ.
 - **Grants without a refresh token expire (1.2).** With `refreshTokenTTL: 0`, a grant now expires with its access token instead of staying in KV for good.
 - **CORS headers from your handler are kept (1.2).** `Access-Control-Allow-*` headers an API handler sets are no longer overwritten, so it can narrow its own policy.
 - **`deleteClient()` (1.2).** The client is deleted first, so it stops working even if revoking its grants fails partway; calling it again finishes the job.
+- **Values too long for a KV key (1.2.2).** A `client_id`, authorization code, refresh token or bearer token too long to form a KV key gets the answer an unknown one gets: `invalid_client`, `invalid_grant`, `invalid_token`, or a successful revocation. `parseAuthRequest()`, `lookupClient()` and `unwrapToken()` treat it as unknown too. Before, KV's 512-byte key limit made these requests throw.
 
 ## `tokenExchangeCallback` (1.1, 1.2)
 
