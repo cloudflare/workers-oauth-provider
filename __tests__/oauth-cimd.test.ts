@@ -589,6 +589,63 @@ describe('Client ID Metadata Document (CIMD)', () => {
       await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(CimdFetchError);
     });
 
+    it('resolves a document that also lists redirect URIs the policy refuses, and holds each request to it', async () => {
+      // A client's document is shared by every server it uses: here a desktop app's private-use
+      // scheme and a remote http URI sit next to the https callback this server accepts.
+      const cimdUrl = 'https://client.example.com/oauth/metadata.json';
+      const metadata = {
+        client_id: cimdUrl,
+        client_name: 'Client with several redirects',
+        redirect_uris: [
+          'https://client.example.com/callback',
+          'com.example.app:/oauth/callback',
+          'http://client.example.com/insecure',
+        ],
+        token_endpoint_auth_method: 'none',
+      };
+      globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(createMockFetchResponse(metadata)));
+      const authorize = (redirectUri: string) =>
+        oauthProvider.fetch(
+          createMockRequest(
+            `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=S256`,
+            'GET'
+          ),
+          mockEnv,
+          mockCtx
+        );
+
+      // The https callback works, as it did before the policy.
+      const response = await authorize('https://client.example.com/callback');
+      expect(response.status).toBe(302);
+      expect(new URL(response.headers.get('Location')!).origin).toBe('https://client.example.com');
+
+      // The others are refused per request, locally: no redirect is ever sent to them.
+      for (const refused of metadata.redirect_uris.slice(1)) {
+        const error = await authorize(refused).then(
+          () => undefined,
+          (thrown: unknown) => thrown
+        );
+        expect(error).toMatchObject({ name: 'AuthorizationError', code: 'invalid_request', redirectUri: undefined });
+      }
+
+      // A caller-built request can't deliver a code to one either.
+      const parsed = await mockEnv.OAUTH_PROVIDER!.parseAuthRequest(
+        createMockRequest(
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent(metadata.redirect_uris[0])}&response_type=code&code_challenge=test-challenge&code_challenge_method=S256`
+        )
+      );
+      await expect(
+        mockEnv.OAUTH_PROVIDER!.completeAuthorization({
+          request: { ...parsed, redirectUri: 'http://client.example.com/insecure' },
+          userId: 'user-1',
+          metadata: {},
+          scope: [],
+          props: {},
+        })
+      ).rejects.toMatchObject({ code: 'invalid_request', description: 'Invalid redirect URI' });
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys).toHaveLength(1);
+    });
+
     it('should treat missing redirect_uris as invalid client', async () => {
       const cimdUrl = 'https://client.example.com/oauth/metadata.json';
       const invalidMetadata = {

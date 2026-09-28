@@ -6557,6 +6557,13 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
         'Invalid redirect URI. The redirect URI provided does not match any registered URI for this client.'
       );
     }
+    // The policy parseAuthRequest() applied, for a caller-built request: a Client ID Metadata
+    // Document may list redirect URIs the policy refuses, and a code must never be sent to one.
+    try {
+      validateRedirectUri(redirectUri, this.provider.serverCapabilities);
+    } catch {
+      throw new AuthorizationError('invalid_request', { description: 'Invalid redirect URI' });
+    }
     validateAuthorizationResponseType(
       this.provider.serverCapabilities,
       options.request.responseType,

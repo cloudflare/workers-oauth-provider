@@ -103,7 +103,7 @@ If you have your own clients on either flow, move them to the authorization code
 
 ### Redirect URIs must be HTTPS or loopback HTTP (1.2)
 
-Redirect URIs must use `https`, or `http` on `localhost`, `127.0.0.0/8` or `::1`, with no userinfo or fragment. That's what MCP and OAuth 2.1 require. The rule applies wherever a redirect URI enters: dynamic registration, CIMD documents, `createClient()`, `updateClient()`, and every authorization request.
+Redirect URIs must use `https`, or `http` on `localhost`, `127.0.0.0/8` or `::1`, with no userinfo or fragment. That's what MCP and OAuth 2.1 require. The rule applies at dynamic registration, in `createClient()` and `updateClient()`, and on every authorization request. A CIMD document may list other redirect URIs too, since it's shared by every server the client uses; a request that uses one of them is refused, and the rest of the document keeps working.
 
 Because it applies at authorization too, clients registered before 1.2 are held to it. A client with a remote `http` redirect URI gets a locally rendered `invalid_request` ("Invalid redirect URI") and is never redirected. It has to register a compliant URI.
 
