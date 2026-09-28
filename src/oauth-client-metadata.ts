@@ -218,7 +218,7 @@ function pickDisplayMetadata(metadata: ParsedOAuthClientMetadata): OAuthClientDi
  * Document is held to these alone; the URI a request uses is then held to {@link validateRedirectUri}.
  * @throws Error when the redirect URI is not safe to store
  */
-export function validateRedirectUriSafety(redirectUri: string): void {
+function validateRedirectUriSafety(redirectUri: string): void {
   const dangerousSchemes = ['javascript:', 'data:', 'vbscript:', 'file:', 'mailto:', 'blob:'];
   const normalized = redirectUri.trim();
 
