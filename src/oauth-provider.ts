@@ -2495,11 +2495,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Call the default handler based on its type
     // Note: We don't add CORS headers to default handler responses
     if (defaultHandler.type === HandlerType.EXPORTED_HANDLER) {
-      return defaultHandler.handler.fetch(
-        request as Parameters<ExportedHandlerWithFetch<Env>['fetch']>[0],
-        env,
-        ctx
-      );
+      return defaultHandler.handler.fetch(request as Parameters<ExportedHandlerWithFetch<Env>['fetch']>[0], env, ctx);
     }
 
     const handler = new defaultHandler.handler(ctx, env);
