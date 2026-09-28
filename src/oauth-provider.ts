@@ -2522,7 +2522,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Retrieve the token from KV
     const [userId, grantId] = parts;
     const id = await generateTokenId(token);
-    const tokenData: Token | null = await env.OAUTH_KV.get(`token:${userId}:${grantId}:${id}`, { type: 'json' });
+    const tokenData = await getStoredJson<Token>(env.OAUTH_KV, `token:${userId}:${grantId}:${id}`);
 
     // Return null if missing or expired
     if (!tokenData) {
@@ -3316,7 +3316,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Get the grant
     const grantKey = `grant:${userId}:${grantId}`;
-    const grantData: Grant | null = await env.OAUTH_KV.get(grantKey, { type: 'json' });
+    const grantData = await getStoredJson<Grant>(env.OAUTH_KV, grantKey);
 
     if (!grantData) {
       return this.createErrorResponse(
@@ -3694,7 +3694,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Get the associated grant using userId in the key
     const grantKey = `grant:${userId}:${grantId}`;
-    const grantData: Grant | null = await env.OAUTH_KV.get(grantKey, { type: 'json' });
+    const grantData = await getStoredJson<Grant>(env.OAUTH_KV, grantKey);
 
     if (!grantData) {
       return this.createErrorResponse(
@@ -4682,7 +4682,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     clientInfo: ClientInfo,
     env: Env & ProviderEnv
   ): Promise<boolean> {
-    const tokenData: Token | null = await env.OAUTH_KV.get(`token:${userId}:${grantId}:${tokenId}`, { type: 'json' });
+    const tokenData = await getStoredJson<Token>(env.OAUTH_KV, `token:${userId}:${grantId}:${tokenId}`);
     if (!tokenData) return false;
 
     const tokenClientId = tokenData.grant?.clientId;
@@ -4691,7 +4691,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     } else {
       // Backward compatibility for token records written before access tokens
       // denormalized grant.clientId. Verify ownership from the backing grant.
-      const grantData: Grant | null = await env.OAUTH_KV.get(`grant:${userId}:${grantId}`, { type: 'json' });
+      const grantData = await getStoredJson<Grant>(env.OAUTH_KV, `grant:${userId}:${grantId}`);
       if (grantData?.clientId !== clientInfo.clientId) return false;
     }
 
@@ -4707,7 +4707,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     clientInfo: ClientInfo,
     env: Env & ProviderEnv
   ): Promise<boolean> {
-    const grantData: Grant | null = await env.OAUTH_KV.get(`grant:${userId}:${grantId}`, { type: 'json' });
+    const grantData = await getStoredJson<Grant>(env.OAUTH_KV, `grant:${userId}:${grantId}`);
     if (!grantData) return false;
     const isRefreshToken = grantData.refreshTokenId === tokenId || grantData.previousRefreshTokenId === tokenId;
     if (!isRefreshToken) return false;
@@ -5010,7 +5010,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     if (isPossiblyInternalFormat) {
       [userId, grantId] = parts;
       const id = await generateTokenId(accessToken);
-      tokenData = await env.OAUTH_KV.get(`token:${userId}:${grantId}:${id}`, { type: 'json' });
+      tokenData = await getStoredJson<Token>(env.OAUTH_KV, `token:${userId}:${grantId}:${id}`);
     }
 
     // No internal token found, and either no external validator, or the token is in this provider's
@@ -5325,8 +5325,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     if (isClientIdMetadataDocumentUrl(clientId)) {
       if (!this.options.clientIdMetadataDocumentEnabled) {
         // CIMD not enabled — treat as standard KV lookup
-        const clientKey = `client:${clientId}`;
-        return env.OAUTH_KV.get(clientKey, { type: 'json' });
+        return getStoredJson<StoredClientInfo>(env.OAUTH_KV, `client:${clientId}`);
       }
       if (!this.hasGlobalFetchStrictlyPublic()) {
         throw new Error(`CIMD is enabled but 'global_fetch_strictly_public' compatibility flag is not set.`);
@@ -5345,8 +5344,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     // Standard KV lookup
-    const clientKey = `client:${clientId}`;
-    return env.OAUTH_KV.get(clientKey, { type: 'json' });
+    return getStoredJson<StoredClientInfo>(env.OAUTH_KV, `client:${clientId}`);
   }
 
   /** Resolve a value to the registry's canonical spelling, requiring one value. */
@@ -5966,6 +5964,23 @@ interface GrantKeyMetadata {
 
 /** KV serialises key metadata as JSON and rejects a write carrying more than this. */
 const MAX_KV_METADATA_BYTES = 1024;
+
+/** KV rejects a key longer than this many UTF-8 bytes, by throwing rather than missing. */
+const MAX_KV_KEY_BYTES = 512;
+
+/** Whether KV accepts `key`. Every UTF-16 code unit is at least one UTF-8 byte, so a longer string never fits. */
+function fitsKvKey(key: string): boolean {
+  return key.length <= MAX_KV_KEY_BYTES && new TextEncoder().encode(key).byteLength <= MAX_KV_KEY_BYTES;
+}
+
+/**
+ * Reads a JSON record whose key is built from request input: a `client_id`, or the user and
+ * grant IDs parsed from a code or token. A key too long for KV was never written, so it reads
+ * as absent instead of throwing, and the request gets the answer an unknown value gets.
+ */
+async function getStoredJson<T>(kv: KVNamespace, key: string): Promise<T | null> {
+  return fitsKvKey(key) ? kv.get<T>(key, { type: 'json' }) : null;
+}
 
 /**
  * Key metadata for a grant record, or `undefined` when it would not fit. A grant

@@ -3,6 +3,9 @@ import type { ExecutionContext } from '@cloudflare/workers-types';
 import { WorkerEntrypoint } from 'cloudflare:workers';
 import type { OAuthHelpers } from '../src/oauth-provider';
 
+/** Cloudflare KV's limit on the UTF-8 length of a key. */
+const MAX_KV_KEY_BYTES = 512;
+
 /**
  * Mock KV namespace implementation that stores data in memory
  */
@@ -25,11 +28,25 @@ export class MockKV {
     this.timeOffsetMs += ms;
   }
 
+  /**
+   * Mirror Cloudflare KV's key length limit: it rejects an oversized key with a 414 rather
+   * than reporting a miss, so a key built from request input fails here as in production.
+   */
+  private checkKeyLength(operation: 'GET' | 'PUT' | 'DELETE', key: string): void {
+    const bytes = new TextEncoder().encode(key).byteLength;
+    if (bytes > MAX_KV_KEY_BYTES) {
+      throw new Error(
+        `KV ${operation} failed: 414 UTF-8 encoded length of ${bytes} exceeds key length limit of ${MAX_KV_KEY_BYTES}.`
+      );
+    }
+  }
+
   async put(
     key: string,
     value: string | ArrayBuffer,
     options?: { expirationTtl?: number; expiration?: number; metadata?: unknown }
   ): Promise<void> {
+    this.checkKeyLength('PUT', key);
     let expirationTime: number | undefined = undefined;
 
     // Mirror Cloudflare KV's limit on serialised key metadata, so a write that would be
@@ -66,6 +83,7 @@ export class MockKV {
   }
 
   async get(key: string, options?: { type: 'text' | 'json' | 'arrayBuffer' | 'stream' }): Promise<any> {
+    this.checkKeyLength('GET', key);
     const item = this.storage.get(key);
 
     if (!item) {
@@ -85,6 +103,7 @@ export class MockKV {
   }
 
   async delete(key: string): Promise<void> {
+    this.checkKeyLength('DELETE', key);
     this.storage.delete(key);
   }
 

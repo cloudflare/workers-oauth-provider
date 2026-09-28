@@ -11407,6 +11407,102 @@ describe('OAuthProvider', () => {
     });
   });
 
+  describe('Values too long to be a KV key', () => {
+    // Cloudflare KV throws for a key over 512 bytes, and MockKV mirrors it. A client_id, code or
+    // token that would build one was never stored, so it gets the answer an unknown one gets.
+    const oversized = 'a'.repeat(600);
+    const redirectUri = 'https://client.example.com/callback';
+    let client: { client_id: string; client_secret: string };
+
+    beforeEach(async () => {
+      const response = await oauthProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify({
+            redirect_uris: [redirectUri],
+            client_name: 'Test Client',
+            token_endpoint_auth_method: 'client_secret_basic',
+          })
+        ),
+        mockEnv,
+        mockCtx
+      );
+      expect(response.status).toBe(201);
+      client = await response.json<any>();
+    });
+
+    function tokenEndpoint(params: Record<string, string>, clientId = client.client_id): Promise<Response> {
+      return oauthProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            Authorization: `Basic ${btoa(`${clientId}:${client.client_secret}`)}`,
+          },
+          new URLSearchParams(params).toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+    }
+
+    it('treats an oversized client_id at the authorization endpoint as an unknown client', async () => {
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${oversized}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}&scope=read&state=xyz`
+      );
+
+      await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+    });
+
+    it('treats an oversized client_id at the token endpoint as an unknown client', async () => {
+      const response = await tokenEndpoint(
+        { grant_type: 'refresh_token', refresh_token: 'user:grant:secret' },
+        oversized
+      );
+
+      expect(response.status).toBe(401);
+      expect(await response.json<any>()).toMatchObject({ error: 'invalid_client' });
+    });
+
+    it.each([
+      ['authorization_code', { code: `${oversized}:grant:secret`, redirect_uri: redirectUri }],
+      ['refresh_token', { refresh_token: `${oversized}:grant:secret` }],
+    ])('treats an oversized %s as an unknown grant', async (grantType, params) => {
+      const response = await tokenEndpoint({ grant_type: grantType, ...params });
+
+      expect(response.status).toBe(400);
+      expect(await response.json<any>()).toMatchObject({ error: 'invalid_grant' });
+    });
+
+    it('treats an oversized token at the revocation endpoint as unknown (RFC 7009 \u00a72.2)', async () => {
+      const response = await tokenEndpoint({ token: `${oversized}:grant:secret` });
+
+      expect(response.status).toBe(200);
+    });
+
+    it('treats an oversized bearer token as invalid', async () => {
+      const response = await oauthProvider.fetch(
+        createMockRequest('https://example.com/api/test', 'GET', { Authorization: `Bearer ${oversized}:grant:secret` }),
+        mockEnv,
+        mockCtx
+      );
+
+      expect(response.status).toBe(401);
+      expect(await response.json<any>()).toMatchObject({ error: 'invalid_token' });
+    });
+
+    it('returns null from lookupClient() and unwrapToken() for oversized values', async () => {
+      await oauthProvider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
+
+      await expect(mockEnv.OAUTH_PROVIDER!.lookupClient(oversized)).resolves.toBeNull();
+      await expect(mockEnv.OAUTH_PROVIDER!.unwrapToken(`${oversized}:grant:secret`)).resolves.toBeNull();
+    });
+  });
+
   describe('RFC 8252 Loopback Redirect URI Port Flexibility', () => {
     let clientId: string;
     let clientSecret: string;
