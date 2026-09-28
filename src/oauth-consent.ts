@@ -106,7 +106,7 @@ export interface ResumedUpstream<Data = unknown> {
 
 const TRANSACTION_TTL_SECONDS = 600;
 /** Default for the provider's `cookiePrefix` option. */
-export const DEFAULT_COOKIE_PREFIX = '__Host-oauth-';
+const DEFAULT_COOKIE_PREFIX = '__Host-oauth-';
 const DEFAULT_REMEMBER_SECONDS = 30 * 24 * 60 * 60;
 const MIN_SECRET_LENGTH = 32;
 // Browsers cap a cookie near 4 KB; older approvals are dropped to stay under it.

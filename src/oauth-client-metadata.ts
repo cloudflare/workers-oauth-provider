@@ -65,7 +65,7 @@ export interface ResolvedDynamicClientRegistrationMetadata extends OAuthClientDi
 }
 
 /** Effective client metadata returned after resolving a Client ID Metadata Document. */
-export interface ResolvedClientIdMetadataDocument extends OAuthClientDisplayMetadata {
+interface ResolvedClientIdMetadataDocument extends OAuthClientDisplayMetadata {
   /** Client identifier matching the fetched document URL. */
   clientId: string;
   /** Required human-readable client name. */
