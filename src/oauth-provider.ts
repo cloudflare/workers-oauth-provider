@@ -22,6 +22,7 @@ import {
   requireJsonObject,
   resolveDynamicClientRegistrationMetadata,
   validateRedirectUri,
+  validateRegisteredRedirectUris,
   type ResolvedDynamicClientRegistrationMetadata,
 } from './oauth-client-metadata';
 import {
@@ -631,9 +632,11 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
   }) => Response | void;
 
   /**
-   * Accept RFC 8252 private-use URI scheme redirect URIs (for example `com.example.app:/oauth`)
-   * for native apps. By default redirect URIs must use `https`, or `http` on a loopback host, as
-   * MCP and OAuth 2.1 require; remote `http` is never accepted. Leave this off for MCP servers.
+   * Let authorization requests use RFC 8252 private-use URI scheme redirect URIs (for example
+   * `com.example.app:/oauth`), for native apps. By default a request's redirect URI must use
+   * `https`, or `http` on a loopback host, as MCP and OAuth 2.1 require; remote `http` is never
+   * accepted. Without this option a client can still register private-use URIs next to a compliant
+   * one (Cursor does), but no request can use them.
    */
   allowPrivateUseRedirectUris?: boolean;
 
@@ -6766,11 +6769,9 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
       ...(authMethodWasExplicit ? { authMethodExplicit: true as const } : {}),
     };
 
-    // Validate each redirect URI against the redirect policy, and the grant and response types
-    // against what this server implements, as dynamic registration does.
-    for (const uri of newClient.redirectUris) {
-      validateRedirectUri(uri, this.provider.serverCapabilities);
-    }
+    // Validate the redirect URIs as dynamic registration does, and the grant and response types
+    // against what this server implements.
+    validateRegisteredRedirectUris(newClient.redirectUris, this.provider.serverCapabilities);
     validateClientCapabilities(this.provider.serverCapabilities, {
       grantTypes: newClient.grantTypes!,
       responseTypes: newClient.responseTypes!,
@@ -6861,7 +6862,7 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
       if (!Array.isArray(updates.redirectUris) || updates.redirectUris.length === 0) {
         throw new Error('redirectUris must not be empty');
       }
-      for (const uri of updates.redirectUris) validateRedirectUri(uri, this.provider.serverCapabilities);
+      validateRegisteredRedirectUris(updates.redirectUris, this.provider.serverCapabilities);
     }
 
     // Determine token endpoint auth method

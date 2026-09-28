@@ -16228,6 +16228,88 @@ describe('redirect URI policy: https, or http on a loopback host', () => {
     expect(error).toMatchObject({ name: 'AuthorizationError', code: 'invalid_request', redirectUri: undefined });
   });
 
+  it('accepts a registration that also lists callbacks the policy refuses, and holds each request to it', async () => {
+    // What some Cursor versions register: a private-use callback next to https and loopback ones.
+    const cursorRedirectUris = [
+      'cursor://anysphere.cursor-mcp/oauth/callback',
+      'https://www.cursor.com/agents/mcp/oauth/callback',
+      'http://localhost:8787/callback',
+    ];
+    const provider = createProvider();
+    const response = await provider.fetch(
+      createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify({ redirect_uris: cursorRedirectUris, client_name: 'Cursor', token_endpoint_auth_method: 'none' })
+      ),
+      env,
+      ctx
+    );
+    expect(response.status).toBe(201);
+    const { client_id: clientId } = (await response.json()) as { client_id: string };
+
+    const oauth = await helpers(provider);
+    const created = await oauth.createClient({ redirectUris: cursorRedirectUris, tokenEndpointAuthMethod: 'none' });
+    await expect(oauth.updateClient(created.clientId, { redirectUris: cursorRedirectUris })).resolves.toBeTruthy();
+
+    const authorizeUrl = (redirectUri: string) =>
+      new Request(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          '&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256'
+      );
+    // The callback Cursor signs in with is accepted.
+    const request = await oauth.parseAuthRequest(authorizeUrl('http://localhost:8787/callback'));
+    expect(request.redirectUri).toBe('http://localhost:8787/callback');
+    // The private-use one is refused locally, never redirected to.
+    const refused = await oauth
+      .parseAuthRequest(authorizeUrl('cursor://anysphere.cursor-mcp/oauth/callback'))
+      .catch((thrown: unknown) => thrown);
+    expect(refused).toMatchObject({ name: 'AuthorizationError', code: 'invalid_request', redirectUri: undefined });
+    // Nor can a caller-built request send a code there.
+    await expect(
+      oauth.completeAuthorization({
+        request: { ...request, redirectUri: 'cursor://anysphere.cursor-mcp/oauth/callback' },
+        userId: 'user-1',
+        metadata: {},
+        scope: [],
+        props: {},
+      })
+    ).rejects.toThrow();
+    expect((await env.OAUTH_KV.list({ prefix: 'grant:' })).keys).toHaveLength(0);
+  });
+
+  it.each([
+    ['a dangerous scheme', 'javascript:alert(1)'],
+    ['a fragment', 'https://client.example.com/other#frag'],
+    ['userinfo', 'https://user@client.example.com/other'],
+  ])('refuses a registration listing %s, even next to a usable callback', async (_label, redirectUri) => {
+    const provider = createProvider();
+    const response = await provider.fetch(
+      createMockRequest(
+        'https://example.com/oauth/register',
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify({
+          redirect_uris: ['https://client.example.com/callback', redirectUri],
+          client_name: 'c',
+          token_endpoint_auth_method: 'none',
+        })
+      ),
+      env,
+      ctx
+    );
+    expect(response.status).toBe(400);
+    const oauth = await helpers(provider);
+    await expect(
+      oauth.createClient({
+        redirectUris: ['https://client.example.com/callback', redirectUri],
+        tokenEndpointAuthMethod: 'none',
+      })
+    ).rejects.toThrow();
+  });
+
   it('accepts private-use schemes for native apps only with allowPrivateUseRedirectUris, never remote http', async () => {
     const provider = createProvider({ allowPrivateUseRedirectUris: true });
     for (const redirectUri of ['myapp://callback', 'com.example.app:/oauth/callback']) {
