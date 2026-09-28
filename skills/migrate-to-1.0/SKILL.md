@@ -46,4 +46,4 @@ No KV migration exists or is needed; never edit stored data.
 
 - `wrangler dev`, then `curl -i http://localhost:8787<api route>`: `401` whose `WWW-Authenticate` has `resource_metadata="…/.well-known/oauth-protected-resource<resource path>"`.
 - With a loopback dev resource, `curl http://localhost:8787/.well-known/oauth-protected-resource<resource path>`: `200` with the exact `resource`. Production serves it only on the resource's own origin.
-- `curl http://localhost:8787/.well-known/oauth-authorization-server`: `authorization_endpoint` and `token_endpoint` unchanged from before the upgrade.
+- `curl http://localhost:8787/.well-known/oauth-authorization-server<issuer path>`: `authorization_endpoint` and `token_endpoint` unchanged from before the upgrade. `OAuthProvider` serves it at the origin root; an `OAuthAuthorizationServer` issuer's path goes after the prefix (RFC 8414 §3.1), e.g. `…/oauth-authorization-server/tenant` for `https://example.com/tenant`.
