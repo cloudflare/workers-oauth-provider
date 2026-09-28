@@ -714,6 +714,7 @@ type InternalOAuthAuthorizationServerOptions<Env = Cloudflare.Env> = Omit<
   | 'apiRoute'
   | 'apiHandler'
   | 'apiHandlers'
+  | 'defaultHandler'
   | 'authorizeEndpoint'
   | 'tokenEndpoint'
   | 'clientRegistrationEndpoint'
@@ -1657,7 +1658,7 @@ interface CreateAccessTokenOptions {
   env: ProviderEnv;
 }
 
-type InternalOAuthProviderOptions<Env> = Omit<OAuthProviderOptions<Env>, 'resourceMetadata'> & {
+type InternalOAuthProviderOptions<Env> = Omit<OAuthProviderOptions<Env>, 'resourceMetadata' | 'defaultHandler'> & {
   resourceMetadata?: OAuthProtectedResourceMetadata;
 };
 
@@ -1736,9 +1737,6 @@ export class OAuthAuthorizationServer<Env = Cloudflare.Env> {
     } = options;
     this.#impl = new OAuthProviderImpl<Env>({
       ...commonOptions,
-      defaultHandler: {
-        fetch: () => new Response(null, { status: 404 }),
-      },
       authorizationServer: {
         issuer,
         resources,
@@ -1830,9 +1828,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   private readonly configuredLegacyGrantResource: string | undefined;
 
   /**
-   * Represents the validated type of a handler (ExportedHandler or WorkerEntrypoint)
+   * The combined provider's validated `defaultHandler` (an ExportedHandler or WorkerEntrypoint).
+   * The split authorization server has none: it answers only its own endpoints.
    */
-  private typedDefaultHandler: TypedHandler<Env>;
+  private readonly typedDefaultHandler: TypedHandler<Env> | undefined;
 
   /**
    * Array of tuples of API routes and their validated handlers
@@ -1862,7 +1861,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    */
   constructor(options: OAuthProviderOptions<Env> | InternalOAuthAuthorizationServerOptions<Env>) {
     this.typedApiHandlers = [];
-    this.typedDefaultHandler = this.validateHandler(options.defaultHandler, 'defaultHandler');
+    this.typedDefaultHandler =
+      'authorizationServer' in options ? undefined : this.validateHandler(options.defaultHandler, 'defaultHandler');
 
     const roleBased = 'authorizationServer' in options;
     if (!roleBased && 'resourceMatchOriginOnly' in (options as unknown as Record<string, unknown>)) {
@@ -2482,9 +2482,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       return withCorsHeaders(response, request);
     }
 
-    if (typeof role === 'object') {
-      return new Response(null, { status: 404 });
-    }
+    // Only the combined provider has application routes. The split server answers its own
+    // endpoints and nothing else, and leaves the caller's env untouched.
+    const defaultHandler = this.typedDefaultHandler;
+    if (!defaultHandler) return new Response(null, { status: 404 });
 
     // Inject OAuth helpers into env if not already present
     if (!(env as Record<string, unknown>).OAUTH_PROVIDER) {
@@ -2493,15 +2494,15 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Call the default handler based on its type
     // Note: We don't add CORS headers to default handler responses
-    if (this.typedDefaultHandler.type === HandlerType.EXPORTED_HANDLER) {
-      return this.typedDefaultHandler.handler.fetch(
+    if (defaultHandler.type === HandlerType.EXPORTED_HANDLER) {
+      return defaultHandler.handler.fetch(
         request as Parameters<ExportedHandlerWithFetch<Env>['fetch']>[0],
         env,
         ctx
       );
     }
 
-    const handler = new this.typedDefaultHandler.handler(ctx, env);
+    const handler = new defaultHandler.handler(ctx, env);
     return handler.fetch(request);
   }
 

@@ -31,7 +31,7 @@ export function withCorsHeaders(response: Response, request: Request): Response 
 }
 
 /** Adds `value` to a comma-separated header unless it's already there (case-insensitively). */
-export function appendHeaderValue(headers: Headers, name: string, value: string): void {
+function appendHeaderValue(headers: Headers, name: string, value: string): void {
   const values = (headers.get(name) ?? '')
     .split(',')
     .map((item) => item.trim())

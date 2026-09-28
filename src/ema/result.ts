@@ -50,7 +50,7 @@ export type EmaValidationError =
   | { reason: 'assertion_expired_after_processing' };
 
 /** Wire-level error response that the AS returns to the client. */
-export interface EmaErrorWireResponse {
+interface EmaErrorWireResponse {
   code: 'invalid_grant' | 'invalid_target' | 'invalid_request';
   message: string;
 }

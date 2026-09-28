@@ -111,7 +111,7 @@ export function withAuthorizationRedirect(
 }
 
 /** PKCE transformation methods implemented by the authorization server. */
-export type PkceCodeChallengeMethod = 'plain' | 'S256';
+type PkceCodeChallengeMethod = 'plain' | 'S256';
 
 export interface OAuthServerCapabilities {
   readonly grantTypes: readonly string[];
@@ -122,14 +122,14 @@ export interface OAuthServerCapabilities {
   readonly allowPrivateUseRedirectUris: boolean;
 }
 
-export interface ClientCapabilities {
+interface ClientCapabilities {
   readonly grantTypes: readonly string[];
   readonly responseTypes: readonly string[];
   readonly tokenEndpointAuthMethod: string;
 }
 
 /** Client-advertised capabilities parsed from OAuth client metadata. */
-export interface ClientMetadataCapabilities {
+interface ClientMetadataCapabilities {
   readonly grantTypes: readonly string[];
   readonly responseTypes: readonly string[];
   readonly tokenEndpointAuthMethod?: string;

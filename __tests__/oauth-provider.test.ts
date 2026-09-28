@@ -14663,6 +14663,16 @@ describe('functional authorization-server and resource-server composition', () =
     ).toBe(404);
   });
 
+  it('answers anything but its own endpoints with 404, and leaves env untouched', async () => {
+    const { authorizationServer } = createRoles();
+    for (const path of ['/authorize', '/callback', '/']) {
+      const response = await authorizationServer.fetch(createMockRequest(`${issuer}${path}`), env, ctx);
+      expect(response.status).toBe(404);
+    }
+    // Only the combined OAuthProvider hands helpers to a defaultHandler through env.
+    expect(env.OAUTH_PROVIDER).toBeNull();
+  });
+
   it('removes a path issuer trailing slash when deriving RFC 8414 discovery', async () => {
     const pathIssuer = 'https://auth.example.com/tenant///';
     const authorizationServer = new OAuthAuthorizationServer<TestEnv>({
