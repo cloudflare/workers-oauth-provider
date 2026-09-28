@@ -213,14 +213,12 @@ function pickDisplayMetadata(metadata: ParsedOAuthClientMetadata): OAuthClientDi
 }
 
 /**
- * Validates a redirect URI against the MCP / OAuth 2.1 redirect policy: `https`, or `http` on a
- * loopback host (`localhost`, `127.0.0.0/8`, `::1`), with no userinfo and no fragment (not even an
- * empty `#`). RFC 8252 private-use schemes are accepted only when the server enables
- * `allowPrivateUseRedirectUris`; remote `http` never is. Control characters and dangerous schemes
- * (`javascript:`, `data:` and the like) are always rejected.
- * @throws Error describing why the redirect URI is not acceptable
+ * The checks every listed redirect URI passes, whatever the policy: no control characters, a
+ * scheme, and not a dangerous one (`javascript:`, `data:` and the like). A Client ID Metadata
+ * Document is held to these alone; the URI a request uses is then held to {@link validateRedirectUri}.
+ * @throws Error when the redirect URI is not safe to store
  */
-export function validateRedirectUri(redirectUri: string, server: OAuthServerCapabilities): void {
+function validateRedirectUriSafety(redirectUri: string): void {
   const dangerousSchemes = ['javascript:', 'data:', 'vbscript:', 'file:', 'mailto:', 'blob:'];
   const normalized = redirectUri.trim();
 
@@ -236,6 +234,19 @@ export function validateRedirectUri(redirectUri: string, server: OAuthServerCapa
 
   const scheme = normalized.slice(0, colonIndex + 1).toLowerCase();
   if (dangerousSchemes.includes(scheme)) throw new Error('Invalid redirect URI');
+}
+
+/**
+ * Validates a redirect URI against the MCP / OAuth 2.1 redirect policy: `https`, or `http` on a
+ * loopback host (`localhost`, `127.0.0.0/8`, `::1`), with no userinfo and no fragment (not even an
+ * empty `#`). RFC 8252 private-use schemes are accepted only when the server enables
+ * `allowPrivateUseRedirectUris`; remote `http` never is. The {@link validateRedirectUriSafety}
+ * checks always apply.
+ * @throws Error describing why the redirect URI is not acceptable
+ */
+export function validateRedirectUri(redirectUri: string, server: OAuthServerCapabilities): void {
+  validateRedirectUriSafety(redirectUri);
+  const normalized = redirectUri.trim();
 
   let url: URL;
   try {
@@ -259,11 +270,14 @@ export function validateRedirectUri(redirectUri: string, server: OAuthServerCapa
   }
 }
 
-function requireValidRedirectUris(redirectUris: string[] | undefined, server: OAuthServerCapabilities): string[] {
+function requireValidRedirectUris(
+  redirectUris: string[] | undefined,
+  validate: (redirectUri: string) => void
+): string[] {
   if (!redirectUris || redirectUris.length === 0) {
     throw new Error('redirect_uris is required and must not be empty');
   }
-  for (const redirectUri of redirectUris) validateRedirectUri(redirectUri, server);
+  for (const redirectUri of redirectUris) validate(redirectUri);
   return redirectUris;
 }
 
@@ -286,7 +300,7 @@ export function resolveDynamicClientRegistrationMetadata(
 
   return {
     ...pickDisplayMetadata(metadata),
-    redirectUris: requireValidRedirectUris(metadata.redirectUris, server),
+    redirectUris: requireValidRedirectUris(metadata.redirectUris, (uri) => validateRedirectUri(uri, server)),
     ...capabilities,
     authMethodExplicit:
       metadata.tokenEndpointAuthMethod !== undefined || metadata.tokenEndpointAuthMethodsSupported !== undefined,
@@ -381,7 +395,11 @@ function resolveClientIdMetadataDocument(
     throw new Error(`client_id "${metadata.clientId}" does not match metadata URL "${metadataUrl}"`);
   }
   if (!metadata.clientName?.trim()) throw new Error('client_name is required and must not be empty');
-  const redirectUris = requireValidRedirectUris(metadata.redirectUris, server);
+  // The document is the client's, shared by every server it uses, so it may list a redirect this
+  // server's policy refuses, such as a desktop app's private-use scheme next to its https callback.
+  // Only the redirect URI a request uses must satisfy the policy, which parseAuthRequest() and
+  // completeAuthorization() enforce; one unusable entry doesn't lock the client out.
+  const redirectUris = requireValidRedirectUris(metadata.redirectUris, validateRedirectUriSafety);
 
   if ('client_secret' in raw || 'client_secret_expires_at' in raw) {
     throw new Error('CIMD documents must not contain client secrets');
