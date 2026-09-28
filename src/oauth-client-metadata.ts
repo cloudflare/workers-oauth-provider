@@ -237,14 +237,12 @@ function validateRedirectUriSafety(redirectUri: string): void {
 }
 
 /**
- * Validates a redirect URI against the MCP / OAuth 2.1 redirect policy: `https`, or `http` on a
- * loopback host (`localhost`, `127.0.0.0/8`, `::1`), with no userinfo and no fragment (not even an
- * empty `#`). RFC 8252 private-use schemes are accepted only when the server enables
- * `allowPrivateUseRedirectUris`; remote `http` never is. The {@link validateRedirectUriSafety}
- * checks always apply.
- * @throws Error describing why the redirect URI is not acceptable
+ * The checks every redirect URI a client registers passes, whether or not this server would send a
+ * code to it: the {@link validateRedirectUriSafety} checks, a parseable URI, and no fragment (not
+ * even an empty `#`) or userinfo.
+ * @throws Error when the redirect URI can't be registered at all
  */
-export function validateRedirectUri(redirectUri: string, server: OAuthServerCapabilities): void {
+function validateListedRedirectUri(redirectUri: string): URL {
   validateRedirectUriSafety(redirectUri);
   const normalized = redirectUri.trim();
 
@@ -257,6 +255,19 @@ export function validateRedirectUri(redirectUri: string, server: OAuthServerCapa
   // RFC 6749 §3.1.2: no fragment, including an empty trailing `#` (which leaves url.hash empty).
   // Userinfo only disguises where the code goes.
   if (normalized.includes('#') || url.username || url.password) throw new Error('Invalid redirect URI');
+  return url;
+}
+
+/**
+ * Validates a redirect URI against the MCP / OAuth 2.1 redirect policy: `https`, or `http` on a
+ * loopback host (`localhost`, `127.0.0.0/8`, `::1`), with no userinfo and no fragment (not even an
+ * empty `#`). RFC 8252 private-use schemes are accepted only when the server enables
+ * `allowPrivateUseRedirectUris`; remote `http` never is. The {@link validateRedirectUriSafety}
+ * checks always apply.
+ * @throws Error describing why the redirect URI is not acceptable
+ */
+export function validateRedirectUri(redirectUri: string, server: OAuthServerCapabilities): void {
+  const url = validateListedRedirectUri(redirectUri);
 
   // MCP and OAuth 2.1: https, or http only on a loopback host (RFC 8252 §7.3). Remote http is never
   // acceptable; private-use schemes (RFC 8252 §7.1) only when the server opts in for native apps.
@@ -268,6 +279,36 @@ export function validateRedirectUri(redirectUri: string, server: OAuthServerCapa
   if (!server.allowPrivateUseRedirectUris) {
     throw new Error('Redirect URI must use https, or http on a loopback host');
   }
+}
+
+/**
+ * Validates the redirect URIs a client registers (dynamic registration, `createClient()`,
+ * `updateClient()`). A client may list callbacks for surfaces this server won't send codes to:
+ * Cursor lists `cursor://anysphere.cursor-mcp/oauth/callback` next to its https and loopback
+ * callbacks. So each URI is held to {@link validateListedRedirectUri}, and at least one must satisfy
+ * {@link validateRedirectUri} so the client can sign in. The URI a request uses is held to the full
+ * policy by `parseAuthRequest()` and `completeAuthorization()`.
+ * @throws Error when a URI can't be registered, or none of them could ever receive a code
+ */
+export function validateRegisteredRedirectUris(
+  redirectUris: string[] | undefined,
+  server: OAuthServerCapabilities
+): string[] {
+  if (!redirectUris || redirectUris.length === 0) {
+    throw new Error('redirect_uris is required and must not be empty');
+  }
+  for (const redirectUri of redirectUris) validateListedRedirectUri(redirectUri);
+
+  let firstRefusal: unknown;
+  for (const redirectUri of redirectUris) {
+    try {
+      validateRedirectUri(redirectUri, server);
+      return redirectUris;
+    } catch (error) {
+      firstRefusal ??= error;
+    }
+  }
+  throw firstRefusal instanceof Error ? firstRefusal : new Error('Invalid redirect URI');
 }
 
 function requireValidRedirectUris(
@@ -300,7 +341,7 @@ export function resolveDynamicClientRegistrationMetadata(
 
   return {
     ...pickDisplayMetadata(metadata),
-    redirectUris: requireValidRedirectUris(metadata.redirectUris, (uri) => validateRedirectUri(uri, server)),
+    redirectUris: validateRegisteredRedirectUris(metadata.redirectUris, server),
     ...capabilities,
     authMethodExplicit:
       metadata.tokenEndpointAuthMethod !== undefined || metadata.tokenEndpointAuthMethodsSupported !== undefined,
