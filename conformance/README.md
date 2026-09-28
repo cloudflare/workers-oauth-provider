@@ -62,7 +62,7 @@ The official [`latest` specification](https://modelcontextprotocol.io/specificat
 
 The broader `2026-07-28` protocol changes—stateless request `_meta`, `server/discover`, MCP method headers, tools, and transport lifecycle—are intentionally out of scope because this package does not implement MCP transport or protocol methods.
 
-Authorization extensions are versioned separately from the core release. Stable Enterprise-Managed Authorization has focused implementation tests in `__tests__/`; it remains experimental package functionality rather than part of this core conformance matrix. The OAuth Client Credentials extension is still draft and is not implemented by this package.
+Authorization extensions are versioned separately from the core release. Stable Enterprise-Managed Authorization has focused implementation tests in `tests/`; it remains experimental package functionality rather than part of this core conformance matrix. The OAuth Client Credentials extension is still draft and is not implemented by this package.
 
 ## Relationship to the official conformance runner
 
