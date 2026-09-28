@@ -41,7 +41,7 @@ workers-oauth-provider/
 │   ├── oauth-error.ts         # OAuthError: what callbacks and validators throw
 │   ├── oauth-consent.ts       # Consent and upstream sign-in transactions (MCP confused-deputy MUSTs)
 │   └── ema/                   # Enterprise-Managed Authorization pipeline
-├── __tests__/
+├── tests/
 │   ├── oauth-provider.test.ts # Comprehensive provider integration suite
 │   ├── oauth-capabilities.test.ts # Pure capability policy tests
 │   ├── public-api.test.ts     # Pins the package's runtime exports
@@ -162,7 +162,7 @@ npm run test:conformance   # MCP authorization conformance only
 npm run test:watch         # Watch mode
 ```
 
-**Main integration test:** `__tests__/oauth-provider.test.ts`
+**Main integration test:** `tests/oauth-provider.test.ts`
 
 **MCP authorization conformance:** `conformance/` contains black-box tests for every dated authorization revision represented by the official MCP conformance timeline. Wrangler's `createTestHarness()` runs a real Worker in Workerd with a local KV binding; tests exercise public `OAuthProvider` and `OAuthHelpers` interfaces and include requirement traceability in `conformance/README.md`.
 
