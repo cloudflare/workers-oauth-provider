@@ -1,5 +1,11 @@
 # @cloudflare/workers-oauth-provider
 
+## 1.2.1
+
+### Patch Changes
+
+- [#391](https://github.com/cloudflare/workers-oauth-provider/pull/391) [`0f0b2cc`](https://github.com/cloudflare/workers-oauth-provider/commit/0f0b2cc9db727b4c3872bfe40a74a95894cecd04) Thanks [@mattzcarey](https://github.com/mattzcarey)! - A registration may list redirect URIs the redirect policy refuses, next to one it accepts. Some Cursor versions register `cursor://anysphere.cursor-mcp/oauth/callback` beside their https and loopback callbacks and sign in with the loopback one; 1.2.0 refused the whole registration because of the `cursor://` entry, although 0.10 accepted it. Dynamic registration, `createClient()` and `updateClient()` now need at least one redirect URI that follows the policy, and still refuse any with a dangerous scheme, a fragment or userinfo. Every authorization request is still held to the full policy: `parseAuthRequest()` refuses a refused URI locally, and `completeAuthorization()` won't send a code to one.
+
 ## 1.2.0
 
 ### Minor Changes
