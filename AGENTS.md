@@ -40,10 +40,12 @@ workers-oauth-provider/
 │   ├── oauth-http.ts          # CORS and scope helpers shared by both hosts
 │   ├── oauth-error.ts         # OAuthError: what callbacks and validators throw
 │   ├── oauth-consent.ts       # Consent and upstream sign-in transactions (MCP confused-deputy MUSTs)
+│   ├── oauth-storage-keys.ts  # Identifiers in KV keys: user ID rule, credential parsing, 512-byte bound
 │   └── ema/                   # Enterprise-Managed Authorization pipeline
 ├── tests/
 │   ├── oauth-provider.test.ts # Comprehensive provider integration suite
 │   ├── oauth-capabilities.test.ts # Pure capability policy tests
+│   ├── oauth-storage-keys.test.ts # KV key bounds and credential parsing
 │   ├── public-api.test.ts     # Pins the package's runtime exports
 │   ├── setup.ts               # Vitest setup and mocking
 │   └── mocks/
@@ -71,7 +73,7 @@ workers-oauth-provider/
 └── README.md                  # Usage documentation
 ```
 
-**Audit-oriented architecture:** Request orchestration and storage-backed OAuth behavior remain in `src/oauth-provider.ts`. Typed OAuth client metadata parsing plus CIMD fetching and resolution live in `src/oauth-client-metadata.ts`; pure authorization-server/client capability policy lives in `src/oauth-capabilities.ts`. Consent pages and third-party sign-in transactions (the MCP confused-deputy protections: `__Host-` browser binding, single-use state, signed remembered approvals) live in `src/oauth-consent.ts`. The experimental Enterprise-Managed Authorization validation pipeline is isolated in `src/ema/` so its JWT and trust-boundary code can be reviewed independently.
+**Audit-oriented architecture:** Request orchestration and storage-backed OAuth behavior remain in `src/oauth-provider.ts`. Typed OAuth client metadata parsing plus CIMD fetching and resolution live in `src/oauth-client-metadata.ts`; pure authorization-server/client capability policy lives in `src/oauth-capabilities.ts`. Consent pages and third-party sign-in transactions (the MCP confused-deputy protections: `__Host-` browser binding, single-use state, signed remembered approvals) live in `src/oauth-consent.ts`. `src/oauth-storage-keys.ts` bounds every identifier that goes into a KV key, because KV throws for a key over 512 bytes: `isValidUserId()` wherever a grant is issued, and `parseCredentialIds()` for every code or token from a request, so any key built from either fits. The experimental Enterprise-Managed Authorization validation pipeline is isolated in `src/ema/` so its JWT and trust-boundary code can be reviewed independently.
 
 ## Setup
 

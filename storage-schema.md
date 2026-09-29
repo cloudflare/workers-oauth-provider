@@ -19,6 +19,8 @@ All keys in the KV namespace follow a consistent pattern to make them easily ide
 | `token:`          | Access and refresh tokens                 | `token:ghi789`         |
 | `transaction:`    | Consent and upstream sign-in transactions | `transaction:5e88…`    |
 
+Cloudflare KV holds keys of up to 512 bytes and throws for a longer one instead of reporting it missing. Grant and client IDs are generated at a fixed 16 characters and token IDs are 64-character SHA-256 digests, so the only part of variable length is the user ID. `completeAuthorization()` limits it to 424 bytes of UTF-8, which is what the longest key holding it, `token:{userId}:{grantId}:{tokenId}`, leaves. A `client_id`, code or token from a request that would need a longer key names nothing stored, and is treated as unknown without a lookup.
+
 ## Data Structures
 
 ### Clients

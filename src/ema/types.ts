@@ -106,6 +106,7 @@ export interface EmaClaimsMapperResult {
    * it will produce tokens that fail to parse on validation. If the IdP
    * subject may contain `:` (e.g. an email), encode or hash it first
    * (e.g. ``userId: `enterprise-${encodeURIComponent(claims.sub)}` ``).
+   * At most 424 bytes of UTF-8, so every KV key that holds it fits.
    */
   userId: string;
 

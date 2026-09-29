@@ -56,6 +56,14 @@ import {
   resourceMatches,
   validateResourceUri,
 } from './oauth-resource';
+import {
+  GRANT_ID_LENGTH,
+  ISSUED_GRANT_ID_PATTERN,
+  MAX_USER_ID_BYTES,
+  fitsKvKey,
+  isValidUserId,
+  parseCredentialIds,
+} from './oauth-storage-keys';
 
 export { AuthorizationError, authorizationErrorRedirect } from './oauth-capabilities';
 export type { AuthorizationErrorCode, AuthorizationErrorOptions } from './oauth-capabilities';
@@ -1208,7 +1216,9 @@ export interface CompleteAuthorizationOptions {
   /**
    * Identifier for the user granting the authorization. Must be non-empty and must not contain
    * `:`, which separates the parts of issued tokens and storage keys; encode namespaced or
-   * composite IDs first (for example `encodeURIComponent('tenant:user')`).
+   * composite IDs first (for example `encodeURIComponent('tenant:user')`). At most 424 bytes of
+   * UTF-8, so the longest key that holds it, an access token's, fits Cloudflare KV's 512-byte
+   * limit; hash a longer ID.
    */
   userId: string;
 
@@ -2512,17 +2522,15 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @returns Promise resolving to token data with decrypted props, or null if token is invalid
    */
   async unwrapToken<T = any>(token: string, env: Env & ProviderEnv): Promise<TokenSummary<T> | null> {
-    const parts = token.split(':');
-    const isPossiblyInternalFormat = parts.length === 3;
-
-    if (!isPossiblyInternalFormat) {
+    const ids = parseCredentialIds(token);
+    if (!ids) {
       return null;
     }
 
     // Retrieve the token from KV
-    const [userId, grantId] = parts;
+    const { userId, grantId } = ids;
     const id = await generateTokenId(token);
-    const tokenData = await getStoredJson<Token>(env.OAUTH_KV, `token:${userId}:${grantId}:${id}`);
+    const tokenData: Token | null = await env.OAUTH_KV.get(`token:${userId}:${grantId}:${id}`, { type: 'json' });
 
     // Return null if missing or expired
     if (!tokenData) {
@@ -3303,8 +3311,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     // Parse the authorization code to extract user ID and grant ID
-    const codeParts = code.split(':');
-    if (codeParts.length !== 3) {
+    const codeIds = parseCredentialIds(code);
+    if (!codeIds) {
       return this.createErrorResponse(
         'invalid_grant',
         { description: 'Invalid authorization code format' },
@@ -3312,11 +3320,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       );
     }
 
-    const [userId, grantId, _] = codeParts;
+    const { userId, grantId } = codeIds;
 
     // Get the grant
     const grantKey = `grant:${userId}:${grantId}`;
-    const grantData = await getStoredJson<Grant>(env.OAUTH_KV, grantKey);
+    const grantData: Grant | null = await env.OAUTH_KV.get(grantKey, { type: 'json' });
 
     if (!grantData) {
       return this.createErrorResponse(
@@ -3678,8 +3686,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     // Parse the token to extract user ID and grant ID
-    const tokenParts = refreshToken.split(':');
-    if (tokenParts.length !== 3) {
+    const tokenIds = parseCredentialIds(refreshToken);
+    if (!tokenIds) {
       return this.createErrorResponse(
         'invalid_grant',
         { description: 'Invalid token format' },
@@ -3687,14 +3695,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       );
     }
 
-    const [userId, grantId, _] = tokenParts;
+    const { userId, grantId } = tokenIds;
 
     // Calculate the token hash
     const providedTokenHash = await generateTokenId(refreshToken);
 
     // Get the associated grant using userId in the key
     const grantKey = `grant:${userId}:${grantId}`;
-    const grantData = await getStoredJson<Grant>(env.OAUTH_KV, grantKey);
+    const grantData: Grant | null = await env.OAUTH_KV.get(grantKey, { type: 'json' });
 
     if (!grantData) {
       return this.createErrorResponse(
@@ -4588,7 +4596,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const tokenScopes =
       args.assertionScopes.length > 0 ? this.downscope(args.mapperScope, args.assertionScopes) : args.mapperScope;
 
-    const grantId = generateRandomString(16);
+    const grantId = generateRandomString(GRANT_ID_LENGTH);
     const { encryptedData, key: encryptionKey } = await encryptProps(args.mapperProps);
     const grant: Grant = {
       id: grantId,
@@ -4645,12 +4653,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         { category: 'token-revocation', reason: 'token_missing' }
       );
     }
-    const tokenParts = token.split(':');
-    if (tokenParts.length !== 3) {
+    const tokenIds = parseCredentialIds(token);
+    if (!tokenIds) {
       return new Response('', { status: 200 });
     }
 
-    const [userId, grantId, _] = tokenParts;
+    const { userId, grantId } = tokenIds;
     const tokenId = await generateTokenId(token);
 
     // Use token_type_hint to check the hinted type first (RFC 7009 §2.1).
@@ -4682,7 +4690,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     clientInfo: ClientInfo,
     env: Env & ProviderEnv
   ): Promise<boolean> {
-    const tokenData = await getStoredJson<Token>(env.OAUTH_KV, `token:${userId}:${grantId}:${tokenId}`);
+    const tokenData: Token | null = await env.OAUTH_KV.get(`token:${userId}:${grantId}:${tokenId}`, { type: 'json' });
     if (!tokenData) return false;
 
     const tokenClientId = tokenData.grant?.clientId;
@@ -4691,7 +4699,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     } else {
       // Backward compatibility for token records written before access tokens
       // denormalized grant.clientId. Verify ownership from the backing grant.
-      const grantData = await getStoredJson<Grant>(env.OAUTH_KV, `grant:${userId}:${grantId}`);
+      const grantData: Grant | null = await env.OAUTH_KV.get(`grant:${userId}:${grantId}`, { type: 'json' });
       if (grantData?.clientId !== clientInfo.clientId) return false;
     }
 
@@ -4707,7 +4715,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     clientInfo: ClientInfo,
     env: Env & ProviderEnv
   ): Promise<boolean> {
-    const grantData = await getStoredJson<Grant>(env.OAUTH_KV, `grant:${userId}:${grantId}`);
+    const grantData: Grant | null = await env.OAUTH_KV.get(`grant:${userId}:${grantId}`, { type: 'json' });
     if (!grantData) return false;
     const isRefreshToken = grantData.refreshTokenId === tokenId || grantData.previousRefreshTokenId === tokenId;
     if (!isRefreshToken) return false;
@@ -4999,18 +5007,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     const accessToken = bearerMatch[1];
-    const parts = accessToken.split(':');
-    const isPossiblyInternalFormat = parts.length === 3;
+    const tokenIds = parseCredentialIds(accessToken);
 
     let tokenData: Token | null = null;
-    let userId = '';
-    let grantId = '';
 
     // It's a token generated by workers-oauth-provider
-    if (isPossiblyInternalFormat) {
-      [userId, grantId] = parts;
+    if (tokenIds) {
       const id = await generateTokenId(accessToken);
-      tokenData = await getStoredJson<Token>(env.OAUTH_KV, `token:${userId}:${grantId}:${id}`);
+      tokenData = await env.OAUTH_KV.get(`token:${tokenIds.userId}:${tokenIds.grantId}:${id}`, { type: 'json' });
     }
 
     // No internal token found, and either no external validator, or the token is in this provider's
@@ -5325,7 +5329,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     if (isClientIdMetadataDocumentUrl(clientId)) {
       if (!this.options.clientIdMetadataDocumentEnabled) {
         // CIMD not enabled — treat as standard KV lookup
-        return getStoredJson<StoredClientInfo>(env.OAUTH_KV, `client:${clientId}`);
+        return getStoredClient(env.OAUTH_KV, clientId);
       }
       if (!this.hasGlobalFetchStrictlyPublic()) {
         throw new Error(`CIMD is enabled but 'global_fetch_strictly_public' compatibility flag is not set.`);
@@ -5344,7 +5348,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     // Standard KV lookup
-    return getStoredJson<StoredClientInfo>(env.OAUTH_KV, `client:${clientId}`);
+    return getStoredClient(env.OAUTH_KV, clientId);
   }
 
   /** Resolve a value to the registry's canonical spelling, requiring one value. */
@@ -5965,21 +5969,13 @@ interface GrantKeyMetadata {
 /** KV serialises key metadata as JSON and rejects a write carrying more than this. */
 const MAX_KV_METADATA_BYTES = 1024;
 
-/** KV rejects a key longer than this many UTF-8 bytes, by throwing rather than missing. */
-const MAX_KV_KEY_BYTES = 512;
-
-/** Whether KV accepts `key`. Every UTF-16 code unit is at least one UTF-8 byte, so a longer string never fits. */
-function fitsKvKey(key: string): boolean {
-  return key.length <= MAX_KV_KEY_BYTES && new TextEncoder().encode(key).byteLength <= MAX_KV_KEY_BYTES;
-}
-
 /**
- * Reads a JSON record whose key is built from request input: a `client_id`, or the user and
- * grant IDs parsed from a code or token. A key too long for KV was never written, so it reads
- * as absent instead of throwing, and the request gets the answer an unknown value gets.
+ * A registered client's record, or null. A client ID too long for its key names no client: KV
+ * can't have stored one under it, and would throw rather than miss if asked.
  */
-async function getStoredJson<T>(kv: KVNamespace, key: string): Promise<T | null> {
-  return fitsKvKey(key) ? kv.get<T>(key, { type: 'json' }) : null;
+async function getStoredClient(kv: KVNamespace, clientId: string): Promise<StoredClientInfo | null> {
+  const key = `client:${clientId}`;
+  return fitsKvKey(key) ? kv.get(key, { type: 'json' }) : null;
 }
 
 /**
@@ -6025,7 +6021,6 @@ function isGrantKeyMetadata(value: unknown): value is GrantKeyMetadata {
  * Length of generated token strings
  */
 const TOKEN_LENGTH = 32;
-const ISSUED_GRANT_ID_PATTERN = /^[A-Za-z0-9_-]{16}$/;
 const ISSUED_TOKEN_SECRET_PATTERN = new RegExp(`^[A-Za-z0-9_-]{${TOKEN_LENGTH}}$`);
 
 // Helper Functions
@@ -6560,9 +6555,10 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
     }
     // `:` separates the parts of issued tokens and grant keys (`userId:grantId:secret`,
     // `grant:{userId}:{grantId}`). A user ID containing it yields tokens that can never be
-    // validated, and grant keys that another user's `grant:{userId}:` prefix would match.
-    if (typeof options.userId !== 'string' || options.userId.length === 0 || options.userId.includes(':')) {
-      throw new TypeError('userId must be a non-empty string without ":"');
+    // validated, and grant keys that another user's `grant:{userId}:` prefix would match. A user ID
+    // too long for an access token's key would get a grant and a code, then fail the exchange.
+    if (!isValidUserId(options.userId)) {
+      throw new TypeError(`userId must be a non-empty string without ":", at most ${MAX_USER_ID_BYTES} bytes of UTF-8`);
     }
 
     // Re-validate the redirectUri to prevent open redirect vulnerabilities
@@ -6616,7 +6612,7 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
     }
 
     // Generate a unique grant ID
-    const grantId = generateRandomString(16);
+    const grantId = generateRandomString(GRANT_ID_LENGTH);
 
     // Encrypt the props data with a new key generated for this grant
     const { encryptedData, key: encryptionKey } = await encryptProps(options.props);

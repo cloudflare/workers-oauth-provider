@@ -11407,10 +11407,18 @@ describe('OAuthProvider', () => {
     });
   });
 
-  describe('Values too long to be a KV key', () => {
-    // Cloudflare KV throws for a key over 512 bytes, and MockKV mirrors it. A client_id, code or
-    // token that would build one was never stored, so it gets the answer an unknown one gets.
-    const oversized = 'a'.repeat(600);
+  describe('Request values too long for a KV key', () => {
+    // Cloudflare KV throws for a key over 512 bytes, and MockKV mirrors it. A client_id, code or token
+    // that would need one names nothing that was ever stored, so it gets the answer an unknown one gets.
+    const oversizedClientId = 'c'.repeat(506); // `client:{clientId}` is 513 bytes
+    const grantId = 'g'.repeat(16);
+    const secret = 's'.repeat(32);
+    // Well formed but for one part: a user ID one byte too long for its access token's key, or a
+    // grant ID far longer than any this provider generates.
+    const oversizedCredentials = [
+      ['user ID', `${'u'.repeat(425)}:${grantId}:${secret}`],
+      ['grant ID', `user:${'g'.repeat(600)}:${secret}`],
+    ];
     const redirectUri = 'https://client.example.com/callback';
     let client: { client_id: string; client_secret: string };
 
@@ -11451,7 +11459,7 @@ describe('OAuthProvider', () => {
 
     it('treats an oversized client_id at the authorization endpoint as an unknown client', async () => {
       const authRequest = createMockRequest(
-        `https://example.com/authorize?response_type=code&client_id=${oversized}` +
+        `https://example.com/authorize?response_type=code&client_id=${oversizedClientId}` +
           `&redirect_uri=${encodeURIComponent(redirectUri)}&scope=read&state=xyz`
       );
 
@@ -11460,46 +11468,53 @@ describe('OAuthProvider', () => {
 
     it('treats an oversized client_id at the token endpoint as an unknown client', async () => {
       const response = await tokenEndpoint(
-        { grant_type: 'refresh_token', refresh_token: 'user:grant:secret' },
-        oversized
+        { grant_type: 'refresh_token', refresh_token: `user:${grantId}:${secret}` },
+        oversizedClientId
       );
 
       expect(response.status).toBe(401);
       expect(await response.json<any>()).toMatchObject({ error: 'invalid_client' });
     });
 
-    it.each([
-      ['authorization_code', { code: `${oversized}:grant:secret`, redirect_uri: redirectUri }],
-      ['refresh_token', { refresh_token: `${oversized}:grant:secret` }],
-    ])('treats an oversized %s as an unknown grant', async (grantType, params) => {
-      const response = await tokenEndpoint({ grant_type: grantType, ...params });
+    describe.each(oversizedCredentials)('a code or token with an oversized %s', (_part, credential) => {
+      it.each([
+        ['authorization code', { grant_type: 'authorization_code', code: credential, redirect_uri: redirectUri }],
+        ['refresh token', { grant_type: 'refresh_token', refresh_token: credential }],
+      ])('is an unknown grant as an %s', async (_kind, params) => {
+        const response = await tokenEndpoint(params);
 
-      expect(response.status).toBe(400);
-      expect(await response.json<any>()).toMatchObject({ error: 'invalid_grant' });
+        expect(response.status).toBe(400);
+        expect(await response.json<any>()).toMatchObject({ error: 'invalid_grant' });
+      });
+
+      it('is unknown at the revocation endpoint (RFC 7009 \u00a72.2)', async () => {
+        const response = await tokenEndpoint({ token: credential });
+
+        expect(response.status).toBe(200);
+      });
+
+      it('is an invalid bearer token', async () => {
+        const response = await oauthProvider.fetch(
+          createMockRequest('https://example.com/api/test', 'GET', { Authorization: `Bearer ${credential}` }),
+          mockEnv,
+          mockCtx
+        );
+
+        expect(response.status).toBe(401);
+        expect(await response.json<any>()).toMatchObject({ error: 'invalid_token' });
+      });
+
+      it('unwraps to null', async () => {
+        await oauthProvider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
+
+        await expect(mockEnv.OAUTH_PROVIDER!.unwrapToken(credential)).resolves.toBeNull();
+      });
     });
 
-    it('treats an oversized token at the revocation endpoint as unknown (RFC 7009 \u00a72.2)', async () => {
-      const response = await tokenEndpoint({ token: `${oversized}:grant:secret` });
-
-      expect(response.status).toBe(200);
-    });
-
-    it('treats an oversized bearer token as invalid', async () => {
-      const response = await oauthProvider.fetch(
-        createMockRequest('https://example.com/api/test', 'GET', { Authorization: `Bearer ${oversized}:grant:secret` }),
-        mockEnv,
-        mockCtx
-      );
-
-      expect(response.status).toBe(401);
-      expect(await response.json<any>()).toMatchObject({ error: 'invalid_token' });
-    });
-
-    it('returns null from lookupClient() and unwrapToken() for oversized values', async () => {
+    it('looks up an oversized client_id as no client', async () => {
       await oauthProvider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
 
-      await expect(mockEnv.OAUTH_PROVIDER!.lookupClient(oversized)).resolves.toBeNull();
-      await expect(mockEnv.OAUTH_PROVIDER!.unwrapToken(`${oversized}:grant:secret`)).resolves.toBeNull();
+      await expect(mockEnv.OAUTH_PROVIDER!.lookupClient(oversizedClientId)).resolves.toBeNull();
     });
   });
 
@@ -15996,7 +16011,11 @@ describe('onError.internal coverage across generic error paths', () => {
     await redeem(`grant_type=refresh_token&refresh_token=garbage&${credentials}`);
     expect(last()).toEqual({ category: 'refresh-token-grant', reason: 'refresh_token_malformed' });
 
+    // Three parts, but no grant ID this provider generates.
     await redeem(`grant_type=refresh_token&refresh_token=user:grant:wrong&${credentials}`);
+    expect(last()).toEqual({ category: 'refresh-token-grant', reason: 'refresh_token_malformed' });
+
+    await redeem(`grant_type=refresh_token&refresh_token=user:${'g'.repeat(16)}:wrong&${credentials}`);
     expect(last()).toEqual({ category: 'refresh-token-grant', reason: 'grant_not_found' });
 
     // A real grant presented with the wrong token half: distinguishable from a missing grant
@@ -16416,7 +16435,7 @@ describe('redirect URI policy: https, or http on a loopback host', () => {
   });
 });
 
-describe('user IDs cannot contain ":"', () => {
+describe('user IDs: no ":", and short enough for every KV key', () => {
   let env: ReturnType<typeof createMockEnv>;
   let ctx: MockExecutionContext;
   beforeEach(() => {
@@ -16425,20 +16444,23 @@ describe('user IDs cannot contain ":"', () => {
   });
   afterEach(() => env.OAUTH_KV.clear());
 
-  async function helpers() {
-    const provider = new OAuthProvider({
+  function createProvider() {
+    return new OAuthProvider({
       apiRoute: ['/api/'],
       apiHandler: TestApiHandler,
       defaultHandler: testDefaultHandler,
       authorizeEndpoint: '/authorize',
       tokenEndpoint: '/oauth/token',
     });
+  }
+
+  async function helpers(provider = createProvider()) {
     await provider.fetch(createMockRequest('https://example.com/'), env, ctx);
     return env.OAUTH_PROVIDER!;
   }
 
-  it('refuses to issue for one: its tokens could never be validated', async () => {
-    const oauth = await helpers();
+  /** A client and a parsed authorization request from it, with the RFC 7636 example PKCE challenge. */
+  async function authorizationRequest(oauth: OAuthHelpers) {
     const client = await oauth.createClient({
       redirectUris: ['https://client.example/cb'],
       tokenEndpointAuthMethod: 'none',
@@ -16450,9 +16472,68 @@ describe('user IDs cannot contain ":"', () => {
           '&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256'
       )
     );
+    return { client, request };
+  }
+
+  it('refuses to issue for one: its tokens could never be validated', async () => {
+    const oauth = await helpers();
+    const { request } = await authorizationRequest(oauth);
     await expect(
       oauth.completeAuthorization({ request, userId: 'tenant:user-7', metadata: {}, scope: [], props: {} })
     ).rejects.toThrow('userId must be a non-empty string without ":"');
+    expect((await env.OAUTH_KV.list({ prefix: 'grant:' })).keys).toHaveLength(0);
+  });
+
+  it('issues for a user ID of 424 bytes: every key holding it fits', async () => {
+    const provider = createProvider();
+    const oauth = await helpers(provider);
+    const { client, request } = await authorizationRequest(oauth);
+    const { redirectTo } = await oauth.completeAuthorization({
+      request,
+      userId: 'u'.repeat(424),
+      metadata: {},
+      scope: [],
+      props: {},
+    });
+    const token = (params: Record<string, string>) =>
+      provider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          new URLSearchParams({ client_id: client.clientId, ...params }).toString()
+        ),
+        env,
+        ctx
+      );
+
+    const issued = await token({
+      grant_type: 'authorization_code',
+      code: new URL(redirectTo).searchParams.get('code')!,
+      redirect_uri: 'https://client.example/cb',
+      code_verifier: 'dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk',
+    });
+    expect(issued.status).toBe(200);
+    const tokens = await issued.json<any>();
+    const api = await provider.fetch(
+      createMockRequest('https://example.com/api/test', 'GET', { Authorization: `Bearer ${tokens.access_token}` }),
+      env,
+      ctx
+    );
+    expect(api.status).toBe(200);
+    expect((await token({ grant_type: 'refresh_token', refresh_token: tokens.refresh_token })).status).toBe(200);
+  });
+
+  it.each([
+    ['425 ASCII bytes', 'u'.repeat(425)],
+    ['213 two-byte characters, 426 bytes', '\u00e9'.repeat(213)],
+  ])('refuses a user ID of %s: its access token would not fit a KV key', async (_label, userId) => {
+    // Before, the grant and code were written and the exchange failed writing the access token.
+    const oauth = await helpers();
+    const { request } = await authorizationRequest(oauth);
+    await expect(oauth.completeAuthorization({ request, userId, metadata: {}, scope: [], props: {} })).rejects.toThrow(
+      'at most 424 bytes of UTF-8'
+    );
     expect((await env.OAUTH_KV.list({ prefix: 'grant:' })).keys).toHaveLength(0);
   });
 
