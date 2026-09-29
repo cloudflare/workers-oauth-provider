@@ -12,6 +12,7 @@
 import type { ClientInfo } from '../oauth-provider';
 import { isValidOAuthScopeToken } from '../oauth-capabilities';
 import { resourceMatches, validateResourceUri } from '../oauth-resource';
+import { isValidUserId } from '../oauth-storage-keys';
 import { EMA_DEFAULT_JWT_ALGORITHM, EMA_SUPPORTED_JWT_ALGORITHMS, type EmaSupportedAlg } from './constants';
 import { err, ok, type EmaValidationError, type Result } from './result';
 import type {
@@ -345,8 +346,9 @@ export function parseEmaScopeParam(
  * Validate the shape of the value returned by the deployer's `mapClaims`
  * callback. A `null` return is treated as a deny decision.
  *
- * The `userId.includes(':')` rejection mirrors the opaque token format
- * (`userId:grantId:secret`) used elsewhere in this provider.
+ * The user ID is held to the rule `completeAuthorization()` applies: non-empty,
+ * without the `:` that separates the parts of an opaque token
+ * (`userId:grantId:secret`), and short enough for every KV key that holds it.
  */
 export function validateEmaMapperResult(result: unknown): Result<EmaClaimsMapperResult, EmaValidationError> {
   if (result === null) {
@@ -359,7 +361,7 @@ export function validateEmaMapperResult(result: unknown): Result<EmaClaimsMapper
 
   const r = result as Partial<EmaClaimsMapperResult>;
 
-  if (typeof r.userId !== 'string' || r.userId.length === 0 || r.userId.includes(':')) {
+  if (!isValidUserId(r.userId)) {
     return err({ reason: 'invalid_mapped_user' });
   }
 

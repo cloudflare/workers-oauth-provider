@@ -136,9 +136,9 @@ Remote `http` is never accepted.
 +  clientRegistrationTTL: undefined, // never expire; omit the option for the 90-day default
 ```
 
-### User IDs cannot contain `:` (1.2)
+### User IDs cannot contain `:`, and are at most 424 bytes (1.2, 1.2.2)
 
-`completeAuthorization()` throws `userId must be a non-empty string without ":"`. The colon separates the parts of issued tokens and KV keys, so such a user's tokens could never be validated anyway. Encode composite IDs:
+`completeAuthorization()` throws `userId must be a non-empty string without ":", at most 424 bytes of UTF-8`. The colon separates the parts of issued tokens and KV keys, so such a user's tokens could never be validated anyway. 424 bytes is what the longest key holding a user ID, an access token's, leaves of Cloudflare KV's 512. Before 1.2.2, a user ID of 425 to 489 bytes got a grant and a code whose exchange then failed, and a longer one failed in `completeAuthorization()` itself. An Enterprise-Managed Authorization `mapClaims` result is held to the same rule. Encode composite IDs, and hash long ones:
 
 ```diff
  await oauth.completeAuthorization({
@@ -203,6 +203,7 @@ These need no code change, but responses differ.
 - **Grants without a refresh token expire (1.2).** With `refreshTokenTTL: 0`, a grant now expires with its access token instead of staying in KV for good.
 - **CORS headers from your handler are kept (1.2).** `Access-Control-Allow-*` headers an API handler sets are no longer overwritten, so it can narrow its own policy.
 - **`deleteClient()` (1.2).** The client is deleted first, so it stops working even if revoking its grants fails partway; calling it again finishes the job.
+- **Values too long for a KV key (1.2.2).** A `client_id`, authorization code, refresh token or bearer token too long to form a KV key gets the answer an unknown one gets: `invalid_client`, `invalid_grant`, `invalid_token`, or a successful revocation. `parseAuthRequest()`, `lookupClient()` and `unwrapToken()` treat it as unknown too. Before, KV's 512-byte key limit made these requests throw. A code or refresh token whose grant ID isn't one this provider generates is now reported to `onError` as `code_malformed` or `refresh_token_malformed` rather than `grant_not_found`; the response is `invalid_grant` either way.
 
 ## `tokenExchangeCallback` (1.1, 1.2)
 

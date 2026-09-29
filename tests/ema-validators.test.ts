@@ -430,6 +430,12 @@ describe('validateEmaMapperResult', () => {
     expect(r).toMatchObject({ ok: false, error: { reason: 'invalid_mapped_user' } });
   });
 
+  it('rejects a userId too long for its access token key, as completeAuthorization() does', () => {
+    expect(validateEmaMapperResult({ userId: 'u'.repeat(424), scope: [], props: {} })).toMatchObject({ ok: true });
+    const r = validateEmaMapperResult({ userId: 'u'.repeat(425), scope: [], props: {} });
+    expect(r).toMatchObject({ ok: false, error: { reason: 'invalid_mapped_user' } });
+  });
+
   it('rejects non-array scope', () => {
     const r = validateEmaMapperResult({ userId: 'u', scope: 'read', props: {} });
     expect(r).toMatchObject({ ok: false, error: { reason: 'invalid_mapped_scope' } });
