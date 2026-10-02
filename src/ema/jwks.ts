@@ -7,6 +7,7 @@
  * `OAuthProvider` instance has its own cache — no cross-instance bleed.
  */
 
+import { OUTBOUND_USER_AGENT } from '../oauth-http';
 import {
   EMA_DEFAULT_JWKS_CACHE_TTL_SECONDS,
   EMA_JWKS_FETCH_TIMEOUT_MS,
@@ -58,7 +59,7 @@ export function createDefaultJwksProvider(opts: DefaultJwksProviderOptions = {})
 
       try {
         const response = await fetch(issuer.jwksUri, {
-          headers: { Accept: 'application/json' },
+          headers: { Accept: 'application/json', 'User-Agent': OUTBOUND_USER_AGENT },
           signal: abortController.signal,
           cf: { cacheEverything: true },
         } as RequestInit);
