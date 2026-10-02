@@ -1,3 +1,4 @@
+import { OUTBOUND_USER_AGENT } from './oauth-http';
 import { isLoopbackHostname } from './oauth-resource';
 import {
   negotiateCimdClientCapabilities,
@@ -542,7 +543,7 @@ async function readJsonWithSizeLimit(
 
 function fetchCimdOrigin(metadataUrl: string, signal: AbortSignal): Promise<Response> {
   return fetch(metadataUrl, {
-    headers: { Accept: 'application/json', 'Cache-Control': 'no-store' },
+    headers: { Accept: 'application/json', 'Cache-Control': 'no-store', 'User-Agent': OUTBOUND_USER_AGENT },
     signal,
     cache: 'no-store',
   });
