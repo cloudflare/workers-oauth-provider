@@ -5110,6 +5110,19 @@ describe('OAuthProvider', () => {
       });
     });
 
+    it("should send a User-Agent when fetching the issuer's JWKS", async () => {
+      // Workers' fetch sends no User-Agent, and WAFs such as AWS CloudFront's refuse requests without one.
+      const tokenResponse = await exchangeAssertion(await createAssertion());
+      expect(tokenResponse.status).toBe(200);
+
+      expect(globalThis.fetch).toHaveBeenCalledWith(
+        `${issuer}/jwks.json`,
+        expect.objectContaining({
+          headers: expect.objectContaining({ 'User-Agent': 'workers-oauth-provider' }),
+        })
+      );
+    });
+
     it('should use the configured resource when the ID-JAG omits its optional resource claim', async () => {
       const tokenResponse = await exchangeAssertion(await createAssertion({ resource: undefined }));
       expect(tokenResponse.status).toBe(200);

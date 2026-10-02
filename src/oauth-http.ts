@@ -4,6 +4,13 @@
  */
 
 /**
+ * `User-Agent` sent on the library's own outbound fetches (EMA JWKS, Client ID Metadata Documents).
+ * Workers' `fetch` sends none by default, and common WAF rule sets (AWS WAF's `NoUserAgent_HEADER`,
+ * for one) block requests without it, so an IdP or client behind one would answer `403`.
+ */
+export const OUTBOUND_USER_AGENT = 'workers-oauth-provider';
+
+/**
  * Adds CORS headers for a browser client. The request's `Origin` is reflected: bearer tokens are
  * not ambient credentials, so any origin may present one it holds. Browser OAuth and MCP clients
  * need `WWW-Authenticate` (discovery, step-up) and `Retry-After` (backoff) exposed. Headers the
