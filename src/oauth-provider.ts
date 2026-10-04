@@ -3011,7 +3011,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @returns An `invalid_client` response, or `undefined` once the assertion verified and was consumed
    */
   private async verifyClientAssertion(
-    body: any,
+    body: { client_assertion?: unknown; client_assertion_type?: unknown },
     clientInfo: StoredClientInfo,
     env: Env & ProviderEnv,
     request: Request

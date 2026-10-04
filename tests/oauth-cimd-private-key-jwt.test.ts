@@ -327,6 +327,21 @@ describe('CIMD private_key_jwt client authentication', () => {
       expect(lastInternalError()).toMatchObject({ detail: { reason: 'replayed' } });
     });
 
+    it('keeps the replay marker for as long as clock skew keeps the assertion acceptable', async () => {
+      const put = vi.spyOn(mockEnv.OAUTH_KV, 'put');
+      const exp = Math.floor(Date.now() / 1000) + 30;
+      const response = await exchangeCode(await authorize(), {
+        client_assertion_type: ASSERTION_TYPE,
+        client_assertion: await signAssertion(key, { exp }),
+      });
+      expect(response.status).toBe(200);
+
+      const marker = put.mock.calls.find(([name]) => String(name).startsWith('client-assertion-jti:'));
+      // exp + 60 s of skew, measured from now.
+      expect(marker?.[2]).toEqual({ expirationTtl: expect.any(Number) });
+      expect((marker![2] as { expirationTtl: number }).expirationTtl).toBeGreaterThanOrEqual(89);
+    });
+
     it('rejects an unsupported client_assertion_type', async () => {
       const response = await exchangeCode(await authorize(), {
         client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:saml2-bearer',
@@ -467,6 +482,29 @@ describe('CIMD private_key_jwt client authentication', () => {
       expect(jwksFetches()).toBe(2);
     });
 
+    it('refetches the JWKS when a key is replaced under the same kid', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      const oldKey = await generateSigningKey('ES256', 'primary');
+      const newKey = await generateSigningKey('ES256', 'primary');
+      let published = [oldKey.publicJwk];
+      serveMetadata({ token_endpoint_auth_method: 'private_key_jwt', jwks_uri: JWKS_URI });
+      documents.set(JWKS_URI, () => ({ keys: published }));
+
+      const first = await exchangeCode(await authorize(), {
+        client_assertion_type: ASSERTION_TYPE,
+        client_assertion: await signAssertion(oldKey),
+      });
+      expect(first.status).toBe(200);
+
+      published = [newKey.publicJwk];
+      vi.setSystemTime(Date.now() + 31_000);
+      const rotated = await exchangeCode(await authorize(), {
+        client_assertion_type: ASSERTION_TYPE,
+        client_assertion: await signAssertion(newKey),
+      });
+      expect(rotated.status).toBe(200);
+    });
+
     it('reports a JWKS that cannot be fetched', async () => {
       const key = await generateSigningKey('ES256', 'key-1');
       serveMetadata({ token_endpoint_auth_method: 'private_key_jwt', jwks_uri: JWKS_URI });
@@ -566,6 +604,14 @@ describe('CIMD private_key_jwt client authentication', () => {
       ['uses an http: jwks_uri', { jwks_uri: 'http://client.example.com/jwks.json' }],
       ['supplies both jwks and jwks_uri', { jwks_uri: JWKS_URI, jwks: { keys: [{ kty: 'EC' }] } }],
       ['supplies an empty jwks', { jwks: { keys: [] } }],
+      [
+        'supplies no inline key for its algorithm',
+        { token_endpoint_auth_signing_alg: 'RS256', jwks: { keys: [{ kty: 'EC', crv: 'P-256', x: 'x', y: 'y' }] } },
+      ],
+      [
+        'supplies only an encryption key',
+        { jwks: { keys: [{ kty: 'EC', crv: 'P-256', x: 'x', y: 'y', use: 'enc' }] } },
+      ],
       ['requires an unimplemented algorithm', { jwks_uri: JWKS_URI, token_endpoint_auth_signing_alg: 'PS256' }],
     ])('refuses a client whose sole method is private_key_jwt and which %s', async (_label, metadata) => {
       serveMetadata({ token_endpoint_auth_method: 'private_key_jwt', ...metadata });

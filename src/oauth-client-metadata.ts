@@ -1,5 +1,5 @@
 import { OUTBOUND_USER_AGENT } from './oauth-http';
-import { CLIENT_ASSERTION_ALGORITHMS, type ClientAssertionKeys } from './client-assertion';
+import { CLIENT_ASSERTION_ALGORITHMS, isKeyUsableForAlgorithm, type ClientAssertionKeys } from './client-assertion';
 import type { JsonWebKeySet, OAuthJsonWebKey } from './ema/types';
 import { isLoopbackHostname } from './oauth-resource';
 import {
@@ -455,16 +455,25 @@ function resolvePrivateKeyJwtKeys(
     }
   }
 
-  const algorithms = CLIENT_ASSERTION_ALGORITHMS.filter(
+  const signingAlgorithms = CLIENT_ASSERTION_ALGORITHMS.filter(
     (alg) =>
       (metadata.tokenEndpointAuthSigningAlg === undefined || metadata.tokenEndpointAuthSigningAlg === alg) &&
       (metadata.tokenEndpointAuthSigningAlgValuesSupported === undefined ||
         metadata.tokenEndpointAuthSigningAlgValuesSupported.includes(alg))
   );
-  if (algorithms.length === 0) {
+  if (signingAlgorithms.length === 0) {
     return {
       problem: `private_key_jwt requires a token_endpoint_auth_signing_alg of ${CLIENT_ASSERTION_ALGORITHMS.join(' or ')}`,
     };
+  }
+  // Inline keys are known now, so a set that can't verify any allowed algorithm is caught before
+  // the client is sent an authorization code it could never exchange. A jwks_uri is fetched, and
+  // so judged, at the token endpoint.
+  const algorithms = jwks
+    ? signingAlgorithms.filter((alg) => (jwks.keys ?? []).some((key) => isKeyUsableForAlgorithm(key, alg)))
+    : signingAlgorithms;
+  if (algorithms.length === 0) {
+    return { problem: `private_key_jwt jwks has no key for ${signingAlgorithms.join(' or ')}` };
   }
 
   return { keys: jwks ? { jwks, algorithms } : { jwksUri, algorithms } };

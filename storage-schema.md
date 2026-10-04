@@ -225,7 +225,7 @@ Markers that make a signed assertion single-use: an enterprise-managed authoriza
 
 **Value:** `1`. An assertion is refused while its marker exists.
 
-**TTL:** the assertion's remaining lifetime, at least 60 seconds (KV's minimum). A client assertion may not be valid for more than an hour, which bounds its marker. KV has no compare-and-set, so two requests presenting the same assertion at once in different locations can both succeed.
+**TTL:** the assertion's remaining lifetime, at least 60 seconds (KV's minimum). A client assertion's marker also covers the 60 seconds of clock skew it is accepted for after `exp`. A client assertion may not be valid for more than an hour, which bounds its marker. KV has no compare-and-set, so two requests presenting the same assertion at once in different locations can both succeed.
 
 ## Security Considerations
 

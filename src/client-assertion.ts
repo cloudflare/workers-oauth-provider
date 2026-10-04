@@ -12,7 +12,7 @@ import { createDefaultJwksProvider } from './ema/jwks';
 import { parseIdJag } from './ema/parser';
 import { err, ok, type EmaValidationError, type Result } from './ema/result';
 import { selectJwk, verifyIdJagSignature } from './ema/signature';
-import type { EmaJwksProvider, JsonWebKeySet } from './ema/types';
+import type { EmaJwksProvider, JsonWebKeySet, OAuthJsonWebKey } from './ema/types';
 
 /** RFC 7523 §2.2 `client_assertion_type` for a JWT client assertion. */
 export const JWT_BEARER_CLIENT_ASSERTION_TYPE = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer';
@@ -40,6 +40,14 @@ const CLIENT_ASSERTION_JTI_KV_PREFIX = 'client-assertion-jti:';
 
 /** draft-ietf-oauth-rfc7523bis explicit type. A typed assertion must use the issuer as its sole audience. */
 const CLIENT_AUTHENTICATION_JWT_TYPES = new Set(['client-authentication+jwt', 'application/client-authentication+jwt']);
+
+/** Whether a public JWK could verify an assertion signed with `alg`, by key type and curve. */
+export function isKeyUsableForAlgorithm(key: OAuthJsonWebKey, alg: EmaSupportedAlg): boolean {
+  if (key.use !== undefined && key.use !== 'sig') return false;
+  if (key.alg !== undefined && key.alg !== alg) return false;
+  if (Array.isArray(key.key_ops) && !key.key_ops.includes('verify')) return false;
+  return alg === 'RS256' ? key.kty === 'RSA' : key.kty === 'EC' && key.crv === 'P-256';
+}
 
 /** Keys and algorithms a CIMD client registered for `private_key_jwt`. */
 export interface ClientAssertionKeys {
@@ -116,7 +124,8 @@ export function createClientAssertionVerifier(): ClientAssertionVerifier {
       return jtiStore.markUsed({
         issuer: input.clientId,
         jti: claims.value.jti,
-        exp: claims.value.exp,
+        // The assertion stays acceptable for the clock skew past exp, so its marker must too.
+        exp: claims.value.exp + CLIENT_ASSERTION_CLOCK_SKEW_SECONDS,
         now: Math.floor(Date.now() / 1000),
         env: input.env,
       });
@@ -225,32 +234,33 @@ async function verifySignature(args: {
   jwksProvider: EmaJwksProvider;
   now: number;
 }): Promise<Result<void, EmaValidationError>> {
-  const { keys, alg, kid } = args;
-  let jwk;
-  if (keys.jwks) {
-    jwk = selectJwk(keys.jwks, alg, kid);
-  } else if (keys.jwksUri) {
-    // The cache is keyed by the JWKS URL, so two clients sharing one key set share one entry.
-    const source = { issuer: keys.jwksUri, jwksUri: keys.jwksUri };
-    const initial = await args.jwksProvider.fetch(source, { forceRefresh: false, now: args.now });
-    if (!initial.ok) return initial;
-    jwk = selectJwk(initial.value, alg, kid);
-    // A kid the cached set lacks may be a rotated key. The provider's cool-down bounds the refetches.
-    if (!jwk.ok && kid) {
-      const refreshed = await args.jwksProvider.fetch(source, { forceRefresh: true, now: args.now });
-      if (!refreshed.ok) return refreshed;
-      jwk = selectJwk(refreshed.value, alg, kid);
-    }
-  } else {
-    return err({ reason: 'no_matching_key' });
-  }
-  if (!jwk.ok) return jwk;
+  const { keys, alg, kid, parsed } = args;
+  const verifyWith = async (jwks: JsonWebKeySet): Promise<Result<void, EmaValidationError>> => {
+    const jwk = selectJwk(jwks, alg, kid);
+    if (!jwk.ok) return jwk;
+    const verified = await verifyIdJagSignature({
+      alg,
+      jwk: jwk.value,
+      signingInput: parsed.signingInput,
+      signature: parsed.signature,
+    });
+    return verified ? ok(undefined) : err({ reason: 'signature_failed' });
+  };
 
-  const verified = await verifyIdJagSignature({
-    alg,
-    jwk: jwk.value,
-    signingInput: args.parsed.signingInput,
-    signature: args.parsed.signature,
-  });
-  return verified ? ok(undefined) : err({ reason: 'signature_failed' });
+  if (keys.jwks) return verifyWith(keys.jwks);
+  if (!keys.jwksUri) return err({ reason: 'no_matching_key' });
+
+  // The cache is keyed by the JWKS URL, so two clients sharing one key set share one entry.
+  const source = { issuer: keys.jwksUri, jwksUri: keys.jwksUri };
+  const initial = await args.jwksProvider.fetch(source, { forceRefresh: false, now: args.now });
+  if (!initial.ok) return initial;
+  const result = await verifyWith(initial.value);
+  if (result.ok) return result;
+
+  // A missing kid, or a kid whose key no longer verifies, may mean the client rotated its keys
+  // since the set was cached. Refetch once; the provider's cool-down bounds how often a stream of
+  // bad assertions can make this server fetch the client's JWKS.
+  const refreshed = await args.jwksProvider.fetch(source, { forceRefresh: true, now: args.now });
+  if (!refreshed.ok) return refreshed;
+  return verifyWith(refreshed.value);
 }
