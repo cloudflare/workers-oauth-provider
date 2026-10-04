@@ -1,4 +1,5 @@
 import { describe, it, expect, expectTypeOf, beforeEach, vi, afterEach } from 'vitest';
+import { version } from '../package.json';
 import {
   AuthorizationError,
   authorizationErrorRedirect,
@@ -5118,7 +5119,9 @@ describe('OAuthProvider', () => {
       expect(globalThis.fetch).toHaveBeenCalledWith(
         `${issuer}/jwks.json`,
         expect.objectContaining({
-          headers: expect.objectContaining({ 'User-Agent': 'workers-oauth-provider' }),
+          headers: expect.objectContaining({
+            'User-Agent': `workers-oauth-provider/${version} (+https://github.com/cloudflare/workers-oauth-provider)`,
+          }),
         })
       );
     });
