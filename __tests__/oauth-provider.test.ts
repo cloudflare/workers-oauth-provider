@@ -1,4 +1,5 @@
 import { describe, it, expect, expectTypeOf, beforeEach, vi, afterEach } from 'vitest';
+import { version } from '../package.json';
 import {
   AuthorizationError,
   CimdFetchError,
@@ -4606,6 +4607,21 @@ describe('OAuthProvider', () => {
         subject: 'employee-123',
         email: 'employee@example.com',
       });
+    });
+
+    it("should send a User-Agent when fetching the issuer's JWKS", async () => {
+      // Workers' fetch sends no User-Agent, and WAFs such as AWS CloudFront's refuse requests without one.
+      const tokenResponse = await exchangeAssertion(await createAssertion());
+      expect(tokenResponse.status).toBe(200);
+
+      expect(globalThis.fetch).toHaveBeenCalledWith(
+        `${issuer}/jwks.json`,
+        expect.objectContaining({
+          headers: expect.objectContaining({
+            'User-Agent': `workers-oauth-provider/${version} (+https://github.com/cloudflare/workers-oauth-provider)`,
+          }),
+        })
+      );
     });
 
     it('should use the configured resource when the ID-JAG omits its optional resource claim', async () => {

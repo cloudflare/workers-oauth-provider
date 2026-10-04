@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { version } from '../package.json';
 import { CimdFetchError, OAuthProvider } from '../src/oauth-provider';
 import {
   MockExecutionContext,
@@ -121,6 +122,40 @@ describe('Client ID Metadata Document (CIMD)', () => {
         cimdUrl,
         expect.objectContaining({
           headers: expect.objectContaining({ Accept: 'application/json' }),
+        })
+      );
+    });
+
+    it('should send a User-Agent when fetching the client metadata document', async () => {
+      // Workers' fetch sends no User-Agent, and WAFs such as AWS CloudFront's refuse requests without one.
+      const cimdUrl = 'https://client.example.com/oauth/metadata.json';
+      globalThis.fetch = vi.fn().mockImplementation(() =>
+        Promise.resolve(
+          createMockFetchResponse({
+            client_id: cimdUrl,
+            client_name: 'CIMD Test Client',
+            redirect_uris: ['https://client.example.com/callback'],
+            token_endpoint_auth_method: 'none',
+          })
+        )
+      );
+
+      const authResponse = await oauthProvider.fetch(
+        createMockRequest(
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=S256`,
+          'GET'
+        ),
+        mockEnv,
+        mockCtx
+      );
+
+      expect(authResponse.status).toBe(302);
+      expect(globalThis.fetch).toHaveBeenCalledWith(
+        cimdUrl,
+        expect.objectContaining({
+          headers: expect.objectContaining({
+            'User-Agent': `workers-oauth-provider/${version} (+https://github.com/cloudflare/workers-oauth-provider)`,
+          }),
         })
       );
     });
