@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { version } from '../package.json';
 import { CimdFetchError, OAuthProvider } from '../src/oauth-provider';
 import {
   MockExecutionContext,
@@ -152,7 +153,9 @@ describe('Client ID Metadata Document (CIMD)', () => {
       expect(globalThis.fetch).toHaveBeenCalledWith(
         cimdUrl,
         expect.objectContaining({
-          headers: expect.objectContaining({ 'User-Agent': 'workers-oauth-provider' }),
+          headers: expect.objectContaining({
+            'User-Agent': `workers-oauth-provider/${version} (+https://github.com/cloudflare/workers-oauth-provider)`,
+          }),
         })
       );
     });
