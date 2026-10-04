@@ -462,14 +462,14 @@ describe('Client ID Metadata Document (CIMD)', () => {
       });
     });
 
-    it('should reject private_key_jwt until token-endpoint assertion validation is implemented', async () => {
+    it('should reject a private_key_jwt-only client whose document supplies no keys', async () => {
+      // tests/oauth-cimd-private-key-jwt.test.ts covers private_key_jwt with keys.
       const cimdUrl = 'https://client.example.com/oauth/metadata.json';
       const validMetadata = {
         client_id: cimdUrl,
         client_name: 'Private Key CIMD Client',
         redirect_uris: ['https://client.example.com/callback'],
         token_endpoint_auth_method: 'private_key_jwt',
-        jwks_uri: 'https://client.example.com/.well-known/jwks.json',
       };
 
       globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(createMockFetchResponse(validMetadata)));

@@ -27,6 +27,11 @@ interface JwksCacheEntry {
 interface DefaultJwksProviderOptions {
   /** Cache TTL in seconds; defaults to `EMA_DEFAULT_JWKS_CACHE_TTL_SECONDS`. */
   cacheTtlSeconds?: number;
+  /**
+   * Most JWKS kept in the cache. The oldest entry is evicted past it. Unbounded by default, which
+   * suits a deployer-configured issuer list; set it when the JWKS URLs come from client metadata.
+   */
+  maxEntries?: number;
 }
 
 /** Create the default JWKS provider — a closure with its own private cache. */
@@ -80,6 +85,12 @@ export function createDefaultJwksProvider(opts: DefaultJwksProviderOptions = {})
         }
 
         const jwks: JsonWebKeySet = { keys: rawJwks.value.keys as OAuthJsonWebKey[] };
+        cache.delete(issuer.issuer);
+        if (opts.maxEntries !== undefined && cache.size >= opts.maxEntries) {
+          // Maps iterate in insertion order, and a refreshed entry is re-inserted above.
+          const oldest = cache.keys().next();
+          if (!oldest.done) cache.delete(oldest.value);
+        }
         cache.set(issuer.issuer, {
           jwks,
           expiresAt: now + cacheTtl,

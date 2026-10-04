@@ -1,4 +1,6 @@
 import { OUTBOUND_USER_AGENT } from './oauth-http';
+import { CLIENT_ASSERTION_ALGORITHMS, type ClientAssertionKeys } from './client-assertion';
+import type { JsonWebKeySet, OAuthJsonWebKey } from './ema/types';
 import { isLoopbackHostname } from './oauth-resource';
 import {
   negotiateCimdClientCapabilities,
@@ -77,8 +79,12 @@ interface ResolvedClientIdMetadataDocument extends OAuthClientDisplayMetadata {
   grantTypes: string[];
   /** Mutually supported OAuth response types. */
   responseTypes: string[];
-  /** Mutually supported token endpoint authentication method. */
+  /** The weakest token endpoint authentication method the client may use: `none` when it is usable. */
   tokenEndpointAuthMethod: string;
+  /** Every token endpoint authentication method the client may present. */
+  tokenEndpointAuthMethods: string[];
+  /** Keys that verify the client's `private_key_jwt` assertions, when that method is usable. */
+  clientAssertionKeys?: ClientAssertionKeys;
 }
 
 export function requireJsonObject(value: unknown): Record<string, unknown> {
@@ -412,17 +418,56 @@ export function isClientIdMetadataDocumentUrl(clientId: string): boolean {
   }
 }
 
-function containsPrivateJwkMaterial(value: unknown): boolean {
-  if (value === undefined) return false;
+const PRIVATE_JWK_MEMBERS = new Set(['d', 'p', 'q', 'dp', 'dq', 'qi', 'oth', 'k']);
+
+/** Parses an inline `jwks`, refusing private or symmetric key material, which a public document must never carry. */
+function parsePublicJwks(value: unknown): JsonWebKeySet | undefined {
+  if (value === undefined) return undefined;
   const jwks = requireJsonObject(value);
   if (!Array.isArray(jwks.keys)) throw new Error('Invalid jwks: keys must be an array');
 
-  const privateMembers = new Set(['d', 'p', 'q', 'dp', 'dq', 'qi', 'oth', 'k']);
-  for (const value of jwks.keys) {
+  const keys = jwks.keys.map((value) => {
     const key = requireJsonObject(value);
-    if (Object.keys(key).some((member) => privateMembers.has(member))) return true;
+    if (Object.keys(key).some((member) => PRIVATE_JWK_MEMBERS.has(member))) {
+      throw new Error('CIMD documents must not contain private key material');
+    }
+    return key as unknown as OAuthJsonWebKey;
+  });
+  return { keys };
+}
+
+/**
+ * The keys and algorithms a document offering `private_key_jwt` supplies, or why they can't be used.
+ * An unusable offer only matters when `private_key_jwt` is the document's sole method.
+ */
+function resolvePrivateKeyJwtKeys(
+  metadata: ParsedOAuthClientMetadata,
+  jwks: JsonWebKeySet | undefined
+): { keys: ClientAssertionKeys } | { problem: string } {
+  const { jwksUri } = metadata;
+  if (jwks && jwksUri) return { problem: 'jwks and jwks_uri must not both be present' };
+  if (!jwks && !jwksUri) return { problem: 'private_key_jwt requires jwks or jwks_uri' };
+  if (jwks && (jwks.keys ?? []).length === 0) return { problem: 'private_key_jwt jwks must contain a key' };
+  if (jwksUri) {
+    const url = new URL(jwksUri);
+    if (url.protocol !== 'https:' || url.username || url.password || url.hash) {
+      return { problem: 'private_key_jwt jwks_uri must be an https: URL without userinfo or a fragment' };
+    }
   }
-  return false;
+
+  const algorithms = CLIENT_ASSERTION_ALGORITHMS.filter(
+    (alg) =>
+      (metadata.tokenEndpointAuthSigningAlg === undefined || metadata.tokenEndpointAuthSigningAlg === alg) &&
+      (metadata.tokenEndpointAuthSigningAlgValuesSupported === undefined ||
+        metadata.tokenEndpointAuthSigningAlgValuesSupported.includes(alg))
+  );
+  if (algorithms.length === 0) {
+    return {
+      problem: `private_key_jwt requires a token_endpoint_auth_signing_alg of ${CLIENT_ASSERTION_ALGORITHMS.join(' or ')}`,
+    };
+  }
+
+  return { keys: jwks ? { jwks, algorithms } : { jwksUri, algorithms } };
 }
 
 function resolveClientIdMetadataDocument(
@@ -446,16 +491,31 @@ function resolveClientIdMetadataDocument(
   if ('client_secret' in raw || 'client_secret_expires_at' in raw) {
     throw new Error('CIMD documents must not contain client secrets');
   }
-  if (containsPrivateJwkMaterial(raw.jwks)) {
-    throw new Error('CIMD documents must not contain private key material');
-  }
+  const jwks = parsePublicJwks(raw.jwks);
 
-  const capabilities = negotiateCimdClientCapabilities(server, {
-    tokenEndpointAuthMethod: metadata.tokenEndpointAuthMethod,
-    tokenEndpointAuthMethodsSupported: metadata.tokenEndpointAuthMethodsSupported,
-    grantTypes: metadata.grantTypes ?? ['authorization_code'],
-    responseTypes: metadata.responseTypes ?? ['code'],
-  });
+  const offersPrivateKeyJwt =
+    metadata.tokenEndpointAuthMethod === 'private_key_jwt' ||
+    !!metadata.tokenEndpointAuthMethodsSupported?.includes('private_key_jwt');
+  const privateKeyJwt = offersPrivateKeyJwt ? resolvePrivateKeyJwtKeys(metadata, jwks) : undefined;
+  const clientAssertionKeys = privateKeyJwt && 'keys' in privateKeyJwt ? privateKeyJwt.keys : undefined;
+
+  let capabilities: ReturnType<typeof negotiateCimdClientCapabilities>;
+  try {
+    capabilities = negotiateCimdClientCapabilities(
+      server,
+      {
+        tokenEndpointAuthMethod: metadata.tokenEndpointAuthMethod,
+        tokenEndpointAuthMethodsSupported: metadata.tokenEndpointAuthMethodsSupported,
+        grantTypes: metadata.grantTypes ?? ['authorization_code'],
+        responseTypes: metadata.responseTypes ?? ['code'],
+      },
+      { privateKeyJwt: clientAssertionKeys !== undefined }
+    );
+  } catch (error) {
+    // Name the key problem rather than the method mismatch it caused.
+    if (privateKeyJwt && 'problem' in privateKeyJwt) throw new Error(privateKeyJwt.problem);
+    throw error;
+  }
 
   return {
     ...pickDisplayMetadata(metadata),
@@ -463,6 +523,7 @@ function resolveClientIdMetadataDocument(
     clientName: metadata.clientName,
     redirectUris,
     ...capabilities,
+    ...(capabilities.tokenEndpointAuthMethods.includes('private_key_jwt') ? { clientAssertionKeys } : {}),
   };
 }
 

@@ -16,15 +16,19 @@ import { sha256Hex } from './util';
 /** Storage key prefix for replay markers. Stable across versions. */
 const EMA_JTI_KV_PREFIX = 'enterprise-jti:';
 
-/** Create the default KV-backed JTI store. KV TTL handles cleanup. */
-export function createKvJtiStore(): EmaJtiStore {
+/**
+ * Create the default KV-backed JTI store. KV TTL handles cleanup.
+ *
+ * @param keyPrefix Storage key prefix, so each kind of assertion keeps its own replay namespace.
+ */
+export function createKvJtiStore(keyPrefix: string = EMA_JTI_KV_PREFIX): EmaJtiStore {
   return {
     async markUsed({ issuer, jti, exp, now, env }) {
       // KV rejects a sub-60s expirationTtl and an assertion in its last minute is
       // still valid; a marker outliving its assertion only tightens replay detection.
       const ttl = Math.max(EMA_JTI_MIN_TTL_SECONDS, exp - now);
       const jtiHash = await sha256Hex(`${issuer}\n${jti}`);
-      const key = `${EMA_JTI_KV_PREFIX}${jtiHash}`;
+      const key = `${keyPrefix}${jtiHash}`;
       const existing = await env.OAUTH_KV.get(key);
       if (existing) {
         return err({ reason: 'replayed', jti });

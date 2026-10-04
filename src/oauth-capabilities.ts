@@ -205,25 +205,46 @@ function negotiateTokenEndpointAuthMethod(options: {
   );
 }
 
-function negotiateCimdTokenEndpointAuthMethod(
+/** Asymmetric method a CIMD client may use when its document supplies usable keys. */
+const PRIVATE_KEY_JWT = 'private_key_jwt';
+
+/**
+ * Every token endpoint authentication method a CIMD client may use with this server, in the
+ * server's order of preference.
+ *
+ * A metadata document has no registration response, so the client learns nothing about which
+ * method this server picked. It chooses one per request from this server's metadata. So every
+ * method both sides support stays usable: a document that offers `none` and `private_key_jwt`
+ * (ChatGPT's does) works with either, and a document that offers only `private_key_jwt` must
+ * use it.
+ */
+function negotiateCimdTokenEndpointAuthMethods(
   server: OAuthServerCapabilities,
   preferredMethod: string | undefined,
-  supportedMethods: readonly string[] | undefined
-): string {
+  supportedMethods: readonly string[] | undefined,
+  privateKeyJwt: boolean
+): string[] {
   if (preferredMethod !== undefined && SHARED_SECRET_TOKEN_ENDPOINT_AUTH_METHODS.has(preferredMethod)) {
     throw new Error(`CIMD clients cannot use symmetric token endpoint authentication method: ${preferredMethod}`);
   }
+  if (preferredMethod !== undefined && supportedMethods !== undefined && !supportedMethods.includes(preferredMethod)) {
+    throw new Error('token_endpoint_auth_method must be included in token_endpoint_auth_methods_supported');
+  }
 
-  const acceptedMethods = server.tokenEndpointAuthMethods.filter(
-    (method) => !SHARED_SECRET_TOKEN_ENDPOINT_AUTH_METHODS.has(method)
+  const acceptedMethods = [
+    ...server.tokenEndpointAuthMethods.filter((method) => !SHARED_SECRET_TOKEN_ENDPOINT_AUTH_METHODS.has(method)),
+    ...(privateKeyJwt ? [PRIVATE_KEY_JWT] : []),
+  ];
+  const advertisedMethods = supportedMethods ?? [preferredMethod ?? 'none'];
+  const methods = acceptedMethods.filter((method) => advertisedMethods.includes(method));
+  if (methods.length > 0) return methods;
+
+  const advertised = [...new Set([...(preferredMethod === undefined ? [] : [preferredMethod]), ...advertisedMethods])];
+  throw new Error(
+    'CIMD client does not support an accepted token endpoint authentication method. ' +
+      `Supported methods: ${acceptedMethods.join(', ')}. ` +
+      `Client advertised: ${advertised.length > 0 ? advertised.join(', ') : '(none)'}`
   );
-  return negotiateTokenEndpointAuthMethod({
-    acceptedMethods,
-    defaultMethod: 'none',
-    preferredMethod,
-    supportedMethods,
-    context: 'CIMD client',
-  });
 }
 
 /**
@@ -262,19 +283,36 @@ export function negotiateDynamicClientRegistrationCapabilities(
  */
 export function negotiateCimdClientCapabilities(
   server: OAuthServerCapabilities,
-  client: ClientMetadataCapabilities
-): { grantTypes: string[]; responseTypes: string[]; tokenEndpointAuthMethod: string } {
+  client: ClientMetadataCapabilities,
+  options: {
+    /** Whether the document supplies keys and an algorithm this server can verify `private_key_jwt` with. */
+    readonly privateKeyJwt: boolean;
+  } = { privateKeyJwt: false }
+): {
+  grantTypes: string[];
+  responseTypes: string[];
+  tokenEndpointAuthMethod: string;
+  tokenEndpointAuthMethods: string[];
+} {
+  const tokenEndpointAuthMethods = negotiateCimdTokenEndpointAuthMethods(
+    server,
+    client.tokenEndpointAuthMethod,
+    client.tokenEndpointAuthMethodsSupported,
+    options.privateKeyJwt
+  );
   const effective = {
     grantTypes: client.grantTypes.filter((grantType) => server.grantTypes.includes(grantType)),
     responseTypes: client.responseTypes.filter((responseType) => server.responseTypes.includes(responseType)),
-    tokenEndpointAuthMethod: negotiateCimdTokenEndpointAuthMethod(
-      server,
-      client.tokenEndpointAuthMethod,
-      client.tokenEndpointAuthMethodsSupported
-    ),
+    // The weakest usable method is the client's recorded method, so a client that may present
+    // `none` is held to the public-client rules (PKCE) on every request.
+    tokenEndpointAuthMethod: tokenEndpointAuthMethods[0],
+    tokenEndpointAuthMethods,
   };
 
-  validateClientCapabilities(server, effective);
+  validateClientCapabilities(
+    { ...server, tokenEndpointAuthMethods: [...server.tokenEndpointAuthMethods, PRIVATE_KEY_JWT] },
+    effective
+  );
   return effective;
 }
 

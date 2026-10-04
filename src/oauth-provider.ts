@@ -34,6 +34,14 @@ import {
   EMA_SUPPORTED_JWT_ALGORITHMS,
   type EmaSupportedAlg,
 } from './ema/constants';
+import {
+  JWT_BEARER_CLIENT_ASSERTION_TYPE,
+  CLIENT_ASSERTION_ALGORITHMS,
+  createClientAssertionVerifier,
+  readClientAssertionIssuer,
+  type ClientAssertionKeys,
+  type ClientAssertionVerifier,
+} from './client-assertion';
 import { createKvJtiStore } from './ema/jti';
 import { createDefaultJwksProvider } from './ema/jwks';
 import { parseIdJag } from './ema/parser';
@@ -1172,10 +1180,23 @@ interface StoredClientInfo extends ClientInfo {
    * provider may renew while it is in use. `createClient()` records never carry it.
    */
   registrationExpiresAt?: number;
+  /**
+   * Every method a Client ID Metadata Document client may present, weakest first, so
+   * `tokenEndpointAuthMethod` is its first entry. Resolved per request, never stored.
+   */
+  tokenEndpointAuthMethods?: string[];
+  /** Keys that verify a Client ID Metadata Document client's `private_key_jwt` assertions. */
+  clientAssertionKeys?: ClientAssertionKeys;
 }
 
 function toPublicClientInfo(client: StoredClientInfo): ClientInfo {
-  const { authMethodExplicit: _explicit, registrationExpiresAt: _expiry, ...publicClient } = client;
+  const {
+    authMethodExplicit: _explicit,
+    registrationExpiresAt: _expiry,
+    tokenEndpointAuthMethods: _methods,
+    clientAssertionKeys: _keys,
+    ...publicClient
+  } = client;
   return publicClient;
 }
 
@@ -1185,6 +1206,7 @@ function isClientAuthMethodAllowed(
   isClientMetadataDocument: boolean
 ): boolean {
   if (presentedMethod === client.tokenEndpointAuthMethod) return true;
+  if (isClientMetadataDocument && client.tokenEndpointAuthMethods?.includes(presentedMethod)) return true;
 
   const isSecretMethod = (method: string): boolean =>
     method === 'client_secret_basic' || method === 'client_secret_post';
@@ -1858,6 +1880,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   /** KV-backed best-effort `jti` replay store; only constructed when EMA is configured. */
   private readonly jtiStore: EmaJtiStore | undefined;
 
+  /** `private_key_jwt` verifier for CIMD clients, with its own JWKS cache; only constructed when CIMD is enabled. */
+  private readonly clientAssertionVerifier: ClientAssertionVerifier | undefined;
+
   /**
    * Creates a new OAuth provider instance
    * @param options - Configuration options for the provider
@@ -2050,6 +2075,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         cacheTtlSeconds: this.options.enterpriseManagedAuthorization.jwksCacheTtlSeconds,
       });
       this.jtiStore = createKvJtiStore();
+    }
+    if (this.options.clientIdMetadataDocumentEnabled) {
+      this.clientAssertionVerifier = createClientAssertionVerifier();
     }
   }
 
@@ -2462,7 +2490,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       if (parsed.isRevocationRequest) {
         response = await this.revokeToken(parsed.body, parsed.clientInfo, env);
       } else {
-        response = await this.handleTokenRequest(parsed.body, parsed.clientInfo, env, url, request);
+        response = await this.handleTokenRequest(
+          parsed.body,
+          parsed.clientInfo,
+          parsed.clientAuthMethod,
+          env,
+          url,
+          request
+        );
       }
       // A successful, client-authenticated request is proof the registration is in use. An
       // error is recognised by construction, not by status, because `onError` may restyle it.
@@ -2725,6 +2760,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     | {
         body: any;
         clientInfo: StoredClientInfo;
+        /** The method this request authenticated the client with. */
+        clientAuthMethod: string;
         isRevocationRequest: boolean;
       }
     | Response
@@ -2803,11 +2840,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // Get client credentials from HTTP Basic auth or form parameters.
     const basicAuthorization = parseBasicAuthorizationHeader(request.headers.get('Authorization'));
     const basicAuthenticationAttempted = basicAuthorization.kind !== 'not-basic';
+    const clientAssertionAttempted = formData.has('client_assertion') || formData.has('client_assertion_type');
     let clientId = '';
     let clientSecret = '';
 
     if (basicAuthenticationAttempted) {
-      if (formData.has('client_id') || formData.has('client_secret')) {
+      if (formData.has('client_id') || formData.has('client_secret') || clientAssertionAttempted) {
         return this.createErrorResponse(
           'invalid_request',
           {
@@ -2828,6 +2866,30 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
       clientId = basicAuthorization.clientId;
       clientSecret = basicAuthorization.clientSecret;
+    } else if (clientAssertionAttempted) {
+      if (formData.has('client_secret')) {
+        return this.createErrorResponse(
+          'invalid_request',
+          {
+            description: 'Client must not use multiple authentication methods',
+            statusCode: 400,
+          },
+          { category: 'client-authentication', reason: 'multiple_authentication_methods' }
+        );
+      }
+      if (!formData.has('client_assertion') || !formData.has('client_assertion_type')) {
+        return this.createErrorResponse(
+          'invalid_request',
+          {
+            description: 'client_assertion and client_assertion_type must be sent together',
+            statusCode: 400,
+          },
+          { category: 'client-authentication', reason: 'client_assertion_incomplete' }
+        );
+      }
+      // RFC 7523 §3: client_id is optional alongside an assertion, whose iss names the client.
+      // A client_id that disagrees with iss fails the assertion's claim check.
+      clientId = body.client_id || readClientAssertionIssuer(body.client_assertion) || '';
     } else {
       clientId = body.client_id;
       clientSecret = body.client_secret || '';
@@ -2875,9 +2937,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // presence rather than truthiness so an empty secret still counts as a POST attempt.
     const presentedAuthMethod = basicAuthenticationAttempted
       ? 'client_secret_basic'
-      : formData.has('client_secret')
-        ? 'client_secret_post'
-        : 'none';
+      : clientAssertionAttempted
+        ? 'private_key_jwt'
+        : formData.has('client_secret')
+          ? 'client_secret_post'
+          : 'none';
     const registeredAuthMethod = clientInfo.tokenEndpointAuthMethod;
     if (
       !isClientAuthMethodAllowed(
@@ -2897,8 +2961,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       });
     }
 
-    // For confidential clients, validate the secret
-    if (presentedAuthMethod !== 'none') {
+    if (presentedAuthMethod === 'private_key_jwt') {
+      const failure = await this.verifyClientAssertion(body, clientInfo, env, request);
+      if (failure) return failure;
+    } else if (presentedAuthMethod !== 'none') {
+      // For confidential clients, validate the secret
       if (!clientSecret) {
         return this.createInvalidClientResponse(
           'Client authentication failed: missing client_secret',
@@ -2933,8 +3000,56 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     return {
       body,
       clientInfo,
+      clientAuthMethod: presentedAuthMethod,
       isRevocationRequest,
     };
+  }
+
+  /**
+   * Authenticates a `private_key_jwt` request (RFC 7523 §2.2). The method check has already
+   * confirmed that the client registered the method, which only a CIMD client with usable keys can.
+   * @returns An `invalid_client` response, or `undefined` once the assertion verified and was consumed
+   */
+  private async verifyClientAssertion(
+    body: any,
+    clientInfo: StoredClientInfo,
+    env: Env & ProviderEnv,
+    request: Request
+  ): Promise<Response | undefined> {
+    const keys = clientInfo.clientAssertionKeys;
+    const verifier = this.clientAssertionVerifier;
+    // Unreachable: only CIMD resolution, which requires the verifier, attaches keys.
+    if (!keys || !verifier) throw new Error('private_key_jwt client resolved without keys or a verifier');
+
+    if (body.client_assertion_type !== JWT_BEARER_CLIENT_ASSERTION_TYPE) {
+      return this.createInvalidClientResponse('Client authentication failed', false, {
+        category: 'client-authentication',
+        reason: 'client_assertion_type_unsupported',
+        detail: { clientId: clientInfo.clientId, clientAssertionType: String(body.client_assertion_type) },
+      });
+    }
+
+    const requestUrl = new URL(request.url);
+    const verified = await verifier.verify({
+      assertion: body.client_assertion,
+      clientId: clientInfo.clientId,
+      keys,
+      issuer: this.getAuthorizationServerIssuer(requestUrl),
+      tokenEndpoint: this.getFullEndpointUrl(this.options.tokenEndpoint, requestUrl),
+      env,
+    });
+    if (verified.ok) return undefined;
+
+    return this.createInvalidClientResponse(
+      'Client authentication failed',
+      false,
+      {
+        category: 'client-authentication',
+        reason: 'client_assertion_invalid',
+        detail: { clientId: clientInfo.clientId, ...verified.error },
+      },
+      request
+    );
   }
 
   /**
@@ -3023,6 +3138,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       ? [EMA_ID_JAG_GRANT_PROFILE]
       : [];
 
+    const cimdSupported = !!this.options.clientIdMetadataDocumentEnabled && this.hasGlobalFetchStrictlyPublic();
     const metadata = {
       issuer: this.getAuthorizationServerIssuer(requestUrl),
       authorization_endpoint: authorizeEndpoint,
@@ -3043,8 +3159,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       ...(authorizationGrantProfilesSupported.length > 0
         ? { authorization_grant_profiles_supported: authorizationGrantProfilesSupported }
         : {}),
-      token_endpoint_auth_methods_supported: this.serverCapabilities.tokenEndpointAuthMethods,
-      // not implemented: token_endpoint_auth_signing_alg_values_supported
+      // private_key_jwt is implemented for CIMD clients, which need the compatibility flag too.
+      token_endpoint_auth_methods_supported: [
+        ...this.serverCapabilities.tokenEndpointAuthMethods,
+        ...(cimdSupported ? ['private_key_jwt'] : []),
+      ],
+      ...(cimdSupported ? { token_endpoint_auth_signing_alg_values_supported: [...CLIENT_ASSERTION_ALGORITHMS] } : {}),
       // not implemented: service_documentation
       // not implemented: ui_locales_supported
       // not implemented: op_policy_uri
@@ -3059,8 +3179,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       authorization_response_iss_parameter_supported: true,
       // MCP Client ID Metadata Document support (CIMD)
       // Only enabled when global_fetch_strictly_public compat flag is set (for SSRF protection)
-      client_id_metadata_document_supported:
-        !!this.options.clientIdMetadataDocumentEnabled && this.hasGlobalFetchStrictlyPublic(),
+      client_id_metadata_document_supported: cimdSupported,
     };
 
     return new Response(JSON.stringify(metadata), {
@@ -3115,6 +3234,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   private async handleTokenRequest(
     body: any,
     clientInfo: ClientInfo,
+    clientAuthMethod: string,
     env: Env & ProviderEnv,
     requestUrl: URL,
     request: Request
@@ -3171,7 +3291,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       } else if (grantType === GrantType.TOKEN_EXCHANGE && this.options.allowTokenExchangeGrant) {
         return await this.handleTokenExchangeGrant(body, clientInfo, env);
       } else if (grantType === GrantType.JWT_BEARER) {
-        return await this.handleJwtBearerGrant(body, clientInfo, env, requestUrl, request);
+        return await this.handleJwtBearerGrant(body, clientInfo, clientAuthMethod, env, requestUrl, request);
       }
 
       // Exhaustive at runtime because unsupported grants returned above.
@@ -4346,6 +4466,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   private async handleJwtBearerGrant(
     body: any,
     clientInfo: ClientInfo,
+    clientAuthMethod: string,
     env: Env & ProviderEnv,
     requestUrl: URL,
     request: Request
@@ -4361,11 +4482,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // By default the EMA grant requires client authentication (per the MCP
     // enterprise-managed-authorization draft). Deployers can opt in to also
-    // accepting public clients (e.g. CIMD clients, which are always
-    // `token_endpoint_auth_method: 'none'`) via `allowPublicClients`. In that
-    // case trust rests on the signature-verified, short-lived, single-use
-    // ID-JAG assertion rather than on a separately presented client secret.
-    if (clientInfo.tokenEndpointAuthMethod === 'none' && !enterpriseOptions.allowPublicClients) {
+    // accepting public clients (e.g. CIMD clients that send no credential)
+    // via `allowPublicClients`. In that case trust rests on the
+    // signature-verified, short-lived, single-use ID-JAG assertion rather than
+    // on a client credential. A CIMD client that may use either `none` or
+    // `private_key_jwt` is judged by what this request presented.
+    if (clientAuthMethod === 'none' && !enterpriseOptions.allowPublicClients) {
       return this.createErrorResponse(
         'invalid_client',
         {
