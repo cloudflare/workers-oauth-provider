@@ -63,8 +63,10 @@ export interface EmaTrustedIssuer {
 
   /**
    * Allowed JWT signing algorithms for this issuer: `RS256`, `ES256`, or both.
-   * Defaults to `['RS256']`, so an IdP that signs with `ES256` must list it.
-   * The IdP's `id_token_signing_alg_values_supported` metadata says which it uses.
+   * Defaults to `['RS256']`, so an IdP that signs ID-JAGs with `ES256` must list it.
+   * Use the algorithm the IdP signs ID-JAGs with, which its documentation or a
+   * sample assertion's `alg` header shows. `id_token_signing_alg_values_supported`
+   * describes ID tokens and may differ.
    */
   algorithms?: string[];
 
