@@ -61,7 +61,11 @@ export interface EmaTrustedIssuer {
   /** HTTPS JWKS endpoint used to validate assertion signatures. */
   jwksUri: string;
 
-  /** Allowed JWT signing algorithms for this issuer. Defaults to `['RS256']`. */
+  /**
+   * Allowed JWT signing algorithms for this issuer: `RS256`, `ES256`, or both.
+   * Defaults to `['RS256']`, so an IdP that signs with `ES256` must list it.
+   * The IdP's `id_token_signing_alg_values_supported` metadata says which it uses.
+   */
   algorithms?: string[];
 
   /** Expected authorization server audience. Defaults to this provider's issuer URL. */
