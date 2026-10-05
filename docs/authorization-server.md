@@ -75,11 +75,26 @@ CIMD validation follows [draft-ietf-oauth-client-id-metadata-document-00](https:
 - Exact authorization-request redirect URI validation, with RFC 8252 loopback port handling.
 - A 5 KB response size limit and a 10 second timeout covering both headers and body.
 - Valid UTF-8 JSON object syntax and safe URI schemes for client metadata fields.
-- No embedded client secrets or private JWK material.
+- No embedded client secrets or private or symmetric JWK material.
 
 Validated documents are cached according to their `Cache-Control` headers, capped at 7 days. Error responses and invalid documents are never cached, and a cached document that stops validating is evicted and re-resolved from origin within the same request.
 
-CIMD token endpoint authentication is negotiated from `token_endpoint_auth_method` and the OpenID RP Metadata Choices field `token_endpoint_auth_methods_supported`. The provider currently implements only `none`: a client may prefer `private_key_jwt` while also offering `none`, in which case the provider selects `none` and applies public-client PKCE requirements. A client that offers only `private_key_jwt` is rejected until assertion validation is implemented.
+CIMD token endpoint authentication is read from `token_endpoint_auth_method` and the OpenID RP Metadata Choices field `token_endpoint_auth_methods_supported`. The provider implements `none` and `private_key_jwt` for CIMD clients. A metadata document gets no registration response, so the client picks its method per request from this server's metadata, and every method both sides support stays usable:
+
+- A document that offers only `private_key_jwt` must authenticate every token and revocation request with a signed client assertion.
+- A document that offers `none` and `private_key_jwt` (ChatGPT's does) may use either. It is held to the public-client rules, so PKCE is required, and `lookupClient()` reports `tokenEndpointAuthMethod: 'none'`. An assertion it does send must be valid, and a failed assertion never falls back to `none`.
+- A document that offers only `none` can't send an assertion.
+
+With CIMD enabled and the compatibility flag set, the provider advertises `private_key_jwt` in `token_endpoint_auth_methods_supported` and `RS256` and `ES256` in `token_endpoint_auth_signing_alg_values_supported`. Only CIMD clients use it: registration and `createClient()` don't accept `private_key_jwt`.
+
+A `private_key_jwt` client publishes its public keys in exactly one of `jwks` or an `https:` `jwks_uri`, and may narrow the algorithm with `token_endpoint_auth_signing_alg` or `token_endpoint_auth_signing_alg_values_supported`. A document whose only method is `private_key_jwt` and whose keys or algorithms are unusable is rejected, including an inline `jwks` with no signing key for an allowed algorithm. One that also offers `none` keeps working with `none`. The token request sends `client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer` and `client_assertion`. `client_id` may be omitted, because the assertion's `iss` identifies the client. The assertion ([RFC 7523](https://www.rfc-editor.org/rfc/rfc7523#section-3)) must:
+
+- Be signed with `RS256` or `ES256` by a key in the client's JWKS, chosen by `kid`, or the only matching key when there is no `kid`.
+- Have `iss` and `sub` equal to the `client_id`.
+- Have `aud` set to the authorization server's issuer identifier or its token endpoint URL. An assertion typed `client-authentication+jwt` ([draft-ietf-oauth-rfc7523bis](https://datatracker.ietf.org/doc/draft-ietf-oauth-rfc7523bis/)) must name the issuer identifier alone, as a string.
+- Carry an `exp` no more than an hour away and a `jti`, which makes it single-use. `nbf` and `iat` are optional. A 60 second clock skew applies.
+
+A remote JWKS is fetched under the same `global_fetch_strictly_public` protection as the metadata document, with a 64 KB limit and a 10 second timeout. It is cached in memory for 5 minutes, so a key the client removes can verify assertions until the cache expires. An unknown `kid`, or a signature that fails against the cached key, refetches it at most once every 30 seconds. A rotated key is picked up without letting bad assertions make this server hammer the client's host. Replay markers are kept in `OAUTH_KV` under `client-assertion-jti:` (see [storage-schema.md](../storage-schema.md)). Failures return a generic `invalid_client`, and `onError.internal` carries `reason: 'client_assertion_invalid'` with the specific check in `detail.reason`.
 
 When a CIMD document cannot be fetched or validated, the token endpoint returns a generic `invalid_client` response and reports diagnostics through `onError.internal`. `OAuthHelpers` methods that resolve a CIMD client throw the exported `CimdFetchError`, allowing applications to distinguish an upstream metadata failure from a client that does not exist. See [Advanced configuration](advanced-configuration.md#cimd-fetch-errors) for an example.
 

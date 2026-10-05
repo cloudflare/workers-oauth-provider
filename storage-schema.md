@@ -12,12 +12,14 @@ The system implements end-to-end encryption for sensitive application-specific p
 
 All keys in the KV namespace follow a consistent pattern to make them easily identifiable:
 
-| Prefix            | Purpose                                   | Example                |
-| ----------------- | ----------------------------------------- | ---------------------- |
-| `client:`         | Client registration data                  | `client:abc123`        |
-| `grant:{userId}:` | Authorization grant data                  | `grant:user123:xyz789` |
-| `token:`          | Access and refresh tokens                 | `token:ghi789`         |
-| `transaction:`    | Consent and upstream sign-in transactions | `transaction:5e88…`    |
+| Prefix                  | Purpose                                      | Example                      |
+| ----------------------- | -------------------------------------------- | ---------------------------- |
+| `client:`               | Client registration data                     | `client:abc123`              |
+| `grant:{userId}:`       | Authorization grant data                     | `grant:user123:xyz789`       |
+| `token:`                | Access and refresh tokens                    | `token:ghi789`               |
+| `transaction:`          | Consent and upstream sign-in transactions    | `transaction:5e88…`          |
+| `enterprise-jti:`       | Used ID-JAG assertion identifiers            | `enterprise-jti:9f2c…`       |
+| `client-assertion-jti:` | Used `private_key_jwt` assertion identifiers | `client-assertion-jti:4b1a…` |
 
 ## Data Structures
 
@@ -214,6 +216,16 @@ Short-lived records written by the consent and upstream sign-in helpers (`beginC
 The browser holds a matching `__Host-` binding cookie per transaction, named `{prefix}consent-{first 16 hex of the hash}` or `{prefix}upstream-…` and holding the full hash.
 
 **TTL:** 600 seconds. Deleted on first successful use (`approveConsent()`, `denyConsent()`, `finishUpstream()`); KV cannot make that read-then-delete atomic.
+
+### Assertion replay markers
+
+Markers that make a signed assertion single-use: an enterprise-managed authorization ID-JAG, or a Client ID Metadata Document client's `private_key_jwt` client assertion.
+
+**Key format:** `enterprise-jti:{sha256(iss + "\n" + jti)}` for an ID-JAG, and `client-assertion-jti:{sha256(client_id + "\n" + jti)}` for a client assertion.
+
+**Value:** `1`. An assertion is refused while its marker exists.
+
+**TTL:** the assertion's remaining lifetime, at least 60 seconds (KV's minimum). A client assertion's marker also covers the 60 seconds of clock skew it is accepted for after `exp`. A client assertion may not be valid for more than an hour, which bounds its marker. KV has no compare-and-set, so two requests presenting the same assertion at once in different locations can both succeed.
 
 ## Security Considerations
 

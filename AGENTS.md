@@ -40,6 +40,7 @@ workers-oauth-provider/
 │   ├── oauth-http.ts          # CORS and scope helpers shared by both hosts
 │   ├── oauth-error.ts         # OAuthError: what callbacks and validators throw
 │   ├── oauth-consent.ts       # Consent and upstream sign-in transactions (MCP confused-deputy MUSTs)
+│   ├── client-assertion.ts    # private_key_jwt client assertions for CIMD clients (reuses src/ema/)
 │   └── ema/                   # Enterprise-Managed Authorization pipeline
 ├── tests/
 │   ├── oauth-provider.test.ts # Comprehensive provider integration suite

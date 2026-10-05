@@ -91,6 +91,7 @@ describe('OAuth server capabilities', () => {
       })
     ).toEqual({
       tokenEndpointAuthMethod: 'none',
+      tokenEndpointAuthMethods: ['none'],
       grantTypes: ['authorization_code', 'refresh_token'],
       responseTypes: ['code'],
     });
@@ -105,6 +106,7 @@ describe('OAuth server capabilities', () => {
       })
     ).toEqual({
       tokenEndpointAuthMethod: 'none',
+      tokenEndpointAuthMethods: ['none'],
       grantTypes: [],
       responseTypes: [],
     });
@@ -125,6 +127,7 @@ describe('OAuth server capabilities', () => {
       })
     ).toEqual({
       tokenEndpointAuthMethod: 'none',
+      tokenEndpointAuthMethods: ['none'],
       grantTypes: ['authorization_code', 'refresh_token', 'urn:ietf:params:oauth:grant-type:jwt-bearer'],
       responseTypes: ['code'],
     });
@@ -142,13 +145,20 @@ describe('OAuth server capabilities', () => {
 });
 
 describe('CIMD token endpoint authentication negotiation', () => {
+  function negotiate(preferred?: string, choices?: string[], privateKeyJwt = false) {
+    return negotiateCimdClientCapabilities(
+      defaults,
+      {
+        grantTypes: ['authorization_code'],
+        responseTypes: ['code'],
+        tokenEndpointAuthMethod: preferred,
+        tokenEndpointAuthMethodsSupported: choices,
+      },
+      { privateKeyJwt }
+    );
+  }
   function negotiateAuthMethod(preferred?: string, choices?: string[]): string {
-    return negotiateCimdClientCapabilities(defaults, {
-      grantTypes: ['authorization_code'],
-      responseTypes: ['code'],
-      tokenEndpointAuthMethod: preferred,
-      tokenEndpointAuthMethodsSupported: choices,
-    }).tokenEndpointAuthMethod;
+    return negotiate(preferred, choices).tokenEndpointAuthMethod;
   }
 
   it.each([
@@ -168,6 +178,27 @@ describe('CIMD token endpoint authentication negotiation', () => {
     expect(() => negotiateAuthMethod(preferred, choices)).toThrow(
       'CIMD client does not support an accepted token endpoint authentication method'
     );
+  });
+
+  it.each([
+    ['a sole private_key_jwt preference', 'private_key_jwt', undefined, ['private_key_jwt']],
+    ['a sole private_key_jwt choice', undefined, ['private_key_jwt'], ['private_key_jwt']],
+    // ChatGPT's document: either method may arrive, and `none` is recorded so PKCE stays required.
+    [
+      'both methods, preferring private_key_jwt',
+      'private_key_jwt',
+      ['none', 'private_key_jwt'],
+      ['none', 'private_key_jwt'],
+    ],
+  ])('accepts %s once the document supplies usable keys', (_label, preferred, choices, methods) => {
+    expect(negotiate(preferred, choices, true)).toMatchObject({
+      tokenEndpointAuthMethod: methods[0],
+      tokenEndpointAuthMethods: methods,
+    });
+  });
+
+  it('keeps a none-only client on none even when keys are usable', () => {
+    expect(negotiate('none', undefined, true).tokenEndpointAuthMethods).toEqual(['none']);
   });
 
   it('rejects symmetric secret methods', () => {
