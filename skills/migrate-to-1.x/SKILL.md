@@ -1,11 +1,11 @@
 ---
-name: workers-oauth-provider-migrate-1.0
+name: workers-oauth-provider-migrate-1.x
 description: Upgrade a Cloudflare Worker's @cloudflare/workers-oauth-provider from 0.x, 1.0 or 1.1 to the latest 1.x. Use when bumping that dependency, or when OAuthProvider / OAuthAuthorizationServer / OAuthResourceServer construction throws after an upgrade.
 ---
 
 # Upgrade @cloudflare/workers-oauth-provider to the latest 1.x
 
-Reference (read the section for every hit): `node_modules/@cloudflare/workers-oauth-provider/docs/migration-1.0.md`.
+Reference (read the section for every hit): `node_modules/@cloudflare/workers-oauth-provider/docs/migration-1.x.md`.
 Types and JSDoc: `node_modules/@cloudflare/workers-oauth-provider/dist/oauth-provider.d.ts`.
 No KV migration exists or is needed; never edit stored data. Existing sessions survive only if the configured resource equals the `resource` stored on existing grants. A mismatch signs every user out at deploy; see "Existing grants decide the resource" below.
 

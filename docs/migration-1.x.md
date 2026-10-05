@@ -2,7 +2,7 @@
 
 This guide takes a Worker from 0.10.x, 1.0 or 1.1 to the latest 1.x release. Each change is tagged with the version that introduced it, so skip the ones older than the version you're on. There is no KV migration, and stored grants, tokens and clients keep working, provided the resource you configure is the one your existing grants are bound to. Read [Match the resource your existing grants carry](#match-the-resource-your-existing-grants-carry-10) before you deploy: getting it wrong signs every user out.
 
-Coding agents can follow [`skills/migrate-to-1.0/SKILL.md`](../skills/migrate-to-1.0/SKILL.md), which ships in the npm package and points back at the sections below.
+Coding agents can follow [`skills/migrate-to-1.x/SKILL.md`](../skills/migrate-to-1.x/SKILL.md), which ships in the npm package and points back at the sections below.
 
 ## Am I affected?
 
