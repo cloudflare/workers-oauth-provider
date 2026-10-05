@@ -1,29 +1,29 @@
 # Migrating to 1.x
 
-This guide takes a Worker from 0.10.x, 1.0 or 1.1 to the latest 1.x release. Each change is tagged with the version that introduced it, so skip the ones older than the version you're on. Stored grants, tokens and clients keep working throughout: there is no KV migration.
+This guide takes a Worker from 0.10.x, 1.0 or 1.1 to the latest 1.x release. Each change is tagged with the version that introduced it, so skip the ones older than the version you're on. There is no KV migration, and stored grants, tokens and clients keep working, provided the resource you configure is the one your existing grants are bound to. Read [Match the resource your existing grants carry](#match-the-resource-your-existing-grants-carry-10) before you deploy: getting it wrong signs every user out.
 
-Coding agents can follow [`skills/migrate-to-1.0/SKILL.md`](../skills/migrate-to-1.0/SKILL.md), which ships in the npm package and points back at the sections below.
+Coding agents can follow [`skills/migrate-to-1.x/SKILL.md`](../skills/migrate-to-1.x/SKILL.md), which ships in the npm package and points back at the sections below.
 
 ## Am I affected?
 
 Search your code for each of these. Anything you don't use needs no change.
 
-| You use                                                                                                                              | Since | Change                                                                                      |
-| ------------------------------------------------------------------------------------------------------------------------------------ | ----- | ------------------------------------------------------------------------------------------- |
-| `new OAuthProvider(` without `resourceMetadata`                                                                                      | 1.0   | [Add the canonical resource](#the-canonical-resource-is-required-10)                        |
-| `resourceMatchOriginOnly`                                                                                                            | 1.0   | [Delete it](#removed-resourcematchoriginonly-10)                                            |
-| `resolveExternalToken`                                                                                                               | 1.0   | [Return `audience`](#resolveexternaltoken-names-its-audience-10)                            |
-| `resourceMetadata.scopes_supported`                                                                                                  | 1.2   | [Move it to `requiredScopes`](#requiredscopes-replaces-resourcemetadatascopes_supported-12) |
-| `allowImplicitFlow` or `allowPlainPKCE`                                                                                              | 1.2   | [Delete them](#removed-the-implicit-grant-and-plain-pkce-12)                                |
-| Clients with remote `http` or `com.example.app:/` redirect URIs                                                                      | 1.2   | [Redirect URI policy](#redirect-uris-must-be-https-or-loopback-http-12)                     |
-| `clientRegistrationTTL: 0`, or any lifetime under 60 seconds                                                                         | 1.2   | [Lifetimes are validated](#lifetimes-are-validated-at-construction-12)                      |
-| User IDs containing `:`                                                                                                              | 1.2   | [Encode them](#user-ids-cannot-contain--12)                                                 |
-| `revokeExistingGrantsBatchSize`                                                                                                      | 1.2   | [Delete it](#removed-revokeexistinggrantsbatchsize-12)                                      |
-| `resourceMatches`, `validateResourceUri`, `isValidOAuthScopeToken`, `base64UrlToBytes`, `parseJwtJsonPart`, `getJwtCryptoAlgorithms` | 1.2   | [No longer exported](#internal-helpers-are-no-longer-exported-12)                           |
-| `createClient()` or `updateClient()`                                                                                                 | 1.2   | [Client helpers validate](#client-helpers-validate-what-they-store-12)                      |
-| `tokenExchangeCallback`                                                                                                              | 1.1   | [It can revoke grants, and lifetimes changed](#tokenexchangecallback-11-12)                 |
-| `purgeExpiredData()` on a schedule                                                                                                   | 1.2   | [Persist the cursor](#purgeexpireddata-resumes-from-a-cursor-12)                            |
-| `OAuthAuthorizationServer` (1.0 or 1.1)                                                                                              | 1.2   | [Endpoints have defaults](#oauthauthorizationserver-endpoints-have-defaults-12)             |
+| You use                                                                                                                              | Since | Change                                                                                                                                              |
+| ------------------------------------------------------------------------------------------------------------------------------------ | ----- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `new OAuthProvider(` without `resourceMetadata`                                                                                      | 1.0   | [Add the canonical resource](#the-canonical-resource-is-required-10), [matching existing grants](#match-the-resource-your-existing-grants-carry-10) |
+| `resourceMatchOriginOnly`                                                                                                            | 1.0   | [Delete it](#removed-resourcematchoriginonly-10), [then match existing grants](#match-the-resource-your-existing-grants-carry-10)                   |
+| `resolveExternalToken`                                                                                                               | 1.0   | [Return `audience`](#resolveexternaltoken-names-its-audience-10)                                                                                    |
+| `resourceMetadata.scopes_supported`                                                                                                  | 1.2   | [Move it to `requiredScopes`](#requiredscopes-replaces-resourcemetadatascopes_supported-12)                                                         |
+| `allowImplicitFlow` or `allowPlainPKCE`                                                                                              | 1.2   | [Delete them](#removed-the-implicit-grant-and-plain-pkce-12)                                                                                        |
+| Clients with remote `http` or `com.example.app:/` redirect URIs                                                                      | 1.2   | [Redirect URI policy](#redirect-uris-must-be-https-or-loopback-http-12)                                                                             |
+| `clientRegistrationTTL: 0`, or any lifetime under 60 seconds                                                                         | 1.2   | [Lifetimes are validated](#lifetimes-are-validated-at-construction-12)                                                                              |
+| User IDs containing `:`                                                                                                              | 1.2   | [Encode them](#user-ids-cannot-contain--12)                                                                                                         |
+| `revokeExistingGrantsBatchSize`                                                                                                      | 1.2   | [Delete it](#removed-revokeexistinggrantsbatchsize-12)                                                                                              |
+| `resourceMatches`, `validateResourceUri`, `isValidOAuthScopeToken`, `base64UrlToBytes`, `parseJwtJsonPart`, `getJwtCryptoAlgorithms` | 1.2   | [No longer exported](#internal-helpers-are-no-longer-exported-12)                                                                                   |
+| `createClient()` or `updateClient()`                                                                                                 | 1.2   | [Client helpers validate](#client-helpers-validate-what-they-store-12)                                                                              |
+| `tokenExchangeCallback`                                                                                                              | 1.1   | [It can revoke grants, and lifetimes changed](#tokenexchangecallback-11-12)                                                                         |
+| `purgeExpiredData()` on a schedule                                                                                                   | 1.2   | [Persist the cursor](#purgeexpireddata-resumes-from-a-cursor-12)                                                                                    |
+| `OAuthAuthorizationServer` (1.0 or 1.1)                                                                                              | 1.2   | [Endpoints have defaults](#oauthauthorizationserver-endpoints-have-defaults-12)                                                                     |
 
 Construction errors name the rule that failed, so a Worker that starts and passes its tests has cleared most of these. The redirect URI policy and the user ID rule act on stored data and live requests instead: check those by hand.
 
@@ -49,11 +49,51 @@ Construction validates the rest of the configuration against it:
 - Every `apiRoute` and `apiHandlers` key must be the resource's path or a path-boundary descendant: `/mcp` covers `/mcp` and `/mcp/tools`, not `/mcp-other`. Absolute routes must be on the resource's origin.
 - The resource must not sit inside `/.well-known/oauth-protected-resource`.
 
-In 0.x the metadata document was derived per request when `resourceMetadata` was omitted. In 1.x the resource is the identity every token is bound to, so it can't be implicit.
+In 0.x the metadata document was derived per request when `resourceMetadata` was omitted. In 1.x the resource is the identity every token is bound to, so it can't be implicit. Upgrading from 0.x, the value isn't a free choice: it must be the one your users' grants already carry.
+
+### Match the resource your existing grants carry (1.0)
+
+Every grant and access token stores the `resource` the client sent when the user signed in, and the client sends that same value again on every refresh. 1.x compares both against the configured resource exactly. Configure a different value, even one that covers the same paths, and every existing session breaks at once:
+
+| Request from an existing session               | Response                                                                                                                       |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| An API call with its current access token      | `401 invalid_token`, internal reason `token_audience_unbound`                                                                  |
+| A refresh that sends `resource` (most clients) | `400 invalid_target`, "The resource parameter must name exactly one configured protected resource" (`resource_not_configured`) |
+| A refresh without `resource`                   | `400 invalid_grant`, "The authorization grant is not bound to a configured resource" (`grant_audience_unbound`)                |
+
+Clients that treat `invalid_target` as temporary retry it forever. Users recover only by signing out and authorizing again. The library won't widen or rewrite a stored resource to match, because RFC 8707 audiences are compared exactly, so the configuration has to match the data.
+
+**What your grants carry.** Without `resourceMetadata.resource`, 0.x derived the resource from the metadata URL the client fetched, and its `401` challenge pointed each client at the metadata for the path it called. A client connecting to `https://mcp.example.com/mcp` was told `resource: "https://mcp.example.com/mcp"` and bound its grant to that. Only clients that fetched `/.well-known/oauth-protected-resource` at the root got the bare origin. `resourceMatchOriginOnly: true` changed how audiences were compared, not what was stored, so those grants carry the path too.
+
+**Check before you deploy.** On the running 0.x deployment, for every API route:
+
+```sh
+curl -si https://mcp.example.com/mcp | grep -i www-authenticate     # note resource_metadata="…"
+curl -s https://mcp.example.com/.well-known/oauth-protected-resource/mcp | jq -r .resource
+```
+
+Then look at real grants. The `resource` field is stored in plain text:
+
+```sh
+npx wrangler kv key list --binding OAUTH_KV --remote --prefix grant: | jq -r '.[0:20][].name' |
+  while read -r key; do npx wrangler kv key get --binding OAUTH_KV --remote "$key" | jq -r .resource; done | sort | uniq -c
+```
+
+Configure exactly the value the grants show, including the path, with no added or dropped trailing slash. A Worker served on several hostnames can build the provider per request with `` `${new URL(request.url).origin}/mcp` ``, as long as the result equals what that hostname advertised before. Grants with no `resource` at all, from clients that never sent one, are fine: they bind to the configured resource on their next refresh ([below](#existing-stored-data-nothing-to-do)).
+
+**When the grants carry more than one value.** A Worker that served `/mcp` and `/sse` in 0.x advertised a different resource on each, so its grants hold both. One `OAuthProvider` resource can't match both: `https://mcp.example.com/mcp` doesn't cover the `/sse` route, so construction refuses it, and the bare origin covers both routes but matches neither kind of grant. Pick one:
+
+- **Drop the second endpoint.** MCP deprecated the HTTP+SSE transport, so if `/sse` sees little traffic, remove the route and configure `https://mcp.example.com/mcp`. Sessions on `/mcp` keep working, and those on `/sse` sign in again.
+- **Declare each resource.** An [`OAuthAuthorizationServer`](resource-servers.md) lists `resources: ['https://mcp.example.com/mcp', 'https://mcp.example.com/sse']`, and each route is hosted by an `OAuthResourceServer` for its own resource. This reproduces what 0.x advertised, so sessions bound to either path keep working. Set `legacyGrantResource` too, so grants with no stored resource have a destination ([below](#existing-stored-data-nothing-to-do)). It is more code: you own the routing.
+- **Accept one sign-in.** Configure the resource you want, tell your users, and make sure your clients start a new authorization on `invalid_target` or `invalid_grant` from a refresh rather than retrying.
+
+**Before switching production**, deploy the upgrade to staging with a copy of real sessions, or keep one session from the 0.x deployment, and confirm that a refresh and an API call both succeed. The responses in the table above are what a mismatch looks like, and `onError` reports their internal reasons.
 
 ### Removed: `resourceMatchOriginOnly` (1.0)
 
 Delete the option. A configuration that still sets it throws `resourceMatchOriginOnly was removed in 1.0`. Audiences are compared exactly against the canonical resource, with two tolerances: ASCII case in the scheme and host is folded, and an empty path equals `/` (RFC 3986 §6.2.3). Port, path, query and trailing slash stay strict.
+
+Don't replace it with `resource: <origin>`. Origin-only matching hid that grants were stored with the path the client connected to, such as `https://mcp.example.com/mcp`, and an origin resource matches none of them. Configure the resource those grants carry: see [Match the resource your existing grants carry](#match-the-resource-your-existing-grants-carry-10).
 
 ### `resolveExternalToken` names its audience (1.0)
 
@@ -256,10 +296,12 @@ You still route the authorization endpoint yourself, before `authorizationServer
 
 ## Existing stored data: nothing to do
 
+This holds once the configured resource matches what your grants carry ([above](#match-the-resource-your-existing-grants-carry-10)).
+
 - An access token stored without an audience keeps working until it expires. It's treated as bound to the migration resource: the sole configured resource, or `legacyGrantResource` on a multi-resource server.
 - Refresh binds the grant to that resource and returns a bound replacement token.
 - A stored 0.x audience array resolves to the registered resource it contains.
-- A grant bound only to unregistered values fails refresh with `invalid_grant`; conformant clients (Claude, the MCP SDKs) answer by starting a fresh authorization.
+- A grant bound to a resource you didn't configure fails refresh. A refresh that names that resource gets `invalid_target`, and one without `resource` gets `invalid_grant`. Conformant clients (Claude, the MCP SDKs) answer `invalid_grant` by starting a fresh authorization, but some clients retry `invalid_target`. If your grants are bound to a resource, configure exactly that one: see [Match the resource your existing grants carry](#match-the-resource-your-existing-grants-carry-10).
 - A multi-resource `OAuthAuthorizationServer` without `legacyGrantResource` has no safe destination for unbound records and rejects them. Set it for the migration window and keep it fixed.
 - Authorization codes issued by 0.x redeem under the same rules, except plain-PKCE ones ([above](#removed-the-implicit-grant-and-plain-pkce-12)).
 - Grants written before 1.0 have no KV key metadata; each refresh adds it.
