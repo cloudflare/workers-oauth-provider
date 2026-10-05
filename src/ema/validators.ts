@@ -66,9 +66,11 @@ interface ResolveTrustedIssuerInput<Env> {
  * validate the returned configuration before signature verification ever
  * runs against it.
  *
- * Every failure here collapses to `issuer_not_trusted` so an attacker
+ * Every trust failure here collapses to `issuer_not_trusted` so an attacker
  * cannot distinguish "unknown IdP" from "resolver returned a malformed
- * config" from "alg not in the IdP's allowlist".
+ * config". An `alg` outside the issuer's allowlist is reported as
+ * `invalid_alg` so the deployer can see it in `onError`; both reach the
+ * client as the same generic `invalid_grant` "Invalid assertion".
  *
  * The resolver's returned `issuer` field MUST equal the input `iss`.
  * Otherwise a buggy resolver could be tricked into returning a config
@@ -109,7 +111,7 @@ export async function resolveTrustedIssuer<Env>(
 
   const allowedAlgorithms = resolved.algorithms ?? [EMA_DEFAULT_JWT_ALGORITHM];
   if (!allowedAlgorithms.includes(alg)) {
-    return err({ reason: 'issuer_not_trusted', iss });
+    return err({ reason: 'invalid_alg', got: alg });
   }
 
   return ok(resolved);

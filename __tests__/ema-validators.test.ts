@@ -163,9 +163,23 @@ describe('resolveTrustedIssuer', () => {
     expect(r).toMatchObject({ ok: false, error: { reason: 'issuer_not_trusted' } });
   });
 
-  it('rejects when alg is not in the resolved issuer allowlist', async () => {
+  it('reports invalid_alg when alg is not in the resolved issuer allowlist', async () => {
     const r = await resolveTrustedIssuer({ iss: 'https://idp1.example.com', alg: 'ES256', resolver, ...ctx });
-    expect(r).toMatchObject({ ok: false, error: { reason: 'issuer_not_trusted' } });
+    expect(r).toMatchObject({ ok: false, error: { reason: 'invalid_alg', got: 'ES256' } });
+  });
+
+  it('allows only RS256 when the resolved issuer omits algorithms', async () => {
+    const defaultAlgResolver = async () => ({
+      issuer: 'https://idp1.example.com',
+      jwksUri: 'https://idp1.example.com/jwks.json',
+    });
+    const r = await resolveTrustedIssuer({
+      iss: 'https://idp1.example.com',
+      alg: 'ES256',
+      resolver: defaultAlgResolver,
+      ...ctx,
+    });
+    expect(r).toMatchObject({ ok: false, error: { reason: 'invalid_alg', got: 'ES256' } });
   });
 
   it('returns the matching issuer when alg is allowed', async () => {
