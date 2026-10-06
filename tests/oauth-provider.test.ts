@@ -2683,6 +2683,91 @@ describe('OAuthProvider', () => {
       }
     );
 
+    // RFC 6749 §3.2: "Parameters sent without a value MUST be treated as if they were omitted."
+    async function requestTokenWithForm(form: Record<string, string>, headers: Record<string, string> = {}) {
+      return oauthProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded', ...headers },
+          new URLSearchParams(form).toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+    }
+
+    it.each([
+      ['an empty client_secret', { client_secret: '' }],
+      ['empty client assertion parameters', { client_assertion: '', client_assertion_type: '' }],
+    ])('treats %s from a public client as omitted', async (_label, extra) => {
+      const client = await registerTestClient('none');
+      const response = await requestTokenWithForm({
+        grant_type: 'authorization_code',
+        code: 'invalid-authorization-code',
+        client_id: client.clientId,
+        ...extra,
+      });
+
+      // Client authentication passed as `none`; only the bogus code fails.
+      expect(response.status).toBe(400);
+      expect(await response.json<any>()).toMatchObject({ error: 'invalid_grant' });
+    });
+
+    it('still refuses a public client that sends a non-empty client_secret', async () => {
+      const client = await registerTestClient('none');
+      const response = await requestTokenWithForm({
+        grant_type: 'authorization_code',
+        code: 'invalid-authorization-code',
+        client_id: client.clientId,
+        client_secret: 'not-a-secret-it-was-issued',
+      });
+
+      expect(response.status).toBe(401);
+      expect(await response.json<any>()).toMatchObject({ error: 'invalid_client' });
+    });
+
+    it('refuses a confidential client whose client_secret is empty, as if it sent none', async () => {
+      const client = await registerTestClient('client_secret_post');
+      const response = await requestTokenWithForm({
+        grant_type: 'authorization_code',
+        code: 'invalid-authorization-code',
+        client_id: client.clientId,
+        client_secret: '',
+      });
+
+      expect(response.status).toBe(401);
+      expect(await response.json<any>()).toEqual({
+        error: 'invalid_client',
+        error_description: 'Client authentication failed',
+      });
+    });
+
+    it.each(['client_id', 'client_secret'])(
+      'does not count an empty %s form parameter as a second method next to Basic',
+      async (parameter) => {
+        const client = await registerTestClient('client_secret_basic');
+        const response = await requestTokenWithForm(
+          { grant_type: 'authorization_code', code: 'invalid-authorization-code', [parameter]: '' },
+          { Authorization: `Basic ${btoa(`${client.clientId}:${client.clientSecret}`)}` }
+        );
+
+        expect(response.status).toBe(400);
+        expect(await response.json<any>()).toMatchObject({ error: 'invalid_grant' });
+      }
+    );
+
+    it('authenticates a public client revocation that sends an empty client_secret', async () => {
+      const client = await registerTestClient('none');
+      const response = await requestTokenWithForm({
+        token: 'unknown-token',
+        client_id: client.clientId,
+        client_secret: '',
+      });
+
+      expect(response.status).toBe(200);
+    });
+
     it.each([
       ['client_secret_basic', 'client_secret_post'],
       ['client_secret_post', 'client_secret_basic'],
@@ -3146,8 +3231,6 @@ describe('OAuthProvider', () => {
     });
 
     it.each([
-      ['client_id', ''],
-      ['client_secret', ''],
       ['client_id', 'form-client-id'],
       ['client_secret', 'form-client-secret'],
     ])('should reject Basic auth combined with a present %s form parameter', async (parameter, value) => {
