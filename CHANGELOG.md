@@ -1,5 +1,17 @@
 # @cloudflare/workers-oauth-provider
 
+## 1.2.2
+
+### Patch Changes
+
+- [#398](https://github.com/cloudflare/workers-oauth-provider/pull/398) [`f5cc398`](https://github.com/cloudflare/workers-oauth-provider/commit/f5cc398bce519dc513697be8b3c8561c5f260fa6) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Client ID Metadata Document clients can authenticate with `private_key_jwt` (RFC 7523). A document that offers only `private_key_jwt`, which was refused before, now works. The client publishes its keys in `jwks` or an `https:` `jwks_uri`, and signs each token and revocation request with an `RS256` or `ES256` client assertion. The assertion is checked for `iss`, `sub`, `aud`, `exp` (at most an hour away) and a single-use `jti`. A document that offers both `none` and `private_key_jwt`, as ChatGPT's does, keeps working with `none` and may use either method. With CIMD enabled, the authorization server metadata advertises `private_key_jwt` and `token_endpoint_auth_signing_alg_values_supported`.
+
+- [#402](https://github.com/cloudflare/workers-oauth-provider/pull/402) [`ec5ece9`](https://github.com/cloudflare/workers-oauth-provider/commit/ec5ece92cb5bcae8a33afe9125f36c9fc74d7b86) Thanks [@mattzcarey](https://github.com/mattzcarey)! - An ID-JAG whose `alg` is not in the trusted issuer's `algorithms` now fails with `invalid_alg` instead of `issuer_not_trusted`, so `onError` shows the real cause. `algorithms` defaults to `['RS256']`, so a resolver for an IdP that signs with `ES256` and leaves `algorithms` unset rejected every assertion as `issuer_not_trusted` even though the issuer was trusted. The client still gets the same `invalid_grant` "Invalid assertion".
+
+- [#405](https://github.com/cloudflare/workers-oauth-provider/pull/405) [`612c2f9`](https://github.com/cloudflare/workers-oauth-provider/commit/612c2f95702fa23b231ead17182f924da1ce2c25) Thanks [@mattzcarey](https://github.com/mattzcarey)! - An empty `client_id`, `client_secret`, `client_assertion` or `client_assertion_type` at the token endpoint is treated as omitted, as RFC 6749 §3.2 requires. A public client that sends `client_secret=` with no value now authenticates as `none` instead of failing with `invalid_client`, and an empty form parameter next to a Basic header no longer counts as a second authentication method. A non-empty secret or Basic credential on a `none` client is still refused.
+
+- [#395](https://github.com/cloudflare/workers-oauth-provider/pull/395) [`16572ac`](https://github.com/cloudflare/workers-oauth-provider/commit/16572acfa4f7d61ec0b085cfcd9f5d706bbfb7b5) Thanks [@mattzcarey](https://github.com/mattzcarey)! - The enterprise-managed authorization JWKS fetch and the Client ID Metadata Document fetch send `User-Agent: workers-oauth-provider/<version> (+https://github.com/cloudflare/workers-oauth-provider)`. Workers' `fetch` sends no `User-Agent`, and WAF rule sets such as AWS WAF's core rule set (`NoUserAgent_HEADER`) block requests without one, so an IdP behind CloudFront answered the JWKS fetch with `403` and every ID-JAG exchange from it failed with `jwks_fetch_failed`.
+
 ## 1.2.1
 
 ### Patch Changes
