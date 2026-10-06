@@ -1200,6 +1200,14 @@ function toPublicClientInfo(client: StoredClientInfo): ClientInfo {
   return publicClient;
 }
 
+/** Token endpoint parameters that carry client authentication (RFC 6749 §2.3, RFC 7521 §4.2). */
+const CLIENT_AUTHENTICATION_PARAMETERS = new Set([
+  'client_id',
+  'client_secret',
+  'client_assertion',
+  'client_assertion_type',
+]);
+
 function isClientAuthMethodAllowed(
   client: StoredClientInfo,
   presentedMethod: string,
@@ -2815,14 +2823,23 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       );
     }
     const processedKeys = new Set<string>();
-    for (const [key, value] of formData.entries()) {
+    for (const key of formData.keys()) {
       if (processedKeys.has(key)) {
         continue;
       }
       processedKeys.add(key);
 
+      // RFC 6749 §3.2 (and OAuth 2.1 §3.2): "Parameters sent without a value MUST be treated as
+      // if they were omitted from the request." Applied to the client-authentication parameters,
+      // so `client_secret=` from a public client is no credential at all and an empty value never
+      // counts as a second authentication method.
+      const allValues = CLIENT_AUTHENTICATION_PARAMETERS.has(key)
+        ? formData.getAll(key).filter((entry) => entry !== '')
+        : formData.getAll(key);
+      if (allValues.length === 0) {
+        continue;
+      }
       // RFC 8707: resource parameter can appear multiple times
-      const allValues = formData.getAll(key);
       if (key !== 'resource' && allValues.length > 1) {
         return this.createErrorResponse(
           'invalid_request',
@@ -2834,18 +2851,20 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         );
       }
 
-      body[key] = allValues.length > 1 ? allValues : value;
+      body[key] = allValues.length > 1 ? allValues : allValues[0];
     }
 
     // Get client credentials from HTTP Basic auth or form parameters.
     const basicAuthorization = parseBasicAuthorizationHeader(request.headers.get('Authorization'));
     const basicAuthenticationAttempted = basicAuthorization.kind !== 'not-basic';
-    const clientAssertionAttempted = formData.has('client_assertion') || formData.has('client_assertion_type');
+    // Presence is read from `body`, which holds only parameters sent with a value.
+    const sent = (name: string): boolean => body[name] !== undefined;
+    const clientAssertionAttempted = sent('client_assertion') || sent('client_assertion_type');
     let clientId = '';
     let clientSecret = '';
 
     if (basicAuthenticationAttempted) {
-      if (formData.has('client_id') || formData.has('client_secret') || clientAssertionAttempted) {
+      if (sent('client_id') || sent('client_secret') || clientAssertionAttempted) {
         return this.createErrorResponse(
           'invalid_request',
           {
@@ -2867,7 +2886,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       clientId = basicAuthorization.clientId;
       clientSecret = basicAuthorization.clientSecret;
     } else if (clientAssertionAttempted) {
-      if (formData.has('client_secret')) {
+      if (sent('client_secret')) {
         return this.createErrorResponse(
           'invalid_request',
           {
@@ -2877,7 +2896,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
           { category: 'client-authentication', reason: 'multiple_authentication_methods' }
         );
       }
-      if (!formData.has('client_assertion') || !formData.has('client_assertion_type')) {
+      if (!sent('client_assertion') || !sent('client_assertion_type')) {
         return this.createErrorResponse(
           'invalid_request',
           {
@@ -2933,13 +2952,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       });
     }
 
-    // RFC 7591 methods identify the credential transport. Check form-parameter
-    // presence rather than truthiness so an empty secret still counts as a POST attempt.
+    // RFC 7591 methods identify the credential transport. An empty `client_secret=` was dropped
+    // above as omitted (RFC 6749 §3.2), so a public client sending one presents `none`.
     const presentedAuthMethod = basicAuthenticationAttempted
       ? 'client_secret_basic'
       : clientAssertionAttempted
         ? 'private_key_jwt'
-        : formData.has('client_secret')
+        : sent('client_secret')
           ? 'client_secret_post'
           : 'none';
     const registeredAuthMethod = clientInfo.tokenEndpointAuthMethod;
