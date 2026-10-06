@@ -1,5 +1,15 @@
 # @cloudflare/workers-oauth-provider
 
+## 0.10.5
+
+### Patch Changes
+
+- [#403](https://github.com/cloudflare/workers-oauth-provider/pull/403) [`0a6bd3b`](https://github.com/cloudflare/workers-oauth-provider/commit/0a6bd3b78d8fdaea79ef8d9a3b601fcc13b5c0a6) Thanks [@mattzcarey](https://github.com/mattzcarey)! - An ID-JAG whose `alg` is not in the trusted issuer's `algorithms` now fails with `invalid_alg` instead of `issuer_not_trusted`, so `onError` shows the real cause. `algorithms` defaults to `['RS256']`, so a resolver for an IdP that signs with `ES256` and leaves `algorithms` unset rejected every assertion as `issuer_not_trusted` even though the issuer was trusted. The client still gets the same `invalid_grant` "Invalid assertion".
+
+- [#406](https://github.com/cloudflare/workers-oauth-provider/pull/406) [`4ff6b7e`](https://github.com/cloudflare/workers-oauth-provider/commit/4ff6b7e864f836ce88712d4acbf5fdbeaf234d97) Thanks [@mattzcarey](https://github.com/mattzcarey)! - An empty `client_id` or `client_secret` at the token endpoint is treated as omitted, as RFC 6749 §3.2 requires. A public client that sends `client_secret=` with no value now authenticates as `none` instead of failing with `invalid_client`, and an empty form parameter next to a Basic header no longer counts as a second authentication method. A non-empty secret or Basic credential on a `none` client is still refused.
+
+- [#396](https://github.com/cloudflare/workers-oauth-provider/pull/396) [`c9d03d3`](https://github.com/cloudflare/workers-oauth-provider/commit/c9d03d30926b3a937f8a9f815c4ff7a35e623ba8) Thanks [@mattzcarey](https://github.com/mattzcarey)! - The enterprise-managed authorization JWKS fetch and the Client ID Metadata Document fetch send `User-Agent: workers-oauth-provider/<version> (+https://github.com/cloudflare/workers-oauth-provider)`. Workers' `fetch` sends no `User-Agent`, and WAF rule sets such as AWS WAF's core rule set (`NoUserAgent_HEADER`) block requests without one, so an IdP behind CloudFront answered the JWKS fetch with `403` and every ID-JAG exchange from it failed with `jwks_fetch_failed`.
+
 ## 0.10.4
 
 ### Patch Changes
