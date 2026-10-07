@@ -61,6 +61,7 @@ import {
   hasAcceptedCanonicalScheme,
   isLoopbackHostname,
   requestCarriesResourceQuery,
+  findCoveringResource,
   resourceMatches,
   validateResourceUri,
 } from './oauth-resource';
@@ -5516,6 +5517,31 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       .find((configured) => isExactResource(singular, configured));
   }
 
+  /**
+   * Resolve a client-supplied RFC 8707 resource indicator to a configured resource.
+   *
+   * An exact match wins. Otherwise a request may name the URL it uses at the resource
+   * when that URL differs from a configured resource only by query parameters the
+   * configured resource does not constrain, such as `https://mcp.example.com/mcp?mode=x`
+   * for `https://mcp.example.com/mcp`. The resource server already treats that URL as
+   * covered by the resource (its 401 points at the resource's metadata, and the
+   * resource's tokens are accepted there), and RFC 8707 §2.2 lets the authorization
+   * server map a requested value to a more general resource. The audience stays the
+   * configured resource, so the token is no broader. See {@link findCoveringResource}.
+   * Only client requests use this; stored audiences and configuration stay exact.
+   */
+  findRequestedResource(value: string | string[] | undefined): string | undefined {
+    const exact = this.findConfiguredResource(value);
+    if (exact) return exact;
+    const distinct = Array.isArray(value) ? [...new Set(value)] : [value];
+    const singular = distinct.length === 1 ? distinct[0] : undefined;
+    if (typeof singular !== 'string' || !validateResourceUri(singular)) return undefined;
+    return findCoveringResource(
+      singular,
+      this.resourceServers.map((server) => server.resourceMetadata.resource)
+    );
+  }
+
   /** Select the audience for a new interactive authorization. */
   resolveAuthorizationRequestResource(requestedResource: string | string[] | undefined): string {
     if (requestedResource === undefined) {
@@ -5525,7 +5551,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         description: 'The resource parameter is required when the authorization server has multiple resources',
       });
     }
-    const configured = this.findConfiguredResource(requestedResource);
+    const configured = this.findRequestedResource(requestedResource);
     if (!configured) {
       throw new AuthorizationError('invalid_target', {
         description: 'The resource parameter must name exactly one configured protected resource',
@@ -5558,7 +5584,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   /** Validate explicit resource syntax and configured-resource policy. */
   private validateTokenRequestResourceIndicator(requestedResource: string | string[] | undefined): void {
     if (requestedResource === undefined) return;
-    if (!this.findConfiguredResource(requestedResource)) {
+    if (!this.findRequestedResource(requestedResource)) {
       throw new OAuthError('invalid_target', {
         description: 'The resource parameter must name exactly one configured protected resource',
         internal: { category: 'resource-indicator', reason: 'resource_not_configured' },
@@ -5580,7 +5606,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     const resourceWasProvided = requestedResource !== undefined;
-    const requestedAudience = resourceWasProvided ? this.findConfiguredResource(requestedResource) : undefined;
+    const requestedAudience = resourceWasProvided ? this.findRequestedResource(requestedResource) : undefined;
     if (resourceWasProvided && (!requestedAudience || requestedAudience !== subjectAudience)) {
       throw new OAuthError('invalid_target', {
         description: 'The requested resource must exactly match the subject token audience',
@@ -5605,7 +5631,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const resourceWasProvided = requestedResource !== undefined;
     const grantResourceWasStored = grantedResource !== undefined;
     const canonicalGrantResource = this.findStoredConfiguredResource(grantedResource);
-    const canonicalRequestedResource = resourceWasProvided ? this.findConfiguredResource(requestedResource) : undefined;
+    const canonicalRequestedResource = resourceWasProvided ? this.findRequestedResource(requestedResource) : undefined;
 
     if (grantResourceWasStored && !canonicalGrantResource) {
       // A grant defect, not a request defect: `invalid_grant` makes conformant clients
