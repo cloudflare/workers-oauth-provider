@@ -116,3 +116,33 @@ export function requestCarriesResourceQuery(requestUrl: URL, resourceUrl: URL): 
   }
   return true;
 }
+
+/**
+ * The configured resource a client-supplied resource indicator names when it is
+ * not an exact match: one with the same origin and path whose query parameters
+ * the indicator carries, as a request URL the resource covers would. With
+ * several such resources, the one with the most query parameters wins and a tie
+ * names none. A value without a query never matches here.
+ */
+export function findCoveringResource(requested: string, configured: readonly string[]): string | undefined {
+  let url: URL;
+  try {
+    url = new URL(requested);
+  } catch {
+    return undefined;
+  }
+  if (url.search === '') return undefined;
+  const covering = configured
+    .map((resource) => ({ resource, url: new URL(resource) }))
+    .filter(
+      (candidate) =>
+        candidate.url.origin === url.origin &&
+        (candidate.url.pathname || '/') === (url.pathname || '/') &&
+        requestCarriesResourceQuery(url, candidate.url)
+    )
+    .map(({ resource, url }) => ({ resource, specificity: [...url.searchParams].length }))
+    .sort((a, b) => b.specificity - a.specificity);
+  if (covering.length === 0) return undefined;
+  if (covering.length > 1 && covering[0].specificity === covering[1].specificity) return undefined;
+  return covering[0].resource;
+}

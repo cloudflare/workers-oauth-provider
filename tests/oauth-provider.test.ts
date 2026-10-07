@@ -7714,7 +7714,7 @@ describe('OAuthProvider', () => {
     it.each([
       ['path case', 'https://example.com/API'],
       ['trailing slash', 'https://example.com/api/'],
-      ['query', 'https://example.com/api?tenant=a'],
+      ['path with a query', 'https://example.com/api/other?tenant=a'],
       ['explicit default port', 'https://example.com:443/api'],
       ['different port', 'https://example.com:8443/api'],
       ['different host', 'https://other.example.com/api'],
@@ -7726,6 +7726,46 @@ describe('OAuthProvider', () => {
         code: 'invalid_target',
       });
       expect((await mockEnv.OAUTH_KV.list({ prefix: 'grant:' })).keys).toHaveLength(0);
+    });
+
+    it('accepts the resource URL with a query the resource does not constrain and returns the configured resource', async () => {
+      // MCP clients send the URL they were configured with, e.g. /mcp?codemode=false. The
+      // resource covers that URL, so the authorization server maps it to the resource.
+      const provider = createProvider();
+      const client = await registerClient(provider);
+      const queryVariant = `${configuredResource}?mode=direct&format=json`;
+
+      const tokens = await issueTokens(provider, client, [queryVariant], queryVariant);
+      expect(tokens.resource).toBe(configuredResource);
+      await expect(getOnlyGrant()).resolves.toMatchObject({ grant: { resource: configuredResource } });
+
+      const refreshed = await refresh(provider, client, tokens.refresh_token, queryVariant);
+      expect(refreshed.status).toBe(200);
+      await expect(refreshed.json()).resolves.toMatchObject({ resource: configuredResource });
+
+      const api = await provider.fetch(
+        createMockRequest(`${configuredResource}/?mode=direct`, 'GET', {
+          Authorization: `Bearer ${tokens.access_token}`,
+        }),
+        mockEnv,
+        mockCtx
+      );
+      expect(api.status).toBe(200);
+    });
+
+    it('keeps a query-bearing configured resource specific', async () => {
+      const scoped = 'https://example.com/api?tenant=a';
+      const provider = createProvider({ resourceMetadata: { resource: scoped } });
+      const client = await registerClient(provider);
+
+      const tokens = await issueTokens(provider, client, [`${scoped}&mode=direct`]);
+      expect(tokens.resource).toBe(scoped);
+
+      for (const resource of ['https://example.com/api?tenant=b', 'https://example.com/api?mode=direct']) {
+        await expect(authorize(provider, client.client_id, [resource])).rejects.toMatchObject({
+          code: 'invalid_target',
+        });
+      }
     });
 
     it('rejects malformed, mismatched, and multi-valued authorization resources before storage', async () => {
