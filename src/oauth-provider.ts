@@ -2973,23 +2973,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
           ? 'client_secret_post'
           : 'none';
     const registeredAuthMethod = clientInfo.tokenEndpointAuthMethod;
-
-    // Normalize: if a public client was allowed through backward compat despite
-    // presenting a credential, treat it as 'none' for downstream validation so
-    // secret verification is skipped (the server never issued a secret).
-    if (
-      registeredAuthMethod === 'none' &&
-      presentedAuthMethod !== 'none' &&
-      clientInfo.authMethodExplicit === undefined
-    ) {
-      presentedAuthMethod = 'none';
-    }
+    const isCimdClient = !!this.options.clientIdMetadataDocumentEnabled && isClientIdMetadataDocumentUrl(clientInfo.clientId);
 
     if (
       !isClientAuthMethodAllowed(
         clientInfo,
         presentedAuthMethod,
-        !!this.options.clientIdMetadataDocumentEnabled && isClientIdMetadataDocumentUrl(clientInfo.clientId)
+        isCimdClient
       )
     ) {
       return this.createInvalidClientResponse('Client authentication failed', basicAuthenticationAttempted, {
@@ -3001,6 +2991,19 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
           presentedMethod: presentedAuthMethod,
         },
       });
+    }
+
+    // Normalize: for stored public clients (non-CIMD, no explicit auth-method provenance)
+    // that were allowed through backward compat despite presenting a spurious credential,
+    // treat them as 'none' so secret verification is skipped (the server never issued one).
+    // CIMD clients are excluded to preserve private_key_jwt assertion verification.
+    if (
+      !isCimdClient &&
+      registeredAuthMethod === 'none' &&
+      presentedAuthMethod !== 'none' &&
+      clientInfo.authMethodExplicit === undefined
+    ) {
+      presentedAuthMethod = 'none';
     }
 
     if (presentedAuthMethod === 'private_key_jwt') {
