@@ -16538,3 +16538,138 @@ describe('user IDs cannot contain ":"', () => {
     expect(firstPage.items.map((grant) => grant.userId)).toEqual(['a']);
   });
 });
+
+describe('discovery for clients that read only the root document', () => {
+  const resource = 'https://example.com/mcp';
+  const pathMetadataUrl = 'https://example.com/.well-known/oauth-protected-resource/mcp';
+  const rootMetadataUrl = 'https://example.com/.well-known/oauth-protected-resource';
+  let env: TestEnv;
+  let ctx: MockExecutionContext;
+
+  beforeEach(() => {
+    env = createMockEnv();
+    ctx = new MockExecutionContext();
+  });
+
+  afterEach(() => {
+    env.OAUTH_KV.clear();
+    vi.restoreAllMocks();
+  });
+
+  function createProvider(options: Partial<TestProviderOptions<TestEnv>> = {}) {
+    return new OAuthProvider<TestEnv>({
+      apiRoute: '/mcp',
+      apiHandler: {
+        fetch(_request: Request, _env: TestEnv, executionContext: ExecutionContext) {
+          return Response.json({ props: (executionContext as MockExecutionContext).props });
+        },
+      },
+      defaultHandler: testDefaultHandler,
+      authorizeEndpoint: '/authorize',
+      tokenEndpoint: '/oauth/token',
+      clientRegistrationEndpoint: '/oauth/register',
+      scopesSupported: ['read'],
+      requiredScopes: ['read'],
+      resourceMetadata: { resource, resource_name: 'Example MCP' },
+      ...options,
+    });
+  }
+
+  describe('serveResourceMetadataAtRoot', () => {
+    it('is off by default: a path resource has no root document', async () => {
+      const response = await createProvider().fetch(createMockRequest(rootMetadataUrl), env, ctx);
+      expect(response.status).toBe(404);
+    });
+
+    it('serves the path resource document at the root too, naming the configured resource', async () => {
+      const provider = createProvider({ serveResourceMetadataAtRoot: true });
+      const expected = {
+        resource,
+        authorization_servers: ['https://example.com'],
+        scopes_supported: ['read'],
+        bearer_methods_supported: ['header'],
+        resource_name: 'Example MCP',
+      };
+
+      const root = await provider.fetch(createMockRequest(rootMetadataUrl), env, ctx);
+      expect(root.status).toBe(200);
+      await expect(root.json()).resolves.toEqual(expected);
+
+      // The RFC 9728 §3 document is unchanged, and it is still what the challenge names.
+      const path = await provider.fetch(createMockRequest(pathMetadataUrl), env, ctx);
+      await expect(path.json()).resolves.toEqual(expected);
+      const challenge = await provider.fetch(createMockRequest(resource), env, ctx);
+      expect(challenge.headers.get('WWW-Authenticate')).toBe(
+        `Bearer realm="OAuth", resource_metadata="${pathMetadataUrl}", scope="read"`
+      );
+    });
+
+    it('answers HEAD, OPTIONS, a cache-busting query and other methods at the root like the path document', async () => {
+      const provider = createProvider({ serveResourceMetadataAtRoot: true });
+
+      const head = await provider.fetch(createMockRequest(rootMetadataUrl, 'HEAD'), env, ctx);
+      expect(head.status).toBe(200);
+      expect(await head.text()).toBe('');
+
+      const cacheBusted = await provider.fetch(createMockRequest(`${rootMetadataUrl}?v=2`), env, ctx);
+      await expect(cacheBusted.json()).resolves.toMatchObject({ resource });
+
+      const preflight = await provider.fetch(
+        createMockRequest(rootMetadataUrl, 'OPTIONS', { Origin: 'https://client.example.com' }),
+        env,
+        ctx
+      );
+      expect(preflight.status).toBe(204);
+      expect(preflight.headers.get('Access-Control-Allow-Origin')).toBe('https://client.example.com');
+
+      const put = await provider.fetch(createMockRequest(rootMetadataUrl, 'PUT'), env, ctx);
+      expect(put.status).toBe(405);
+      expect(put.headers.get('Allow')).toBe('GET, HEAD, OPTIONS');
+    });
+
+    it('serves the root only on the resource origin, and no other alias', async () => {
+      const provider = createProvider({ serveResourceMetadataAtRoot: true });
+      for (const alias of [
+        'https://other.example.com/.well-known/oauth-protected-resource',
+        'https://example.com/.well-known/oauth-protected-resource/other',
+        'https://example.com/.well-known/oauth-protected-resource/',
+      ]) {
+        expect((await provider.fetch(createMockRequest(alias), env, ctx)).status).toBe(404);
+      }
+    });
+
+    it('changes nothing for a resource that is a bare origin', async () => {
+      const provider = new OAuthProvider<TestEnv>({
+        apiRoute: '/api/',
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        serveResourceMetadataAtRoot: true,
+      });
+      const root = await provider.fetch(createMockRequest(rootMetadataUrl), env, ctx);
+      await expect(root.json()).resolves.toMatchObject({ resource: TEST_RESOURCE });
+      const alias = await provider.fetch(createMockRequest(pathMetadataUrl), env, ctx);
+      expect(alias.status).toBe(404);
+    });
+  });
+
+  it('lets a client that reads only the root find the authorization server', async () => {
+    const provider = createProvider({ serveResourceMetadataAtRoot: true });
+
+    // Alexa+ account linking, for one, reads the root document and discovers the endpoints from it.
+    const metadata = await provider.fetch(createMockRequest(rootMetadataUrl), env, ctx);
+    const { resource: advertised, authorization_servers } = await metadata.json<any>();
+    expect(advertised).toBe(resource);
+
+    const authorizationServerMetadata = await provider.fetch(
+      createMockRequest(`${authorization_servers[0]}/.well-known/oauth-authorization-server`),
+      env,
+      ctx
+    );
+    await expect(authorizationServerMetadata.json()).resolves.toMatchObject({
+      code_challenge_methods_supported: ['S256'],
+      protected_resources: [resource],
+    });
+  });
+});

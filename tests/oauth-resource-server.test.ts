@@ -912,3 +912,83 @@ describe('validateToken throwing OAuthError', () => {
     expect((await call(malformed)).status).toBe(503);
   });
 });
+
+describe('serveResourceMetadataAtRoot', () => {
+  const env = { deployment: 'test' };
+  const ROOT_METADATA_URL = 'https://mcp.example.com/.well-known/oauth-protected-resource';
+
+  it('is off by default: a path resource has no root document', async () => {
+    const root = await createTestServer().fetch(new Request(ROOT_METADATA_URL), env, new MockExecutionContext());
+    expect(root.status).toBe(404);
+  });
+
+  it("serves the resource's document at the origin's root too, and the challenge still names the path document", async () => {
+    const server = createTestServer({ serveResourceMetadataAtRoot: true });
+    const ctx = new MockExecutionContext();
+
+    const root = await server.fetch(new Request(ROOT_METADATA_URL), env, ctx);
+    expect(root.status).toBe(200);
+    expect(root.headers.get('Cache-Control')).toBe('no-store');
+    const path = await server.fetch(new Request(METADATA_URL), env, ctx);
+    await expect(root.json()).resolves.toEqual(await path.json());
+
+    const challenge = await server.fetch(new Request(RESOURCE), env, ctx);
+    expect(challenge.headers.get('WWW-Authenticate')).toContain(`resource_metadata="${METADATA_URL}"`);
+  });
+
+  it('answers HEAD, OPTIONS, a cache-busting query and other methods at the root like the path document, and no other alias', async () => {
+    const server = createTestServer({ serveResourceMetadataAtRoot: true });
+    const ctx = new MockExecutionContext();
+
+    const head = await server.fetch(new Request(ROOT_METADATA_URL, { method: 'HEAD' }), env, ctx);
+    expect(head.status).toBe(200);
+    expect(await head.text()).toBe('');
+    const cacheBusted = await server.fetch(new Request(`${ROOT_METADATA_URL}?v=2`), env, ctx);
+    await expect(cacheBusted.json()).resolves.toMatchObject({ resource: RESOURCE });
+
+    const preflight = await server.fetch(
+      new Request(ROOT_METADATA_URL, { method: 'OPTIONS', headers: { Origin: 'https://spa.example.com' } }),
+      env,
+      ctx
+    );
+    expect(preflight.status).toBe(204);
+    expect(preflight.headers.get('Access-Control-Allow-Origin')).toBe('https://spa.example.com');
+    const post = await server.fetch(new Request(ROOT_METADATA_URL, { method: 'POST' }), env, ctx);
+    expect(post.status).toBe(405);
+    expect(post.headers.get('Allow')).toBe('GET, HEAD, OPTIONS');
+
+    for (const alias of [
+      'https://other.example.com/.well-known/oauth-protected-resource',
+      'https://mcp.example.com/.well-known/oauth-protected-resource/other',
+      'https://mcp.example.com/.well-known/oauth-protected-resource/',
+    ]) {
+      expect((await server.fetch(new Request(alias), env, ctx)).status).toBe(404);
+    }
+  });
+
+  it('serves the root for a query-bearing resource whatever query the request carries', async () => {
+    const resource = 'https://mcp.example.com/mcp?tenant=a';
+    const server = createTestServer({
+      serveResourceMetadataAtRoot: true,
+      resourceMetadata: { resource, authorization_servers: ['https://auth.example.com'] },
+    });
+    for (const url of [ROOT_METADATA_URL, `${ROOT_METADATA_URL}?tenant=b`]) {
+      const root = await server.fetch(new Request(url), env, new MockExecutionContext());
+      await expect(root.json()).resolves.toMatchObject({ resource });
+    }
+  });
+
+  it('serves the root for a query-only resource, which otherwise needs its query there', async () => {
+    const resource = 'https://mcp.example.com/?tenant=a';
+    const options = { resourceMetadata: { resource, authorization_servers: ['https://auth.example.com'] } };
+    const ctx = new MockExecutionContext();
+
+    expect((await createTestServer(options).fetch(new Request(ROOT_METADATA_URL), env, ctx)).status).toBe(404);
+    const root = await createTestServer({ ...options, serveResourceMetadataAtRoot: true }).fetch(
+      new Request(ROOT_METADATA_URL),
+      env,
+      ctx
+    );
+    await expect(root.json()).resolves.toMatchObject({ resource });
+  });
+});

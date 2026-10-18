@@ -106,6 +106,26 @@ export interface OAuthResourceServerOptions<Env = Cloudflare.Env, Props = unknow
    */
   requiredScopes?: string[];
 
+  /**
+   * Also serve this resource's protected resource metadata at the origin's root,
+   * `/.well-known/oauth-protected-resource`, when the resource has a path or query. The document
+   * RFC 9728 §3 places at `/.well-known/oauth-protected-resource/mcp` for `https://example.com/mcp`
+   * is still served, and is still the one the `401` challenge names; the root serves the same JSON,
+   * whose `resource` stays the configured one.
+   *
+   * This is for clients that look only at the root: Alexa+ account linking reads the document there
+   * when account linking is configured, and Amazon's example document names a path resource.
+   * Clients that follow MCP use the challenge's `resource_metadata`, or try the path-specific URL
+   * first, so they never reach the root. This steps outside RFC 9728, whose well-known locations
+   * derive from the resource identifier: a client that applies §3.3 strictly to the root expects the
+   * origin as `resource` and gets no usable document, as with the `404` before. Don't enable it on a
+   * host whose other paths belong to other parties: a client that reads only the root would get this
+   * resource's document for any resource on the host. One resource per origin can claim the
+   * root: route it to that resource's server. Has no effect for a resource that is a bare origin,
+   * whose document is already there. Defaults to false.
+   */
+  serveResourceMetadataAtRoot?: boolean;
+
   /** Application handler for the canonical resource URL and its path descendants. */
   handler: OAuthResourceHandler<Env, Props>;
   /**
@@ -212,7 +232,7 @@ export class OAuthResourceServer<Env = Cloudflare.Env, Props = unknown> {
 
       // RFC 9728 §3 fixes the origin and path; a cache-busting query must not hide the
       // document, while a resource's own query parameters must still be present.
-      if (!isMetadataUrlRequest(url, validated.metadataUrl)) {
+      if (!isMetadataUrlRequest(url, validated)) {
         return withCorsHeaders(new Response(null, { status: 404 }), request);
       }
 
@@ -289,6 +309,7 @@ interface ValidatedResourceConfiguration {
   resourceUrl: URL;
   metadataUrl: URL;
   metadata: OAuthResourceMetadata;
+  serveResourceMetadataAtRoot: boolean;
 }
 
 function validateOptions<Env, Props>(options: OAuthResourceServerOptions<Env, Props>): ValidatedResourceConfiguration {
@@ -360,6 +381,7 @@ function validateOptions<Env, Props>(options: OAuthResourceServerOptions<Env, Pr
         ? { resource_name: options.resourceMetadata.resource_name }
         : {}),
     },
+    serveResourceMetadataAtRoot: options.serveResourceMetadataAtRoot === true,
   };
 }
 
@@ -417,12 +439,15 @@ function isProtectedResourceMetadataPath(url: URL): boolean {
   );
 }
 
-function isMetadataUrlRequest(requestUrl: URL, metadataUrl: URL): boolean {
-  return (
-    requestUrl.origin === metadataUrl.origin &&
-    requestUrl.pathname === metadataUrl.pathname &&
-    requestCarriesResourceQuery(requestUrl, metadataUrl)
-  );
+function isMetadataUrlRequest(requestUrl: URL, validated: ValidatedResourceConfiguration): boolean {
+  const { metadataUrl } = validated;
+  if (requestUrl.origin !== metadataUrl.origin) return false;
+  // Opt-in: the origin's root document names this resource too. MCP lists the root among
+  // the well-known locations a server may use.
+  if (validated.serveResourceMetadataAtRoot && requestUrl.pathname === PROTECTED_RESOURCE_WELL_KNOWN_PREFIX) {
+    return true;
+  }
+  return requestUrl.pathname === metadataUrl.pathname && requestCarriesResourceQuery(requestUrl, metadataUrl);
 }
 
 function isCanonicalResourceRequest(requestUrl: URL, resourceUrl: URL): boolean {

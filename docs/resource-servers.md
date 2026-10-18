@@ -12,7 +12,7 @@ new OAuthResourceServer<Env, Props>({
 });
 ```
 
-The host publishes RFC 9728 metadata at `/.well-known/oauth-protected-resource<path>`, answers unauthenticated requests with a Bearer challenge that names it and the `requiredScopes` to ask for (published as `scopes_supported`), calls your validator with its own canonical resource and the presented token, refuses a result whose `audience` is not that resource, and answers `503` when the validator throws. Only `validateToken` changes between the topologies below.
+The host publishes RFC 9728 metadata at `/.well-known/oauth-protected-resource<path>`, answers unauthenticated requests with a Bearer challenge that names it and the `requiredScopes` to ask for (published as `scopes_supported`), calls your validator with its own canonical resource and the presented token, refuses a result whose `audience` is not that resource, and answers `503` when the validator throws. Only `validateToken` changes between the topologies below. For clients that read only the root metadata document, see [MCP authorization discovery](mcp-discovery.md#clients-that-read-only-the-root-document).
 
 ## What the handler sees
 

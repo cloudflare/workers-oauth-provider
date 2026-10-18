@@ -682,6 +682,25 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
    * one), which MCP requires servers to honour.
    */
   requiredScopes?: string[];
+
+  /**
+   * Also serve this resource's protected resource metadata at the origin's root,
+   * `/.well-known/oauth-protected-resource`, when the resource has a path or query. The document
+   * RFC 9728 §3 places at `/.well-known/oauth-protected-resource/mcp` for `https://example.com/mcp`
+   * is still served, and is still the one the `401` challenge names; the root serves the same JSON,
+   * whose `resource` stays the configured one.
+   *
+   * This is for clients that look only at the root: Alexa+ account linking reads the document there
+   * when account linking is configured, and Amazon's example document names a path resource.
+   * Clients that follow MCP use the challenge's `resource_metadata`, or try the path-specific URL
+   * first, so they never reach the root. This steps outside RFC 9728, whose well-known locations
+   * derive from the resource identifier: a client that applies §3.3 strictly to the root expects the
+   * origin as `resource` and gets no usable document, as with the `404` before. Don't enable it on a
+   * host whose other paths belong to other parties: a client that reads only the root would get this
+   * resource's document for any resource on the host. Has no effect for a resource that is a
+   * bare origin, whose document is already there. Defaults to false.
+   */
+  serveResourceMetadataAtRoot?: boolean;
 }
 
 /** Where the split server's endpoints are unless configured otherwise, under the issuer. */
@@ -732,6 +751,7 @@ type InternalOAuthAuthorizationServerOptions<Env = Cloudflare.Env> = Omit<
   | 'clientRegistrationEndpoint'
   | 'resourceMetadata'
   | 'requiredScopes'
+  | 'serveResourceMetadataAtRoot'
 > & {
   authorizationServer: OAuthAuthorizationServerConfiguration;
 };
@@ -752,6 +772,7 @@ export type OAuthAuthorizationServerOptions<Env = Cloudflare.Env> = Omit<
   | 'tokenEndpoint'
   | 'resourceMetadata'
   | 'requiredScopes'
+  | 'serveResourceMetadataAtRoot'
   | 'resolveExternalToken'
 > & {
   /** Canonical RFC 8414 issuer. */
@@ -1699,6 +1720,8 @@ type InternalOAuthProviderOptions<Env> = Omit<OAuthProviderOptions<Env>, 'resour
 interface NormalizedResourceServer<Env> {
   resourceMetadata: OAuthProtectedResourceMetadata;
   resolveExternalToken?: (input: ResolveExternalTokenInput<Env>) => Promise<ResolveExternalTokenResult | null>;
+  /** Whether the origin's root metadata URL serves this resource's document too. */
+  serveResourceMetadataAtRoot: boolean;
 }
 
 interface NormalizedApiRoute<Env> {
@@ -1911,6 +1934,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     let configuredResourceServers: Array<{
       resourceMetadata: OAuthProtectedResourceMetadata;
       resolveExternalToken?: OAuthProviderOptions<Env>['resolveExternalToken'];
+      serveResourceMetadataAtRoot?: boolean;
     }>;
 
     if (roleBased) {
@@ -1944,6 +1968,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
           // One internal shape: requiredScopes, or the deprecated field it replaces, as scopes_supported.
           resourceMetadata: withRequiredScopes(options.resourceMetadata, options.requiredScopes),
           resolveExternalToken: options.resolveExternalToken,
+          serveResourceMetadataAtRoot: options.serveResourceMetadataAtRoot,
         },
       ];
     }
@@ -1967,14 +1992,17 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       this.validateAuthorizationServerRouteIsolation();
     }
 
-    this.resourceServers = configuredResourceServers.map(({ resourceMetadata, resolveExternalToken }) => {
-      const metadata = this.snapshotResourceMetadata(resourceMetadata);
-      this.validateResourceMetadataOptions(metadata);
-      return {
-        resourceMetadata: metadata,
-        resolveExternalToken,
-      };
-    });
+    this.resourceServers = configuredResourceServers.map(
+      ({ resourceMetadata, resolveExternalToken, serveResourceMetadataAtRoot }) => {
+        const metadata = this.snapshotResourceMetadata(resourceMetadata);
+        this.validateResourceMetadataOptions(metadata);
+        return {
+          resourceMetadata: metadata,
+          resolveExternalToken,
+          serveResourceMetadataAtRoot: serveResourceMetadataAtRoot === true,
+        };
+      }
+    );
     for (const [index, server] of this.resourceServers.entries()) {
       const duplicate = this.resourceServers
         .slice(0, index)
@@ -2468,7 +2496,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Handle .well-known/oauth-protected-resource (RFC 9728). A document at
     // any alias would identify a different resource than the URL used to fetch
-    // it, so reserve the namespace and return 404 for noncanonical variants.
+    // it, so reserve the namespace and return 404 for noncanonical variants. The
+    // one exception is opt-in: `serveResourceMetadataAtRoot` claims the root.
     if (servesProtectedResources && this.isProtectedResourceMetadataPath(url)) {
       if (!metadataResourceServer) {
         return withCorsHeaders(new Response(null, { status: 404 }), request);
@@ -2695,18 +2724,19 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   /**
    * Checks if a URL is a request for OAuth Protected Resource Metadata (RFC 9728).
    * Only the well-known URL constructed from the configured canonical resource
-   * may return its document; aliases would violate RFC 9728 §3.3.
+   * may return its document; aliases would violate RFC 9728 §3.3. The origin's
+   * root is the one opt-in exception, with `serveResourceMetadataAtRoot`.
    */
   private findResourceServerForMetadataUrl(url: URL): NormalizedResourceServer<Env> | undefined {
     return this.resourceServers.find((server) => {
       // RFC 9728 §3 fixes the origin and path; a cache-busting query must not hide the
       // document, while a resource's own query parameters must still be present.
       const expected = new URL(this.getConfiguredResourceMetadataUrl(server.resourceMetadata.resource));
-      return (
-        url.origin === expected.origin &&
-        url.pathname === expected.pathname &&
-        requestCarriesResourceQuery(url, expected)
-      );
+      if (url.origin !== expected.origin) return false;
+      // Opt-in: the origin's root document names this resource too. MCP lists the root among
+      // the well-known locations a server may use.
+      if (server.serveResourceMetadataAtRoot && url.pathname === PROTECTED_RESOURCE_WELL_KNOWN_PREFIX) return true;
+      return url.pathname === expected.pathname && requestCarriesResourceQuery(url, expected);
     });
   }
 

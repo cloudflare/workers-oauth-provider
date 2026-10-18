@@ -207,6 +207,7 @@ The existing `OAuthProvider` combined configuration uses these options:
 | `clientRegistrationEndpoint`       | Enable RFC 7591 DCR                                                         | Disabled                                 |
 | `scopesSupported`                  | Publish authorization server scopes                                         | Omitted                                  |
 | `resourceMetadata.resource`        | Canonical HTTPS resource and token audience                                 | Required                                 |
+| `serveResourceMetadataAtRoot`      | Also serve a path or query resource's metadata at the root well-known URL   | `false`                                  |
 | `clientIdMetadataDocumentEnabled`  | Enable CIMD lookup and advertisement                                        | `false`                                  |
 | `allowPrivateUseRedirectUris`      | Accept RFC 8252 private-use scheme redirect URIs for native apps            | `false`                                  |
 | `cookiePrefix`                     | Prefix for the consent and upstream helpers' cookies (must be `__Host-…`)   | `__Host-oauth-`                          |
