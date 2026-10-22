@@ -85,16 +85,16 @@ Node 24+ required.
 
 ## Commands
 
-| Command                             | What it does                                                            |
-| ----------------------------------- | ----------------------------------------------------------------------- |
-| `npm run build`                     | Builds single-file ESM bundle with tsdown                               |
-| `npm run check`                     | Runs typecheck + tests                                                  |
-| `npm run typecheck`                 | TypeScript type checking (no emit)                                      |
-| `npm run test`                      | Runs vitest test suite                                                  |
-| `npm run test:conformance`          | Runs MCP auth conformance tests                                         |
-| `npm run test:conformance:upstream` | Runs the official MCP conformance runner against the conformance Worker |
-| `npm run test:watch`                | Runs vitest in watch mode                                               |
-| `npm run prettier`                  | Formats all files with Prettier                                         |
+| Command                             | What it does                                                                                                                                                                    |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `npm run build`                     | Builds single-file ESM bundle with tsdown                                                                                                                                       |
+| `npm run check`                     | Runs typecheck + tests                                                                                                                                                          |
+| `npm run typecheck`                 | TypeScript type checking (no emit)                                                                                                                                              |
+| `npm run test`                      | Runs vitest test suite                                                                                                                                                          |
+| `npm run test:conformance`          | Runs MCP auth conformance tests                                                                                                                                                 |
+| `npm run test:conformance:upstream` | Runs the official MCP conformance runner against the conformance Worker, sending the RFC 8707 `resource`. Needs runner `0.2.0-alpha.12`+, also for a `CONFORMANCE_CLI` override |
+| `npm run test:watch`                | Runs vitest in watch mode                                                                                                                                                       |
+| `npm run prettier`                  | Formats all files with Prettier                                                                                                                                                 |
 
 ## Code standards
 
