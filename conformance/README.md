@@ -74,12 +74,11 @@ npm run test:conformance:upstream
 
 `upstream/run.mjs` starts the fixture in Workerd with a loopback issuer, pre-registers the public client the runner uses, plays the browser for the authorization code scenario, and runs every revision. The runner is a pinned devDependency; Dependabot proposes its new releases (`.github/dependabot.yml`), so the job keeps up with upstream. To try an unreleased runner, point `CONFORMANCE_CLI` at its built `dist/index.js`.
 
-| Runner                           | RFC 8707 `resource` | 2025-03-26 | 2025-06-18 | 2025-11-25 | 2026-07-28 |
-| -------------------------------- | ------------------- | ---------- | ---------- | ---------- | ---------- |
-| `0.2.0-alpha.11` (pinned)        | not sent            | 2/2        | 2/2        | 3/3        | 3/3        |
-| `main` at `7169291` (unreleased) | sent                | 2/2        | 2/2        | 3/3        | 3/3        |
+| Runner                    | RFC 8707 `resource` | 2025-03-26 | 2025-06-18 | 2025-11-25 | 2026-07-28 |
+| ------------------------- | ------------------- | ---------- | ---------- | ---------- | ---------- |
+| `0.2.0-alpha.12` (pinned) | sent                | 2/2        | 2/2        | 3/3        | 3/3        |
 
-Upstream now sends `resource` in the authorization and token requests when given one ([#466](https://github.com/modelcontextprotocol/conformance/pull/466)). The script passes the fixture's canonical resource whenever the runner supports it, so the next release exercises explicit Resource Indicators too. Older runners omit it; the provider then defaults the configured canonical resource at authorization and inherits it at code exchange, so those runs remain audience-bound. This suite additionally tests explicit Resource Indicators and the revision-specific protected-resource, audience, registration, scope, refresh, revocation, and issuer scenarios listed above.
+The script passes the fixture's canonical resource, which the runner sends in the authorization and token requests ([#466](https://github.com/modelcontextprotocol/conformance/pull/466), first released in `0.2.0-alpha.12`), so the upstream runs exercise explicit Resource Indicators. Runners before `0.2.0-alpha.12` don't accept `--resource`. This suite additionally tests omitted and explicit Resource Indicators and the revision-specific protected-resource, audience, registration, scope, refresh, revocation, and issuer scenarios listed above.
 
 ## Test architecture
 

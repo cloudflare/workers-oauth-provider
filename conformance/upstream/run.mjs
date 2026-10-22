@@ -42,9 +42,6 @@ function runCli(args, onOutput) {
   });
 }
 
-// Runners from before RFC 8707 support don't take --resource; newer ones send it in both requests.
-const sendsResource = (await runCli(['authorization', '--help'])).output.includes('--resource');
-
 const harness = createTestHarness({ workers: [{ configPath: './conformance/worker/wrangler.jsonc' }] });
 const { url } = await harness.listen();
 const origin = url.origin;
@@ -52,13 +49,14 @@ const resource = `${origin}/mcp`;
 const worker = await harness.getWorker('mcp-oauth-conformance-worker').getExport();
 await worker.configure({ dynamicClientRegistration: true, origin, resource, resourceScopes: ['mcp:read'] });
 const client = await worker.createClient('none', `http://127.0.0.1:${CALLBACK_PORT}/callback`);
-console.log(`runner ${cli}\nissuer ${origin}, resource ${sendsResource ? resource : '(not sent by this runner)'}\n`);
+console.log(`runner ${cli}\nissuer ${origin}, resource ${resource}\n`);
 
 let failed = false;
 for (const revision of REVISIONS) {
   let browsed = false;
+  // The runner sends the RFC 8707 resource in the authorization and token requests.
   const args = ['authorization', '--url', origin, '--client-id', client.clientId, '--port', String(CALLBACK_PORT)];
-  args.push('--spec-version', revision, ...(sendsResource ? ['--resource', resource] : []));
+  args.push('--spec-version', revision, '--resource', resource);
   const { code, output } = await runCli(args, (soFar) => {
     const authorize = /(http:\/\/127\.0\.0\.1:\d+\/authorize\?\S+)/.exec(soFar);
     if (authorize && !browsed && soFar.includes('Callback server started')) {
