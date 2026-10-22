@@ -55,13 +55,12 @@ In 0.x the metadata document was derived per request when `resourceMetadata` was
 
 Every grant and access token stores the `resource` the client sent when the user signed in, and the client sends that same value again on every refresh. 1.x compares both against the configured resource exactly. Configure a different value, even one that covers the same paths, and every existing session breaks at once:
 
-| Request from an existing session               | Response                                                                                                                       |
-| ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| An API call with its current access token      | `401 invalid_token`, internal reason `token_audience_unbound`                                                                  |
-| A refresh that sends `resource` (most clients) | `400 invalid_target`, "The resource parameter must name exactly one configured protected resource" (`resource_not_configured`) |
-| A refresh without `resource`                   | `400 invalid_grant`, "The authorization grant is not bound to a configured resource" (`grant_audience_unbound`)                |
+| Request from an existing session          | Response                                                                                                                                        |
+| ----------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| An API call with its current access token | `401 invalid_token`, internal reason `token_audience_unbound`                                                                                   |
+| A refresh, with or without `resource`     | `400 invalid_grant`, "The authorization grant is bound to a resource this server no longer serves. Authorize again." (`grant_audience_unbound`) |
 
-Clients that treat `invalid_target` as temporary retry it forever. Users recover only by signing out and authorizing again. The library won't widen or rewrite a stored resource to match, because RFC 8707 audiences are compared exactly, so the configuration has to match the data.
+Conformant clients (Claude, the MCP SDKs) answer `invalid_grant` by discarding their tokens and signing the user in again, so each affected user signs in once. Before 1.2.4, a refresh that sent `resource` got `invalid_target` instead, which those clients don't recover from. The library won't widen or rewrite a stored resource to match, because RFC 8707 audiences are compared exactly, so the configuration has to match the data.
 
 **What your grants carry.** Without `resourceMetadata.resource`, 0.x derived the resource from the metadata URL the client fetched, and its `401` challenge pointed each client at the metadata for the path it called. A client connecting to `https://mcp.example.com/mcp` was told `resource: "https://mcp.example.com/mcp"` and bound its grant to that. Only clients that fetched `/.well-known/oauth-protected-resource` at the root got the bare origin. `resourceMatchOriginOnly: true` changed how audiences were compared, not what was stored, so those grants carry the path too.
 
@@ -85,7 +84,7 @@ Configure exactly the value the grants show, including the path, with no added o
 
 - **Drop the second endpoint.** MCP deprecated the HTTP+SSE transport, so if `/sse` sees little traffic, remove the route and configure `https://mcp.example.com/mcp`. Sessions on `/mcp` keep working, and those on `/sse` sign in again.
 - **Declare each resource.** An [`OAuthAuthorizationServer`](resource-servers.md) lists `resources: ['https://mcp.example.com/mcp', 'https://mcp.example.com/sse']`, and each route is hosted by an `OAuthResourceServer` for its own resource. This reproduces what 0.x advertised, so sessions bound to either path keep working. Set `legacyGrantResource` too, so grants with no stored resource have a destination ([below](#existing-stored-data-nothing-to-do)). It is more code: you own the routing.
-- **Accept one sign-in.** Configure the resource you want, tell your users, and make sure your clients start a new authorization on `invalid_target` or `invalid_grant` from a refresh rather than retrying.
+- **Accept one sign-in.** Configure the resource you want, tell your users, and make sure your clients start a new authorization on `invalid_grant` from a refresh rather than retrying.
 
 **Before switching production**, deploy the upgrade to staging with a copy of real sessions, or keep one session from the 0.x deployment, and confirm that a refresh and an API call both succeed. The responses in the table above are what a mismatch looks like, and `onError` reports their internal reasons.
 
@@ -301,7 +300,7 @@ This holds once the configured resource matches what your grants carry ([above](
 - An access token stored without an audience keeps working until it expires. It's treated as bound to the migration resource: the sole configured resource, or `legacyGrantResource` on a multi-resource server.
 - Refresh binds the grant to that resource and returns a bound replacement token.
 - A stored 0.x audience array resolves to the registered resource it contains.
-- A grant bound to a resource you didn't configure fails refresh. A refresh that names that resource gets `invalid_target`, and one without `resource` gets `invalid_grant`. Conformant clients (Claude, the MCP SDKs) answer `invalid_grant` by starting a fresh authorization, but some clients retry `invalid_target`. If your grants are bound to a resource, configure exactly that one: see [Match the resource your existing grants carry](#match-the-resource-your-existing-grants-carry-10).
+- A grant bound to a resource you didn't configure fails refresh with `invalid_grant`, whether or not the refresh names that resource. Conformant clients (Claude, the MCP SDKs) answer it by starting a fresh authorization. If your grants are bound to a resource, configure exactly that one: see [Match the resource your existing grants carry](#match-the-resource-your-existing-grants-carry-10).
 - A multi-resource `OAuthAuthorizationServer` without `legacyGrantResource` has no safe destination for unbound records and rejects them. Set it for the migration window and keep it fixed.
 - Authorization codes issued by 0.x redeem under the same rules, except plain-PKCE ones ([above](#removed-the-implicit-grant-and-plain-pkce-12)).
 - Grants written before 1.0 have no KV key metadata; each refresh adds it.
