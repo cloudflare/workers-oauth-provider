@@ -8132,6 +8132,52 @@ describe('OAuthProvider', () => {
       expect(await mockEnv.OAUTH_KV.get(key)).toBe(grantBefore);
     });
 
+    // A client repeats its grant's resource on every refresh (RFC 8707 §2.2, and MCP requires
+    // it). When the server no longer hosts that resource the grant is what's broken, so the
+    // answer must be invalid_grant: MCP SDKs re-authorize on it, and fail on invalid_target.
+    it.each([
+      ['the resource the grant is bound to', 'https://example.com'],
+      ['another resource the server does not host', 'https://other.example.com/api'],
+    ] as const)(
+      'answers a refresh of a grant bound to an unhosted resource with invalid_grant when it names %s',
+      async (_label, requestedResource) => {
+        const provider = createProvider();
+        const client = await registerClient(provider);
+        const tokens = await issueTokens(provider, client);
+        const { key, grant } = await getOnlyGrant();
+        grant.resource = 'https://example.com';
+        await mockEnv.OAUTH_KV.put(key, JSON.stringify(grant));
+        const grantBefore = await mockEnv.OAUTH_KV.get(key);
+        const tokenCountBefore = (await mockEnv.OAUTH_KV.list({ prefix: 'token:' })).keys.length;
+
+        const blocked = await refresh(provider, client, tokens.refresh_token, requestedResource);
+        expect(blocked.status).toBe(400);
+        await expect(blocked.json()).resolves.toEqual({
+          error: 'invalid_grant',
+          error_description:
+            'The authorization grant is bound to a resource this server no longer serves. Authorize again.',
+        });
+        expect(await mockEnv.OAUTH_KV.get(key)).toBe(grantBefore);
+        expect((await mockEnv.OAUTH_KV.list({ prefix: 'token:' })).keys).toHaveLength(tokenCountBefore);
+      }
+    );
+
+    it('still answers a refresh that names an unhosted resource for a valid grant with invalid_target', async () => {
+      const provider = createProvider();
+      const client = await registerClient(provider);
+      const tokens = await issueTokens(provider, client);
+      const { key } = await getOnlyGrant();
+      const grantBefore = await mockEnv.OAUTH_KV.get(key);
+
+      const rejected = await refresh(provider, client, tokens.refresh_token, 'https://other.example.com/api');
+      expect(rejected.status).toBe(400);
+      await expect(rejected.json()).resolves.toEqual({
+        error: 'invalid_target',
+        error_description: 'The resource parameter must name exactly one configured protected resource',
+      });
+      expect(await mockEnv.OAUTH_KV.get(key)).toBe(grantBefore);
+    });
+
     it('pins reconstructed authorization requests to canonical and rejects explicit mismatch', async () => {
       const provider = createProvider();
       await provider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);

@@ -42,7 +42,7 @@ The canonical `resource` is not a free choice on a 0.x upgrade. Every stored gra
 - Never pick `new URL(request.url).origin` just because it satisfies the route-coverage check. It matches no path-bound grant.
 - Before changing code, get the value from the live 0.x deployment: `curl -si <api route>` for the `resource_metadata` URL, then `curl <that URL> | jq -r .resource`. If you have access, sample grants with `wrangler kv key list --binding OAUTH_KV --remote --prefix grant:` and `wrangler kv key get … | jq -r .resource`. If you can't check, ask the user and say why it matters.
 - Routes that advertised different resources in 0.x (e.g. `/mcp` and `/sse`) can't share one `OAuthProvider` resource. Stop and give the user the guide's three options (drop the deprecated endpoint, declare each resource on an `OAuthAuthorizationServer`, or accept one sign-in). Don't choose for them.
-- Mismatch symptoms after deploy: `401 invalid_token` (`token_audience_unbound`), refresh `400 invalid_target` "must name exactly one configured protected resource" (`resource_not_configured`), or refresh `400 invalid_grant` (`grant_audience_unbound`).
+- Mismatch symptoms after deploy: `401 invalid_token` (`token_audience_unbound`), or refresh `400 invalid_grant` (`grant_audience_unbound`; before 1.2.4, a refresh that sent `resource` got `400 invalid_target` `resource_not_configured` instead).
 
 ## Ask the user, don't guess
 

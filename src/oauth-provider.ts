@@ -3302,7 +3302,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
       // Validate an explicit resource before any grant-specific callbacks or
       // mutations. Tolerate legacy omission and inherit the configured resource.
-      this.validateTokenRequestResourceIndicator(body.resource);
+      // A refresh validates it against its grant first instead (resolveTokenResource,
+      // still before callbacks and writes), so a grant bound to a resource the server
+      // no longer hosts gets invalid_grant, not invalid_target.
+      if (grantType !== GrantType.REFRESH_TOKEN) {
+        this.validateTokenRequestResourceIndicator(body.resource);
+      }
 
       if (grantType === GrantType.AUTHORIZATION_CODE) {
         return await this.handleAuthorizationCodeGrant(body, clientInfo, env);
@@ -5619,6 +5624,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   /**
    * Resolves an access-token audience from a token request and its authorization grant.
    * The configured canonical resource is inherited when omitted and cannot be overridden.
+   *
+   * The grant is checked before the request. A grant bound to a resource the server no longer
+   * hosts fails with `invalid_grant` even when the request names that resource, as a client
+   * repeating its grant's resource on refresh does: the grant is the defect, and `invalid_grant`
+   * makes conformant clients discard their tokens and re-authorize, where `invalid_target`
+   * would make them fail.
    */
   private resolveTokenResource(
     requestedResource: string | string[] | undefined,
@@ -5629,48 +5640,57 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   } {
     const grantedResource = grant.resource;
     const resourceWasProvided = requestedResource !== undefined;
-    const grantResourceWasStored = grantedResource !== undefined;
-    const canonicalGrantResource = this.findStoredConfiguredResource(grantedResource);
     const canonicalRequestedResource = resourceWasProvided ? this.findRequestedResource(requestedResource) : undefined;
+    const binding = this.resolveGrantBinding(grantedResource);
 
-    if (grantResourceWasStored && !canonicalGrantResource) {
-      // A grant defect, not a request defect: `invalid_grant` makes conformant clients
-      // discard their tokens and re-authorize, where `invalid_target` would make them fail.
-      throw new OAuthError('invalid_grant', {
-        description: 'The authorization grant is not bound to a configured resource',
-        internal: { category: 'resource-indicator', reason: 'grant_audience_unbound' },
+    // The grant is sound; now the request. RFC 8707: a resource the server does not host.
+    if (resourceWasProvided && !canonicalRequestedResource) {
+      throw new OAuthError('invalid_target', {
+        description: 'The resource parameter must name exactly one configured protected resource',
+        internal: { category: 'resource-indicator', reason: 'resource_not_configured' },
       });
     }
-    if (canonicalGrantResource) {
-      if (resourceWasProvided && canonicalRequestedResource !== canonicalGrantResource) {
-        throw new OAuthError('invalid_target', {
-          description: 'The requested resource does not match the authorization grant',
-          internal: { category: 'resource-indicator', reason: 'resource_grant_mismatch' },
+    if (resourceWasProvided && canonicalRequestedResource !== binding.resource) {
+      throw binding.legacy
+        ? new OAuthError('invalid_target', {
+            description: 'The requested resource does not match the server legacy-grant migration policy',
+            internal: { category: 'resource-indicator', reason: 'legacy_grant_resource_mismatch' },
+          })
+        : new OAuthError('invalid_target', {
+            description: 'The requested resource does not match the authorization grant',
+            internal: { category: 'resource-indicator', reason: 'resource_grant_mismatch' },
+          });
+    }
+    return {
+      audience: binding.resource,
+      ...(grantedResource === binding.resource ? {} : { grantResourceBackfill: binding.resource }),
+    };
+  }
+
+  /**
+   * The configured resource a stored grant belongs to: the one it is bound to, or for a grant
+   * stored with no resource, the legacy-grant migration resource. Throws `invalid_grant` when
+   * there is none, since only re-authorization can repair the grant.
+   */
+  private resolveGrantBinding(grantedResource: string | string[] | undefined): { resource: string; legacy: boolean } {
+    if (grantedResource !== undefined) {
+      const resource = this.findStoredConfiguredResource(grantedResource);
+      if (!resource) {
+        throw new OAuthError('invalid_grant', {
+          description: 'The authorization grant is bound to a resource this server no longer serves. Authorize again.',
+          internal: { category: 'resource-indicator', reason: 'grant_audience_unbound' },
         });
       }
-      return {
-        audience: canonicalGrantResource,
-        ...(grantedResource === canonicalGrantResource ? {} : { grantResourceBackfill: canonicalGrantResource }),
-      };
+      return { resource, legacy: false };
     }
-
-    const legacyGrantResource = this.getLegacyGrantResource();
-    if (!legacyGrantResource) {
+    const resource = this.getLegacyGrantResource();
+    if (!resource) {
       throw new OAuthError('invalid_grant', {
         description: 'This legacy authorization grant has no resource binding and must be reauthorized',
         internal: { category: 'resource-indicator', reason: 'legacy_grant_unbound' },
       });
     }
-    if (resourceWasProvided && canonicalRequestedResource !== legacyGrantResource) {
-      throw new OAuthError('invalid_target', {
-        description: 'The requested resource does not match the server legacy-grant migration policy',
-        internal: { category: 'resource-indicator', reason: 'legacy_grant_resource_mismatch' },
-      });
-    }
-    return {
-      audience: legacyGrantResource,
-      grantResourceBackfill: legacyGrantResource,
-    };
+    return { resource, legacy: true };
   }
 
   /**
