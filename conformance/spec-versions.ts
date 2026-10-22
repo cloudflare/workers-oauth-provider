@@ -8,6 +8,7 @@ export function mcpAuthRevisionsSince(first: McpAuthRevision): readonly McpAuthR
   return MCP_AUTH_REVISIONS.slice(MCP_AUTH_REVISIONS.indexOf(first));
 }
 
-export function clientResourceForRevision(revision: McpAuthRevision): string | undefined {
-  return mcpAuthRevisionsSince('2025-06-18').includes(revision) ? MCP_RESOURCE : undefined;
+/** The RFC 8707 `resource` a client of this revision sends for a server hosting `resource`. */
+export function clientResourceForRevision(revision: McpAuthRevision, resource = MCP_RESOURCE): string | undefined {
+  return mcpAuthRevisionsSince('2025-06-18').includes(revision) ? resource : undefined;
 }

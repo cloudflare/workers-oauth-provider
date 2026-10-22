@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { MCP_AUTH_REVISIONS } from './spec-versions';
 import {
+  CONFORMANCE_ORIGIN,
+  MCP_RESOURCE,
   McpOAuthClient,
   createMcpOAuthClient,
   READ_SCOPE,
@@ -137,6 +139,40 @@ describe.each(MCP_AUTH_REVISIONS)('MCP %s OAuth token lifecycle conformance', (r
       headers: { Authorization: `Bearer ${tokens.access_token}` },
     });
     expect(accessResponse.status).toBe(200);
+  });
+
+  // A server that stops hosting a resource (an `/sse` endpoint, or the bare origin a 0.x server
+  // advertised at its root metadata URL) leaves grants bound to it. A client repeats its grant's
+  // resource on refresh (RFC 8707 §2.2) from 2025-06-18 on. The grant is the defect, so the answer
+  // is invalid_grant, on which clients re-authorize (RFC 6749 §5.2), not invalid_target.
+  it('answers a refresh of a grant bound to a resource the server no longer hosts with invalid_grant', async () => {
+    const before = await createMcpOAuthClient(revision, { resource: CONFORMANCE_ORIGIN });
+    const existingClient = await before.createClient('none');
+    const { tokens } = await before.completeAuthorizationCodeFlow(existingClient);
+    expect(tokens.refresh_token).toBeTruthy();
+
+    await before.redeploy(MCP_RESOURCE);
+
+    const accessResponse = await before.request('/mcp', {
+      headers: { Authorization: `Bearer ${tokens.access_token}` },
+    });
+    expect(accessResponse.status).toBe(401);
+    expect(accessResponse.headers.get('WWW-Authenticate')).toContain('error="invalid_token"');
+
+    const refreshResponse = await before.refresh(existingClient, tokens.refresh_token!);
+    expect(refreshResponse.response.status).toBe(400);
+    expect(await readJson<OAuthErrorBody>(refreshResponse.response)).toEqual({
+      error: 'invalid_grant',
+      error_description:
+        'The authorization grant is bound to a resource this server no longer serves. Authorize again.',
+    });
+
+    // Re-authorizing for the resource the server now hosts recovers the same client.
+    const reauthorized = await oauth.completeAuthorizationCodeFlow(existingClient);
+    const recovered = await oauth.request('/mcp', {
+      headers: { Authorization: `Bearer ${reauthorized.tokens.access_token}` },
+    });
+    expect(recovered.status).toBe(200);
   });
 
   it('rejects authorization-code replay and invalidates tokens issued from that code', async () => {

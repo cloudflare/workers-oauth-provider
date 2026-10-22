@@ -65,6 +65,8 @@ interface DcrResponse {
 
 interface ConformanceClientOptions {
   dynamicClientRegistration?: boolean;
+  /** The resource the Worker hosts and the client binds to. Defaults to {@link MCP_RESOURCE}. */
+  resource?: string;
   resourceScopes?: string[];
 }
 
@@ -77,16 +79,16 @@ export async function createMcpOAuthClient(
   revision: McpAuthRevision,
   options: ConformanceClientOptions = {}
 ): Promise<McpOAuthClient> {
-  const clientResource = clientResourceForRevision(revision);
+  const resource = options.resource ?? MCP_RESOURCE;
   const configuration: WorkerConfiguration = {
     dynamicClientRegistration: options.dynamicClientRegistration !== false,
     origin: CONFORMANCE_ORIGIN,
-    resource: MCP_RESOURCE,
+    resource,
     resourceScopes: options.resourceScopes ?? [READ_SCOPE],
   };
   const api = await worker.getExport();
   await api.configure(configuration);
-  return new McpOAuthClient(revision, clientResource, api);
+  return new McpOAuthClient(revision, clientResourceForRevision(revision, resource), api, configuration);
 }
 
 /** OAuth client for the real Worker started by createTestHarness(). */
@@ -94,8 +96,17 @@ class McpOAuthClient {
   constructor(
     private readonly revision: McpAuthRevision,
     private readonly resource: string | undefined,
-    private readonly api: WorkerApi
+    private readonly api: WorkerApi,
+    private readonly configuration: WorkerConfiguration
   ) {}
+
+  /**
+   * Redeploy the Worker to host `resource` instead, over the same KV. This client keeps the
+   * resource it bound its grants to and keeps sending it, as a deployed client does.
+   */
+  async redeploy(resource: string): Promise<void> {
+    await this.api.configure({ ...this.configuration, resource });
+  }
 
   request(path: `/${string}`, options: RequestOptions = {}): Promise<HarnessResponse> {
     return harness.fetch(`${CONFORMANCE_ORIGIN}${path}`, {
