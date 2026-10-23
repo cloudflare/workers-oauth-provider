@@ -1218,13 +1218,23 @@ function isClientAuthMethodAllowed(
   if (isClientMetadataDocument && client.tokenEndpointAuthMethods?.includes(presentedMethod)) return true;
 
   const isSecretMethod = (method: string): boolean =>
-    method === 'client_secret_basic' || method === 'client_secret_post';
-  return (
-    !isClientMetadataDocument &&
-    client.authMethodExplicit === undefined &&
-    isSecretMethod(client.tokenEndpointAuthMethod) &&
-    isSecretMethod(presentedMethod)
-  );
+    'client_secret_basic' === method || 'client_secret_post' === method;
+
+  // Backward compat for clients without explicit auth-method provenance.
+  if (!isClientMetadataDocument && client.authMethodExplicit === undefined) {
+    // Allow secret-method swaps (basic <-> post) as before.
+    if (isSecretMethod(client.tokenEndpointAuthMethod) && isSecretMethod(presentedMethod)) {
+      return true;
+    }
+    // Allow public clients that receive a spurious credential. Ignoring a
+    // secret the server never issued does not weaken public-client security,
+    // which rests on PKCE and refresh rotation (RFC 6749 §2.1).
+    if (client.tokenEndpointAuthMethod === 'none' && isSecretMethod(presentedMethod)) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 /**
@@ -2955,7 +2965,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // RFC 7591 methods identify the credential transport. An empty `client_secret=` was dropped
     // above as omitted (RFC 6749 §3.2), so a public client sending one presents `none`.
-    const presentedAuthMethod = basicAuthenticationAttempted
+    let presentedAuthMethod = basicAuthenticationAttempted
       ? 'client_secret_basic'
       : clientAssertionAttempted
         ? 'private_key_jwt'
@@ -2963,11 +2973,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
           ? 'client_secret_post'
           : 'none';
     const registeredAuthMethod = clientInfo.tokenEndpointAuthMethod;
+    const isCimdClient = !!this.options.clientIdMetadataDocumentEnabled && isClientIdMetadataDocumentUrl(clientInfo.clientId);
+
     if (
       !isClientAuthMethodAllowed(
         clientInfo,
         presentedAuthMethod,
-        !!this.options.clientIdMetadataDocumentEnabled && isClientIdMetadataDocumentUrl(clientInfo.clientId)
+        isCimdClient
       )
     ) {
       return this.createInvalidClientResponse('Client authentication failed', basicAuthenticationAttempted, {
@@ -2979,6 +2991,19 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
           presentedMethod: presentedAuthMethod,
         },
       });
+    }
+
+    // Normalize: for stored public clients (non-CIMD, no explicit auth-method provenance)
+    // that were allowed through backward compat despite presenting a spurious credential,
+    // treat them as 'none' so secret verification is skipped (the server never issued one).
+    // CIMD clients are excluded to preserve private_key_jwt assertion verification.
+    if (
+      !isCimdClient &&
+      registeredAuthMethod === 'none' &&
+      presentedAuthMethod !== 'none' &&
+      clientInfo.authMethodExplicit === undefined
+    ) {
+      presentedAuthMethod = 'none';
     }
 
     if (presentedAuthMethod === 'private_key_jwt') {
