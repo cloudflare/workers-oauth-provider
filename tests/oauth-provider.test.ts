@@ -3456,6 +3456,115 @@ describe('OAuthProvider', () => {
       expect(grantsAfter.keys.length).toBe(0);
     });
 
+    it('should reject one of two concurrent exchanges of the same code', async () => {
+      // Two token requests using the same authorization code can both read the
+      // grant before either consumes it (#420): KV has no compare-and-swap, so
+      // both exchanges would issue token sets. The consumption write now carries
+      // a per-exchange marker and the grant is re-read after the write, so the
+      // exchange whose marker did not survive is answered like a sequential
+      // replay: invalid_grant, with the grant and its tokens revoked.
+      const authRequest = createMockRequest(
+        `https://example.com/authorize?response_type=code&client_id=${clientId}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&scope=read%20write&state=xyz123`
+      );
+
+      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const location = authResponse.headers.get('Location')!;
+      const code = new URL(location).searchParams.get('code')!;
+
+      const tokenRequest = () => {
+        const params = new URLSearchParams();
+        params.append('grant_type', 'authorization_code');
+        params.append('code', code);
+        params.append('redirect_uri', redirectUri);
+        params.append('client_id', clientId);
+        params.append('client_secret', clientSecret);
+        return createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          params.toString()
+        );
+      };
+
+      // A KV shim that forces the concurrent interleave on grant keys: both
+      // exchanges read the grant before either writes it, and the post-write
+      // re-read only resolves once both writes have landed. Everything else
+      // (client records, token records) passes straight through.
+      const inner = mockEnv.OAUTH_KV;
+      let grantReads = 0;
+      let grantWrites = 0;
+      let sawBothReads!: () => void;
+      let sawBothWrites!: () => void;
+      const bothReads = new Promise<void>((resolve) => (sawBothReads = resolve));
+      const bothWrites = new Promise<void>((resolve) => (sawBothWrites = resolve));
+
+      const gated = {
+        async get(key: string, options?: { type: 'text' | 'json' | 'arrayBuffer' | 'stream' }): Promise<any> {
+          if (!key.startsWith('grant:')) return inner.get(key, options);
+          grantReads++;
+          if (grantReads === 2) sawBothReads();
+          if (grantReads >= 3) await bothWrites;
+          return inner.get(key, options);
+        },
+        async put(
+          key: string,
+          value: string | ArrayBuffer,
+          options?: { expirationTtl?: number; expiration?: number; metadata?: unknown }
+        ): Promise<void> {
+          if (!key.startsWith('grant:')) return inner.put(key, value, options);
+          await bothReads;
+          const result = inner.put(key, value, options);
+          grantWrites++;
+          if (grantWrites === 2) sawBothWrites();
+          return result;
+        },
+        delete(key: string): Promise<void> {
+          return inner.delete(key);
+        },
+        list(options: { prefix: string; limit?: number; cursor?: string }) {
+          return inner.list(options);
+        },
+      };
+      mockEnv.OAUTH_KV = gated as unknown as typeof inner;
+
+      let responses: Response[];
+      try {
+        responses = await Promise.all([
+          oauthProvider.fetch(tokenRequest(), mockEnv, mockCtx),
+          oauthProvider.fetch(tokenRequest(), mockEnv, mockCtx),
+        ]);
+      } finally {
+        mockEnv.OAUTH_KV = inner;
+      }
+
+      // The race must not let both exchanges issue tokens. Depending on how the
+      // two requests interleave, either exactly one exchange succeeds, or the
+      // exchange that loses the fence revokes the grant family before the other
+      // exchange's fence re-reads, in which case both are rejected. Both are the
+      // replay policy from RFC 6749 §10.5; what must never happen is two 200s.
+      const statuses = responses.map((response) => response.status).sort();
+      expect(statuses).not.toEqual([200, 200]);
+
+      for (const rejected of responses.filter((response) => response.status !== 200)) {
+        const error = await rejected.json<any>();
+        expect(error.error).toBe('invalid_grant');
+        expect(error.error_description).toBe('Authorization code already used');
+      }
+
+      const accepted = responses.find((response) => response.status === 200);
+      if (accepted) {
+        const tokens = await accepted.json<any>();
+        expect(tokens.access_token).toBeDefined();
+      }
+
+      // The race was detected as a replay, so the grant is revoked like a
+      // sequential replay would be, leaving no grant behind.
+      const grantsAfter = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      expect(grantsAfter.keys.length).toBe(0);
+    });
+
     it('should not act on a grant when an unmatched code is submitted by another client', async () => {
       // Legitimate client obtains an auth code and exchanges it for tokens
       const authRequest = createMockRequest(
