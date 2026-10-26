@@ -962,6 +962,160 @@ describe('Client ID Metadata Document (CIMD)', () => {
     });
   });
 
+  describe('Last-good fallback', () => {
+    const cimdUrl = 'https://client.example.com/oauth/metadata.json';
+    const validMetadata = {
+      client_id: cimdUrl,
+      client_name: 'Fallback Client',
+      redirect_uris: ['https://client.example.com/callback'],
+      token_endpoint_auth_method: 'none',
+    };
+    const encode = (document: object | string) =>
+      new TextEncoder().encode(typeof document === 'string' ? document : JSON.stringify(document));
+    const authRequest = () =>
+      createMockRequest(
+        `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=S256`,
+        'GET'
+      );
+
+    let stored: Map<string, { bytes: Uint8Array; validatedAt: number }>;
+    let onServedStale: ReturnType<typeof vi.fn<(event: { url: string; validatedAt: number; reason: string }) => void>>;
+
+    beforeEach(() => {
+      stored = new Map();
+      onServedStale = vi.fn<(event: { url: string; validatedAt: number; reason: string }) => void>();
+      oauthProvider = new OAuthProvider({
+        apiRoute: '/api/',
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientIdMetadataDocumentEnabled: true,
+        clientIdMetadataDocumentFallback: {
+          load: async (url) => stored.get(url),
+          save: async (url, bytes) => {
+            stored.set(url, { bytes, validatedAt: 1_000 });
+          },
+          onServedStale,
+        },
+      });
+    });
+
+    it('saves the validated bytes of a fresh document', async () => {
+      globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(createMockFetchResponse(validMetadata)));
+
+      expect((await oauthProvider.fetch(authRequest(), mockEnv, mockCtx)).status).toBe(302);
+      expect(JSON.parse(new TextDecoder().decode(stored.get(cimdUrl)?.bytes))).toEqual(validMetadata);
+    });
+
+    it.each([
+      ['HTTP 404', 'http_404', () => Promise.resolve(new Response('Not Found', { status: 404 }))],
+      ['HTTP 503', 'http_503', () => Promise.resolve(new Response('Unavailable', { status: 503 }))],
+      ['a network error', 'network_error', () => Promise.reject(new TypeError('fetch failed'))],
+      ['an abort', 'timeout', () => Promise.reject(new DOMException('Aborted', 'AbortError'))],
+    ])('serves the stored copy on %s', async (_label, reason, originFailure) => {
+      stored.set(cimdUrl, { bytes: encode(validMetadata), validatedAt: 1_000 });
+      globalThis.fetch = vi.fn().mockImplementation(originFailure);
+
+      expect((await oauthProvider.fetch(authRequest(), mockEnv, mockCtx)).status).toBe(302);
+      expect(onServedStale).toHaveBeenCalledWith({ url: cimdUrl, validatedAt: 1_000, reason });
+    });
+
+    it('serves the stored copy when the origin times out', async () => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      stored.set(cimdUrl, { bytes: encode(validMetadata), validatedAt: 1_000 });
+      globalThis.fetch = vi.fn().mockImplementation(
+        (_url, init) =>
+          new Promise((_resolve, reject) => {
+            init?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')));
+          })
+      );
+
+      try {
+        let settled = false;
+        const response = oauthProvider.fetch(authRequest(), mockEnv, mockCtx).finally(() => (settled = true));
+        // The authorize flow looks the client up more than once; each lookup waits out its own timeout.
+        while (!settled) await vi.advanceTimersByTimeAsync(10_001);
+        expect((await response).status).toBe(302);
+        expect(onServedStale).toHaveBeenCalledWith(expect.objectContaining({ reason: 'timeout' }));
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it.each([403, 410, 429])('never serves the stored copy on HTTP %i', async (status) => {
+      stored.set(cimdUrl, { bytes: encode(validMetadata), validatedAt: 1_000 });
+      globalThis.fetch = vi.fn().mockResolvedValue(new Response('No', { status }));
+
+      await expect(oauthProvider.fetch(authRequest(), mockEnv, mockCtx)).rejects.toThrow(`HTTP ${status}`);
+      expect(onServedStale).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      [
+        'fails validation',
+        () => createMockFetchResponse({ ...validMetadata, client_id: 'https://other.example.com/c.json' }),
+      ],
+      ['is malformed JSON', () => createMockFetchResponse('{')],
+    ])('does not mask a fresh document that %s', async (_label, freshResponse) => {
+      stored.set(cimdUrl, { bytes: encode(validMetadata), validatedAt: 1_000 });
+      globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(freshResponse()));
+
+      await expect(oauthProvider.fetch(authRequest(), mockEnv, mockCtx)).rejects.toThrow(CimdFetchError);
+      expect(onServedStale).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['fails validation', encode({ ...validMetadata, redirect_uris: [] })],
+      ['is malformed JSON', encode('{')],
+    ])('keeps the origin error when the stored copy %s', async (_label, bytes) => {
+      stored.set(cimdUrl, { bytes, validatedAt: 1_000 });
+      globalThis.fetch = vi.fn().mockResolvedValue(new Response('Not Found', { status: 404 }));
+
+      await expect(oauthProvider.fetch(authRequest(), mockEnv, mockCtx)).rejects.toThrow('HTTP 404');
+      expect(onServedStale).not.toHaveBeenCalled();
+    });
+
+    it('keeps the timeout error when the stored copy fails validation', async () => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      stored.set(cimdUrl, { bytes: encode({ ...validMetadata, redirect_uris: [] }), validatedAt: 1_000 });
+      globalThis.fetch = vi.fn().mockImplementation(
+        (_url, init) =>
+          new Promise((_resolve, reject) => {
+            init?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')));
+          })
+      );
+
+      try {
+        const rejection = expect(oauthProvider.fetch(authRequest(), mockEnv, mockCtx)).rejects.toThrow('timed out');
+        await vi.advanceTimersByTimeAsync(10_001);
+        await rejection;
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('keeps the origin error and the fresh result when storage fails', async () => {
+      oauthProvider = new OAuthProvider({
+        apiRoute: '/api/',
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientIdMetadataDocumentEnabled: true,
+        clientIdMetadataDocumentFallback: {
+          load: () => Promise.reject(new Error('storage down')),
+          save: () => Promise.reject(new Error('storage down')),
+        },
+      });
+      globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(createMockFetchResponse(validMetadata)));
+      expect((await oauthProvider.fetch(authRequest(), mockEnv, mockCtx)).status).toBe(302);
+
+      globalThis.fetch = vi.fn().mockResolvedValue(new Response('Not Found', { status: 404 }));
+      await expect(oauthProvider.fetch(authRequest(), mockEnv, mockCtx)).rejects.toThrow('HTTP 404');
+    });
+  });
+
   describe('SSRF Protection', () => {
     it('should reject CIMD fetch when global_fetch_strictly_public is not enabled', async () => {
       // Remove the compatibility flag to simulate it not being enabled

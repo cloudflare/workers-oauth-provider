@@ -23,8 +23,10 @@ import {
   resolveDynamicClientRegistrationMetadata,
   validateRedirectUri,
   validateRegisteredRedirectUris,
+  type ClientIdMetadataDocumentFallback,
   type ResolvedDynamicClientRegistrationMetadata,
 } from './oauth-client-metadata';
+export type { ClientIdMetadataDocumentFallback } from './oauth-client-metadata';
 import {
   EMA_DEFAULT_CLOCK_SKEW_SECONDS,
   EMA_DEFAULT_MAX_ASSERTION_LIFETIME_SECONDS,
@@ -656,6 +658,18 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
    * Defaults to false.
    */
   clientIdMetadataDocumentEnabled?: boolean;
+
+  /**
+   * Optional last-good storage for Client ID Metadata Documents. When a
+   * document's origin returns 404 or 5xx, times out, or fails at the network
+   * level, the client resolves from the stored copy instead of failing, after
+   * the copy passes the same validation as a fresh document. 403, other 4xx
+   * responses, and fresh documents that fail validation never use it.
+   * The implementation owns storage, eligibility, and maximum age. A client
+   * owner who withdraws its document stays resolvable until the stored copy
+   * expires, so keep that window short. See docs/advanced-configuration.md.
+   */
+  clientIdMetadataDocumentFallback?: ClientIdMetadataDocumentFallback;
 
   /**
    * Prefix for the cookies the consent and upstream helpers set (`<prefix>consent`,
@@ -5479,7 +5493,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         throw new Error(`CIMD is enabled but 'global_fetch_strictly_public' compatibility flag is not set.`);
       }
       try {
-        return await fetchClientIdMetadataDocument(clientId, this.serverCapabilities);
+        return await fetchClientIdMetadataDocument(
+          clientId,
+          this.serverCapabilities,
+          this.options.clientIdMetadataDocumentFallback
+        );
       } catch (error) {
         // CIMD fetch failed (size limit, timeout, HTTP error, invalid metadata, etc.)
         // Throw a tagged error rather than returning null: KV-backed lookups
