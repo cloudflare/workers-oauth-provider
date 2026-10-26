@@ -3461,7 +3461,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Get the grant
     const grantKey = `grant:${userId}:${grantId}`;
-    const grantData: Grant | null = await env.OAUTH_KV.get(grantKey, { type: 'json' });
+    const grantData: Grant | null = await env.OAUTH_KV.get(grantKey, {
+      type: 'json',
+      cacheTtl: KV_MIN_CACHE_TTL_SECONDS,
+    });
 
     if (!grantData) {
       return this.createErrorResponse(
@@ -6027,6 +6030,17 @@ const DEFAULT_CLIENT_REGISTRATION_TTL = 90 * 24 * 60 * 60;
  * to clamp absolute expirations when writing grants back to KV.
  */
 const KV_MIN_EXPIRATION_TTL_SECONDS = 60;
+
+/**
+ * Minimum edge cache TTL for a single KV read, in seconds. KV caches a
+ * negative lookup at the edge for the full `cacheTtl` (60 seconds by default),
+ * and a grant is written by the authorize location but read by the token
+ * endpoint from wherever the client's server is. A read that races the
+ * write's propagation would otherwise serve the cached miss to every retry of
+ * a fresh authorization code until the entry expires, so the token endpoint
+ * reads grants with the shortest TTL the KV API allows.
+ */
+const KV_MIN_CACHE_TTL_SECONDS = 30;
 
 /** Whether a registration refused without `none` on offer would otherwise have been a public client. */
 function wouldRegisterPublicClient(
