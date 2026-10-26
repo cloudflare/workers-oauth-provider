@@ -4,6 +4,7 @@ import {
   AuthorizationError,
   buildOAuthServerCapabilities,
   negotiateCimdClientCapabilities,
+  negotiateDynamicClientRegistrationCapabilities,
   normalizePkceCodeChallengeMethod,
   validateAuthorizationPkce,
   validateAuthorizationResponseType,
@@ -296,5 +297,72 @@ describe('authorization server scopes', () => {
 
   it.each([[['']], [['scope with spaces']], [['read', 'read']]])('rejects invalid scope configuration %j', (scopes) => {
     expect(() => validateAuthorizationServerScopes(scopes)).toThrow();
+  });
+});
+
+describe('Dynamic client registration capability negotiation', () => {
+  it('narrows requested grant types to the subset the server supports', () => {
+    expect(
+      negotiateDynamicClientRegistrationCapabilities(defaults, {
+        tokenEndpointAuthMethod: 'none',
+        grantTypes: ['authorization_code', 'refresh_token', 'urn:ietf:params:oauth:grant-type:device_code'],
+        responseTypes: ['code'],
+      })
+    ).toEqual({
+      tokenEndpointAuthMethod: 'none',
+      grantTypes: ['authorization_code', 'refresh_token'],
+      responseTypes: ['code'],
+    });
+  });
+
+  it('narrows unsupported extension grants while keeping the flows this server runs', () => {
+    expect(
+      negotiateDynamicClientRegistrationCapabilities(defaults, {
+        tokenEndpointAuthMethod: 'client_secret_basic',
+        grantTypes: ['authorization_code', 'urn:ietf:params:oauth:grant-type:jwt-bearer', 'client_credentials'],
+        responseTypes: ['code'],
+      })
+    ).toEqual({
+      tokenEndpointAuthMethod: 'client_secret_basic',
+      grantTypes: ['authorization_code'],
+      responseTypes: ['code'],
+    });
+  });
+
+  it('rejects a request whose supported grant set is empty', () => {
+    expect(() =>
+      negotiateDynamicClientRegistrationCapabilities(defaults, {
+        tokenEndpointAuthMethod: 'none',
+        grantTypes: ['urn:ietf:params:oauth:grant-type:device_code'],
+        responseTypes: ['code'],
+      })
+    ).toThrow(/No supported grant types requested/);
+    expect(() =>
+      negotiateDynamicClientRegistrationCapabilities(defaults, {
+        tokenEndpointAuthMethod: 'none',
+        grantTypes: [],
+        responseTypes: [],
+      })
+    ).toThrow(/No supported grant types requested/);
+  });
+
+  it('keeps response type validation strict', () => {
+    expect(() =>
+      negotiateDynamicClientRegistrationCapabilities(defaults, {
+        tokenEndpointAuthMethod: 'none',
+        grantTypes: ['authorization_code'],
+        responseTypes: ['code', 'id_token'],
+      })
+    ).toThrow('Unsupported response_type: id_token');
+  });
+
+  it('still rejects an inconsistent effective grant and response pair', () => {
+    expect(() =>
+      negotiateDynamicClientRegistrationCapabilities(defaults, {
+        tokenEndpointAuthMethod: 'none',
+        grantTypes: ['refresh_token'],
+        responseTypes: ['code'],
+      })
+    ).toThrow('grant_types authorization_code and response_types code must be registered together');
   });
 });
