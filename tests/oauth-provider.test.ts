@@ -12178,6 +12178,41 @@ describe('OAuthProvider', () => {
       reAuthEnv.OAUTH_KV.clear();
     });
 
+    describe('grant read cache TTL on the exchange path', () => {
+      it('reads the grant with the minimum edge cache TTL', async () => {
+        const provider = new OAuthProvider({
+          apiRoute: ['/api/'],
+          apiHandler: TestApiHandler,
+          defaultHandler: createDefaultHandlerNoRevoke(() => propsFromAuthorize),
+          authorizeEndpoint: '/authorize',
+          tokenEndpoint: '/oauth/token',
+          clientRegistrationEndpoint: '/oauth/register',
+          scopesSupported: ['read', 'write'],
+        });
+
+        const { clientId, clientSecret } = await registerClient(provider, reAuthEnv, reAuthCtx);
+        const code = await authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, clientId);
+
+        // KV caches negative lookups at the edge for the full cacheTtl. The grant read
+        // below must therefore ask for the shortest TTL the API allows, so a code
+        // exchanged seconds after completeAuthorization() in another location is not
+        // served a cached miss for the default 60 seconds (#419).
+        const gets: Array<{ key: string; options: any }> = [];
+        const originalGet = reAuthEnv.OAUTH_KV.get.bind(reAuthEnv.OAUTH_KV);
+        (reAuthEnv.OAUTH_KV as any).get = async (key: string, options?: any) => {
+          gets.push({ key, options });
+          return originalGet(key, options);
+        };
+
+        const tokens = await exchangeCodeForTokens(provider, reAuthEnv, reAuthCtx, code, clientId, clientSecret);
+        expect(tokens.access_token).toBeDefined();
+
+        const grantReads = gets.filter((g) => g.key.startsWith('grant:'));
+        expect(grantReads.length).toBeGreaterThan(0);
+        expect(grantReads.every((g) => g.options?.cacheTtl === 30)).toBe(true);
+      });
+    });
+
     describe('WITHOUT revokeExistingGrants (opt-out / the bug)', () => {
       it('should demonstrate that re-authorization creates a second grant while old grant persists', async () => {
         const provider = new OAuthProvider({
