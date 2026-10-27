@@ -5795,6 +5795,20 @@ describe('OAuthProvider', () => {
       await expect(response.json()).resolves.toMatchObject({ scope: 'read' });
     });
 
+    it('should answer invalid_scope, without consuming the assertion, when no requested scope can be granted', async () => {
+      const { provider, client } = await createEnterpriseProviderWith({}, { scopesSupported: ['read'] });
+      const assertion = await createAssertion({ client_id: client.client_id, scope: 'read write' });
+
+      const refused = await redeem(provider, client, assertion, 'write');
+      expect(refused.status).toBe(400);
+      await expect(refused.json()).resolves.toMatchObject({ error: 'invalid_scope' });
+
+      // The same assertion still works with a scope it can have.
+      const retried = await redeem(provider, client, assertion, 'read');
+      expect(retried.status).toBe(200);
+      await expect(retried.json()).resolves.toMatchObject({ scope: 'read' });
+    });
+
     it('should leave mapped scopes alone when scopesSupported is not configured', async () => {
       const { provider, client } = await createEnterpriseProviderWith({
         mapClaims: async () => ({ userId: 'employee-123', scope: ['anything'], props: {} }),

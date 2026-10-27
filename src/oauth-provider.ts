@@ -4624,6 +4624,18 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     });
     if (!claims.ok) return claims;
 
+    const parsedScope = parseEmaScopeParam(body.scope, claims.value.assertionScopes);
+    if (!parsedScope.ok) return parsedScope;
+    // Like an interactive grant, an EMA grant carries only scopes this server supports.
+    const requestedScope = { ...parsedScope, value: this.limitToSupportedScopes(parsedScope.value) };
+    // A request that names scopes and can get none of them fails invalid_scope, as an
+    // authorization-code or refresh request does. Checked before the replay marker, so the
+    // client can retry the same assertion with a scope it can have.
+    const named = parseEmaScopeParam(body.scope, []);
+    if (named.ok && named.value.length > 0 && requestedScope.value.length === 0) {
+      return err({ reason: 'scope_not_granted', requested: named.value });
+    }
+
     // Fresh clock read so the JTI KV TTL reflects the assertion's remaining
     // lifetime at the moment of write, not at pipeline start (JWKS fetch
     // already burned several ms; mapper hasn't run yet).
@@ -4636,11 +4648,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       env,
     });
     if (!replay.ok) return replay;
-
-    const parsedScope = parseEmaScopeParam(body.scope, claims.value.assertionScopes);
-    if (!parsedScope.ok) return parsedScope;
-    // Like an interactive grant, an EMA grant carries only scopes this server supports.
-    const requestedScope = { ...parsedScope, value: this.limitToSupportedScopes(parsedScope.value) };
 
     let mapperOutput: unknown;
     try {
