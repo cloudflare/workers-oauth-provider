@@ -962,6 +962,189 @@ describe('Client ID Metadata Document (CIMD)', () => {
     });
   });
 
+  describe('Last-good copy', () => {
+    const cimdUrl = 'https://client.example.com/oauth/metadata.json';
+    const validMetadata = {
+      client_id: cimdUrl,
+      client_name: 'Last-good Client',
+      redirect_uris: ['https://client.example.com/callback'],
+      token_endpoint_auth_method: 'none',
+    };
+    const cimdAuthRequest = () =>
+      createMockRequest(
+        `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state&code_challenge=test-challenge&code_challenge_method=S256`,
+        'GET'
+      );
+    const lastGoodKey = async () => {
+      const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(cimdUrl));
+      return `cimd:${[...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('')}`;
+    };
+    /** Resolve the client once against a healthy origin, which stores the last-good copy. */
+    const resolveOnceFromOrigin = async (metadata: object = validMetadata) => {
+      globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(createMockFetchResponse(metadata)));
+      expect((await oauthProvider.fetch(cimdAuthRequest(), mockEnv, mockCtx)).status).toBe(302);
+    };
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it.each([404, 408, 429, 500, 502, 503])('uses the last-good copy when the origin answers %i', async (status) => {
+      await resolveOnceFromOrigin();
+      globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(new Response('unavailable', { status })));
+
+      expect((await oauthProvider.fetch(cimdAuthRequest(), mockEnv, mockCtx)).status).toBe(302);
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining(`HTTP ${status}`));
+    });
+
+    it('uses the last-good copy when the origin is unreachable', async () => {
+      await resolveOnceFromOrigin();
+      globalThis.fetch = vi.fn().mockRejectedValue(new TypeError('Network connection lost'));
+
+      expect((await oauthProvider.fetch(cimdAuthRequest(), mockEnv, mockCtx)).status).toBe(302);
+    });
+
+    it('uses the last-good copy when the origin times out', async () => {
+      await resolveOnceFromOrigin();
+      vi.useFakeTimers();
+      globalThis.fetch = vi.fn().mockImplementation(
+        (_url, init) =>
+          new Promise((_resolve, reject) => {
+            (init?.signal as AbortSignal).addEventListener('abort', () =>
+              reject(new DOMException('Aborted', 'AbortError'))
+            );
+          })
+      );
+
+      const responsePromise = oauthProvider.fetch(cimdAuthRequest(), mockEnv, mockCtx);
+      // The authorize flow resolves the client more than once, and each lookup waits out the
+      // timeout. Real async work (digests, stream reads) runs between them, so step the clock
+      // until the request settles.
+      let settled = false;
+      void responsePromise.finally(() => (settled = true)).catch(() => undefined);
+      while (!settled) await vi.advanceTimersByTimeAsync(1_000);
+      expect((await responsePromise).status).toBe(302);
+    });
+
+    it.each([401, 403, 410])('does not use the last-good copy when the origin answers %i', async (status) => {
+      await resolveOnceFromOrigin();
+      globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(new Response('refused', { status })));
+
+      await expect(oauthProvider.fetch(cimdAuthRequest(), mockEnv, mockCtx)).rejects.toThrow(CimdFetchError);
+    });
+
+    it('deletes the last-good copy when the origin answers 410', async () => {
+      await resolveOnceFromOrigin();
+      globalThis.fetch = vi
+        .fn()
+        .mockImplementationOnce(() => Promise.resolve(new Response('Gone', { status: 410 })))
+        .mockImplementation(() => Promise.resolve(new Response('Not Found', { status: 404 })));
+
+      await expect(oauthProvider.fetch(cimdAuthRequest(), mockEnv, mockCtx)).rejects.toThrow(CimdFetchError);
+      // A later outage cannot bring a withdrawn document back.
+      await expect(oauthProvider.fetch(cimdAuthRequest(), mockEnv, mockCtx)).rejects.toThrow(CimdFetchError);
+      expect(await mockEnv.OAUTH_KV.get(await lastGoodKey())).toBeNull();
+    });
+
+    it('does not mask a fresh document that fails validation', async () => {
+      await resolveOnceFromOrigin();
+      globalThis.fetch = vi
+        .fn()
+        .mockImplementation(() =>
+          Promise.resolve(
+            createMockFetchResponse({ ...validMetadata, client_id: 'https://attacker.example.com/client.json' })
+          )
+        );
+
+      await expect(oauthProvider.fetch(cimdAuthRequest(), mockEnv, mockCtx)).rejects.toThrow(CimdFetchError);
+    });
+
+    it('does not mask a fresh response that is not JSON', async () => {
+      await resolveOnceFromOrigin();
+      globalThis.fetch = vi
+        .fn()
+        .mockImplementation(() => Promise.resolve(new Response('<html>maintenance</html>', { status: 200 })));
+
+      await expect(oauthProvider.fetch(cimdAuthRequest(), mockEnv, mockCtx)).rejects.toThrow(CimdFetchError);
+    });
+
+    it('reports the origin error when the stored copy no longer validates', async () => {
+      await mockEnv.OAUTH_KV.put(
+        await lastGoodKey(),
+        JSON.stringify({
+          document: JSON.stringify({ ...validMetadata, client_id: 'https://attacker.example.com/client.json' }),
+          storedAt: Math.floor(Date.now() / 1000),
+        })
+      );
+      globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(new Response('Not Found', { status: 404 })));
+
+      const error = await oauthProvider.fetch(cimdAuthRequest(), mockEnv, mockCtx).catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(CimdFetchError);
+      expect((error as CimdFetchError).detail).toBe('Failed to fetch client metadata: HTTP 404');
+    });
+
+    it('does not use a copy older than 24 hours', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      await resolveOnceFromOrigin();
+      vi.setSystemTime(Date.now() + 24 * 60 * 60 * 1000 + 1000);
+      globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(new Response('Not Found', { status: 404 })));
+
+      await expect(oauthProvider.fetch(cimdAuthRequest(), mockEnv, mockCtx)).rejects.toThrow(CimdFetchError);
+    });
+
+    it('rewrites an unchanged document at most once an hour', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      const putSpy = vi.spyOn(mockEnv.OAUTH_KV, 'put');
+      const lastGoodWrites = () => putSpy.mock.calls.filter(([key]) => key.startsWith('cimd:')).length;
+
+      await resolveOnceFromOrigin();
+      await resolveOnceFromOrigin();
+      expect(lastGoodWrites()).toBe(1);
+
+      vi.setSystemTime(Date.now() + 60 * 60 * 1000);
+      await resolveOnceFromOrigin();
+      expect(lastGoodWrites()).toBe(2);
+    });
+
+    it('stores a changed document straight away', async () => {
+      await resolveOnceFromOrigin();
+      await resolveOnceFromOrigin({ ...validMetadata, client_name: 'Renamed Client' });
+
+      const stored: { document: string } = await mockEnv.OAUTH_KV.get(await lastGoodKey(), { type: 'json' });
+      expect(JSON.parse(stored.document).client_name).toBe('Renamed Client');
+    });
+
+    it('ignores storage failures', async () => {
+      const kv = mockEnv.OAUTH_KV;
+      const get = kv.get.bind(kv);
+      const put = kv.put.bind(kv);
+      vi.spyOn(kv, 'get').mockImplementation((async (key: string, options?: { type: 'json' }) => {
+        if (key.startsWith('cimd:')) throw new Error('KV unavailable');
+        return get(key, options);
+      }) as typeof kv.get);
+      vi.spyOn(kv, 'put').mockImplementation(async (key, value, options) => {
+        if (key.startsWith('cimd:')) throw new Error('KV unavailable');
+        return put(key, value, options);
+      });
+
+      await resolveOnceFromOrigin();
+      globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(new Response('Not Found', { status: 404 })));
+      await expect(oauthProvider.fetch(cimdAuthRequest(), mockEnv, mockCtx)).rejects.toThrow(CimdFetchError);
+    });
+
+    it('stops sending requests to an unavailable origin for a minute after using the copy', async () => {
+      installMockCimdCache();
+      await resolveOnceFromOrigin();
+      globalThis.fetch = vi
+        .fn()
+        .mockImplementation(() => Promise.resolve(new Response('Too Many Requests', { status: 429 })));
+
+      expect((await oauthProvider.fetch(cimdAuthRequest(), mockEnv, mockCtx)).status).toBe(302);
+      expect((await oauthProvider.fetch(cimdAuthRequest(), mockEnv, mockCtx)).status).toBe(302);
+      expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe('SSRF Protection', () => {
     it('should reject CIMD fetch when global_fetch_strictly_public is not enabled', async () => {
       // Remove the compatibility flag to simulate it not being enabled
