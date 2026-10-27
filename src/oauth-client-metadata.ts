@@ -13,6 +13,15 @@ const CIMD_FETCH_TIMEOUT_MS = 10_000;
 const CIMD_CACHE_NAME = 'workers-oauth-provider:cimd:v1';
 const CIMD_CACHE_MAX_TTL_SECONDS = 7 * 24 * 60 * 60;
 
+/** KV key prefix for the last validated copy of each metadata document. */
+const CIMD_LAST_GOOD_KEY_PREFIX = 'cimd:';
+/** How long a last-good copy outlives the last successful fetch that wrote it. */
+const CIMD_LAST_GOOD_TTL_SECONDS = 24 * 60 * 60;
+/** An unchanged document is rewritten at most this often, to stay under KV's per-key write limit. */
+const CIMD_LAST_GOOD_REWRITE_SECONDS = 60 * 60;
+/** How long a data center serves a last-good copy from the Cache API before trying the origin again. */
+const CIMD_LAST_GOOD_CACHE_SECONDS = 60;
+
 /** Human-readable and key-discovery client metadata shared by DCR and CIMD clients. */
 interface OAuthClientDisplayMetadata {
   /** Human-readable client name. */
@@ -559,7 +568,7 @@ async function readJsonWithSizeLimit(
   response: Response,
   maxBytes: number,
   signal: AbortSignal
-): Promise<{ value: unknown; bytes: Uint8Array }> {
+): Promise<{ value: unknown; text: string; bytes: Uint8Array }> {
   const contentLength = response.headers.get('Content-Length');
   if (contentLength !== null) {
     const declaredSize = Number(contentLength);
@@ -605,7 +614,7 @@ async function readJsonWithSizeLimit(
   }
 
   try {
-    return { value: JSON.parse(text), bytes };
+    return { value: JSON.parse(text), text, bytes };
   } catch {
     throw new Error('Client metadata response is not valid JSON');
   }
@@ -703,39 +712,158 @@ async function tryResolveFromCache(
   }
 }
 
+/** The last validated copy of a metadata document, as stored in KV. */
+interface LastGoodDocument {
+  /** The document's exact text as the origin served it. */
+  document: string;
+  /** Unix time, in seconds, of the write. */
+  storedAt: number;
+}
+
+/** The KV operations the last-good copy needs. */
+export type LastGoodDocumentStore = Pick<KVNamespace, 'get' | 'put' | 'delete'>;
+
+/**
+ * Origin answers that say the host is having trouble, not that the document is
+ * gone or refused: 404 (the Oct 2026 ChatGPT outage), 408, 429 and 5xx. A 403
+ * or other 4xx may be the owner enforcing access, and 410 is the owner
+ * withdrawing the document, so neither falls back.
+ */
+function isOriginOutageStatus(status: number): boolean {
+  return status === 404 || status === 408 || status === 429 || status >= 500;
+}
+
+async function lastGoodKey(metadataUrl: string): Promise<string> {
+  // Hashed because a URL can be longer than KV's 512-byte key limit.
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(metadataUrl));
+  const hex = [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+  return `${CIMD_LAST_GOOD_KEY_PREFIX}${hex}`;
+}
+
+function parseLastGoodDocument(value: unknown): LastGoodDocument | undefined {
+  if (typeof value !== 'object' || value === null) return undefined;
+  const { document, storedAt } = value as Record<string, unknown>;
+  if (typeof document !== 'string' || typeof storedAt !== 'number') return undefined;
+  return { document, storedAt };
+}
+
+/**
+ * Records a freshly validated document. Skips the write when the stored copy
+ * has the same text and was written within the last hour: every data center
+ * refetches once per cache lifetime, and KV allows one write per key per
+ * second. Best effort; a storage failure must not fail OAuth.
+ */
+async function saveLastGoodDocument(
+  store: LastGoodDocumentStore,
+  metadataUrl: string,
+  document: string
+): Promise<void> {
+  const now = Math.floor(Date.now() / 1000);
+  try {
+    const key = await lastGoodKey(metadataUrl);
+    const stored = parseLastGoodDocument(await store.get(key, { type: 'json' }));
+    if (stored?.document === document && now - stored.storedAt < CIMD_LAST_GOOD_REWRITE_SECONDS) return;
+    const value: LastGoodDocument = { document, storedAt: now };
+    await store.put(key, JSON.stringify(value), { expirationTtl: CIMD_LAST_GOOD_TTL_SECONDS });
+  } catch {
+    // Ignore: the fresh document already resolved this request.
+  }
+}
+
+async function deleteLastGoodDocument(store: LastGoodDocumentStore, metadataUrl: string): Promise<void> {
+  try {
+    await store.delete(await lastGoodKey(metadataUrl));
+  } catch {
+    // Ignore: the copy still expires on its own.
+  }
+}
+
+/**
+ * Resolves the last-good copy when the origin is unavailable. The copy is held
+ * to the same size limit and validation as a fresh document, so a stored copy
+ * that no longer validates (stricter rules after an upgrade) is never used.
+ * On success the copy is also put in the Cache API briefly, so the data center
+ * stops sending every request to a host that is down or rate limiting it.
+ */
+async function tryResolveLastGood(
+  store: LastGoodDocumentStore,
+  cache: Cache | undefined,
+  metadataUrl: string,
+  server: OAuthServerCapabilities
+): Promise<{ resolved: ResolvedClientIdMetadataDocument; storedAt: number } | undefined> {
+  try {
+    const stored = parseLastGoodDocument(await store.get(await lastGoodKey(metadataUrl), { type: 'json' }));
+    if (!stored) return undefined;
+    const bytes = new TextEncoder().encode(stored.document);
+    if (bytes.byteLength > CIMD_MAX_SIZE_BYTES) return undefined;
+    const resolved = resolveClientIdMetadataDocument(metadataUrl, JSON.parse(stored.document), server);
+    const cacheHeaders = { 'Cache-Control': `public, max-age=${CIMD_LAST_GOOD_CACHE_SECONDS}` };
+    await cacheValidatedDocument(cache, metadataUrl, new Response(null, { headers: cacheHeaders }), bytes);
+    return { resolved, storedAt: stored.storedAt };
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Fetches, bounds, parses, validates, and negotiates a Client ID Metadata
  * Document into the single effective client configuration used by OAuth flows.
+ *
+ * Every validated document is kept in `store` as the last-good copy for 24
+ * hours after the last successful fetch. When the origin times out, fails at
+ * the network level, or answers 404, 408, 429 or 5xx, the last-good copy is
+ * used in its place. A 410 deletes it.
  */
 export async function fetchClientIdMetadataDocument(
   metadataUrl: string,
-  server: OAuthServerCapabilities
+  server: OAuthServerCapabilities,
+  store: LastGoodDocumentStore
 ): Promise<ResolvedClientIdMetadataDocument> {
   validateClientIdentifierUrl(metadataUrl);
 
   const abortController = new AbortController();
   const timeoutId = setTimeout(() => abortController.abort(), CIMD_FETCH_TIMEOUT_MS);
+  const cache = await openCimdCache();
+  let originUnavailable = false;
 
   try {
-    const cache = await openCimdCache();
     const cachedDocument = await tryResolveFromCache(cache, metadataUrl, server, abortController.signal);
     if (cachedDocument) return cachedDocument;
 
-    const response = await fetchCimdOrigin(metadataUrl, abortController.signal);
+    const response = await fetchCimdOrigin(metadataUrl, abortController.signal).catch((error: unknown) => {
+      originUnavailable = true;
+      throw error;
+    });
     if (!response.ok) {
+      await response.body?.cancel().catch(() => undefined);
+      originUnavailable = isOriginOutageStatus(response.status);
+      if (response.status === 410) await deleteLastGoodDocument(store, metadataUrl);
       throw new Error(`Failed to fetch client metadata: HTTP ${response.status}`);
     }
 
-    const { value, bytes } = await readJsonWithSizeLimit(response, CIMD_MAX_SIZE_BYTES, abortController.signal);
+    const { value, text, bytes } = await readJsonWithSizeLimit(response, CIMD_MAX_SIZE_BYTES, abortController.signal);
     const resolved = resolveClientIdMetadataDocument(metadataUrl, value, server);
     clearTimeout(timeoutId);
-    await cacheValidatedDocument(cache, metadataUrl, response, bytes);
+    await Promise.all([
+      cacheValidatedDocument(cache, metadataUrl, response, bytes),
+      saveLastGoodDocument(store, metadataUrl, text),
+    ]);
     return resolved;
   } catch (error) {
-    if (abortController.signal.aborted) {
-      throw new Error(`Client metadata fetch timed out after ${CIMD_FETCH_TIMEOUT_MS}ms`);
+    const timedOut = abortController.signal.aborted;
+    const originError = timedOut
+      ? new Error(`Client metadata fetch timed out after ${CIMD_FETCH_TIMEOUT_MS}ms`)
+      : error;
+    if (timedOut || originUnavailable) {
+      const lastGood = await tryResolveLastGood(store, cache, metadataUrl, server);
+      if (lastGood) {
+        const ageSeconds = Math.max(0, Math.floor(Date.now() / 1000) - lastGood.storedAt);
+        const reason = originError instanceof Error ? originError.message : String(originError);
+        console.warn(`CIMD origin unavailable for ${metadataUrl}, using copy stored ${ageSeconds}s ago: ${reason}`);
+        return lastGood.resolved;
+      }
     }
-    throw error;
+    throw originError;
   } finally {
     clearTimeout(timeoutId);
   }

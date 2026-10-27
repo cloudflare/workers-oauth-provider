@@ -20,6 +20,7 @@ All keys in the KV namespace follow a consistent pattern to make them easily ide
 | `transaction:`          | Consent and upstream sign-in transactions    | `transaction:5e88…`          |
 | `enterprise-jti:`       | Used ID-JAG assertion identifiers            | `enterprise-jti:9f2c…`       |
 | `client-assertion-jti:` | Used `private_key_jwt` assertion identifiers | `client-assertion-jti:4b1a…` |
+| `cimd:`                 | Last-good Client ID Metadata Documents       | `cimd:7d3e…`                 |
 
 ## Data Structures
 
@@ -226,6 +227,27 @@ Markers that make a signed assertion single-use: an enterprise-managed authoriza
 **Value:** `1`. An assertion is refused while its marker exists.
 
 **TTL:** the assertion's remaining lifetime, at least 60 seconds (KV's minimum). A client assertion's marker also covers the 60 seconds of clock skew it is accepted for after `exp`. A client assertion may not be valid for more than an hour, which bounds its marker. KV has no compare-and-set, so two requests presenting the same assertion at once in different locations can both succeed.
+
+### Last-good Client ID Metadata Documents
+
+The last validated copy of each Client ID Metadata Document, used when the document's host is unavailable. Written only when `clientIdMetadataDocumentEnabled` is on.
+
+**Key format:** `cimd:{sha256(client_id)}`. Hashed because a URL can exceed KV's 512-byte key limit.
+
+**Value:**
+
+```json
+{
+  "document": "{\"client_id\":\"https://client.example/oauth/client.json\",\"client_name\":\"Example\",...}",
+  "storedAt": 1793117210
+}
+```
+
+`document` is the exact text the origin served, at most 5 KB. `storedAt` is the Unix time of the write. A copy is only written after the document validates, and it is validated again before it is used.
+
+**Writes:** after a successful origin fetch, when no copy exists, the text changed, or the copy is more than an hour old. Every data center refetches once per cache lifetime, so this keeps writes to an unchanged document to about one an hour, under KV's one write per key per second. Deleted when the origin answers 410.
+
+**TTL:** 24 hours from the last write. A document its owner deletes keeps resolving for at most that long during an outage; answering 410 ends it at once.
 
 ## Security Considerations
 

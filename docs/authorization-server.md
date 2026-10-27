@@ -79,6 +79,8 @@ CIMD validation follows [draft-ietf-oauth-client-id-metadata-document-00](https:
 
 Validated documents are cached according to their `Cache-Control` headers, capped at 7 days. Error responses and invalid documents are never cached, and a cached document that stops validating is evicted and re-resolved from origin within the same request.
 
+The provider also keeps the last validated copy of each document in `OAUTH_KV` (see [storage-schema.md](../storage-schema.md)), so clients stay signed in while the document's host is down. When the origin times out, fails at the network level, or answers 404, 408, 429 or 5xx, the stored copy is validated again and used in its place, and is then served from the Cache API for 60 seconds so the host isn't sent every request. The copy expires 24 hours after the last successful fetch. A 401, 403 or other 4xx, or a fresh document that fails to parse or validate, never falls back. A 410 deletes the copy, so a client owner that needs a withdrawal to take effect straight away should answer 410, not 404.
+
 CIMD token endpoint authentication is read from `token_endpoint_auth_method` and the OpenID RP Metadata Choices field `token_endpoint_auth_methods_supported`. The provider implements `none` and `private_key_jwt` for CIMD clients. A metadata document gets no registration response, so the client picks its method per request from this server's metadata, and every method both sides support stays usable:
 
 - A document that offers only `private_key_jwt` must authenticate every token and revocation request with a signed client assertion.
