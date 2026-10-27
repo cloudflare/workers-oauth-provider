@@ -12,6 +12,7 @@ import {
   type OAuthProviderOptions,
   type OAuthTokenErrorCode,
   type ResolveExternalTokenResult,
+  type EmaTokenIssuedEvent,
   type Grant,
   type Token,
   OAuthResourceServer,
@@ -5705,6 +5706,201 @@ describe('OAuthProvider', () => {
       const tokens = await response.json<any>();
       expect(response.status).toBe(200);
       expect(tokens.scope).toBe('read');
+    });
+
+    /** A provider with the shared EMA defaults, `overrides` merged over them, and one registered client. */
+    async function createEnterpriseProviderWith(
+      overrides: Partial<OAuthProviderOptions<TestEnv>['enterpriseManagedAuthorization'] & object> = {},
+      providerOverrides: Partial<OAuthProviderOptions<TestEnv>> = {}
+    ) {
+      const provider = new OAuthProvider<TestEnv>({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        resourceMetadata: { resource },
+        ...providerOverrides,
+        enterpriseManagedAuthorization: {
+          trustedIssuers: async () => ({ issuer, jwksUri: `${issuer}/jwks.json`, algorithms: ['RS256'] }),
+          mapClaims: async ({ claims, requestedScope }) => ({
+            userId: `enterprise-${claims.sub}`,
+            scope: requestedScope,
+            props: { subject: claims.sub },
+          }),
+          ...overrides,
+        },
+      });
+      const registerResponse = await provider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify({
+            redirect_uris: ['https://client.example.com/callback'],
+            token_endpoint_auth_method: 'client_secret_basic',
+          })
+        ),
+        mockEnv,
+        mockCtx
+      );
+      const client = await registerResponse.json<{ client_id: string; client_secret: string }>();
+      return { provider, client };
+    }
+
+    function redeem(
+      provider: OAuthProvider<TestEnv>,
+      client: { client_id: string; client_secret: string },
+      assertion: string,
+      scope?: string
+    ) {
+      const params = new URLSearchParams({
+        grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+        assertion,
+        ...(scope === undefined ? {} : { scope }),
+      });
+      return provider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            Authorization: `Basic ${btoa(`${client.client_id}:${client.client_secret}`)}`,
+          },
+          params.toString()
+        ),
+        mockEnv,
+        mockCtx
+      );
+    }
+
+    it('should cap requested and mapped scopes at scopesSupported when the assertion has no scope', async () => {
+      let mapperSaw: string[] | undefined;
+      const { provider, client } = await createEnterpriseProviderWith(
+        {
+          mapClaims: async ({ requestedScope }) => {
+            mapperSaw = requestedScope;
+            return { userId: 'employee-123', scope: [...requestedScope, 'admin'], props: {} };
+          },
+        },
+        { scopesSupported: ['read', 'write'] }
+      );
+      const assertion = await createAssertion({ client_id: client.client_id, scope: undefined });
+
+      const response = await redeem(provider, client, assertion, 'read delete');
+
+      expect(response.status).toBe(200);
+      expect(mapperSaw).toEqual(['read']);
+      await expect(response.json()).resolves.toMatchObject({ scope: 'read' });
+    });
+
+    it('should leave mapped scopes alone when scopesSupported is not configured', async () => {
+      const { provider, client } = await createEnterpriseProviderWith({
+        mapClaims: async () => ({ userId: 'employee-123', scope: ['anything'], props: {} }),
+      });
+      const assertion = await createAssertion({ client_id: client.client_id, scope: undefined });
+
+      const response = await redeem(provider, client, assertion);
+
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toMatchObject({ scope: 'anything' });
+    });
+
+    it('should report the issued grant to onTokenIssued before responding', async () => {
+      const events: EmaTokenIssuedEvent<TestEnv>[] = [];
+      const { provider, client } = await createEnterpriseProviderWith({
+        onTokenIssued: async (event) => {
+          // The grant is already stored when the hook runs.
+          const stored = await event.env.OAUTH_KV.get(`grant:${event.userId}:${event.grantId}`);
+          expect(stored).not.toBeNull();
+          events.push(event);
+        },
+      });
+      const assertion = await createAssertion({ client_id: client.client_id });
+
+      const response = await redeem(provider, client, assertion);
+
+      expect(response.status).toBe(200);
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({
+        userId: 'enterprise-employee-123',
+        resource,
+        scope: ['read', 'write'],
+        expiresIn: expect.any(Number),
+        claims: expect.objectContaining({ iss: issuer, sub: 'employee-123', email: 'employee@example.com' }),
+        clientInfo: expect.objectContaining({ clientId: client.client_id }),
+      });
+      expect(JSON.stringify(events[0])).not.toContain(assertion);
+    });
+
+    it('should propagate an onTokenIssued error instead of returning the token', async () => {
+      const { provider, client } = await createEnterpriseProviderWith({
+        onTokenIssued: async () => {
+          throw new Error('audit log unavailable');
+        },
+      });
+      const assertion = await createAssertion({ client_id: client.client_id });
+
+      // Like other unexpected callback errors it propagates, so the Worker answers 500.
+      await expect(redeem(provider, client, assertion)).rejects.toThrow('audit log unavailable');
+    });
+
+    it('should reject a non-function onTokenIssued at construction time', () => {
+      expect(
+        () =>
+          new OAuthProvider<TestEnv>({
+            apiRoute: ['/api/'],
+            apiHandler: TestApiHandler,
+            defaultHandler: testDefaultHandler,
+            authorizeEndpoint: '/authorize',
+            tokenEndpoint: '/oauth/token',
+            resourceMetadata: { resource },
+            enterpriseManagedAuthorization: {
+              trustedIssuers: async () => null,
+              mapClaims: async () => null,
+              onTokenIssued: 'log' as unknown as () => void,
+            },
+          })
+      ).toThrow('enterpriseManagedAuthorization.onTokenIssued must be a function');
+    });
+
+    it('should not verify an assertion with keys cached from a different JWKS URL for the same issuer', async () => {
+      // Two tenant rows can name one issuer with different JWKS URLs. Keys cached for one must
+      // never verify an assertion the resolver routed to the other.
+      const other = await createRsaJwtKey('test-key');
+      vi.mocked(globalThis.fetch).mockImplementation(async (input) => {
+        if (input === `${issuer}/jwks.json`) return Response.json({ keys: [publicJwk] });
+        if (input === `${issuer}/other-jwks.json`) return Response.json({ keys: [other.publicJwk] });
+        return new Response('not found', { status: 404 });
+      });
+      let jwksUri = `${issuer}/jwks.json`;
+      const { provider, client } = await createEnterpriseProviderWith({
+        trustedIssuers: async () => ({ issuer, jwksUri, algorithms: ['RS256'] }),
+      });
+
+      const first = await redeem(provider, client, await createAssertion({ client_id: client.client_id }));
+      expect(first.status).toBe(200);
+
+      // Same issuer and kid, but now routed to a JWKS that holds a different key. An assertion
+      // signed with the first key must fail, and one signed with the second must succeed.
+      jwksUri = `${issuer}/other-jwks.json`;
+      const signedWithFirstKey = await redeem(provider, client, await createAssertion({ client_id: client.client_id }));
+      expect(signedWithFirstKey.status).toBe(400);
+
+      const now = Math.floor(Date.now() / 1000);
+      const signedWithSecondKey = await signJwt(other.privateKey, {
+        iss: issuer,
+        sub: 'employee-123',
+        aud: 'https://example.com',
+        resource,
+        client_id: client.client_id,
+        jti: crypto.randomUUID(),
+        iat: now,
+        exp: now + 300,
+      });
+      const second = await redeem(provider, client, signedWithSecondKey);
+      expect(second.status).toBe(200);
     });
 
     it('should reject mapped scopes with invalid OAuth scope-token characters', async () => {
@@ -16582,5 +16778,129 @@ describe('user IDs cannot contain ":"', () => {
     // A page the legacy key fills entirely doesn't end the listing early: a's grant still comes back.
     const firstPage = await oauth.listUserGrants('a', { limit: 1 });
     expect(firstPage.items.map((grant) => grant.userId)).toEqual(['a']);
+  });
+});
+
+describe('Enterprise-Managed Authorization on an authorization server with several resources', () => {
+  const issuer = 'https://auth.example.com';
+  const idp = 'https://idp.example.com';
+  const calendarResource = 'https://calendar.example.com/mcp';
+  const driveResource = 'https://drive.example.com/mcp';
+  let env: TestEnv;
+  let ctx: MockExecutionContext;
+  let privateKey: CryptoKey;
+  let authorizationServer: OAuthAuthorizationServer<TestEnv>;
+  let client: { client_id: string; client_secret: string };
+
+  beforeEach(async () => {
+    env = createMockEnv();
+    ctx = new MockExecutionContext();
+    const key = await createRsaJwtKey();
+    privateKey = key.privateKey;
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) =>
+      input === `${idp}/jwks.json` ? Response.json({ keys: [key.publicJwk] }) : new Response('', { status: 404 })
+    );
+    // No defaultResource: a request without `resource` has to be routed by the assertion.
+    authorizationServer = new OAuthAuthorizationServer<TestEnv>({
+      issuer,
+      resources: [calendarResource, driveResource],
+      clientRegistrationEndpoint: '/oauth/register',
+      scopesSupported: ['calendar:read', 'drive:read'],
+      enterpriseManagedAuthorization: {
+        trustedIssuers: async ({ iss }) => (iss === idp ? { issuer: idp, jwksUri: `${idp}/jwks.json` } : null),
+        mapClaims: async ({ claims, requestedScope }) => ({
+          userId: `enterprise-${claims.sub}`,
+          scope: requestedScope,
+          props: { subject: claims.sub },
+        }),
+      },
+    });
+    const response = await authorizationServer.fetch(
+      createMockRequest(
+        `${issuer}/oauth/register`,
+        'POST',
+        { 'Content-Type': 'application/json' },
+        JSON.stringify({
+          redirect_uris: ['https://client.example.com/callback'],
+          token_endpoint_auth_method: 'client_secret_post',
+        })
+      ),
+      env,
+      ctx
+    );
+    client = await response.json();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  async function assertion(claims: Record<string, unknown>) {
+    const now = Math.floor(Date.now() / 1000);
+    return signJwt(privateKey, {
+      iss: idp,
+      sub: 'employee-123',
+      aud: issuer,
+      client_id: client.client_id,
+      jti: crypto.randomUUID(),
+      iat: now,
+      exp: now + 300,
+      ...claims,
+    });
+  }
+
+  function redeem(idJag: string, resource?: string) {
+    const params = new URLSearchParams({
+      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+      assertion: idJag,
+      client_id: client.client_id,
+      client_secret: client.client_secret,
+    });
+    if (resource) params.set('resource', resource);
+    return authorizationServer.fetch(
+      createMockRequest(
+        `${issuer}/oauth/token`,
+        'POST',
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+        params.toString()
+      ),
+      env,
+      ctx
+    );
+  }
+
+  it("should bind the token to the ID-JAG's resource when the request omits resource", async () => {
+    const response = await redeem(await assertion({ resource: driveResource, scope: 'drive:read' }));
+
+    expect(response.status).toBe(200);
+    const tokens = await response.json<{ access_token: string; resource: string; scope: string }>();
+    expect(tokens).toMatchObject({ resource: driveResource, scope: 'drive:read' });
+    await expect(authorizationServer.validateToken(driveResource, tokens.access_token, env)).resolves.toMatchObject({
+      audience: driveResource,
+    });
+    await expect(authorizationServer.validateToken(calendarResource, tokens.access_token, env)).resolves.toBeNull();
+  });
+
+  it('should still require resource when neither the request nor the ID-JAG names one', async () => {
+    const response = await redeem(await assertion({}));
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({ error: 'invalid_target' });
+  });
+
+  it('should reject a request resource that differs from the signed resource claim', async () => {
+    const response = await redeem(await assertion({ resource: driveResource }), calendarResource);
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({ error: 'invalid_target' });
+    expect((await env.OAUTH_KV.list({ prefix: 'grant:' })).keys).toHaveLength(0);
+  });
+
+  it('should reject an ID-JAG resource that names no configured resource', async () => {
+    const response = await redeem(await assertion({ resource: 'https://other.example.com/mcp' }));
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({ error: 'invalid_target' });
+    expect((await env.OAUTH_KV.list({ prefix: 'grant:' })).keys).toHaveLength(0);
   });
 });

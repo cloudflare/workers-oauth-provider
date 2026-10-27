@@ -132,6 +132,34 @@ new OAuthProvider({
 
 The provider validates ID-JAG type, signature, issuer, audience, client binding, resource, timestamps, maximum lifetime, and replay identifier. The audience must be the authorization server issuer as a string or a single-element array. Assertions containing `authorization_details` or `cnf` fail closed until typed authorization-detail and DPoP processing are implemented. Refresh tokens are not issued for this grant.
 
+The token is bound to the resource the ID-JAG's `resource` claim names, so on an `OAuthAuthorizationServer` with several `resources` the client doesn't have to repeat it. A `resource` request parameter must name the same resource. With neither, the token gets `defaultResource`, or the request fails `invalid_target` when there is none. Scopes are capped by the assertion's `scope` claim, when it has one, and by `scopesSupported`, so `mapClaims` can't mint a scope the server wouldn't approve interactively.
+
+### One authorization server, many enterprises
+
+`trustedIssuers` runs on every request, so each enterprise can register its own IdP without a deploy. The resolver receives the unverified `iss` and may read it from KV or D1. Only the issuer-level trust belongs there: the issuer, its JWKS URL and algorithms. Validate a tenant-supplied `jwksUri` against your own allowlist before storing it, because the provider fetches it. Keys are cached per issuer and JWKS URL, so two tenant rows naming one issuer with different URLs never share keys.
+
+Per-tenant policy goes in `mapClaims`, which sees the verified claims and the authenticated client. Pick the tenant there, for example by the ID-JAG's `aud_tenant` claim, which an IdP admin sets on purpose, and return `null` for a client or subject the tenant doesn't allow. `onTokenIssued` then sees the grant ID, for audit logs or an index that lets you revoke a tenant's grants with `revokeGrant` when it switches EMA off:
+
+```ts
+enterpriseManagedAuthorization: {
+  trustedIssuers: async ({ iss, env }) => tenants.issuer(env, iss),
+  mapClaims: async ({ claims, clientInfo, requestedScope, env }) => {
+    const tenant = await tenants.find(env, claims.iss, claims.aud_tenant);
+    if (!tenant?.clients.includes(clientInfo.clientId)) return null;
+    return {
+      userId: `ema-${tenant.id}-${await sha256Hex(claims.sub)}`,
+      scope: requestedScope,
+      props: { tenant: tenant.id, subject: claims.sub },
+    };
+  },
+  onTokenIssued: async ({ userId, grantId, claims, scope, env }) => {
+    await auditLog(env, { userId, grantId, issuer: claims.iss, subject: claims.sub, scope });
+  },
+},
+```
+
+`onTokenIssued` runs after the grant and token are stored and before the response. If it throws, the error propagates like any unexpected one, the client gets a 500, and the stored token expires unused.
+
 The grant requires client authentication by default. Set `allowPublicClients: true` only when public clients, including CIMD clients, must use it and the ID-JAG trust model is appropriate for the deployment.
 
 The default replay marker uses KV and is best effort across Cloudflare locations because KV is eventually consistent. Signature checks, short assertion lifetime, audience, resource, and client binding limit the replay window. The package does not currently expose a custom replay store, so do not describe ID-JAG redemption as globally single-use.

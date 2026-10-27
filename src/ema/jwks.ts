@@ -41,7 +41,11 @@ export function createDefaultJwksProvider(opts: DefaultJwksProviderOptions = {})
 
   return {
     async fetch(issuer, { forceRefresh, now }) {
-      const cached = cache.get(issuer.issuer);
+      // Keyed by the URL as well as the issuer: a dynamic resolver can return different
+      // `jwksUri` values for one issuer (two tenant rows, say), and keys fetched from one
+      // URL must never verify an assertion resolved to the other.
+      const cacheKey = `${issuer.issuer}\n${issuer.jwksUri}`;
+      const cached = cache.get(cacheKey);
 
       if (!forceRefresh && cached && cached.expiresAt > now) {
         return ok(cached.jwks);
@@ -85,13 +89,13 @@ export function createDefaultJwksProvider(opts: DefaultJwksProviderOptions = {})
         }
 
         const jwks: JsonWebKeySet = { keys: rawJwks.value.keys as OAuthJsonWebKey[] };
-        cache.delete(issuer.issuer);
+        cache.delete(cacheKey);
         if (opts.maxEntries !== undefined && cache.size >= opts.maxEntries) {
           // Maps iterate in insertion order, and a refreshed entry is re-inserted above.
           const oldest = cache.keys().next();
           if (!oldest.done) cache.delete(oldest.value);
         }
-        cache.set(issuer.issuer, {
+        cache.set(cacheKey, {
           jwks,
           expiresAt: now + cacheTtl,
           nextForceRefreshAllowedAt: now + EMA_JWKS_FORCE_REFRESH_COOLDOWN_SECONDS,
