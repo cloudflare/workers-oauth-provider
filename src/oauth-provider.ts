@@ -96,6 +96,7 @@ export type {
   EmaClaimsMapperResult,
   EmaIdJagClaims,
   EmaOptions,
+  EmaTokenIssuedEvent,
   EmaTrustedIssuer,
   EmaTrustedIssuerResolver,
   EmaTrustedIssuerResolverInput,
@@ -2389,6 +2390,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       throw new TypeError('enterpriseManagedAuthorization.mapClaims must be a function');
     }
 
+    if (options.onTokenIssued !== undefined && typeof options.onTokenIssued !== 'function') {
+      throw new TypeError('enterpriseManagedAuthorization.onTokenIssued must be a function');
+    }
+
     if (options.jwksCacheTtlSeconds !== undefined && options.jwksCacheTtlSeconds <= 0) {
       throw new TypeError('enterpriseManagedAuthorization.jwksCacheTtlSeconds must be greater than 0');
     }
@@ -4559,15 +4564,27 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   }): Promise<Result<TokenResponse, EmaValidationError>> {
     const { body, clientInfo, env, requestUrl, request, enterpriseOptions } = args;
     const { jwksProvider, jtiStore } = this;
-    const configuredResource = this.resolveNewTokenResource(body.resource);
     // Unreachable: handleJwtBearerGrant short-circuits when enterpriseOptions is absent.
     if (!jwksProvider || !jtiStore) {
       throw new Error('EMA pipeline invoked without configured adapters');
     }
+    // An explicit `resource` parameter is validated before the assertion is parsed, so a bad
+    // one is reported as invalid_target whatever the assertion holds.
+    const requestedResource = body.resource === undefined ? undefined : this.resolveNewTokenResource(body.resource);
     const now = Math.floor(Date.now() / 1000);
 
     const parsed = parseIdJag(body.assertion, EMA_MAX_JWT_BYTES);
     if (!parsed.ok) return parsed;
+
+    // The issued token must be audience-restricted to the resource the ID-JAG names (MCP EMA
+    // §5.1), and a client may omit the request parameter. The unverified claim only selects one
+    // of the configured resources here; validateIdJagClaims checks the signed claim against it,
+    // so a claim naming no configured resource falls back to the default and fails there.
+    const resourceHint = parsed.value.rawClaims.resource;
+    const configuredResource =
+      requestedResource ??
+      (typeof resourceHint === 'string' ? this.findRequestedResource(resourceHint) : undefined) ??
+      this.resolveNewTokenResource(undefined);
 
     const header = validateIdJagHeader(parsed.value.header, EMA_ID_JAG_JWT_TYPE, EMA_SUPPORTED_JWT_ALGORITHMS);
     if (!header.ok) return header;
@@ -4607,6 +4624,18 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     });
     if (!claims.ok) return claims;
 
+    const parsedScope = parseEmaScopeParam(body.scope, claims.value.assertionScopes);
+    if (!parsedScope.ok) return parsedScope;
+    // Like an interactive grant, an EMA grant carries only scopes this server supports.
+    const requestedScope = { ...parsedScope, value: this.limitToSupportedScopes(parsedScope.value) };
+    // A request that names scopes and can get none of them fails invalid_scope, as an
+    // authorization-code or refresh request does. Checked before the replay marker, so the
+    // client can retry the same assertion with a scope it can have.
+    const named = parseEmaScopeParam(body.scope, []);
+    if (named.ok && named.value.length > 0 && requestedScope.value.length === 0) {
+      return err({ reason: 'scope_not_granted', requested: named.value });
+    }
+
     // Fresh clock read so the JTI KV TTL reflects the assertion's remaining
     // lifetime at the moment of write, not at pipeline start (JWKS fetch
     // already burned several ms; mapper hasn't run yet).
@@ -4619,9 +4648,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       env,
     });
     if (!replay.ok) return replay;
-
-    const requestedScope = parseEmaScopeParam(body.scope, claims.value.assertionScopes);
-    if (!requestedScope.ok) return requestedScope;
 
     let mapperOutput: unknown;
     try {
@@ -4653,20 +4679,35 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     });
     if (!ttl.ok) return ttl;
 
-    return ok(
-      await this.issueEmaAccessToken({
-        clientId: clientInfo.clientId,
-        userId: mapped.value.userId,
-        mapperScope: mapped.value.scope,
-        mapperProps: mapped.value.props,
-        mapperMetadata: mapped.value.metadata,
-        assertionScopes: claims.value.assertionScopes,
-        resource: configuredResource,
-        accessTokenTTLSeconds: ttl.value,
-        env,
-        now: issueNow,
-      })
-    );
+    const issued = await this.issueEmaAccessToken({
+      clientId: clientInfo.clientId,
+      userId: mapped.value.userId,
+      mapperScope: mapped.value.scope,
+      mapperProps: mapped.value.props,
+      mapperMetadata: mapped.value.metadata,
+      assertionScopes: claims.value.assertionScopes,
+      resource: configuredResource,
+      accessTokenTTLSeconds: ttl.value,
+      env,
+      now: issueNow,
+    });
+
+    // After the grant and token are stored, before the client sees the token. A throw propagates
+    // as an unexpected error (500): the stored token is never returned and expires with its TTL,
+    // so a deployer whose audit write fails hands out nothing.
+    await enterpriseOptions.onTokenIssued?.({
+      claims: claims.value.claims,
+      clientInfo,
+      userId: mapped.value.userId,
+      grantId: issued.grantId,
+      resource: configuredResource,
+      scope: issued.scope,
+      expiresIn: ttl.value,
+      request,
+      env,
+    });
+
+    return ok(issued.response);
   }
 
   /**
@@ -4724,7 +4765,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     accessTokenTTLSeconds: number;
     env: Env & ProviderEnv;
     now: number;
-  }): Promise<TokenResponse> {
+  }): Promise<{ grantId: string; scope: string[]; response: TokenResponse }> {
     // Defense-in-depth downscope: the mapper's output is filtered through the
     // assertion's scope claim (when present) so that a mapper returning an
     // out-of-band `admin` scope cannot escalate beyond what the IdP authorized.
@@ -4732,8 +4773,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     // the mapper saw it; this is the second layer that bounds the *mapper's*
     // output too. When the assertion carries no scope claim, the mapper has
     // full discretion (no ceiling to enforce).
-    const tokenScopes =
-      args.assertionScopes.length > 0 ? this.downscope(args.mapperScope, args.assertionScopes) : args.mapperScope;
+    // `scopesSupported` is the outer ceiling either way, so a mapper can't mint a scope the
+    // authorization server would never approve interactively.
+    const tokenScopes = this.limitToSupportedScopes(
+      args.assertionScopes.length > 0 ? this.downscope(args.mapperScope, args.assertionScopes) : args.mapperScope
+    );
 
     const grantId = generateRandomString(16);
     const { encryptedData, key: encryptionKey } = await encryptProps(args.mapperProps);
@@ -4763,11 +4807,15 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     });
 
     return {
-      access_token: accessToken,
-      token_type: 'bearer',
-      expires_in: args.accessTokenTTLSeconds,
-      scope: tokenScopes.join(' '),
-      resource: args.resource,
+      grantId,
+      scope: tokenScopes,
+      response: {
+        access_token: accessToken,
+        token_type: 'bearer',
+        expires_in: args.accessTokenTTLSeconds,
+        scope: tokenScopes.join(' '),
+        resource: args.resource,
+      },
     };
   }
 
@@ -5760,6 +5808,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
    * @param allowedScopes - The maximum scopes available for the current flow
    * @returns The requested scopes that are included in the allowed scopes
    */
+  /** Keep only scopes in `scopesSupported`, when the deployer configured one. */
+  private limitToSupportedScopes(scopes: string[]): string[] {
+    const supported = this.options.scopesSupported;
+    return supported ? scopes.filter((scope) => supported.includes(scope)) : scopes;
+  }
+
   private downscope(requestedScope: string | string[] | undefined, allowedScopes: string[]): string[] {
     if (!requestedScope) return allowedScopes;
 
