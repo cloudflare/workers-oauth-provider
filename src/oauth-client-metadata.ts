@@ -704,34 +704,78 @@ async function tryResolveFromCache(
 }
 
 /**
+ * Optional last-good storage for Client ID Metadata Documents, used when the
+ * document's origin is unavailable. The library stores nothing itself: the
+ * implementation owns storage, which client IDs are eligible, and how old a
+ * copy may be. Stored bytes are revalidated before use, exactly like a fresh
+ * document.
+ */
+export interface ClientIdMetadataDocumentFallback {
+  /**
+   * Returns the last stored copy for `url`, or undefined when there is none or
+   * it should not be served (not eligible, or too old). Called only after the
+   * origin returned 404 or 5xx, timed out, or the fetch failed at the network
+   * level; never after 403 or another 4xx, and never when a fresh document was
+   * read but failed to parse or validate.
+   */
+  load(url: string): Promise<{ bytes: Uint8Array; validatedAt: number } | undefined>;
+  /**
+   * Stores the raw bytes of a document that was just fetched and validated.
+   * Runs on the OAuth request path, so keep it fast; errors are ignored.
+   */
+  save(url: string, bytes: Uint8Array): Promise<void>;
+  /** Called when a stored copy is served. `validatedAt` is Unix time in milliseconds. Errors are ignored. */
+  onServedStale?(event: { url: string; validatedAt: number; reason: string }): void;
+}
+
+/**
  * Fetches, bounds, parses, validates, and negotiates a Client ID Metadata
  * Document into the single effective client configuration used by OAuth flows.
+ * With a `fallback`, an origin outage resolves from the last stored copy.
  */
 export async function fetchClientIdMetadataDocument(
   metadataUrl: string,
-  server: OAuthServerCapabilities
+  server: OAuthServerCapabilities,
+  fallback?: ClientIdMetadataDocumentFallback
 ): Promise<ResolvedClientIdMetadataDocument> {
   validateClientIdentifierUrl(metadataUrl);
 
   const abortController = new AbortController();
   const timeoutId = setTimeout(() => abortController.abort(), CIMD_FETCH_TIMEOUT_MS);
 
+  let response: Response | undefined;
+  // False once a full document arrives: a document that fails to resolve is authoritative.
+  let fetching = true;
   try {
     const cache = await openCimdCache();
     const cachedDocument = await tryResolveFromCache(cache, metadataUrl, server, abortController.signal);
     if (cachedDocument) return cachedDocument;
 
-    const response = await fetchCimdOrigin(metadataUrl, abortController.signal);
+    response = await fetchCimdOrigin(metadataUrl, abortController.signal);
     if (!response.ok) {
       throw new Error(`Failed to fetch client metadata: HTTP ${response.status}`);
     }
 
     const { value, bytes } = await readJsonWithSizeLimit(response, CIMD_MAX_SIZE_BYTES, abortController.signal);
+    fetching = false;
     const resolved = resolveClientIdMetadataDocument(metadataUrl, value, server);
     clearTimeout(timeoutId);
+    if (fallback) {
+      try {
+        await fallback.save(metadataUrl, bytes);
+      } catch {
+        // Last-good storage is best effort; a storage failure must not fail OAuth.
+      }
+    }
     await cacheValidatedDocument(cache, metadataUrl, response, bytes);
     return resolved;
   } catch (error) {
+    clearTimeout(timeoutId);
+    const reason = fetching ? cimdOriginFailureReason(response, error, abortController.signal.aborted) : undefined;
+    if (reason && fallback) {
+      const stale = await resolveStoredDocument(fallback, metadataUrl, server, reason);
+      if (stale) return stale;
+    }
     if (abortController.signal.aborted) {
       throw new Error(`Client metadata fetch timed out after ${CIMD_FETCH_TIMEOUT_MS}ms`);
     }
@@ -739,4 +783,58 @@ export async function fetchClientIdMetadataDocument(
   } finally {
     clearTimeout(timeoutId);
   }
+}
+
+/**
+ * Names an origin availability failure that may use a stored copy, or returns
+ * undefined. 403 and other 4xx responses are the origin owner's answer and are
+ * never bypassed (a 403 may enforce regional restrictions).
+ */
+function cimdOriginFailureReason(
+  response: Response | undefined,
+  error: unknown,
+  timedOut: boolean
+): string | undefined {
+  if (response && !response.ok) {
+    return response.status === 404 || (response.status >= 500 && response.status <= 599)
+      ? `http_${response.status}`
+      : undefined;
+  }
+  if (timedOut || (error instanceof DOMException && error.name === 'AbortError')) return 'timeout';
+  if (!response || error instanceof TypeError) return 'network_error';
+  return undefined;
+}
+
+/**
+ * Revalidates a stored copy through the same pipeline as a fresh document.
+ * Returns undefined when there is no usable copy, so the caller reports the
+ * origin failure instead of a storage or validation error.
+ */
+async function resolveStoredDocument(
+  fallback: ClientIdMetadataDocumentFallback,
+  metadataUrl: string,
+  server: OAuthServerCapabilities,
+  reason: string
+): Promise<ResolvedClientIdMetadataDocument | undefined> {
+  let resolved: ResolvedClientIdMetadataDocument;
+  let validatedAt: number;
+  try {
+    const stored = await fallback.load(metadataUrl);
+    if (!stored) return undefined;
+    const { value } = await readJsonWithSizeLimit(
+      new Response(stored.bytes),
+      CIMD_MAX_SIZE_BYTES,
+      new AbortController().signal
+    );
+    resolved = resolveClientIdMetadataDocument(metadataUrl, value, server);
+    validatedAt = stored.validatedAt;
+  } catch {
+    return undefined;
+  }
+  try {
+    fallback.onServedStale?.({ url: metadataUrl, validatedAt, reason });
+  } catch {
+    // An observer must not prevent a validated fallback from being served.
+  }
+  return resolved;
 }

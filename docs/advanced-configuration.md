@@ -179,6 +179,46 @@ try {
 
 Do not log credentials or request bodies when recording these failures.
 
+### Serving the last good document during an outage
+
+A CIMD client is resolved on every authorization, code exchange, and refresh. When the client's document host is down, those requests fail, and a failed refresh signs the user out. The Workers Cache API only covers outages shorter than the document's `max-age`, per data center.
+
+`clientIdMetadataDocumentFallback` lets you keep the last document that validated and use it while the origin is unavailable. The library stores nothing itself. It calls `save` with the raw bytes of each document it fetches and validates, and calls `load` only when the origin returns 404 or 5xx, times out, or fails at the network level. It never uses the stored copy after 403 or another 4xx response, or when a fresh document arrives but fails to parse or validate. A stored copy goes through the same validation as a fresh document. If it is missing or no longer validates, the request fails with the origin's error.
+
+Your implementation decides which clients are eligible and how old a copy may be. For example, a KV-backed store with a 24-hour limit:
+
+```ts
+const MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+new OAuthProvider({
+  // Other options...
+  clientIdMetadataDocumentEnabled: true,
+  clientIdMetadataDocumentFallback: {
+    async load(url) {
+      const { value, metadata } = await env.OAUTH_KV.getWithMetadata<{ validatedAt: number }>(
+        `cimd_fallback:${url}`,
+        'arrayBuffer'
+      );
+      if (!value || !metadata || Date.now() - metadata.validatedAt > MAX_AGE_MS) return undefined;
+      return { bytes: new Uint8Array(value), validatedAt: metadata.validatedAt };
+    },
+    async save(url, bytes) {
+      await env.OAUTH_KV.put(`cimd_fallback:${url}`, bytes, {
+        metadata: { validatedAt: Date.now() },
+        expirationTtl: MAX_AGE_MS / 1000,
+      });
+    },
+    onServedStale({ url, validatedAt, reason }) {
+      console.warn('Serving stored client metadata', { url, ageMs: Date.now() - validatedAt, reason });
+    },
+  },
+});
+```
+
+`save` runs on the request path after a successful fetch, so keep it fast. Errors from `load`, `save`, and `onServedStale` are ignored. Every cache miss calls `save`, so you may want to skip writes when the stored bytes are unchanged and recent.
+
+The tradeoff is revocation. A client owner who removes its document on purpose, for example by returning 404, stays resolvable until your stored copy is too old to serve. Keep the window short, and consider limiting the fallback to client IDs you know.
+
 ## Custom error responses
 
 `onError` runs whenever the provider is about to return an OAuth error. Use it for logging or monitoring:
