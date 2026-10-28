@@ -215,7 +215,7 @@ new OAuthProvider({
 });
 ```
 
-`save` runs on the request path after a successful fetch, so keep it fast. Errors from `load` and `save` are ignored. Every cache miss calls `save`, so you may want to skip writes when the stored bytes are unchanged and recent.
+`save` runs on the request path after a successful fetch, so keep it fast. Errors from `load`, `save`, and `onServedStale` are ignored. Every cache miss calls `save`, so you may want to skip writes when the stored bytes are unchanged and recent.
 
 The tradeoff is revocation. A client owner who removes its document on purpose, for example by returning 404, stays resolvable until your stored copy is too old to serve. Keep the window short, and consider limiting the fallback to client IDs you know.
 

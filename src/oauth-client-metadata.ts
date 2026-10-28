@@ -724,7 +724,7 @@ export interface ClientIdMetadataDocumentFallback {
    * Runs on the OAuth request path, so keep it fast; errors are ignored.
    */
   save(url: string, bytes: Uint8Array): Promise<void>;
-  /** Called when a stored copy is served. `validatedAt` is Unix time in milliseconds. */
+  /** Called when a stored copy is served. `validatedAt` is Unix time in milliseconds. Errors are ignored. */
   onServedStale?(event: { url: string; validatedAt: number; reason: string }): void;
 }
 
@@ -831,6 +831,10 @@ async function resolveStoredDocument(
   } catch {
     return undefined;
   }
-  fallback.onServedStale?.({ url: metadataUrl, validatedAt, reason });
+  try {
+    fallback.onServedStale?.({ url: metadataUrl, validatedAt, reason });
+  } catch {
+    // An observer must not prevent a validated fallback from being served.
+  }
   return resolved;
 }

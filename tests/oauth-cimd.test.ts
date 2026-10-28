@@ -1021,6 +1021,17 @@ describe('Client ID Metadata Document (CIMD)', () => {
       expect(onServedStale).toHaveBeenCalledWith({ url: cimdUrl, validatedAt: 1_000, reason });
     });
 
+    it('serves the stored copy when the observer throws', async () => {
+      stored.set(cimdUrl, { bytes: encode(validMetadata), validatedAt: 1_000 });
+      globalThis.fetch = vi.fn().mockResolvedValue(new Response('Unavailable', { status: 503 }));
+      onServedStale.mockImplementation(() => {
+        throw new Error('observer failed');
+      });
+
+      expect((await oauthProvider.fetch(authRequest(), mockEnv, mockCtx)).status).toBe(302);
+      expect(onServedStale).toHaveBeenCalled();
+    });
+
     it('serves the stored copy when the origin times out', async () => {
       vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
       stored.set(cimdUrl, { bytes: encode(validMetadata), validatedAt: 1_000 });
