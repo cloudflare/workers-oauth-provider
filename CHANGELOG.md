@@ -1,5 +1,11 @@
 # @cloudflare/workers-oauth-provider
 
+## 1.2.5
+
+### Patch Changes
+
+- [#423](https://github.com/cloudflare/workers-oauth-provider/pull/423) [`5c75ddc`](https://github.com/cloudflare/workers-oauth-provider/commit/5c75ddcf475e247791502eac14dcf14ab0dd4b3b) Thanks [@choksi2212](https://github.com/choksi2212)! - Dynamic Client Registration now registers the grant types this server supports instead of rejecting a client that asks for more. VS Code's published metadata declares the device-code grant next to authorization code and refresh grants, and registration failed with `invalid_client_metadata` before this change. RFC 7591 allows the server to ignore unsupported requested values, so the registration keeps the supported subset, echoes it in the response, and the token endpoint still refuses grants the client never got. Response type validation stays strict, and a request whose supported grant set is empty is rejected, including `grant_types: []`, which previously registered a client that could never complete any flow.
+
 ## 1.2.4
 
 ### Patch Changes
