@@ -720,6 +720,20 @@ interface LastGoodDocument {
   storedAt: number;
 }
 
+/** Overrides for the last-good copy kept of each Client ID Metadata Document. */
+export interface ClientIdMetadataDocumentFallbackOptions {
+  /**
+   * How long a copy may be used after it was stored, in seconds. At least 60, KV's minimum
+   * expiration. Defaults to 24 hours.
+   */
+  maxAgeSeconds?: number;
+  /**
+   * Whether a copy of this client's document may be stored and used; `clientId` is the
+   * document's URL. Defaults to every client. An error it throws fails the client lookup.
+   */
+  eligible?(clientId: string): boolean;
+}
+
 /** The KV operations the last-good copy needs. */
 export type LastGoodDocumentStore = Pick<KVNamespace, 'get' | 'put' | 'delete'>;
 
@@ -756,15 +770,18 @@ function parseLastGoodDocument(value: unknown): LastGoodDocument | undefined {
 async function saveLastGoodDocument(
   store: LastGoodDocumentStore,
   metadataUrl: string,
-  document: string
+  document: string,
+  maxAgeSeconds: number
 ): Promise<void> {
   const now = Math.floor(Date.now() / 1000);
   try {
     const key = await lastGoodKey(metadataUrl);
     const stored = parseLastGoodDocument(await store.get(key, { type: 'json' }));
-    if (stored?.document === document && now - stored.storedAt < CIMD_LAST_GOOD_REWRITE_SECONDS) return;
+    // A copy is rewritten before half its lifetime has passed, so a short lifetime never lapses between writes.
+    const rewriteAfter = Math.min(CIMD_LAST_GOOD_REWRITE_SECONDS, maxAgeSeconds / 2);
+    if (stored?.document === document && now - stored.storedAt < rewriteAfter) return;
     const value: LastGoodDocument = { document, storedAt: now };
-    await store.put(key, JSON.stringify(value), { expirationTtl: CIMD_LAST_GOOD_TTL_SECONDS });
+    await store.put(key, JSON.stringify(value), { expirationTtl: maxAgeSeconds });
   } catch {
     // Ignore: the fresh document already resolved this request.
   }
@@ -789,15 +806,19 @@ async function tryResolveLastGood(
   store: LastGoodDocumentStore,
   cache: Cache | undefined,
   metadataUrl: string,
-  server: OAuthServerCapabilities
+  server: OAuthServerCapabilities,
+  maxAgeSeconds: number
 ): Promise<{ resolved: ResolvedClientIdMetadataDocument; storedAt: number } | undefined> {
   try {
     const stored = parseLastGoodDocument(await store.get(await lastGoodKey(metadataUrl), { type: 'json' }));
     if (!stored) return undefined;
+    // KV expires the copy on the lifetime it was written with; this holds it to the current one.
+    const remaining = stored.storedAt + maxAgeSeconds - Math.floor(Date.now() / 1000);
+    if (!(remaining > 0)) return undefined;
     const bytes = new TextEncoder().encode(stored.document);
     if (bytes.byteLength > CIMD_MAX_SIZE_BYTES) return undefined;
     const resolved = resolveClientIdMetadataDocument(metadataUrl, JSON.parse(stored.document), server);
-    const cacheHeaders = { 'Cache-Control': `public, max-age=${CIMD_LAST_GOOD_CACHE_SECONDS}` };
+    const cacheHeaders = { 'Cache-Control': `public, max-age=${Math.min(CIMD_LAST_GOOD_CACHE_SECONDS, remaining)}` };
     await cacheValidatedDocument(cache, metadataUrl, new Response(null, { headers: cacheHeaders }), bytes);
     return { resolved, storedAt: stored.storedAt };
   } catch {
@@ -812,14 +833,22 @@ async function tryResolveLastGood(
  * Every validated document is kept in `store` as the last-good copy for 24
  * hours after the last successful fetch. When the origin times out, fails at
  * the network level, or answers 404, 408, 429 or 5xx, the last-good copy is
- * used in its place. A 410 deletes it.
+ * used in its place. A 410 deletes it. `fallback` changes the lifetime or the
+ * clients it applies to, and `false` keeps no copy.
  */
 export async function fetchClientIdMetadataDocument(
   metadataUrl: string,
   server: OAuthServerCapabilities,
-  store: LastGoodDocumentStore
+  store: LastGoodDocumentStore,
+  fallback: ClientIdMetadataDocumentFallbackOptions | boolean = true
 ): Promise<ResolvedClientIdMetadataDocument> {
   validateClientIdentifierUrl(metadataUrl);
+  // Undefined when no last-good copy is kept for this client.
+  const options = fallback === true ? {} : fallback;
+  const maxAgeSeconds =
+    options && (!options.eligible || options.eligible(metadataUrl))
+      ? (options.maxAgeSeconds ?? CIMD_LAST_GOOD_TTL_SECONDS)
+      : undefined;
 
   const abortController = new AbortController();
   const timeoutId = setTimeout(() => abortController.abort(), CIMD_FETCH_TIMEOUT_MS);
@@ -846,7 +875,7 @@ export async function fetchClientIdMetadataDocument(
     clearTimeout(timeoutId);
     await Promise.all([
       cacheValidatedDocument(cache, metadataUrl, response, bytes),
-      saveLastGoodDocument(store, metadataUrl, text),
+      maxAgeSeconds !== undefined && saveLastGoodDocument(store, metadataUrl, text, maxAgeSeconds),
     ]);
     return resolved;
   } catch (error) {
@@ -854,8 +883,8 @@ export async function fetchClientIdMetadataDocument(
     const originError = timedOut
       ? new Error(`Client metadata fetch timed out after ${CIMD_FETCH_TIMEOUT_MS}ms`)
       : error;
-    if (timedOut || originUnavailable) {
-      const lastGood = await tryResolveLastGood(store, cache, metadataUrl, server);
+    if (maxAgeSeconds !== undefined && (timedOut || originUnavailable)) {
+      const lastGood = await tryResolveLastGood(store, cache, metadataUrl, server, maxAgeSeconds);
       if (lastGood) {
         const ageSeconds = Math.max(0, Math.floor(Date.now() / 1000) - lastGood.storedAt);
         const reason = originError instanceof Error ? originError.message : String(originError);

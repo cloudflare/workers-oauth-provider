@@ -81,6 +81,17 @@ Validated documents are cached according to their `Cache-Control` headers, cappe
 
 The provider also keeps the last validated copy of each document in `OAUTH_KV` (see [storage-schema.md](../storage-schema.md)), so clients stay signed in while the document's host is down. When the origin times out, fails at the network level, or answers 404, 408, 429 or 5xx, the stored copy is validated again and used in its place, and is then served from the Cache API for 60 seconds so the host isn't sent every request. The copy expires 24 hours after the last successful fetch. A 401, 403 or other 4xx, or a fresh document that fails to parse or validate, never falls back. A 410 deletes the copy, so a client owner that needs a withdrawal to take effect straight away should answer 410, not 404.
 
+`clientIdMetadataDocumentFallback` changes this. `true` is the default described above. `false` keeps no copy, so a client resolves only from its live document and the Cache API. An object shortens the copy's lifetime or limits it to clients you choose:
+
+```ts
+clientIdMetadataDocumentFallback: {
+  maxAgeSeconds: 6 * 60 * 60, // default 24 hours, at least 60 seconds
+  eligible: (clientId) => TRUSTED_CLIENT_IDS.has(clientId), // default: every client
+},
+```
+
+An error `eligible` throws fails the client lookup, like any other failure to resolve the client. A copy already in use stays in the Cache API for up to 60 seconds after either setting changes.
+
 CIMD token endpoint authentication is read from `token_endpoint_auth_method` and the OpenID RP Metadata Choices field `token_endpoint_auth_methods_supported`. The provider implements `none` and `private_key_jwt` for CIMD clients. A metadata document gets no registration response, so the client picks its method per request from this server's metadata, and every method both sides support stays usable:
 
 - A document that offers only `private_key_jwt` must authenticate every token and revocation request with a signed client assertion.
@@ -210,6 +221,7 @@ The existing `OAuthProvider` combined configuration uses these options:
 | `scopesSupported`                  | Publish authorization server scopes                                         | Omitted                                  |
 | `resourceMetadata.resource`        | Canonical HTTPS resource and token audience                                 | Required                                 |
 | `clientIdMetadataDocumentEnabled`  | Enable CIMD lookup and advertisement                                        | `false`                                  |
+| `clientIdMetadataDocumentFallback` | Last-good copy of CIMD documents: its lifetime and clients, or `false`      | Every client, 24 hours                   |
 | `allowPrivateUseRedirectUris`      | Accept RFC 8252 private-use scheme redirect URIs for native apps            | `false`                                  |
 | `cookiePrefix`                     | Prefix for the consent and upstream helpers' cookies (must be `__Host-…`)   | `__Host-oauth-`                          |
 | `disallowPublicClientRegistration` | Reject public clients at DCR                                                | `false`                                  |

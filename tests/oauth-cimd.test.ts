@@ -984,6 +984,24 @@ describe('Client ID Metadata Document (CIMD)', () => {
       globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(createMockFetchResponse(metadata)));
       expect((await oauthProvider.fetch(cimdAuthRequest(), mockEnv, mockCtx)).status).toBe(302);
     };
+    const originAnswers404 = () => {
+      globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(new Response('Not Found', { status: 404 })));
+    };
+    const useFallback = (
+      clientIdMetadataDocumentFallback: OAuthProviderOptions['clientIdMetadataDocumentFallback']
+    ) => {
+      oauthProvider = new OAuthProvider({
+        apiRoute: '/api/',
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientIdMetadataDocumentEnabled: true,
+        clientIdMetadataDocumentFallback,
+      });
+      // The env keeps the helpers of the first provider that served it.
+      mockEnv.OAUTH_PROVIDER = null;
+    };
 
     afterEach(() => {
       vi.useRealTimers();
@@ -1090,6 +1108,82 @@ describe('Client ID Metadata Document (CIMD)', () => {
       globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(new Response('Not Found', { status: 404 })));
 
       await expect(oauthProvider.fetch(cimdAuthRequest(), mockEnv, mockCtx)).rejects.toThrow(CimdFetchError);
+    });
+
+    it.each([
+      ['the fallback is false', false],
+      ['the client is not eligible', { eligible: () => false }],
+    ])('keeps no copy and does not fall back when %s', async (_label, fallback) => {
+      useFallback(fallback);
+      await resolveOnceFromOrigin();
+      expect(await mockEnv.OAUTH_KV.get(await lastGoodKey())).toBeNull();
+
+      originAnswers404();
+      await expect(oauthProvider.fetch(cimdAuthRequest(), mockEnv, mockCtx)).rejects.toThrow(CimdFetchError);
+    });
+
+    it('fails the client lookup when eligible throws', async () => {
+      useFallback({
+        eligible: () => {
+          throw new Error('policy store unavailable');
+        },
+      });
+      globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(createMockFetchResponse(validMetadata)));
+
+      const error = await oauthProvider.fetch(cimdAuthRequest(), mockEnv, mockCtx).catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(CimdFetchError);
+      expect((error as CimdFetchError).detail).toBe('policy store unavailable');
+    });
+
+    it.each([
+      ['the fallback is true', true],
+      ['the client is eligible', { eligible: (clientId: string) => clientId === cimdUrl }],
+    ])('uses the last-good copy when %s', async (_label, fallback) => {
+      useFallback(fallback);
+      await resolveOnceFromOrigin();
+
+      originAnswers404();
+      expect((await oauthProvider.fetch(cimdAuthRequest(), mockEnv, mockCtx)).status).toBe(302);
+    });
+
+    it('holds a copy stored under a longer lifetime to maxAgeSeconds', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      await resolveOnceFromOrigin();
+      useFallback({ maxAgeSeconds: 600 });
+      originAnswers404();
+
+      vi.setSystemTime(Date.now() + 599 * 1000);
+      expect((await oauthProvider.fetch(cimdAuthRequest(), mockEnv, mockCtx)).status).toBe(302);
+      vi.setSystemTime(Date.now() + 2 * 1000);
+      await expect(oauthProvider.fetch(cimdAuthRequest(), mockEnv, mockCtx)).rejects.toThrow(CimdFetchError);
+    });
+
+    it('rewrites an unchanged document before a short maxAgeSeconds lapses', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      const putSpy = vi.spyOn(mockEnv.OAUTH_KV, 'put');
+      useFallback({ maxAgeSeconds: 600 });
+
+      await resolveOnceFromOrigin();
+      vi.setSystemTime(Date.now() + 300 * 1000);
+      await resolveOnceFromOrigin();
+      expect(putSpy.mock.calls.filter(([key]) => key.startsWith('cimd:')).length).toBe(2);
+    });
+
+    it('does not serve a used copy from the Cache API past maxAgeSeconds', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      installMockCimdCache();
+      useFallback({ maxAgeSeconds: 600 });
+      await resolveOnceFromOrigin();
+
+      vi.setSystemTime(Date.now() + 570 * 1000);
+      originAnswers404();
+      expect((await oauthProvider.fetch(cimdAuthRequest(), mockEnv, mockCtx)).status).toBe(302);
+      const cached = await (await caches.open('test')).match(cimdUrl);
+      expect(cached?.headers.get('Cache-Control')).toBe('public, max-age=30');
+    });
+
+    it.each([0, 59, 90.5, Infinity, NaN])('rejects a maxAgeSeconds of %s', (maxAgeSeconds) => {
+      expect(() => useFallback({ maxAgeSeconds })).toThrow(TypeError);
     });
 
     it('rewrites an unchanged document at most once an hour', async () => {
