@@ -1349,6 +1349,16 @@ export interface Grant {
   authCodeWrappedKey?: string;
 
   /**
+   * Random marker written when the authorization code is exchanged
+   * Each exchange writes its own marker and re-reads the grant afterwards, so an
+   * exchange that finds a marker it did not write knows another concurrent
+   * exchange consumed the same code (RFC 6749 §4.1.2 single use; see the
+   * consumption fence in the authorization code grant handler). Absent on grants
+   * written before this field existed and until the code is exchanged.
+   */
+  authCodeConsumptionId?: string;
+
+  /**
    * PKCE code challenge for this authorization
    * Only present during the authorization code exchange process
    */
@@ -3740,6 +3750,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     delete grantData.codeChallengeMethod;
     delete grantData.authCodeWrappedKey;
 
+    // Stamp the consumption with a per-exchange marker. KV has no compare-and-swap,
+    // so the replay check above can pass for two concurrent exchanges of the same
+    // code (#420): both read the wrapped key as present, both reach this write, and
+    // the last write silently wins. The fence below re-reads the grant and rejects an
+    // exchange whose marker did not survive.
+    const authCodeConsumptionId = generateRandomString(TOKEN_LENGTH);
+    grantData.authCodeConsumptionId = authCodeConsumptionId;
+
     // Only generate refresh token if issuing one
     let refreshToken: string | undefined;
 
@@ -3770,6 +3788,30 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Save the updated grant with TTL matching refresh token expiration (if any)
     await this.saveGrantWithTTL(env, grantKey, grantData, now);
+
+    // Consumption fence: KV cannot make the write above atomic, so two concurrent
+    // exchanges can both consume the same code. A read from the same location that
+    // wrote observes that location's writes, so re-read the grant: if our marker did
+    // not survive, another exchange of the same code wrote the grant concurrently and
+    // this request is a replay. Treat it exactly like the sequential replay above —
+    // revoke everything issued on the code and answer invalid_grant, per
+    // RFC 6749 §10.5. This closes the same-location interleave from #420; two
+    // exchanges served by different edge locations can each observe their own write
+    // for the length of KV's convergence window, so a fully atomic claim needs a
+    // transactional storage backend.
+    const consumedGrant: Grant | null = await env.OAUTH_KV.get(grantKey, { type: 'json' });
+    if (!consumedGrant || consumedGrant.authCodeConsumptionId !== authCodeConsumptionId) {
+      try {
+        await this.createOAuthHelpers(env).revokeGrant(grantId, userId);
+      } catch {
+        // Best-effort revocation — always return invalid_grant per RFC 6749 §10.5
+      }
+      return this.createErrorResponse(
+        'invalid_grant',
+        { description: 'Authorization code already used' },
+        { category: 'authorization-code-grant', reason: 'code_replayed' }
+      );
+    }
 
     // Create and store access token with potentially narrowed scopes
     const accessToken = await this.createAccessToken({

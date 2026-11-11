@@ -121,6 +121,7 @@ Grant records store information about permissions a user has granted to an appli
   "createdAt": 1644256123,
   "resource": "https://example.com/mcp",
   "authCodeId": "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8",
+  "authCodeConsumptionId": "kZ3v1VcW7HQOaJnESqPT2YI0fRcOErBR",
   "refreshTokenId": "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8",
   "refreshTokenWrappedKey": "base64-encoded wrapped encryption key"
 }
@@ -296,6 +297,10 @@ Markers that make a signed assertion single-use: an enterprise-managed authoriza
      before any action is taken; the `authCodeWrappedKey` and PKCE fields are removed
      from the grant. The absence of `authCodeWrappedKey` (with `authCodeId` still set)
      marks the code as already used
+   - The consumption write also stores a random `authCodeConsumptionId` marker, and the
+     grant is re-read after the write: a marker that does not match the exchange's own
+     means another concurrent exchange consumed the same code, and the exchange is
+     rejected with the grant and its tokens revoked, like a sequential replay
    - A refresh token is generated and its hash is stored in the grant's `refreshTokenId` field
    - The wrapped key for the refresh token is stored in `refreshTokenWrappedKey`
    - The grant's TTL is removed, making it permanent
