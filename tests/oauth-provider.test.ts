@@ -13903,6 +13903,31 @@ describe('OAuthProvider', () => {
       expect(writes()).toEqual([]);
     });
 
+    it('skips renewal write when the re-read client has no registration expiry', async () => {
+      const provider = makeProvider();
+      const client = await registerDcr(provider);
+      const tokens = await issueTokens(provider, client);
+      await ageRegistration(client.client_id, NINETY_DAYS / 2 - 1);
+
+      const originalGet = mockEnv.OAUTH_KV.get.bind(mockEnv.OAUTH_KV);
+      let clientGetCount = 0;
+      vi.spyOn(mockEnv.OAUTH_KV, 'get').mockImplementation(async (key, options) => {
+        const result = await originalGet(key, options);
+        if (key === `client:${client.client_id}`) {
+          clientGetCount += 1;
+          if (clientGetCount === 2 && result) {
+            const { registrationExpiresAt: _ignored, ...withoutExpiry } = result;
+            return withoutExpiry;
+          }
+        }
+        return result;
+      });
+
+      const writes = clientWrites();
+      expect((await refresh(provider, client, tokens.refresh_token)).status).toBe(200);
+      expect(writes()).toEqual([]);
+    });
+
     it('keeps both grant and DCR client registration alive past 90 days when refreshTokenIdleTTL is configured', async () => {
       vi.useFakeTimers();
       try {
