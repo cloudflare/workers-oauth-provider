@@ -13876,6 +13876,91 @@ describe('OAuthProvider', () => {
       mockEnv.OAUTH_KV.advanceTime((NINETY_DAYS + 1) * 1000);
       expect(await readClient(client.clientId)).not.toBeNull();
     });
+
+    it('skips redundant KV write when concurrent request already renewed the registration', async () => {
+      const provider = makeProvider();
+      const client = await registerDcr(provider);
+      const tokens = await issueTokens(provider, client);
+      await ageRegistration(client.client_id, NINETY_DAYS / 2 - 1);
+
+      const originalGet = mockEnv.OAUTH_KV.get.bind(mockEnv.OAUTH_KV);
+      let clientGetCount = 0;
+      vi.spyOn(mockEnv.OAUTH_KV, 'get').mockImplementation(async (key, options) => {
+        const result = await originalGet(key, options);
+        if (key === `client:${client.client_id}`) {
+          clientGetCount += 1;
+          // On the second read (inside renewClientRegistrationIfDue), simulate a concurrent
+          // request having just renewed the client record in KV.
+          if (clientGetCount === 2 && result) {
+            return { ...result, registrationExpiresAt: nowSeconds() + NINETY_DAYS };
+          }
+        }
+        return result;
+      });
+
+      const writes = clientWrites();
+      expect((await refresh(provider, client, tokens.refresh_token)).status).toBe(200);
+      expect(writes()).toEqual([]);
+    });
+
+    it('skips renewal write when the re-read client has no registration expiry', async () => {
+      const provider = makeProvider();
+      const client = await registerDcr(provider);
+      const tokens = await issueTokens(provider, client);
+      await ageRegistration(client.client_id, NINETY_DAYS / 2 - 1);
+
+      const originalGet = mockEnv.OAUTH_KV.get.bind(mockEnv.OAUTH_KV);
+      let clientGetCount = 0;
+      vi.spyOn(mockEnv.OAUTH_KV, 'get').mockImplementation(async (key, options) => {
+        const result = await originalGet(key, options);
+        if (key === `client:${client.client_id}`) {
+          clientGetCount += 1;
+          if (clientGetCount === 2 && result) {
+            const { registrationExpiresAt: _ignored, ...withoutExpiry } = result;
+            return withoutExpiry;
+          }
+        }
+        return result;
+      });
+
+      const writes = clientWrites();
+      expect((await refresh(provider, client, tokens.refresh_token)).status).toBe(200);
+      expect(writes()).toEqual([]);
+    });
+
+    it('keeps both grant and DCR client registration alive past 90 days when refreshTokenIdleTTL is configured', async () => {
+      vi.useFakeTimers();
+      try {
+        const THIRTY_DAYS = 30 * 24 * 60 * 60;
+        const TWENTY_DAYS = 20 * 24 * 60 * 60;
+        const provider = makeProvider({
+          refreshTokenTTL: THIRTY_DAYS,
+          refreshTokenIdleTTL: THIRTY_DAYS,
+        });
+
+        const client = await registerDcr(provider);
+        let currentRefreshToken = (await issueTokens(provider, client)).refresh_token;
+
+        // Refresh every 20 days across 5 cycles (100 days total), exceeding both the 30-day
+        // initial grant TTL and the 90-day initial DCR clientRegistrationTTL.
+        for (let cycle = 0; cycle < 5; cycle++) {
+          vi.advanceTimersByTime(TWENTY_DAYS * 1000);
+          const response = await refresh(provider, client, currentRefreshToken);
+          expect(response.status).toBe(200);
+          const body = (await response.json()) as { refresh_token: string };
+          currentRefreshToken = body.refresh_token;
+        }
+
+        const survivingClient = await readClient(client.client_id);
+        expect(survivingClient).not.toBeNull();
+        expect(survivingClient.registrationExpiresAt).toBeGreaterThan(nowSeconds() + NINETY_DAYS / 2);
+
+        const day100Tokens = await issueTokens(provider, client);
+        expect(day100Tokens.refresh_token).toBeTruthy();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
   });
 
   describe('deleteClient cascading to grants', () => {
