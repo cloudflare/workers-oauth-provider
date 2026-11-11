@@ -13885,7 +13885,7 @@ describe('OAuthProvider', () => {
 
       const originalGet = mockEnv.OAUTH_KV.get.bind(mockEnv.OAUTH_KV);
       let clientGetCount = 0;
-      vi.spyOn(mockEnv.OAUTH_KV, 'get').mockImplementation((async (key: string, options?: any) => {
+      vi.spyOn(mockEnv.OAUTH_KV, 'get').mockImplementation(async (key, options) => {
         const result = await originalGet(key, options);
         if (key === `client:${client.client_id}`) {
           clientGetCount += 1;
@@ -13896,7 +13896,7 @@ describe('OAuthProvider', () => {
           }
         }
         return result;
-      }) as any);
+      });
 
       const writes = clientWrites();
       expect((await refresh(provider, client, tokens.refresh_token)).status).toBe(200);
@@ -13929,6 +13929,9 @@ describe('OAuthProvider', () => {
         const survivingClient = await readClient(client.client_id);
         expect(survivingClient).not.toBeNull();
         expect(survivingClient.registrationExpiresAt).toBeGreaterThan(nowSeconds() + NINETY_DAYS / 2);
+
+        const day100Tokens = await issueTokens(provider, client);
+        expect(day100Tokens.refresh_token).toBeTruthy();
       } finally {
         vi.useRealTimers();
       }

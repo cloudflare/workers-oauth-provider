@@ -5461,7 +5461,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       // Re-read rather than re-write the authenticated copy: the record may have been
       // updated or deleted since this request loaded it.
       const current: StoredClientInfo | null = await env.OAUTH_KV.get(`client:${client.clientId}`, { type: 'json' });
-      if (!current || current.registrationExpiresAt === undefined || current.registrationExpiresAt - now > ttl / 2) {
+      if (!current || current.registrationExpiresAt - now > ttl / 2) {
         return;
       }
       await this.putRegisteredClient(env, current, now);
