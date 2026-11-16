@@ -1139,6 +1139,74 @@ describe('OAuthProvider', () => {
       expect(client.response_types).toEqual(['code']);
     });
 
+    it('registers the supported subset when a client declares extra grant types', async () => {
+      const response = await registerMetadata({
+        token_endpoint_auth_method: 'none',
+        redirect_uris: ['http://127.0.0.1:33418/', 'https://vscode.dev/redirect'],
+        grant_types: ['authorization_code', 'refresh_token', 'urn:ietf:params:oauth:grant-type:device_code'],
+        response_types: ['code'],
+      });
+
+      expect(response.status).toBe(201);
+      const client = await response.json<any>();
+      expect(client.grant_types).toEqual(['authorization_code', 'refresh_token']);
+      expect(client.response_types).toEqual(['code']);
+
+      const savedClient = await mockEnv.OAUTH_KV.get(`client:${client.client_id}`, { type: 'json' });
+      expect(savedClient.grantTypes).toEqual(['authorization_code', 'refresh_token']);
+    });
+
+    it('rejects a registration whose supported grant set is empty', async () => {
+      const response = await registerMetadata({
+        token_endpoint_auth_method: 'none',
+        grant_types: ['urn:ietf:params:oauth:grant-type:device_code'],
+        response_types: ['code'],
+      });
+
+      expect(response.status).toBe(400);
+      expect(await response.json<any>()).toMatchObject({ error: 'invalid_client_metadata' });
+      expect((await mockEnv.OAUTH_KV.list({ prefix: 'client:' })).keys).toHaveLength(0);
+
+      const emptyArrays = await registerMetadata({
+        token_endpoint_auth_method: 'none',
+        grant_types: [],
+        response_types: [],
+      });
+      expect(emptyArrays.status).toBe(400);
+      expect(await emptyArrays.json<any>()).toMatchObject({ error: 'invalid_client_metadata' });
+    });
+
+    it('still refuses a grant type that registration narrowed away', async () => {
+      const register = await registerMetadata({
+        token_endpoint_auth_method: 'none',
+        grant_types: ['authorization_code', 'urn:ietf:params:oauth:grant-type:device_code'],
+        response_types: ['code'],
+      });
+      expect(register.status).toBe(201);
+      const client = await register.json<any>();
+
+      const tokenResponse = await oauthProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          `grant_type=urn:ietf:params:oauth:grant-type:device_code&client_id=${encodeURIComponent(client.client_id)}`
+        ),
+        mockEnv,
+        mockCtx
+      );
+
+      expect(tokenResponse.status).toBe(400);
+      expect(await tokenResponse.json<any>()).toMatchObject({ error: 'unsupported_grant_type' });
+    });
+
+    it('still rejects malformed grant arrays', async () => {
+      const response = await registerMetadata({ grant_types: 'authorization_code' });
+
+      expect(response.status).toBe(400);
+      expect(await response.json<any>()).toMatchObject({ error: 'invalid_client_metadata' });
+    });
+
     it.each([
       ['unsupported authentication method', { token_endpoint_auth_method: 'private_key_jwt' }],
       [

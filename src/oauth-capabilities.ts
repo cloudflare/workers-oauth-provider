@@ -248,15 +248,27 @@ function negotiateCimdTokenEndpointAuthMethods(
 }
 
 /**
- * Negotiates choice-valued authentication metadata while keeping DCR grant and
- * response registration strict.
+ * Negotiates choice-valued authentication metadata and narrows requested grant
+ * types to the subset this server implements. RFC 7591 §3.2.1 allows a server
+ * to ignore unsupported requested values, and a client that asks for an extra
+ * flow alongside the ones this server runs (VS Code declares
+ * `urn:ietf:params:oauth:grant-type:device_code` next to authorization code
+ * and refresh grants) is more useful registered for the supported subset than
+ * refused outright. Response type validation stays strict: an unsupported
+ * response_type is still a registration error, and so is a request whose
+ * supported grant set ends up empty, because the client could then never
+ * complete a flow.
  */
 export function negotiateDynamicClientRegistrationCapabilities(
   server: OAuthServerCapabilities,
   client: ClientMetadataCapabilities
 ): { grantTypes: string[]; responseTypes: string[]; tokenEndpointAuthMethod: string } {
+  const grantTypes = client.grantTypes.filter((grantType) => server.grantTypes.includes(grantType));
+  if (grantTypes.length === 0) {
+    throw new Error(`No supported grant types requested. This server supports: ${server.grantTypes.join(', ')}`);
+  }
   const effective = {
-    grantTypes: [...client.grantTypes],
+    grantTypes,
     responseTypes: [...client.responseTypes],
     tokenEndpointAuthMethod: negotiateTokenEndpointAuthMethod({
       acceptedMethods: server.tokenEndpointAuthMethods,
