@@ -1022,6 +1022,20 @@ describe('Client ID Metadata Document (CIMD)', () => {
       expect((await oauthProvider.fetch(cimdAuthRequest(), mockEnv, mockCtx)).status).toBe(302);
     });
 
+    it('uses the last-good copy when the response body fails in transit', async () => {
+      await resolveOnceFromOrigin();
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        const body = new ReadableStream<Uint8Array>({
+          start: (controller) => controller.enqueue(new TextEncoder().encode('{"client_id":')),
+          pull: (controller) => controller.error(new Error('Network connection lost')),
+        });
+        return Promise.resolve(new Response(body, { status: 200 }));
+      });
+
+      expect((await oauthProvider.fetch(cimdAuthRequest(), mockEnv, mockCtx)).status).toBe(302);
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('Network connection lost'));
+    });
+
     it('uses the last-good copy when the origin times out', async () => {
       await resolveOnceFromOrigin();
       vi.useFakeTimers();

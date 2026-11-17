@@ -545,6 +545,9 @@ function resolveClientIdMetadataDocument(
   };
 }
 
+/** The response body failed in transit: the origin is unavailable, unlike a body that arrived and is invalid. */
+class ClientMetadataBodyReadError extends Error {}
+
 function readStreamChunk(
   reader: ReadableStreamDefaultReader<Uint8Array>,
   signal: AbortSignal
@@ -585,7 +588,11 @@ async function readJsonWithSizeLimit(
   let totalSize = 0;
 
   while (true) {
-    const { done, value } = await readStreamChunk(reader, signal);
+    const { done, value } = await readStreamChunk(reader, signal).catch((error: unknown) => {
+      if (signal.aborted) throw error;
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new ClientMetadataBodyReadError(`Client metadata response body could not be read: ${reason}`);
+    });
     if (done) break;
     if (!value) continue;
 
@@ -870,7 +877,15 @@ export async function fetchClientIdMetadataDocument(
       throw new Error(`Failed to fetch client metadata: HTTP ${response.status}`);
     }
 
-    const { value, text, bytes } = await readJsonWithSizeLimit(response, CIMD_MAX_SIZE_BYTES, abortController.signal);
+    const { value, text, bytes } = await readJsonWithSizeLimit(
+      response,
+      CIMD_MAX_SIZE_BYTES,
+      abortController.signal
+    ).catch((error: unknown) => {
+      // A connection lost mid-body is an outage. A body that arrived and is invalid is not.
+      originUnavailable = error instanceof ClientMetadataBodyReadError;
+      throw error;
+    });
     const resolved = resolveClientIdMetadataDocument(metadataUrl, value, server);
     clearTimeout(timeoutId);
     await Promise.all([

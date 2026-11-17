@@ -247,7 +247,7 @@ The last validated copy of each Client ID Metadata Document, used when the docum
 
 **Writes:** after a successful origin fetch, when no copy exists, the text changed, or the copy is more than an hour old. Every data center refetches once per cache lifetime, so this keeps writes to an unchanged document to about one an hour, under KV's one write per key per second. Deleted when the origin answers 410.
 
-**TTL:** 24 hours from the last write, or `clientIdMetadataDocumentFallback.maxAgeSeconds`; a shorter lifetime also rewrites an unchanged document once half of it has passed. A document its owner deletes keeps resolving for at most that long during an outage; answering 410 ends it at once.
+**TTL:** 24 hours from the last write, or `clientIdMetadataDocumentFallback.maxAgeSeconds`; a shorter lifetime also rewrites an unchanged document once half of it has passed. A document its owner deletes keeps resolving for at most that long during an outage; answering 410 ends it the next time the provider fetches the document.
 
 ## Security Considerations
 
