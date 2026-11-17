@@ -23,8 +23,10 @@ import {
   resolveDynamicClientRegistrationMetadata,
   validateRedirectUri,
   validateRegisteredRedirectUris,
+  type ClientIdMetadataDocumentFallbackOptions,
   type ResolvedDynamicClientRegistrationMetadata,
 } from './oauth-client-metadata';
+export type { ClientIdMetadataDocumentFallbackOptions } from './oauth-client-metadata';
 import {
   EMA_DEFAULT_CLOCK_SKEW_SECONDS,
   EMA_DEFAULT_MAX_ASSERTION_LIFETIME_SECONDS,
@@ -656,6 +658,13 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
    * Defaults to false.
    */
   clientIdMetadataDocumentEnabled?: boolean;
+
+  /**
+   * The last-good copy of each Client ID Metadata Document, used while the document's host is
+   * down. By default, or with `true`, every client's copy is kept in `OAUTH_KV` for 24 hours. Pass an object to
+   * shorten that or limit it to clients you choose, or `false` to keep no copy.
+   */
+  clientIdMetadataDocumentFallback?: ClientIdMetadataDocumentFallbackOptions | boolean;
 
   /**
    * Prefix for the cookies the consent and upstream helpers set (`<prefix>consent`,
@@ -2069,6 +2078,16 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       throw new TypeError(
         `clientRegistrationTTL must be undefined (no expiry) or an integer of at least ${KV_MIN_EXPIRATION_TTL_SECONDS} seconds (Cloudflare KV's minimum expiration window).`
       );
+    }
+    const cimdFallback = this.options.clientIdMetadataDocumentFallback;
+    const cimdFallbackOptions = typeof cimdFallback === 'object' ? cimdFallback : {};
+    if (cimdFallbackOptions.maxAgeSeconds !== undefined && !isValidAccessTokenTTL(cimdFallbackOptions.maxAgeSeconds)) {
+      throw new TypeError(
+        `clientIdMetadataDocumentFallback.maxAgeSeconds must be an integer of at least ${KV_MIN_EXPIRATION_TTL_SECONDS} seconds (Cloudflare KV's minimum expiration window).`
+      );
+    }
+    if (cimdFallbackOptions.eligible !== undefined && typeof cimdFallbackOptions.eligible !== 'function') {
+      throw new TypeError('clientIdMetadataDocumentFallback.eligible must be a function');
     }
 
     this.serverCapabilities = buildOAuthServerCapabilities({
@@ -5479,7 +5498,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         throw new Error(`CIMD is enabled but 'global_fetch_strictly_public' compatibility flag is not set.`);
       }
       try {
-        return await fetchClientIdMetadataDocument(clientId, this.serverCapabilities);
+        return await fetchClientIdMetadataDocument(
+          clientId,
+          this.serverCapabilities,
+          env.OAUTH_KV,
+          this.options.clientIdMetadataDocumentFallback
+        );
       } catch (error) {
         // CIMD fetch failed (size limit, timeout, HTTP error, invalid metadata, etc.)
         // Throw a tagged error rather than returning null: KV-backed lookups
