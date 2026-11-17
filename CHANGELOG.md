@@ -1,5 +1,19 @@
 # @cloudflare/workers-oauth-provider
 
+## 1.3.0
+
+### Minor Changes
+
+- [#426](https://github.com/cloudflare/workers-oauth-provider/pull/426) [`dbd149a`](https://github.com/cloudflare/workers-oauth-provider/commit/dbd149a21962f02d732dfa98ae7b2316a814d6ba) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Client ID Metadata Document clients stay signed in while their document's host is down. The provider keeps the last validated copy of each document in `OAUTH_KV` under `cimd:{sha256(url)}`. When the origin times out, fails at the network level, or answers 404, 408, 429 or 5xx, the stored copy is validated again and used in its place. Before this, every authorize, code exchange and refresh in that window failed with `invalid_client`: on Oct 22 2026 `chatgpt.com/oauth/client.json` returned 404 for about half an hour, and on Oct 27 GitHub answered 429 for GitHub Copilot's documents when fetched from a Worker.
+
+  The copy expires 24 hours after the last successful fetch, and an unchanged document is rewritten at most once an hour. 401, 403 and other 4xx responses, and fresh documents that fail to parse or validate, never use it. A 410 deletes it the next time the provider fetches the document, so a client owner withdrawing a document should answer 410, not 404.
+
+  The new `clientIdMetadataDocumentFallback` option shortens the copy's lifetime (`maxAgeSeconds`), limits it to clients you choose (`eligible`), or turns it off (`false`).
+
+### Patch Changes
+
+- [#423](https://github.com/cloudflare/workers-oauth-provider/pull/423) [`5c75ddc`](https://github.com/cloudflare/workers-oauth-provider/commit/5c75ddcf475e247791502eac14dcf14ab0dd4b3b) Thanks [@choksi2212](https://github.com/choksi2212)! - Dynamic Client Registration now registers the grant types this server supports instead of rejecting a client that asks for more. VS Code's published metadata declares the device-code grant next to authorization code and refresh grants, and registration failed with `invalid_client_metadata` before this change. RFC 7591 allows the server to ignore unsupported requested values, so the registration keeps the supported subset, echoes it in the response, and the token endpoint still refuses grants the client never got. Response type validation stays strict, and a request whose supported grant set is empty is rejected, including `grant_types: []`, which previously registered a client that could never complete any flow.
+
 ## 1.2.4
 
 ### Patch Changes
