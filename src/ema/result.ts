@@ -41,6 +41,7 @@ export type EmaValidationError =
   | { reason: 'resource_invalid'; resource: string }
   | { reason: 'resource_mismatch'; expected: string; got: string }
   | { reason: 'invalid_scope_param' }
+  | { reason: 'scope_not_granted'; requested: string[] }
   | { reason: 'invalid_mapped_user' }
   | { reason: 'invalid_mapped_scope' }
   | { reason: 'invalid_mapped_props' }
@@ -51,7 +52,7 @@ export type EmaValidationError =
 
 /** Wire-level error response that the AS returns to the client. */
 interface EmaErrorWireResponse {
-  code: 'invalid_grant' | 'invalid_target' | 'invalid_request';
+  code: 'invalid_grant' | 'invalid_target' | 'invalid_request' | 'invalid_scope';
   message: string;
 }
 
@@ -68,6 +69,8 @@ export function emaErrorToWire(e: EmaValidationError): EmaErrorWireResponse {
       return { code: 'invalid_request', message: 'assertion is required' };
     case 'invalid_scope_param':
       return { code: 'invalid_request', message: 'Invalid scope parameter format' };
+    case 'scope_not_granted':
+      return { code: 'invalid_scope', message: 'None of the requested scopes can be granted' };
     case 'resource_invalid':
     case 'resource_mismatch':
       return { code: 'invalid_target', message: 'Invalid resource' };

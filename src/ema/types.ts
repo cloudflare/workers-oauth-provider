@@ -156,6 +156,40 @@ export type EmaClaimsMapper<Env = Cloudflare.Env> = (
   input: EmaClaimsMapperInput<Env>
 ) => Promise<EmaClaimsMapperResult | null>;
 
+/**
+ * Passed to `enterpriseManagedAuthorization.onTokenIssued` once an ID-JAG has been redeemed and
+ * the grant and access token are stored. It carries what an audit record needs and never the
+ * assertion or the token.
+ */
+export interface EmaTokenIssuedEvent<Env = Cloudflare.Env> {
+  /** Validated ID-JAG claims, including `iss`, `sub`, `jti` and any IdP-specific claims. */
+  claims: EmaIdJagClaims;
+
+  /** Authenticated OAuth client that redeemed the assertion. */
+  clientInfo: ClientInfo;
+
+  /** User ID returned by `mapClaims`. */
+  userId: string;
+
+  /** ID of the grant the access token belongs to, for `revokeGrant(grantId, userId)`. */
+  grantId: string;
+
+  /** Resource the access token is audience-restricted to. */
+  resource: string;
+
+  /** Scopes the access token carries, after every ceiling was applied. */
+  scope: string[];
+
+  /** Access token lifetime in seconds. */
+  expiresIn: number;
+
+  /** The token request. */
+  request: Request;
+
+  /** Cloudflare Worker environment variables. */
+  env: Env;
+}
+
 /** Internal provider for fetching an IdP's JWKS during ID-JAG signature verification. */
 export interface EmaJwksProvider {
   fetch(
@@ -254,6 +288,16 @@ export interface EmaOptions<Env = Cloudflare.Env> {
 
   /** Maps validated enterprise claims to local token data. */
   mapClaims: EmaClaimsMapper<Env>;
+
+  /**
+   * Called after a redeemed ID-JAG's grant and access token are stored, before the token
+   * response is sent. Use it for audit logs and metrics, or to index the grant (for example
+   * by tenant, so a tenant can be switched off with `revokeGrant`).
+   *
+   * The token response waits for it. A thrown error propagates like any unexpected error, so
+   * the Worker answers 500: the stored token is never returned and expires with its TTL.
+   */
+  onTokenIssued?: (event: EmaTokenIssuedEvent<Env>) => void | Promise<void>;
 
   /** JWKS cache TTL in seconds. Defaults to 300 seconds. */
   jwksCacheTtlSeconds?: number;
