@@ -13720,6 +13720,27 @@ describe('OAuthProvider', () => {
     }
 
     const nowSeconds = () => Math.floor(Date.now() / 1000);
+    type StoredClientRecord = Record<string, unknown> & { registrationExpiresAt?: number };
+    const isStoredClientRecord = (value: unknown): value is StoredClientRecord =>
+      typeof value === 'object' && value !== null;
+
+    function rewriteClientOnSecondRead(
+      clientId: string,
+      rewrite: (record: StoredClientRecord) => StoredClientRecord
+    ) {
+      const originalGet = mockEnv.OAUTH_KV.get.bind(mockEnv.OAUTH_KV);
+      let clientGetCount = 0;
+      vi.spyOn(mockEnv.OAUTH_KV, 'get').mockImplementation(async (key, options) => {
+        const result = await originalGet(key, options);
+        if (key === `client:${clientId}`) {
+          clientGetCount += 1;
+          if (clientGetCount === 2 && isStoredClientRecord(result)) {
+            return rewrite(result);
+          }
+        }
+        return result;
+      });
+    }
 
     it('stamps a dynamically registered client with the expiry it was written under, and keeps the stamp internal', async () => {
       const provider = makeProvider();
@@ -13883,19 +13904,10 @@ describe('OAuthProvider', () => {
       const tokens = await issueTokens(provider, client);
       await ageRegistration(client.client_id, NINETY_DAYS / 2 - 1);
 
-      const originalGet = mockEnv.OAUTH_KV.get.bind(mockEnv.OAUTH_KV);
-      let clientGetCount = 0;
-      vi.spyOn(mockEnv.OAUTH_KV, 'get').mockImplementation(async (key, options) => {
-        const result = await originalGet(key, options);
-        if (key === `client:${client.client_id}`) {
-          clientGetCount += 1;
-          // On the second read (inside renewClientRegistrationIfDue), simulate a concurrent
-          // request having just renewed the client record in KV.
-          if (clientGetCount === 2 && result) {
-            return { ...result, registrationExpiresAt: nowSeconds() + NINETY_DAYS };
-          }
-        }
-        return result;
+      rewriteClientOnSecondRead(client.client_id, (record) => {
+        // On the second read (inside renewClientRegistrationIfDue), simulate a concurrent
+        // request having just renewed the client record in KV.
+        return { ...record, registrationExpiresAt: nowSeconds() + NINETY_DAYS };
       });
 
       const writes = clientWrites();
@@ -13909,18 +13921,9 @@ describe('OAuthProvider', () => {
       const tokens = await issueTokens(provider, client);
       await ageRegistration(client.client_id, NINETY_DAYS / 2 - 1);
 
-      const originalGet = mockEnv.OAUTH_KV.get.bind(mockEnv.OAUTH_KV);
-      let clientGetCount = 0;
-      vi.spyOn(mockEnv.OAUTH_KV, 'get').mockImplementation(async (key, options) => {
-        const result = await originalGet(key, options);
-        if (key === `client:${client.client_id}`) {
-          clientGetCount += 1;
-          if (clientGetCount === 2 && result) {
-            const { registrationExpiresAt: _ignored, ...withoutExpiry } = result;
-            return withoutExpiry;
-          }
-        }
-        return result;
+      rewriteClientOnSecondRead(client.client_id, (record) => {
+        const { registrationExpiresAt: _ignored, ...withoutExpiry } = record;
+        return withoutExpiry;
       });
 
       const writes = clientWrites();
