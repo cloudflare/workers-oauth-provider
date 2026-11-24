@@ -5480,7 +5480,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       // Re-read rather than re-write the authenticated copy: the record may have been
       // updated or deleted since this request loaded it.
       const current: StoredClientInfo | null = await env.OAUTH_KV.get(`client:${client.clientId}`, { type: 'json' });
-      if (current) await this.putRegisteredClient(env, current, now);
+      // `registrationExpiresAt` can be absent for permanent registrations or pre-stamp
+      // records. In both cases we must not rewrite here, or we may convert a permanent
+      // record into an expiring one under concurrent updates.
+      if (!current || current.registrationExpiresAt === undefined || current.registrationExpiresAt - now > ttl / 2) {
+        return;
+      }
+      await this.putRegisteredClient(env, current, now);
     } catch (error) {
       console.warn(`Failed to renew client registration ${client.clientId}:`, error);
     }
