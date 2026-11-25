@@ -1753,6 +1753,35 @@ describe('Client ID Metadata Document (CIMD)', () => {
       expect(grants.items.length).toBe(2);
     });
 
+    it('should revoke only the same redirect URI grant when revokeExistingGrants is true', async () => {
+      globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(createMockFetchResponse(cimdMetadata)));
+
+      const codeA = await authorizeAndGetCode(cimdUrl, installA);
+      const tokensA = await exchangeCodeForTokens(cimdUrl, codeA, installA);
+      const codeB = await authorizeAndGetCode(cimdUrl, installB);
+      const tokensB = await exchangeCodeForTokens(cimdUrl, codeB, installB);
+
+      // An application that opts in replaces installation A's grant, and only that one.
+      const request = await mockEnv.OAUTH_PROVIDER!.parseAuthRequest(
+        createMockRequest(
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent(installA)}&response_type=code&state=test-state&code_challenge=${codeChallenge}&code_challenge_method=S256`
+        )
+      );
+      await mockEnv.OAUTH_PROVIDER!.completeAuthorization({
+        request,
+        userId: 'test-user-123',
+        metadata: {},
+        scope: request.scope,
+        props: { userId: 'test-user-123', username: 'TestUser' },
+        revokeExistingGrants: true,
+      });
+
+      expect(await callApi(tokensA.access_token)).toBe(401);
+      expect(await callApi(tokensB.access_token)).toBe(200);
+      const grants = await mockEnv.OAUTH_PROVIDER!.listUserGrants('test-user-123');
+      expect(grants.items.map((grant) => grant.redirectUri).sort()).toEqual([installA, installB]);
+    });
+
     it('should leave grants recorded before redirectUri existed untouched', async () => {
       // A grant persisted by a release that predates the redirectUri field.
       await mockEnv.OAUTH_KV.put(
