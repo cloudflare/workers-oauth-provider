@@ -1797,6 +1797,37 @@ describe('Client ID Metadata Document (CIMD)', () => {
       expect(grants.items[0].id).not.toBe('legacygrant1');
     });
 
+    it('should replace the grant of a URL client_id stored in KV when CIMD is off', async () => {
+      oauthProvider = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        scopesSupported: ['read', 'write', 'profile'],
+      });
+      // The env keeps the helpers of the first provider that served it.
+      mockEnv.OAUTH_PROVIDER = null;
+      await mockEnv.OAUTH_KV.put(
+        `client:${cimdUrl}`,
+        JSON.stringify({ clientId: cimdUrl, redirectUris: [installA, installB], tokenEndpointAuthMethod: 'none' })
+      );
+      const fetchSpy = vi.fn();
+      globalThis.fetch = fetchSpy;
+
+      const codeA = await authorizeAndGetCode(cimdUrl, installA);
+      const tokensA = await exchangeCodeForTokens(cimdUrl, codeA, installA);
+      expect(await callApi(tokensA.access_token)).toBe(200);
+
+      // Nothing resolves this client through CIMD, so it is a registered client like any other.
+      await authorizeAndGetCode(cimdUrl, installB);
+
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(await callApi(tokensA.access_token)).toBe(401);
+      const grants = await mockEnv.OAUTH_PROVIDER!.listUserGrants('test-user-123');
+      expect(grants.items.length).toBe(1);
+    });
+
     it('should still revoke by client alone for non-CIMD clients with a different redirect URI', async () => {
       const registerResponse = await oauthProvider.fetch(
         createMockRequest(

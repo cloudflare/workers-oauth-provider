@@ -1274,11 +1274,11 @@ export interface CompleteAuthorizationOptions {
    * stale tokens from causing infinite re-auth loops when props change.
    * Set to false to allow multiple concurrent grants per user+client.
    *
-   * Defaults to true, except for a Client ID Metadata Document client_id (an https URL
-   * with a path), where it defaults to false. That client_id is shared by every
-   * installation and connection of the client, so the earlier grants may belong to
-   * another device or agent that is still in use. Setting it to true for such a client
-   * signs the user out of all of them.
+   * Defaults to true, except for a Client ID Metadata Document client (an https URL
+   * client_id, with `clientIdMetadataDocumentEnabled` on), where it defaults to false.
+   * That client_id is shared by every installation and connection of the client, so the
+   * earlier grants may belong to another device or agent that is still in use. Setting
+   * it to true for such a client signs the user out of all of them for this resource.
    */
   revokeExistingGrants?: boolean;
 }
@@ -6793,14 +6793,16 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
     // If requested, collect existing grants for this user+client to revoke AFTER the new grant is created.
     // This avoids a data-loss window where the user has no grants if creation fails.
     let grantsToRevoke: string[] = [];
-    // A generated client_id belongs to one installation, so its earlier grants are stale
+    // A registered client_id belongs to one installation, so its earlier grants are stale
     // and replacing them is the default. A CIMD client_id is the metadata document URL,
     // shared by every installation and connection of the client, and nothing in the
     // request tells them apart: a hosted client uses one https callback for all of its
     // connections, and a fixed loopback port is the same on every device. Its earlier
     // grants may be live, so the default is to keep them; the client revokes its own
-    // (RFC 7009).
-    if (options.revokeExistingGrants ?? !isClientIdMetadataDocumentUrl(clientId)) {
+    // (RFC 7009). A URL client_id stored in KV with CIMD off is a registered client.
+    const isCimdClient =
+      !!this.provider.options.clientIdMetadataDocumentEnabled && isClientIdMetadataDocumentUrl(clientId);
+    if (options.revokeExistingGrants ?? !isCimdClient) {
       const readConcurrency = DEFAULT_REVOKE_EXISTING_GRANTS_BATCH_SIZE;
       grantsToRevoke = await this.findGrantIds(
         options.userId,
