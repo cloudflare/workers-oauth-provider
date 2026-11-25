@@ -1,5 +1,19 @@
 # @cloudflare/workers-oauth-provider
 
+## 1.4.0
+
+### Minor Changes
+
+- [#434](https://github.com/cloudflare/workers-oauth-provider/pull/434) [`151220e`](https://github.com/cloudflare/workers-oauth-provider/commit/151220e1cdf3c2e7528ef5a25f320eb981e37379) Thanks [@mattzcarey](https://github.com/mattzcarey)! - A new authorization from a Client ID Metadata Document client no longer revokes the user's other grants from that client. `revokeExistingGrants` now defaults to `false` for a client resolved from a Client ID Metadata Document, and stays `true` for every registered client.
+
+  A CIMD `client_id` is shared by every installation and connection of the client, so an earlier grant can belong to another device or agent that is still in use. 0.10.3 limited the default revocation to grants from the same redirect URI, but a hosted client uses one https callback for all of its connections and a fixed loopback port is the same on every device. Signing in a second agent still revoked the first, whose next refresh failed with `Grant not found`.
+
+  `revokeExistingGrants: true` now means the same for every client: revoke the user's other grants for this client and resource. For a CIMD client that used to revoke only grants from the same redirect URI. To keep one grant per user and resource for a CIMD client, pass `true`. To choose which grants to end, use `listUserGrants()` and `revokeGrant()`.
+
+  A URL `client_id` stored in KV, with `clientIdMetadataDocumentEnabled` off, is a registered client again: a new authorization replaces its earlier grants whatever their redirect URI.
+
+  Grant keys no longer mirror `redirectUri` into KV metadata. The grant record still stores it, and `listUserGrants()` still returns it.
+
 ## 1.3.0
 
 ### Minor Changes
