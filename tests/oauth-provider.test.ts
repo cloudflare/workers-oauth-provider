@@ -12714,24 +12714,27 @@ describe('OAuthProvider', () => {
       });
 
       it('writes a grant without key metadata when it would exceed the KV limit, and still replaces it later', async () => {
-        // A redirect URI long enough that clientId + resource + redirectUri cannot fit in a
-        // kilobyte of metadata. The mock rejects oversize metadata exactly as KV does.
-        const longRedirectUri = `https://client.example.com/callback?state=${'x'.repeat(1100)}`;
+        // A resource long enough that clientId + resource cannot fit in a kilobyte of
+        // metadata. The mock rejects oversize metadata exactly as KV does.
+        const longPath = `/${'x'.repeat(1100)}`;
+        const longResource = `https://example.com${longPath}`;
+        const redirectUri = 'https://client.example.com/callback';
         const provider = new OAuthProvider({
-          apiRoute: ['/api/'],
+          apiRoute: [`${longPath}/`],
           apiHandler: TestApiHandler,
           defaultHandler: createDefaultHandlerWithRevoke(() => propsFromAuthorize),
           authorizeEndpoint: '/authorize',
           tokenEndpoint: '/oauth/token',
           clientRegistrationEndpoint: '/oauth/register',
           scopesSupported: ['read', 'write'],
+          resourceMetadata: { resource: longResource },
         });
         const registration = await provider.fetch(
           createMockRequest(
             'https://example.com/oauth/register',
             'POST',
             { 'Content-Type': 'application/json' },
-            JSON.stringify({ redirect_uris: [longRedirectUri], token_endpoint_auth_method: 'none' })
+            JSON.stringify({ redirect_uris: [redirectUri], token_endpoint_auth_method: 'none' })
           ),
           reAuthEnv,
           reAuthCtx
@@ -12741,7 +12744,7 @@ describe('OAuthProvider', () => {
           provider.fetch(
             createMockRequest(
               `https://example.com/authorize?response_type=code&client_id=${clientId}` +
-                `&redirect_uri=${encodeURIComponent(longRedirectUri)}&scope=read` +
+                `&redirect_uri=${encodeURIComponent(redirectUri)}&scope=read` +
                 `&code_challenge=${'a'.repeat(43)}&code_challenge_method=S256`
             ),
             reAuthEnv,
@@ -12777,7 +12780,7 @@ describe('OAuthProvider', () => {
 
         // Strip the metadata, as if a version before 1.0 had written the record.
         const [{ name: grantKey, metadata }] = (await reAuthEnv.OAUTH_KV.list({ prefix: 'grant:user-1:' })).keys;
-        expect(metadata).toMatchObject({ clientId, redirectUri: 'https://client.example.com/callback' });
+        expect(metadata).toMatchObject({ clientId });
         await reAuthEnv.OAUTH_KV.put(grantKey, (await reAuthEnv.OAUTH_KV.get(grantKey)) as string);
         expect((await reAuthEnv.OAUTH_KV.list({ prefix: 'grant:user-1:' })).keys[0].metadata).toBeUndefined();
 

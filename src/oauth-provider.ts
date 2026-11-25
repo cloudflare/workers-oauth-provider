@@ -1269,10 +1269,16 @@ export interface CompleteAuthorizationOptions {
   props: any;
 
   /**
-   * Revokes all existing grants for this user+client combination
-   * after storing the new grant. Defaults to true. This prevents stale
-   * tokens from causing infinite re-auth loops when props change.
+   * Revokes the user's existing grants for this client and resource after storing
+   * the new grant, so the user holds one grant per client and resource. This prevents
+   * stale tokens from causing infinite re-auth loops when props change.
    * Set to false to allow multiple concurrent grants per user+client.
+   *
+   * Defaults to true, except for a Client ID Metadata Document client (an https URL
+   * client_id, with `clientIdMetadataDocumentEnabled` on), where it defaults to false.
+   * That client_id is shared by every installation and connection of the client, so the
+   * earlier grants may belong to another device or agent that is still in use. Setting
+   * it to true for such a client signs the user out of all of them for this resource.
    */
   revokeExistingGrants?: boolean;
 }
@@ -1376,10 +1382,9 @@ export interface Grant {
   resource?: string | string[];
 
   /**
-   * The exact redirect URI used in the authorization request that created this grant
-   * Recorded so that default grant revocation can be scoped to a single installation
-   * of a CIMD client (whose client_id is shared across all installations). Absent on
-   * grants created before this field was introduced.
+   * The exact redirect URI used in the authorization request that created this grant.
+   * Checked against the `redirect_uri` at code exchange. Absent on grants created before
+   * this field was introduced.
    */
   redirectUri?: string;
 }
@@ -1641,10 +1646,9 @@ export interface GrantSummary {
   expiresAt?: number;
 
   /**
-   * The exact redirect URI used in the authorization request that created this grant
-   * Recorded so that default grant revocation can be scoped to a single installation
-   * of a CIMD client (whose client_id is shared across all installations). Absent on
-   * grants created before this field was introduced.
+   * The exact redirect URI used in the authorization request that created this grant.
+   * Checked against the `redirect_uri` at code exchange. Absent on grants created before
+   * this field was introduced.
    */
   redirectUri?: string;
   /** Canonical protected resource, absent only on a pre-resource legacy grant. */
@@ -6167,12 +6171,11 @@ const DEFAULT_REVOKE_EXISTING_GRANTS_BATCH_SIZE = 50;
  * The fields a new authorization matches an existing grant on, mirrored into the
  * grant key's KV metadata so `list()` returns them and `completeAuthorization()` does
  * not have to read every grant record the user has. Nothing here is secret: the
- * grant record already stores all three in the clear.
+ * grant record already stores both in the clear.
  */
 interface GrantKeyMetadata {
   clientId: string;
   resource?: string | string[];
-  redirectUri?: string;
 }
 
 /** KV serialises key metadata as JSON and rejects a write carrying more than this. */
@@ -6181,13 +6184,12 @@ const MAX_KV_METADATA_BYTES = 1024;
 /**
  * Key metadata for a grant record, or `undefined` when it would not fit. A grant
  * written without metadata is read individually when scanned, exactly like a grant
- * written before metadata existed; that only happens when a `client_id` and two URLs
- * together exceed a kilobyte.
+ * written before metadata existed; that only happens when a `client_id` and its
+ * resources together exceed a kilobyte.
  */
 function grantKeyMetadata(grant: Grant): GrantKeyMetadata | undefined {
   const metadata: GrantKeyMetadata = { clientId: grant.clientId };
   if (grant.resource !== undefined) metadata.resource = grant.resource;
-  if (grant.redirectUri !== undefined) metadata.redirectUri = grant.redirectUri;
   const bytes = new TextEncoder().encode(JSON.stringify(metadata)).byteLength;
   return bytes <= MAX_KV_METADATA_BYTES ? metadata : undefined;
 }
@@ -6209,11 +6211,9 @@ function parseGrantKey(name: string): { userId: string; grantId: string } | unde
 /** Whether a listed key carries metadata this version can match a grant on. */
 function isGrantKeyMetadata(value: unknown): value is GrantKeyMetadata {
   if (typeof value !== 'object' || value === null) return false;
-  const { clientId, resource, redirectUri } = value as Record<string, unknown>;
+  const { clientId, resource } = value as Record<string, unknown>;
   return (
-    typeof clientId === 'string' &&
-    (resource === undefined || typeof resource === 'string' || Array.isArray(resource)) &&
-    (redirectUri === undefined || typeof redirectUri === 'string')
+    typeof clientId === 'string' && (resource === undefined || typeof resource === 'string' || Array.isArray(resource))
   );
 }
 
@@ -6793,20 +6793,21 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
     // If requested, collect existing grants for this user+client to revoke AFTER the new grant is created.
     // This avoids a data-loss window where the user has no grants if creation fails.
     let grantsToRevoke: string[] = [];
-    if (options.revokeExistingGrants !== false) {
-      // A CIMD client_id is the metadata document URL, shared across all installations of
-      // the client, so revoking by clientId alone would log the user out everywhere. The
-      // redirect URI identifies the installation, so scope revocation to it. Legacy grants
-      // without a stored redirectUri never match and are left alone — the bug being fixed
-      // is over-revocation, so not revoking is the safe direction.
-      const isCimdClient = isClientIdMetadataDocumentUrl(clientId);
+    // A registered client_id belongs to one installation, so its earlier grants are stale
+    // and replacing them is the default. A CIMD client_id is the metadata document URL,
+    // shared by every installation and connection of the client, and nothing in the
+    // request tells them apart: a hosted client uses one https callback for all of its
+    // connections, and a fixed loopback port is the same on every device. Its earlier
+    // grants may be live, so the default is to keep them; the client revokes its own
+    // (RFC 7009). A URL client_id stored in KV with CIMD off is a registered client.
+    const isCimdClient =
+      !!this.provider.options.clientIdMetadataDocumentEnabled && isClientIdMetadataDocumentUrl(clientId);
+    if (options.revokeExistingGrants ?? !isCimdClient) {
       const readConcurrency = DEFAULT_REVOKE_EXISTING_GRANTS_BATCH_SIZE;
       grantsToRevoke = await this.findGrantIds(
         options.userId,
         (grant) =>
-          grant.clientId === clientId &&
-          (!isCimdClient || grant.redirectUri === options.request.redirectUri) &&
-          this.provider.shouldReplaceGrantForResource(grant.resource, effectiveResource),
+          grant.clientId === clientId && this.provider.shouldReplaceGrantForResource(grant.resource, effectiveResource),
         readConcurrency
       );
     }

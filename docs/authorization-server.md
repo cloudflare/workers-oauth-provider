@@ -22,7 +22,7 @@ A typical flow has three steps:
 
 `completeAuthorization()` stores a new grant and, by default, revokes existing grants for the same user, client, and resource after the new grant is safely stored. A grant for another registered resource is a separate authorization and is not revoked. Set `revokeExistingGrants: false` only when the application intentionally allows concurrent grants within the same resource.
 
-For Client ID Metadata Document clients, whose client_id is the metadata URL shared by every installation, default revocation is additionally scoped to grants created from the same redirect URI, so one installation's re-authorization does not revoke another's. Grants created before the redirect URI was recorded are never auto-revoked by CIMD clients.
+Client ID Metadata Document clients are the exception: with `clientIdMetadataDocumentEnabled` on, `revokeExistingGrants` defaults to `false` for a client_id that is an https URL with a path. That client_id is shared by every installation and connection of the client, so the user's earlier grants may belong to another device or agent that is still in use, and nothing in the request tells them apart. A hosted client uses one https callback for all of its connections, and a fixed loopback port is the same on every device. Those grants end when they expire or when the client revokes them (RFC 7009). Pass `revokeExistingGrants: true` to keep one grant per user and resource for such a client, which signs the user out of its other installations for that resource. To end some grants and keep others, use `listUserGrants()` and `revokeGrant()`.
 
 ### Authorization response issuer
 
@@ -200,7 +200,7 @@ Sensitive values are not stored in plaintext:
 
 See [storage-schema.md](../storage-schema.md) for the complete KV layout.
 
-By default `completeAuthorization()` revokes the user's earlier grants for the same client and resource. It finds them from KV key metadata that every grant written by 1.0 or later carries, so the cost is one `list()` per thousand grants the user has, not a read per grant. Grants written before 1.0 are read individually, 50 at a time, until a refresh rewrites them with metadata.
+By default `completeAuthorization()` revokes the user's earlier grants for the same client and resource, except for Client ID Metadata Document clients ([Authorization endpoint](#authorization-endpoint)). It finds them from KV key metadata that every grant written by 1.0 or later carries, so the cost is one `list()` per thousand grants the user has, not a read per grant. Grants written before 1.0 are read individually, 50 at a time, until a refresh rewrites them with metadata.
 
 KV TTLs remove expiring records automatically. `purgeExpiredData()` sweeps orphaned or expired grants and tokens in resumable batches from a Cron Trigger; see [KV cleanup](advanced-configuration.md#kv-cleanup).
 

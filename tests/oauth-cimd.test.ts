@@ -1694,25 +1694,66 @@ describe('Client ID Metadata Document (CIMD)', () => {
       expect(grants.items.map((grant) => grant.redirectUri).sort()).toEqual([installA, installB]);
     });
 
-    it('should revoke the previous grant when the same installation re-authorizes', async () => {
+    it('should keep the earlier grant when an authorization reuses the same redirect URI', async () => {
       globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(createMockFetchResponse(cimdMetadata)));
 
       const codeA = await authorizeAndGetCode(cimdUrl, installA);
       const tokensA = await exchangeCodeForTokens(cimdUrl, codeA, installA);
       expect(await callApi(tokensA.access_token)).toBe(200);
 
-      // Same installation authorizes again with the same redirect URI.
+      // The same redirect URI can be another device (a fixed loopback port), so it is no
+      // evidence the earlier grant is stale.
       const codeB = await authorizeAndGetCode(cimdUrl, installA);
       const tokensB = await exchangeCodeForTokens(cimdUrl, codeB, installA);
 
-      expect(await callApi(tokensA.access_token)).toBe(401);
+      expect(await callApi(tokensA.access_token)).toBe(200);
       expect(await callApi(tokensB.access_token)).toBe(200);
 
       const grants = await mockEnv.OAUTH_PROVIDER!.listUserGrants('test-user-123');
-      expect(grants.items.length).toBe(1);
+      expect(grants.items.length).toBe(2);
     });
 
-    it('should leave grants recorded before redirectUri existed untouched', async () => {
+    it('should keep every connection of a hosted client that shares one https callback', async () => {
+      const hostedUrl = 'https://hosted.example.com/oauth/metadata.json';
+      const hostedCallback = 'https://hosted.example.com/oauth/callback';
+      globalThis.fetch = vi.fn().mockImplementation(() =>
+        Promise.resolve(
+          createMockFetchResponse({
+            client_id: hostedUrl,
+            client_name: 'Hosted CIMD Client',
+            redirect_uris: [hostedCallback],
+            token_endpoint_auth_method: 'none',
+          })
+        )
+      );
+
+      // One user connects the hosted client twice (two agents or workspaces).
+      const codeOne = await authorizeAndGetCode(hostedUrl, hostedCallback);
+      const tokensOne = await exchangeCodeForTokens(hostedUrl, codeOne, hostedCallback);
+      const codeTwo = await authorizeAndGetCode(hostedUrl, hostedCallback);
+      const tokensTwo = await exchangeCodeForTokens(hostedUrl, codeTwo, hostedCallback);
+
+      expect(await callApi(tokensOne.access_token)).toBe(200);
+      expect(await callApi(tokensTwo.access_token)).toBe(200);
+
+      // The first connection can still refresh: no "Grant not found".
+      const refreshResponse = await oauthProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          `grant_type=refresh_token&refresh_token=${encodeURIComponent(tokensOne.refresh_token)}&client_id=${encodeURIComponent(hostedUrl)}`
+        ),
+        mockEnv,
+        mockCtx
+      );
+      expect(refreshResponse.status).toBe(200);
+
+      const grants = await mockEnv.OAUTH_PROVIDER!.listUserGrants('test-user-123');
+      expect(grants.items.length).toBe(2);
+    });
+
+    it('should revoke every grant of the CIMD client when revokeExistingGrants is true', async () => {
       // A grant persisted by a release that predates the redirectUri field.
       await mockEnv.OAUTH_KV.put(
         'grant:test-user-123:legacygrant1',
@@ -1728,12 +1769,63 @@ describe('Client ID Metadata Document (CIMD)', () => {
       );
       globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(createMockFetchResponse(cimdMetadata)));
 
-      const code = await authorizeAndGetCode(cimdUrl, installA);
-      expect(code).toBeTruthy();
+      const codeA = await authorizeAndGetCode(cimdUrl, installA);
+      const tokensA = await exchangeCodeForTokens(cimdUrl, codeA, installA);
+      const codeB = await authorizeAndGetCode(cimdUrl, installB);
+      const tokensB = await exchangeCodeForTokens(cimdUrl, codeB, installB);
 
+      // An application that opts in keeps one grant per user: the option means the same
+      // for a CIMD client as for any other, whatever redirect URI the earlier grants used.
+      const request = await mockEnv.OAUTH_PROVIDER!.parseAuthRequest(
+        createMockRequest(
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent(installA)}&response_type=code&state=test-state&code_challenge=${codeChallenge}&code_challenge_method=S256`
+        )
+      );
+      await mockEnv.OAUTH_PROVIDER!.completeAuthorization({
+        request,
+        userId: 'test-user-123',
+        metadata: {},
+        scope: request.scope,
+        props: { userId: 'test-user-123', username: 'TestUser' },
+        revokeExistingGrants: true,
+      });
+
+      expect(await callApi(tokensA.access_token)).toBe(401);
+      expect(await callApi(tokensB.access_token)).toBe(401);
       const grants = await mockEnv.OAUTH_PROVIDER!.listUserGrants('test-user-123');
-      expect(grants.items.length).toBe(2);
-      expect(grants.items.some((grant) => grant.id === 'legacygrant1')).toBe(true);
+      expect(grants.items.length).toBe(1);
+      expect(grants.items[0].id).not.toBe('legacygrant1');
+    });
+
+    it('should replace the grant of a URL client_id stored in KV when CIMD is off', async () => {
+      oauthProvider = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: TestApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        scopesSupported: ['read', 'write', 'profile'],
+      });
+      // The env keeps the helpers of the first provider that served it.
+      mockEnv.OAUTH_PROVIDER = null;
+      await mockEnv.OAUTH_KV.put(
+        `client:${cimdUrl}`,
+        JSON.stringify({ clientId: cimdUrl, redirectUris: [installA, installB], tokenEndpointAuthMethod: 'none' })
+      );
+      const fetchSpy = vi.fn();
+      globalThis.fetch = fetchSpy;
+
+      const codeA = await authorizeAndGetCode(cimdUrl, installA);
+      const tokensA = await exchangeCodeForTokens(cimdUrl, codeA, installA);
+      expect(await callApi(tokensA.access_token)).toBe(200);
+
+      // Nothing resolves this client through CIMD, so it is a registered client like any other.
+      await authorizeAndGetCode(cimdUrl, installB);
+
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(await callApi(tokensA.access_token)).toBe(401);
+      const grants = await mockEnv.OAUTH_PROVIDER!.listUserGrants('test-user-123');
+      expect(grants.items.length).toBe(1);
     });
 
     it('should still revoke by client alone for non-CIMD clients with a different redirect URI', async () => {
