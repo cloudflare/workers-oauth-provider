@@ -1273,8 +1273,9 @@ export interface CompleteAuthorizationOptions {
    * after storing the new grant. Defaults to true. This prevents stale
    * tokens from causing infinite re-auth loops when props change.
    * Set to false to allow multiple concurrent grants per user+client.
-   * For Client ID Metadata Document clients it defaults to false, because their
-   * client_id and redirect URI are shared by every installation and connection;
+   * For https URL client IDs (Client ID Metadata Document clients, or a URL pre-registered
+   * in KV) it defaults to false, because their client_id and redirect URI are shared by
+   * every installation and connection;
    * set it to true to revoke their grants from the same redirect URI.
    */
   revokeExistingGrants?: boolean;

@@ -1782,8 +1782,9 @@ describe('Client ID Metadata Document (CIMD)', () => {
       expect(grants.items.map((grant) => grant.redirectUri).sort()).toEqual([installA, installB]);
     });
 
-    it('should leave grants recorded before redirectUri existed untouched', async () => {
-      // A grant persisted by a release that predates the redirectUri field.
+    it('should leave grants recorded before redirectUri existed untouched when revokeExistingGrants is true', async () => {
+      // A grant persisted by a release that predates the redirectUri field. Opting in is the
+      // only path that revokes CIMD grants, so this is where the legacy grant must not match.
       await mockEnv.OAUTH_KV.put(
         'grant:test-user-123:legacygrant1',
         JSON.stringify({
@@ -1798,9 +1799,25 @@ describe('Client ID Metadata Document (CIMD)', () => {
       );
       globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(createMockFetchResponse(cimdMetadata)));
 
+      // A grant from the same redirect URI, which the opt-in does revoke.
       const code = await authorizeAndGetCode(cimdUrl, installA);
-      expect(code).toBeTruthy();
+      const tokens = await exchangeCodeForTokens(cimdUrl, code, installA);
 
+      const request = await mockEnv.OAUTH_PROVIDER!.parseAuthRequest(
+        createMockRequest(
+          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent(installA)}&response_type=code&state=test-state&code_challenge=${codeChallenge}&code_challenge_method=S256`
+        )
+      );
+      await mockEnv.OAUTH_PROVIDER!.completeAuthorization({
+        request,
+        userId: 'test-user-123',
+        metadata: {},
+        scope: request.scope,
+        props: { userId: 'test-user-123', username: 'TestUser' },
+        revokeExistingGrants: true,
+      });
+
+      expect(await callApi(tokens.access_token)).toBe(401);
       const grants = await mockEnv.OAUTH_PROVIDER!.listUserGrants('test-user-123');
       expect(grants.items.length).toBe(2);
       expect(grants.items.some((grant) => grant.id === 'legacygrant1')).toBe(true);
