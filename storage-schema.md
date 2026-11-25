@@ -77,12 +77,11 @@ Grant records store information about permissions a user has granted to an appli
 ```json
 {
   "clientId": "client_abc123",
-  "resource": "https://mcp.example.com/mcp",
-  "redirectUri": "https://client.example.com/callback"
+  "resource": "https://mcp.example.com/mcp"
 }
 ```
 
-`completeAuthorization()` finds the grants a new authorization replaces from `list()` alone, without reading a record per grant, so its KV cost is one `list()` per thousand grants the user has rather than one `get()` per grant. Grants written before 1.0 have no key metadata and are read individually, 50 at a time; every refresh rewrites the grant with metadata. A grant whose metadata would exceed KV's 1,024-byte limit is written without it and read individually in the same way. None of these fields is secret: the record itself stores all three in the clear.
+`completeAuthorization()` finds the grants a new authorization replaces from `list()` alone, without reading a record per grant, so its KV cost is one `list()` per thousand grants the user has rather than one `get()` per grant. Grants written before 1.0 have no key metadata and are read individually, 50 at a time; every refresh rewrites the grant with metadata. A grant whose metadata would exceed KV's 1,024-byte limit is written without it and read individually in the same way. None of these fields is secret: the record itself stores both in the clear. Keys written by 1.0 to 1.3 also carry `redirectUri`, which is no longer read.
 
 **Content Example (during authorization):**
 

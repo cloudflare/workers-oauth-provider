@@ -1753,7 +1753,20 @@ describe('Client ID Metadata Document (CIMD)', () => {
       expect(grants.items.length).toBe(2);
     });
 
-    it('should revoke only the same redirect URI grant when revokeExistingGrants is true', async () => {
+    it('should revoke every grant of the CIMD client when revokeExistingGrants is true', async () => {
+      // A grant persisted by a release that predates the redirectUri field.
+      await mockEnv.OAUTH_KV.put(
+        'grant:test-user-123:legacygrant1',
+        JSON.stringify({
+          id: 'legacygrant1',
+          clientId: cimdUrl,
+          userId: 'test-user-123',
+          scope: ['read'],
+          metadata: {},
+          encryptedProps: 'legacy-ciphertext',
+          createdAt: 1700000000,
+        })
+      );
       globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(createMockFetchResponse(cimdMetadata)));
 
       const codeA = await authorizeAndGetCode(cimdUrl, installA);
@@ -1761,7 +1774,8 @@ describe('Client ID Metadata Document (CIMD)', () => {
       const codeB = await authorizeAndGetCode(cimdUrl, installB);
       const tokensB = await exchangeCodeForTokens(cimdUrl, codeB, installB);
 
-      // An application that opts in replaces installation A's grant, and only that one.
+      // An application that opts in keeps one grant per user: the option means the same
+      // for a CIMD client as for any other, whatever redirect URI the earlier grants used.
       const request = await mockEnv.OAUTH_PROVIDER!.parseAuthRequest(
         createMockRequest(
           `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent(installA)}&response_type=code&state=test-state&code_challenge=${codeChallenge}&code_challenge_method=S256`
@@ -1777,50 +1791,10 @@ describe('Client ID Metadata Document (CIMD)', () => {
       });
 
       expect(await callApi(tokensA.access_token)).toBe(401);
-      expect(await callApi(tokensB.access_token)).toBe(200);
+      expect(await callApi(tokensB.access_token)).toBe(401);
       const grants = await mockEnv.OAUTH_PROVIDER!.listUserGrants('test-user-123');
-      expect(grants.items.map((grant) => grant.redirectUri).sort()).toEqual([installA, installB]);
-    });
-
-    it('should leave grants recorded before redirectUri existed untouched when revokeExistingGrants is true', async () => {
-      // A grant persisted by a release that predates the redirectUri field. Opting in is the
-      // only path that revokes CIMD grants, so this is where the legacy grant must not match.
-      await mockEnv.OAUTH_KV.put(
-        'grant:test-user-123:legacygrant1',
-        JSON.stringify({
-          id: 'legacygrant1',
-          clientId: cimdUrl,
-          userId: 'test-user-123',
-          scope: ['read'],
-          metadata: {},
-          encryptedProps: 'legacy-ciphertext',
-          createdAt: 1700000000,
-        })
-      );
-      globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(createMockFetchResponse(cimdMetadata)));
-
-      // A grant from the same redirect URI, which the opt-in does revoke.
-      const code = await authorizeAndGetCode(cimdUrl, installA);
-      const tokens = await exchangeCodeForTokens(cimdUrl, code, installA);
-
-      const request = await mockEnv.OAUTH_PROVIDER!.parseAuthRequest(
-        createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent(installA)}&response_type=code&state=test-state&code_challenge=${codeChallenge}&code_challenge_method=S256`
-        )
-      );
-      await mockEnv.OAUTH_PROVIDER!.completeAuthorization({
-        request,
-        userId: 'test-user-123',
-        metadata: {},
-        scope: request.scope,
-        props: { userId: 'test-user-123', username: 'TestUser' },
-        revokeExistingGrants: true,
-      });
-
-      expect(await callApi(tokens.access_token)).toBe(401);
-      const grants = await mockEnv.OAUTH_PROVIDER!.listUserGrants('test-user-123');
-      expect(grants.items.length).toBe(2);
-      expect(grants.items.some((grant) => grant.id === 'legacygrant1')).toBe(true);
+      expect(grants.items.length).toBe(1);
+      expect(grants.items[0].id).not.toBe('legacygrant1');
     });
 
     it('should still revoke by client alone for non-CIMD clients with a different redirect URI', async () => {
