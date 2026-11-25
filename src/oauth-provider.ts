@@ -1273,6 +1273,8 @@ export interface CompleteAuthorizationOptions {
    * after storing the new grant. Defaults to true. This prevents stale
    * tokens from causing infinite re-auth loops when props change.
    * Set to false to allow multiple concurrent grants per user+client.
+   * Client ID Metadata Document clients are never revoked this way: their
+   * client_id and redirect URI are shared by every installation and connection.
    */
   revokeExistingGrants?: boolean;
 }
@@ -1376,10 +1378,8 @@ export interface Grant {
   resource?: string | string[];
 
   /**
-   * The exact redirect URI used in the authorization request that created this grant
-   * Recorded so that default grant revocation can be scoped to a single installation
-   * of a CIMD client (whose client_id is shared across all installations). Absent on
-   * grants created before this field was introduced.
+   * The exact redirect URI used in the authorization request that created this grant.
+   * Absent on grants created before this field was introduced.
    */
   redirectUri?: string;
 }
@@ -1641,10 +1641,8 @@ export interface GrantSummary {
   expiresAt?: number;
 
   /**
-   * The exact redirect URI used in the authorization request that created this grant
-   * Recorded so that default grant revocation can be scoped to a single installation
-   * of a CIMD client (whose client_id is shared across all installations). Absent on
-   * grants created before this field was introduced.
+   * The exact redirect URI used in the authorization request that created this grant.
+   * Absent on grants created before this field was introduced.
    */
   redirectUri?: string;
   /** Canonical protected resource, absent only on a pre-resource legacy grant. */
@@ -6793,20 +6791,19 @@ class OAuthHelpersImpl<Env = Cloudflare.Env> implements OAuthHelpers {
     // If requested, collect existing grants for this user+client to revoke AFTER the new grant is created.
     // This avoids a data-loss window where the user has no grants if creation fails.
     let grantsToRevoke: string[] = [];
-    if (options.revokeExistingGrants !== false) {
-      // A CIMD client_id is the metadata document URL, shared across all installations of
-      // the client, so revoking by clientId alone would log the user out everywhere. The
-      // redirect URI identifies the installation, so scope revocation to it. Legacy grants
-      // without a stored redirectUri never match and are left alone — the bug being fixed
-      // is over-revocation, so not revoking is the safe direction.
-      const isCimdClient = isClientIdMetadataDocumentUrl(clientId);
+    // A CIMD client_id is the metadata document URL, shared by every installation and
+    // connection of the client, and its redirect URI does not tell them apart either: a
+    // hosted client uses one https callback for all of its connections, and a fixed
+    // loopback port or private-use scheme is the same on every device. Revoking "existing"
+    // grants would revoke another live connection, so CIMD grants are never replaced; the
+    // client revokes its own (RFC 7009). Over-revocation is the bug, so not revoking is the
+    // safe direction.
+    if (options.revokeExistingGrants !== false && !isClientIdMetadataDocumentUrl(clientId)) {
       const readConcurrency = DEFAULT_REVOKE_EXISTING_GRANTS_BATCH_SIZE;
       grantsToRevoke = await this.findGrantIds(
         options.userId,
         (grant) =>
-          grant.clientId === clientId &&
-          (!isCimdClient || grant.redirectUri === options.request.redirectUri) &&
-          this.provider.shouldReplaceGrantForResource(grant.resource, effectiveResource),
+          grant.clientId === clientId && this.provider.shouldReplaceGrantForResource(grant.resource, effectiveResource),
         readConcurrency
       );
     }

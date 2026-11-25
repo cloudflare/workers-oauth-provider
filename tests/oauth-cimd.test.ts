@@ -1694,22 +1694,63 @@ describe('Client ID Metadata Document (CIMD)', () => {
       expect(grants.items.map((grant) => grant.redirectUri).sort()).toEqual([installA, installB]);
     });
 
-    it('should revoke the previous grant when the same installation re-authorizes', async () => {
+    it('should keep the earlier grant when an authorization reuses the same redirect URI', async () => {
       globalThis.fetch = vi.fn().mockImplementation(() => Promise.resolve(createMockFetchResponse(cimdMetadata)));
 
       const codeA = await authorizeAndGetCode(cimdUrl, installA);
       const tokensA = await exchangeCodeForTokens(cimdUrl, codeA, installA);
       expect(await callApi(tokensA.access_token)).toBe(200);
 
-      // Same installation authorizes again with the same redirect URI.
+      // The same redirect URI can be another device (a fixed loopback port), so it is no
+      // evidence the earlier grant is stale.
       const codeB = await authorizeAndGetCode(cimdUrl, installA);
       const tokensB = await exchangeCodeForTokens(cimdUrl, codeB, installA);
 
-      expect(await callApi(tokensA.access_token)).toBe(401);
+      expect(await callApi(tokensA.access_token)).toBe(200);
       expect(await callApi(tokensB.access_token)).toBe(200);
 
       const grants = await mockEnv.OAUTH_PROVIDER!.listUserGrants('test-user-123');
-      expect(grants.items.length).toBe(1);
+      expect(grants.items.length).toBe(2);
+    });
+
+    it('should keep every connection of a hosted client that shares one https callback', async () => {
+      const hostedUrl = 'https://hosted.example.com/oauth/metadata.json';
+      const hostedCallback = 'https://hosted.example.com/oauth/callback';
+      globalThis.fetch = vi.fn().mockImplementation(() =>
+        Promise.resolve(
+          createMockFetchResponse({
+            client_id: hostedUrl,
+            client_name: 'Hosted CIMD Client',
+            redirect_uris: [hostedCallback],
+            token_endpoint_auth_method: 'none',
+          })
+        )
+      );
+
+      // One user connects the hosted client twice (two agents or workspaces).
+      const codeOne = await authorizeAndGetCode(hostedUrl, hostedCallback);
+      const tokensOne = await exchangeCodeForTokens(hostedUrl, codeOne, hostedCallback);
+      const codeTwo = await authorizeAndGetCode(hostedUrl, hostedCallback);
+      const tokensTwo = await exchangeCodeForTokens(hostedUrl, codeTwo, hostedCallback);
+
+      expect(await callApi(tokensOne.access_token)).toBe(200);
+      expect(await callApi(tokensTwo.access_token)).toBe(200);
+
+      // The first connection can still refresh: no "Grant not found".
+      const refreshResponse = await oauthProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          `grant_type=refresh_token&refresh_token=${encodeURIComponent(tokensOne.refresh_token)}&client_id=${encodeURIComponent(hostedUrl)}`
+        ),
+        mockEnv,
+        mockCtx
+      );
+      expect(refreshResponse.status).toBe(200);
+
+      const grants = await mockEnv.OAUTH_PROVIDER!.listUserGrants('test-user-123');
+      expect(grants.items.length).toBe(2);
     });
 
     it('should leave grants recorded before redirectUri existed untouched', async () => {
